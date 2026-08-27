@@ -20,22 +20,45 @@ ensure_packages() {
     return 0
   fi
   export DEBIAN_FRONTEND=noninteractive
-  if [ ! -x "$(tailscaled_bin)" ] || [ ! -x /usr/sbin/sshd ]; then
+
+  need_apt=0
+  have_tailscaled_daemon || need_apt=1
+  [ -x /usr/sbin/sshd ] || need_apt=1
+  have nft || need_apt=1
+  have curl || need_apt=1
+  have python3 || need_apt=1
+
+  if [ "$need_apt" = 1 ]; then
     apt-get update -qq || true
     apt-get install -y -qq --no-install-recommends \
       openssh-server iptables nftables ca-certificates curl python3 \
       iproute2 procps sudo 2>/dev/null || true
   fi
-  if [ ! -x "$(tailscaled_bin)" ]; then
-    # Official Tailscale repo is optional; ignore failure — vendored bin wins later.
-    if [ ! -f /usr/share/keyrings/tailscale-archive-keyring.gpg ]; then
-      curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg \
-        -o /usr/share/keyrings/tailscale-archive-keyring.gpg 2>/dev/null || true
+
+  if ! have_tailscaled_daemon; then
+    local codename gpg
+    codename=bookworm
+    if [ -f /etc/os-release ]; then
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      codename="${VERSION_CODENAME:-bookworm}"
+    fi
+    gpg=/usr/share/keyrings/tailscale-archive-keyring.gpg
+    if [ ! -f "$gpg" ] && have curl; then
+      curl -fsSL "https://pkgs.tailscale.com/stable/debian/${codename}.noarmor.gpg" \
+        -o "$gpg" 2>/dev/null || \
+      curl -fsSL "https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg" \
+        -o "$gpg" 2>/dev/null || true
+    fi
+    if [ -f "$gpg" ]; then
+      echo "deb [signed-by=$gpg] https://pkgs.tailscale.com/stable/debian ${codename} main" \
+        > /etc/apt/sources.list.d/tailscale.list
+      apt-get update -qq || true
     fi
     apt-get install -y -qq tailscale 2>/dev/null || \
       dpkg --force-confold --configure tailscale 2>/dev/null || true
   fi
-  # Vendor bins so the next overlay skip can use $ROOT/bin
+
   mkdir -p "$BIN_DIR"
   if [ -x /usr/bin/tailscale ] && [ ! -x "$BIN_DIR/tailscale" ]; then
     cp -a /usr/bin/tailscale "$BIN_DIR/tailscale" 2>/dev/null || true
@@ -49,7 +72,7 @@ install_helpers_to_usr() {
   mkdir -p /usr/local/sbin
   for s in box-bootstrap.sh start-tailscaled.sh tailscale-selfheal.sh \
            ensure-ip-forward.sh refresh-exitnode-if-needed.sh \
-           health-tick-forward.sh tailscale-exitnode-nat.sh; do
+           health-tick-forward.sh tailscale-exitnode-nat.sh pick-name.sh; do
     if [ -f "$HERE/$s" ]; then
       install -m 0755 "$HERE/$s" "/usr/local/sbin/$s" 2>/dev/null || true
     fi
@@ -69,7 +92,6 @@ ensure_sshd() {
   if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
     ssh-keygen -A >/dev/null 2>&1 || true
   fi
-  # Listen on all addresses, not only the Tailscale IP.
   if [ -f /etc/ssh/sshd_config ]; then
     grep -q '^ListenAddress 0.0.0.0' /etc/ssh/sshd_config 2>/dev/null || \
       echo 'ListenAddress 0.0.0.0' >> /etc/ssh/sshd_config
@@ -84,22 +106,11 @@ ensure_sshd() {
 }
 
 maybe_login_up() {
-  # Only when statedir is empty AND backend is NeedsLogin.
-  local backend auth=""
-  backend=$(timeout 5 tailscale status --json 2>/dev/null | python3 -c '
-import json,sys
-try:
-    d=json.load(sys.stdin); print(d.get("BackendState") or "")
-except Exception:
-    print("")
-' 2>/dev/null || true)
+  local backend
+  backend="$(wait_for_backend || true)"
 
   case "$backend" in
     Running|Starting) return 0 ;;
-    NoState)
-      sleep 2
-      return 0
-      ;;
   esac
 
   if state_is_populated; then
@@ -111,14 +122,20 @@ except Exception:
     *) return 0 ;;
   esac
 
-  local up=(tailscale up --ssh=false --operator=box
-            --advertise-exit-node --accept-dns
-            --snat-subnet-routes=true --timeout=25s)
+  have_tailscale_cli || return 0
+  local b
+  b="$(tailscale_bin)"
+
+  local -a up
+  up=("$b" up --ssh=false --advertise-exit-node --accept-dns
+      --snat-subnet-routes=true --timeout=25s)
+  if id box >/dev/null 2>&1; then
+    up+=(--operator=box)
+  fi
 
   if [ -s "$AUTHKEY_FILE" ]; then
     echo "bootstrap: auth-key join (statedir empty)"
-    "${up[@]}" --auth-key="file:$AUTHKEY_FILE" || \
-      "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
+    "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
   else
     echo "bootstrap: minting AuthURL (statedir empty, no key)"
     "${up[@]}" || true
@@ -127,10 +144,10 @@ except Exception:
 
 print_status() {
   local backend="unknown" online="no" exitn="no" sshd="down"
-  local ts_pid sh_pid wrk_pid hb="-"
+  local ts_pid="" sh_pid="" wrk_pid="" hb="-"
   local ipfwd="4:?,6:?" auth=""
+  local v4 v6 parsed
 
-  local v4 v6
   v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
   v6=$(tr -d '[:space:]' < /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
   ipfwd="4:${v4},6:${v6}"
@@ -148,7 +165,10 @@ print_status() {
     local now last
     now=$(date +%s)
     last=$(tr -d '[:space:]' < "$RUN_DIR/hb" 2>/dev/null || echo 0)
-    if [ -n "$last" ] && [ "$last" -gt 0 ] 2>/dev/null; then
+    case "$last" in
+      ''|*[!0-9]*) last=0 ;;
+    esac
+    if [ "$last" -gt 0 ] 2>/dev/null; then
       hb="$((now - last))s"
     fi
   fi
@@ -157,23 +177,33 @@ print_status() {
     sshd="up"
   fi
 
-  if have tailscale; then
-    eval "$(timeout 8 tailscale status --json 2>/dev/null | python3 -c '
+  if have_tailscale_cli; then
+    parsed="$(ts status --json 2>/dev/null | python3 -c '
 import json,sys
 try:
     d=json.load(sys.stdin)
     s=d.get("Self") or {}
+    auth=d.get("AuthURL") or ""
     print("backend="+str(d.get("BackendState") or "unknown"))
     print("online="+("yes" if s.get("Online") else "no"))
     print("exitn="+("yes" if s.get("ExitNodeOption") else "no"))
-    ba=d.get("AuthURL") or ""
-    print("auth="+ba)
+    print("auth="+auth.replace("\n"," ").strip())
 except Exception:
     print("backend=unknown")
     print("online=no")
     print("exitn=no")
     print("auth=")
 ' 2>/dev/null || true)"
+    while IFS= read -r line; do
+      case "$line" in
+        backend=*) backend="${line#backend=}" ;;
+        online=*)  online="${line#online=}" ;;
+        exitn=*)   exitn="${line#exitn=}" ;;
+        auth=*)    auth="${line#auth=}" ;;
+      esac
+    done <<EOF
+$parsed
+EOF
   fi
 
   printf 'backend=%s online=%s exit-node=%s sshd=%s ipfwd=%s tailscaled=%s selfheal=%s worker=%s hb=%s' \
@@ -192,7 +222,7 @@ do_ensure() {
   ensure_sshd
   "$HERE/ensure-ip-forward.sh" || true
   "$HERE/start-tailscaled.sh" || true
-  sleep 1
+  wait_for_socket || true
   maybe_login_up
   "$HERE/health-tick-forward.sh" || true
 }
