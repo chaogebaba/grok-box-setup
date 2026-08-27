@@ -10,7 +10,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 INTERVAL="${SELFHEAL_INTERVAL:-15}"
 # hb older than this ⇒ the box (and this worker) was frozen.
 FREEZE_SECS="${SELFHEAL_FREEZE_SECS:-60}"
+# After a recycle, Online=false lags. Do not recycle again during this window.
+RECYCLE_COOLDOWN="${SELFHEAL_RECYCLE_COOLDOWN:-120}"
 MODE="${1:-}"
+# Process start. A new worker (--once after --stop) must not treat leftover
+# hb as a freeze; a long-lived worker that actually thawed should.
+WORKER_STARTED=$(date +%s)
 
 hb_age() {
   local now prev
@@ -27,6 +32,41 @@ hb_age() {
     return 0
   fi
   echo $((now - prev))
+}
+
+recent_time_jump() {
+  python3 - "$TAILSCALED_LOG" <<'PY'
+import datetime, re, sys, time
+path = sys.argv[1]
+try:
+    lines = open(path, errors="replace").read().splitlines()[-150:]
+except Exception:
+    sys.exit(1)
+pat = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}).*time jump detected")
+now = time.time()
+for line in reversed(lines):
+    m = pat.search(line)
+    if not m:
+        continue
+    ts = datetime.datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
+    ts = ts.replace(tzinfo=datetime.timezone.utc)
+    age = now - ts.timestamp()
+    sys.exit(0 if 0 <= age <= 180 else 1)
+sys.exit(1)
+PY
+}
+
+recycled_recently() {
+  local now rec
+  now=$(date +%s)
+  rec=0
+  if [ -f "$RUN_DIR/last-recycle" ]; then
+    rec=$(tr -d '[:space:]' < "$RUN_DIR/last-recycle" 2>/dev/null || echo 0)
+  fi
+  case "$rec" in
+    ''|*[!0-9]*) rec=0 ;;
+  esac
+  [ "$rec" -gt 0 ] && [ $((now - rec)) -lt "$RECYCLE_COOLDOWN" ]
 }
 
 parse_ts() {
@@ -134,6 +174,7 @@ recycle_tailscaled() {
     sleep 0.3
   fi
   rm -f "$RUN_DIR/last-online" "$RUN_DIR/offline-ticks"
+  date +%s > "$RUN_DIR/last-recycle" 2>/dev/null || true
   "$HERE/start-tailscaled.sh" || true
   # Hostinfo set is skipped while backend=NoState; wait out the blip.
   wait_for_backend >/dev/null || true
@@ -142,14 +183,30 @@ recycle_tailscaled() {
 
 # After freeze/thaw, PollNetMap's long-poll is already dead. Self.Online and
 # Health stay green for ~2 min (map timeout), so rebind/restun leaves the
-# admin pane grey. hb age is the wake signal — always recycle that PID.
+# admin pane grey. A long-lived worker's stale hb is the wake signal — recycle
+# that PID. A brand-new worker after --stop also sees leftover hb; only
+# recycle then if tailscaled logged a time jump or the node is already down.
 maybe_wake_recycle() {
-  local age
+  local age now started
   age=$(hb_age)
   case "$age" in
     ''|*[!0-9]*) age=0 ;;
   esac
   [ "$age" -ge "$FREEZE_SECS" ] || return 0
+  recycled_recently && return 0
+
+  now=$(date +%s)
+  started=${WORKER_STARTED:-0}
+  case "$started" in
+    ''|*[!0-9]*) started=0 ;;
+  esac
+  if [ "$started" -gt 0 ] && [ $((now - started)) -lt "$FREEZE_SECS" ]; then
+    read_parsed
+    if [ "$online" = "yes" ] && [ "$mapfail" != "yes" ] && ! recent_time_jump; then
+      echo "selfheal: stale hb ${age}s but worker is new and node is live — skip"
+      return 0
+    fi
+  fi
 
   recycle_tailscaled "time jump ${age}s (hb) — map poll dies on freeze"
 }
@@ -158,6 +215,7 @@ maybe_wake_recycle() {
 # Not NeedsLogin. Not a new AuthURL.
 recycle_offline_tailscaled() {
   local now last ticks do_recycle
+  recycled_recently && return 0
   read_parsed
 
   case "$backend" in

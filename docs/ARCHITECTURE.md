@@ -74,11 +74,16 @@ tick after thaw (hb age ≥ 60s) selfheal recycles **that** `tailscaled` PID via
 does **not** restart PollNetMap: after freeze the long-poll is already dead
 while `Self.Online` and Health stay green until the ~2 min map timeout, so a
 rebind-only path leaves the admin pane grey. 4.1.3 always recycles on the
-hb jump.
+hb jump. A brand-new worker after `--stop` also sees leftover hb — it
+skips recycle unless tailscaled logged `time jump detected` or the node
+is already `online=no`. A 120s cooldown stops recycle storms while
+`Online` lags.
 
-`install.sh` `--stop`s **every** `tailscale-selfheal.sh --worker` (walk
-`/proc` cmdline; never `pkill -f`). A pidfile-only stop left 4.1.0 workers
-running next to 4.1.2. `--once` then starts one worker from the new file.
+`install.sh` `--stop`s **every** `tailscale-selfheal.sh --worker` (argv
+path + `--worker`, skip bash `-c`; never `pkill -f`). A pidfile-only
+stop left 4.1.0 workers running next to 4.1.2. Flattened-cmdline greps
+SIGTERM the keep-alive agent. `--once` then starts one worker from the
+new file.
 
 The node is unreachable for the minutes the container is actually frozen.
 After wake, `--once` / the worker should bring `online=yes` back.
