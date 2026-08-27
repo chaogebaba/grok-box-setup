@@ -1013,6 +1013,7 @@ is_worker_proc() {
   [ "$have_c" = 0 ] && [ "$have_script" = 1 ] && [ "$have_worker" = 1 ]
 }
 
+# shellcheck disable=SC2120  # optional $1 (keep-pid) reserved for callers
 stop_workers() {
   local keep="${1:-}" pid i leftover
   for pid in $(pgrep -x bash 2>/dev/null || true); do
