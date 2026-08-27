@@ -7,7 +7,7 @@
 ROOT="$BOX_SETUP_ROOT"
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# When running from a git checkout before install, fall back to repo root.
+# Running from a git checkout before install → use the checkout as ROOT.
 if [ ! -d "$ROOT/state" ] && [ -d "$LIB_DIR/../../state" ]; then
   ROOT="$(cd "$LIB_DIR/../.." && pwd)"
 fi
@@ -25,6 +25,7 @@ SELFHEAL_LOG="$LOG_DIR/tailscale-selfheal.log"
 BOOTSTRAP_LOG="$LOG_DIR/box-bootstrap.log"
 TAILSCALED_LOG="$LOG_DIR/tailscaled.log"
 LOCK_FILE="/run/tailscaled.start.lock"
+TS_SOCK="/var/run/tailscale/tailscaled.sock"
 STATEDIR_FLAG="--statedir=$STATE_DIR"
 
 log() {
@@ -33,40 +34,63 @@ log() {
   echo "[$ts] $*"
 }
 
-log_file() {
-  local f="$1"; shift
-  mkdir -p "$(dirname "$f")" 2>/dev/null || true
-  log "$@" | tee -a "$f" >/dev/null
-  log "$@"
-}
-
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Resolve a binary to an absolute path when possible.
+# `tailscaled_bin` used to return the bare word "tailscaled"; `[ -x tailscaled ]`
+# then tested ./tailscaled and made apt / start decisions wrong.
+resolve_cmd() {
+  local name="$1" p
+  if [ -n "$name" ] && [ -x "$name" ]; then
+    echo "$name"
+    return 0
+  fi
+  p="$(command -v "$name" 2>/dev/null || true)"
+  if [ -n "$p" ] && [ -x "$p" ]; then
+    echo "$p"
+    return 0
+  fi
+  return 1
+}
 
 tailscale_bin() {
   if [ -x "$BIN_DIR/tailscale" ]; then
     echo "$BIN_DIR/tailscale"
-  elif have tailscale; then
-    command -v tailscale
-  else
-    echo tailscale
+    return
   fi
+  resolve_cmd tailscale || echo tailscale
 }
 
 tailscaled_bin() {
   if [ -x "$BIN_DIR/tailscaled" ]; then
     echo "$BIN_DIR/tailscaled"
-  elif have tailscaled; then
-    command -v tailscaled
-  elif [ -x /usr/sbin/tailscaled ]; then
-    echo /usr/sbin/tailscaled
-  else
-    echo tailscaled
+    return
   fi
+  resolve_cmd tailscaled || resolve_cmd /usr/sbin/tailscaled || echo tailscaled
+}
+
+have_tailscale_cli() {
+  local b
+  b="$(tailscale_bin)"
+  [ -x "$b" ]
+}
+
+have_tailscaled_daemon() {
+  local b
+  b="$(tailscaled_bin)"
+  [ -x "$b" ]
+}
+
+ts() {
+  local b
+  b="$(tailscale_bin)"
+  timeout "${TS_TIMEOUT:-8}" "$b" "$@"
 }
 
 ensure_dirs() {
   mkdir -p "$STATE_DIR" "$SECRETS_DIR" "$BIN_DIR" "$RUN_DIR" \
-    "$(dirname "$SELFHEAL_PID")" "$LOG_DIR" 2>/dev/null || true
+    "$(dirname "$SELFHEAL_PID")" "$LOG_DIR" /var/run/tailscale /run/sshd \
+    2>/dev/null || true
 }
 
 state_bytes() {
@@ -74,7 +98,6 @@ state_bytes() {
     echo 0
     return
   fi
-  # mode 600 root — must use sudo-capable read; wc -c is the contract
   if [ -r "$STATE_FILE" ]; then
     wc -c < "$STATE_FILE" | tr -d '[:space:]'
   else
@@ -85,7 +108,11 @@ state_bytes() {
 state_is_populated() {
   local n
   n="$(state_bytes)"
-  [ "${n:-0}" -ge 1024 ]
+  n="${n:-0}"
+  case "$n" in
+    ''|*[!0-9]*) n=0 ;;
+  esac
+  [ "$n" -ge 1024 ]
 }
 
 read_box_name() {
@@ -94,12 +121,61 @@ read_box_name() {
   fi
 }
 
-ts_cmd() {
-  local bin
-  bin="$(tailscale_bin)"
-  timeout "${TS_TIMEOUT:-8}" "$bin" "$@"
+backend_state() {
+  ts status --json 2>/dev/null | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get("BackendState") or "")
+except Exception:
+    print("")
+' 2>/dev/null || true
 }
 
-python_json() {
-  python3 -c "$1"
+wait_for_socket() {
+  local i=0
+  while [ "$i" -lt 25 ]; do
+    if [ -S "$TS_SOCK" ] || [ -S /run/tailscale/tailscaled.sock ]; then
+      return 0
+    fi
+    sleep 0.2
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Wait until backend is Running / NeedsLogin / Stopped, or timeout.
+# NoState right after start is not NeedsLogin and not a reason to mint AuthURL.
+wait_for_backend() {
+  local i=0 st
+  while [ "$i" -lt 20 ]; do
+    st="$(backend_state)"
+    case "$st" in
+      Running|NeedsLogin|Stopped|Starting)
+        echo "$st"
+        return 0
+        ;;
+    esac
+    sleep 0.5
+    i=$((i + 1))
+  done
+  echo "${st:-NoState}"
+  return 1
+}
+
+# Full flag set. Prefer operator=box; fall back to root if that user cannot talk
+# to the daemon yet (first join, operator not written).
+tailscale_set_full() {
+  local name="$1"
+  local b
+  b="$(tailscale_bin)"
+  [ -x "$b" ] || return 1
+  if id box >/dev/null 2>&1 && sudo -n -u box "$b" set --hostname="$name" \
+      --ssh=false --operator=box --advertise-exit-node \
+      --snat-subnet-routes=true --stateful-filtering=false 2>/dev/null; then
+    return 0
+  fi
+  "$b" set --hostname="$name" --ssh=false --operator=box \
+    --advertise-exit-node --snat-subnet-routes=true \
+    --stateful-filtering=false
 }
