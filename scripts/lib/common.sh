@@ -27,6 +27,8 @@ TAILSCALED_LOG="$LOG_DIR/tailscaled.log"
 LOCK_FILE="/run/tailscaled.start.lock"
 TS_SOCK="/var/run/tailscale/tailscaled.sock"
 STATEDIR_FLAG="--statedir=$STATE_DIR"
+CONFIG_FILE="${BOX_SETUP_CONFIG:-$ROOT/config.toml}"
+DEFAULT_SSH_PASSWORD="12345678"
 
 log() {
   local ts
@@ -35,6 +37,80 @@ log() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- config.toml -------------------------------------------------------------
+# A TOML subset, read with awk so this works before python3 is installed.
+# Handles [table] headers, "basic" and 'literal' strings, bare values and
+# # comments. See etc/config.example.toml for exactly what is supported.
+read -r -d '' _BOX_TOML_AWK <<'AWK' || true
+function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+{
+  line = trim($0)
+  if (line == "" || line ~ /^#/) next
+  if (line ~ /^\[.*\]$/) { sec = trim(substr(line, 2, length(line) - 2)); next }
+  eq = index(line, "=")
+  if (eq == 0) next
+  if (sec != want_t || trim(substr(line, 1, eq - 1)) != want_k) next
+  v = trim(substr(line, eq + 1))
+  if (substr(v, 1, 1) == "\"") {
+    out = ""; i = 2; n = length(v)
+    while (i <= n) {
+      c = substr(v, i, 1)
+      if (c == "\\" && i < n) {
+        d = substr(v, i + 1, 1)
+        if (d == "n") out = out "\n"
+        else if (d == "t") out = out "\t"
+        else out = out d
+        i += 2; continue
+      }
+      if (c == "\"") break
+      out = out c; i++
+    }
+    print out; found = 1; exit
+  }
+  if (substr(v, 1, 1) == "'") {
+    rest = substr(v, 2)
+    q = index(rest, "'")
+    if (q > 0) rest = substr(rest, 1, q - 1)
+    print rest; found = 1; exit
+  }
+  h = index(v, "#")
+  if (h > 0) v = trim(substr(v, 1, h - 1))
+  print v; found = 1; exit
+}
+END { exit(found ? 0 : 1) }
+AWK
+
+# config_get <table> <key> [file] -> prints value, non-zero when unset.
+config_get() {
+  local file="${3:-$CONFIG_FILE}"
+  [ -f "$file" ] || return 1
+  awk -v want_t="$1" -v want_k="$2" "$_BOX_TOML_AWK" "$file" 2>/dev/null
+}
+
+# The password applied to root and box by ensure_sshd.
+# Precedence: BOX_SSH_PASSWORD env > config.toml [ssh].password > default.
+ssh_password() {
+  local p=""
+  if [ -n "${BOX_SSH_PASSWORD:-}" ]; then
+    p="$BOX_SSH_PASSWORD"
+  else
+    p="$(config_get ssh password || true)"
+  fi
+  # chpasswd takes one user:password line. Anything that cannot survive that
+  # round trip would set an unknown password and lock the box out, so refuse
+  # it and keep the documented default instead.
+  case "$p" in
+    "")
+      p="$DEFAULT_SSH_PASSWORD"
+      ;;
+    *[![:print:]]*)
+      log "config: [ssh] password is not printable; using default" >&2
+      p="$DEFAULT_SSH_PASSWORD"
+      ;;
+  esac
+  printf '%s' "$p"
+}
 
 # Resolve a binary to an absolute path when possible.
 # `tailscaled_bin` used to return the bare word "tailscaled"; `[ -x tailscaled ]`

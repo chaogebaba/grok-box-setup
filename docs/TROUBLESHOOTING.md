@@ -17,6 +17,8 @@
 | Android hangs on some sites | AAAA / broken v6 WAN | advertise `::/0`, `prohibit default` v6, nft6 reject |
 | sshd missing on :22 | no systemd | `--once` |
 | SSH banner on :22, password `12345678` denied | `box`/`root` shadow locked (`passwd -S` is `L`). Image ships no password. `ensure_sshd` only toggled `sshd_config`. | `ensure_sshd` `chpasswd` both to `12345678`. `--once`. |
+| SSH password denied after setting `config.toml` | edited but never applied; or another `sshd_config.d` drop-in wins | `--once` re-applies it and rewrites `00-box-setup.conf`, which sorts first so it beats other drop-ins. Check `sudo sshd -T \| grep -i passwordauth`. |
+| `config: [ssh] password is not printable; using default` | value has a newline/control char `chpasswd` cannot take on one line | quote a printable value in `config.toml`, then `--once` |
 | `NeedsLogin` + empty `auth=` | `up` never minted a URL | `--once` (waits out NoState first) |
 | `NeedsLogin` + `auth=` | statedir empty/corrupt | paste AuthURL, stop. Do not pick N yet |
 | `NeedsLogin` but state is kilobytes | socket vs state | `start-tailscaled.sh`, not a new login |

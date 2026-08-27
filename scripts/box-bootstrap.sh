@@ -87,30 +87,75 @@ install_helpers_to_usr() {
   fi
 }
 
+SSHD_DROPIN="/etc/ssh/sshd_config.d/00-box-setup.conf"
+
+# Password login is the contract for these boxes: after an image swap it is the
+# only way back in. Own it in a drop-in rather than sed-ing the main file --
+# Debian's sshd_config has `Include sshd_config.d/*.conf` near the top and sshd
+# keeps the FIRST value it obtains, so 00- wins over the main file and over any
+# other drop-in. Falls back to editing the main file on images without Include.
+write_sshd_config() {
+  local tmp
+  if [ -d /etc/ssh/sshd_config.d ] && \
+     grep -qiE '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' \
+       /etc/ssh/sshd_config 2>/dev/null; then
+    tmp="$(mktemp)" || return 1
+    cat > "$tmp" <<'DROPIN'
+# Managed by grok-box-setup. Edits here are overwritten on every --ensure.
+# Set the password in /workspace/box-setup/config.toml instead.
+ListenAddress 0.0.0.0
+ListenAddress ::
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+UsePAM yes
+DROPIN
+    if [ -f "$SSHD_DROPIN" ] && cmp -s "$tmp" "$SSHD_DROPIN"; then
+      rm -f "$tmp"
+      return 1          # already correct, no reload needed
+    fi
+    install -m 0644 "$tmp" "$SSHD_DROPIN"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  [ -f /etc/ssh/sshd_config ] || return 1
+  grep -q '^ListenAddress 0.0.0.0' /etc/ssh/sshd_config 2>/dev/null || \
+    echo 'ListenAddress 0.0.0.0' >> /etc/ssh/sshd_config
+  grep -q '^ListenAddress ::' /etc/ssh/sshd_config 2>/dev/null || \
+    echo 'ListenAddress ::' >> /etc/ssh/sshd_config
+  sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
+  sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
+  return 0
+}
+
 ensure_sshd() {
+  local changed=0 pw
   mkdir -p /run/sshd /etc/ssh
   if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
     ssh-keygen -A >/dev/null 2>&1 || true
   fi
-  if [ -f /etc/ssh/sshd_config ]; then
-    grep -q '^ListenAddress 0.0.0.0' /etc/ssh/sshd_config 2>/dev/null || \
-      echo 'ListenAddress 0.0.0.0' >> /etc/ssh/sshd_config
-    grep -q '^ListenAddress ::' /etc/ssh/sshd_config 2>/dev/null || \
-      echo 'ListenAddress ::' >> /etc/ssh/sshd_config
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
-  fi
-  # Grok images ship box/root with locked shadow (* / !). sshd=up is not login.
-  # Contract: password 12345678. /etc/shadow dies on image swap; re-apply here.
+
+  write_sshd_config && changed=1
+
+  # Grok images ship box/root with a locked shadow entry (* / !). sshd=up is
+  # not a working login. /etc/shadow dies on image swap, so re-apply every
+  # tick. Password comes from config.toml [ssh].password, default 12345678.
+  pw="$(ssh_password)"
   if have chpasswd; then
     if id box >/dev/null 2>&1; then
-      printf 'box:12345678\n' | chpasswd >/dev/null 2>&1 || true
+      printf 'box:%s\n' "$pw" | chpasswd >/dev/null 2>&1 || true
     fi
-    printf 'root:12345678\n' | chpasswd >/dev/null 2>&1 || true
+    printf 'root:%s\n' "$pw" | chpasswd >/dev/null 2>&1 || true
   fi
+
   if [ -x /usr/sbin/sshd ]; then
     if pgrep -x sshd >/dev/null 2>&1; then
-      kill -HUP "$(pgrep -n -x sshd)" 2>/dev/null || true
+      # Only reload when the config actually changed; a HUP every tick would
+      # churn sshd for nothing.
+      if [ "$changed" = 1 ]; then
+        kill -HUP "$(pgrep -n -x sshd)" 2>/dev/null || true
+      fi
     else
       /usr/sbin/sshd 2>/dev/null || true
     fi

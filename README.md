@@ -52,10 +52,35 @@ Human clicks: Connect, then approve exit-node routes. Everything else is scripte
 ├── install.sh
 ├── docs/           AGENT.md, RUNBOOK.md, ARCHITECTURE.md, NAMING.md, TROUBLESHOOTING.md
 ├── scripts/        box-bootstrap.sh, selfheal, forwarding heal, pick-name.sh
-├── etc/default-tailscaled
+├── etc/default-tailscaled, config.example.toml
+├── config.toml        THIS box's settings — seeded once, never overwritten
 ├── state/tailscale/   empty in git — THIS box's login after Connect
 └── secrets/           optional ts-authkey, never committed
 ```
+
+## SSH login
+
+Password login is on by design: after an image swap, `/etc/shadow` is gone and
+this is the only way back in. Every `--ensure` re-applies the password to
+`root` and `box` and rewrites `/etc/ssh/sshd_config.d/00-box-setup.conf`.
+
+Default password is `12345678`. To change it, edit `config.toml` on the box:
+
+```toml
+[ssh]
+password = "something-else"
+```
+
+```bash
+sudo /workspace/box-setup/box-bootstrap.sh --once   # applies it
+```
+
+`install.sh` seeds `config.toml` once and never overwrites it, so the setting
+survives every upgrade. For a single run without editing the file, set
+`BOX_SSH_PASSWORD`. Precedence: `BOX_SSH_PASSWORD` > `config.toml` > default.
+
+These boxes are exit nodes on your tailnet, so anyone on the tailnet can reach
+`:22`. Change the default if that matters to you.
 
 ## Status line
 

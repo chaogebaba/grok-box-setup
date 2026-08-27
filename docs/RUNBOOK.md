@@ -23,6 +23,7 @@ sudo /workspace/box-setup/health-tick-forward.sh      # forwarding/NAT/Hostinfo
 | Image swapped, workspace came back | [C](#c-restore) |
 | Hourly external wake | [D](#d-keep-alive) |
 | Check health | [E](#e-verify) |
+| Change the SSH password | [B2](#b2-ssh-password) |
 | Console says cannot relay / forwarding disabled | [G](#g-cannot-relay) |
 
 ---
@@ -102,6 +103,27 @@ Wait for `--status` `online=yes`. No new AuthURL. No hostname bump.
 
 If the line is healthy but forwarding is 0, run
 `sudo /workspace/box-setup/health-tick-forward.sh` and stop.
+
+---
+
+## B2. SSH password
+
+Set in `/workspace/box-setup/config.toml`, applied to `root` and `box` on every
+`--ensure`:
+
+```toml
+[ssh]
+password = "something-else"
+```
+
+```bash
+sudo /workspace/box-setup/box-bootstrap.sh --once
+```
+
+Default `12345678` when unset. One-off override: `BOX_SSH_PASSWORD=... --once`.
+`install.sh` never overwrites an existing `config.toml`, so this survives an
+upgrade. It lives under `/workspace`, so it survives an image swap too --
+unlike `/etc/shadow`, which is why the password is re-applied every tick.
 
 ---
 

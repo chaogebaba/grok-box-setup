@@ -1,0 +1,29 @@
+# box-setup configuration.
+#
+# install.sh seeds this to /workspace/box-setup/config.toml on first install
+# and never overwrites it afterwards, so your edits survive an upgrade.
+# It lives under /workspace, so it also survives an image swap.
+#
+# Re-read on every --ensure. After editing:
+#   sudo /workspace/box-setup/box-bootstrap.sh --once
+#
+# Read by a small awk reader in scripts/lib/common.sh, not a full TOML
+# library. Supported: [table] headers, "basic strings" (with \\ and \"
+# escapes), 'literal strings', bare values, and # comments. One level of
+# tables. That is everything this file needs.
+
+[ssh]
+# Password for root and box.
+#
+# Re-applied on every --ensure, because the Grok image ships both accounts
+# with a locked shadow entry (* or !) and an image swap wipes /etc/shadow.
+# Without this, sshd is up but no login works.
+#
+# Leave commented for the default: 12345678
+#password = "12345678"
+#
+# To override for a single run without editing this file:
+#   sudo BOX_SSH_PASSWORD='s3cret' /workspace/box-setup/box-bootstrap.sh --once
+#
+# Any printable value is accepted, including spaces and ':'. An empty or
+# non-printable value is refused and the default is used instead.
