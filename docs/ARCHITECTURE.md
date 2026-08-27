@@ -64,9 +64,16 @@ runs with forwarding already 1.
 A second “offline after a while” path is freeze/thaw. The box sleeps;
 `tailscaled` stays alive; PollNetMap’s long-poll dies (`time jump detected`,
 `PollNetMap: context canceled`). `Self.Online` is false while
-`BackendState=Running`. Selfheal used to only restart if the process was
-missing. `recycle_offline_tailscaled` kills **that** PID and runs
-`start-tailscaled.sh`. Same statedir. Not NeedsLogin.
+`BackendState=Running` — but that flag lags by minutes (map long-poll ~2 min).
+Selfheal used to only restart if the process was missing. 4.1.1 recycled on
+`Online=false`. That is too late for the admin console.
+
+The worker heartbeat (`/run/box-setup/hb`) freezes with the box. On the first
+tick after thaw (hb age ≥ 60s) selfheal `debug rebind`/`restun`s, and if the
+node is already `online=no` or Health says not-in-map-poll it recycles **that**
+PID via `start-tailscaled.sh`. Same statedir. Not NeedsLogin.
+
+`install.sh` `--stop`s the old in-memory worker so this logic actually loads.
 
 The node is unreachable for the minutes the container is actually frozen.
 After wake, `--once` / the worker should bring `online=yes` back.
