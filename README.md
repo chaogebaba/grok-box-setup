@@ -30,7 +30,9 @@ sudo bash /tmp/grok-box-setup/install.sh
 sudo bash /workspace/box-setup/box-bootstrap.sh --once
 ```
 
-GitHub clone is mode 644 — use `sudo bash`, not `sudo ./install.sh`.
+Do this even if `/workspace/box-setup` already exists. That tree is a copy,
+not a git checkout; `install.sh` keeps statedir + hostname and `--stop`s old
+workers. GitHub clone is mode 644 — use `sudo bash`, not `sudo ./install.sh`.
 
 If the status line contains `auth=https://login.tailscale.com/…`, open it and
 click **Connect**. Then:

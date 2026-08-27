@@ -8,6 +8,7 @@
 | Admin: node **offline**; Health “Unable to connect to the Tailscale coordination server” | `refresh-exitnode` grepped JSON key `Warning` (`{"Warning":""}` still matches) → `tailscale set` every 20s cancels PollNetMap | parse a **non-empty** Warning only; kill **that** `tailscaled` PID, `start-tailscaled.sh`. Not NeedsLogin. |
 | Admin: node **offline** after idle; `time jump detected (slept …)` then `PollNetMap: context canceled`; process still running | Freeze/thaw. Map long-poll dies. `Online=false` lags ~2 min. `debug rebind` does not restart PollNetMap, so a recycle that waits for `online=no` leaves the admin pane grey. | First tick after hb age ≥ 60s: recycle **that** PID. Same statedir. Not NeedsLogin. |
 | Admin: node **offline**; several `bash …/tailscale-selfheal.sh --worker`; pidfile has one | `--stop` only killed the pidfile PID. Older in-memory workers kept ticking. | `--stop` walks `/proc` cmdline and kills every `--worker`. Never `pkill -f`. Then `--once`. |
+| GitHub already has the fix; this box still offline / SSH locked | `AGENT.md` skipped clone when `$DEST/box-bootstrap.sh` existed. DEST is a copy, not a git repo. In-memory old worker kept running. | `git clone --depth 1` to a temp dir, `sudo bash install.sh`, `--once`. Never `git -C /workspace/box-setup pull`. Not NeedsLogin. |
 | Phone uses exit node, no internet | NAT / Docker `FORWARD DROP` | `sudo bash /workspace/box-setup/tailscale-exitnode-nat.sh` then `--status` |
 | `missing kernel module` / connmark | tailscaled without nftables env | Kill **that PID**, `start-tailscaled.sh` |
 | Two `tailscaled` | second start / dpkg default | `start-tailscaled.sh` kills every wrong PID. Never `pkill -f`. |
@@ -54,3 +55,4 @@ Logs: `/var/log/tailscaled.log`, `/var/log/tailscale-selfheal.log`,
 11. Clone from GitHub is mode 644. Always `sudo bash install.sh`.
 12. `backend=Running online=no` after sleep is a dead map poll, not NeedsLogin. Recycle that PID. Do not mint AuthURL.
 13. `sshd=up` is the listener, not a working login. `passwd -S box` must not be `L`.
+14. `$DEST/box-bootstrap.sh` existing is not current. Always clone + `install.sh`. DEST is not a git checkout.

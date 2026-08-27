@@ -7,18 +7,22 @@ Read this file first. Then `docs/RUNBOOK.md`. Do not improvise around the Never 
 
 ## 1. Clone and install
 
+`/workspace/box-setup` is a **copy**, not a git checkout. A dest hit
+(`box-bootstrap.sh` already there) is not "already up to date". grok-box-7
+stayed on 4.1.2 after 4.1.3/4.1.4 merged because this step skipped clone;
+the in-memory worker never loaded the freeze-recycle or `chpasswd` fixes.
+Always clone to a temp dir and re-run `install.sh` (it `--stop`s leftover
+workers and keeps statedir + hostname). Then `--once`. Never
+`git -C /workspace/box-setup pull`.
+
 ```bash
 DEST=/workspace/box-setup
 REPO_URL="${REPO_URL:-https://github.com/chaogebaba/grok-box-setup.git}"
 
-if [ -f "$DEST/box-bootstrap.sh" ]; then
-  sudo bash "$DEST/box-bootstrap.sh" --once
-else
-  tmp=$(mktemp -d)
-  git clone --depth 1 "$REPO_URL" "$tmp/grok-box-setup"
-  sudo bash "$tmp/grok-box-setup/install.sh"
-  sudo bash "$DEST/box-bootstrap.sh" --once
-fi
+tmp=$(mktemp -d)
+git clone --depth 1 "$REPO_URL" "$tmp/grok-box-setup"
+sudo bash "$tmp/grok-box-setup/install.sh"
+sudo bash "$DEST/box-bootstrap.sh" --once
 ```
 
 GitHub serves scripts as mode 644. Always `sudo bash …/install.sh`, never `sudo ./install.sh`.
@@ -54,7 +58,7 @@ Print the `--once` status line. Then follow **exactly one** procedure in
 
 ## 3. Hard rules
 
-- Call `/workspace/box-setup/box-bootstrap.sh` as the restore path.
+- Refresh from GitHub (`clone` + `install.sh`) then `--once`. Dest existing is not current.
 - Do **not** pick `grok-box-N` until `tailscale status` lists Self + peers.
 - Do not ask the human which N to use. Compute it ([`NAMING.md`](NAMING.md)).
 - Do not ask for an auth key when `sudo wc -c state/tailscale/tailscaled.state`

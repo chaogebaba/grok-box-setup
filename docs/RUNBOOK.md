@@ -109,9 +109,13 @@ If the line is healthy but forwarding is 0, run
 
 Apt, `/usr/local`, `/etc/sysctl.d`, nft tables, and the start hook are gone.
 `/workspace/box-setup/` (statedir + hostname + scripts + bins) comes back.
-Forwarding is 0 until the first tick.
+Those scripts may be stale (grok-box-7 woke with 4.1.2 after 4.1.4 merged).
+Forwarding is 0 until the first tick. Refresh from GitHub, then `--once`.
 
 ```bash
+tmp=$(mktemp -d)
+git clone --depth 1 https://github.com/chaogebaba/grok-box-setup.git "$tmp/grok-box-setup"
+sudo bash "$tmp/grok-box-setup/install.sh"
 sudo /workspace/box-setup/box-bootstrap.sh --once
 ```
 
