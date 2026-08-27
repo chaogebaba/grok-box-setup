@@ -1,0 +1,27 @@
+# Runtime identity — never publish another box's node
+state/tailscale/**
+!state/tailscale/.gitkeep
+secrets/**
+!secrets/.gitkeep
+hostname
+*.pre-v4
+*.v4tmp
+
+# Logs and pid files
+*.log
+*.pid
+/run/
+
+# Local overlays
+/usr-copy/
+box-bootstrap.sh.bak
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*~
+*.swp
+.idea/
+.vscode/
+.env
+.env.*

@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: syntax
+        run: |
+          set -e
+          find scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          bash -n install.sh
+      - name: no identity leaked
+        run: |
+          set -e
+          test ! -f hostname
+          test ! -f secrets/ts-authkey
+          test ! -f state/tailscale/tailscaled.state
+          if git ls-files | grep -E 'tailscaled\.state$|ts-authkey$|^hostname$'; then
+            echo "refusing to ship box identity" >&2
+            exit 1
+          fi

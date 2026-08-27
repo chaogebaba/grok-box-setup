@@ -1,0 +1,2 @@
+# Intentionally empty. Each box mints its own tailscaled.state after Connect.
+# Copying this directory between boxes merges two machines into one node.
