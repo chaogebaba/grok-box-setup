@@ -5,6 +5,7 @@
 | Symptom | Cause | Fix |
 |---|---|
 | Admin: “IP forwarding disabled” / cannot relay | v4 or v6 forwarding 0, or Hostinfo stale | Section G in RUNBOOK |
+| Admin: node **offline**; Health “Unable to connect to the Tailscale coordination server” | `refresh-exitnode` grepped JSON key `Warning` (`{"Warning":""}` still matches) → `tailscale set` every 20s cancels PollNetMap | parse a **non-empty** Warning only; kill **that** `tailscaled` PID, `start-tailscaled.sh`. Not NeedsLogin. |
 | Phone uses exit node, no internet | NAT / Docker `FORWARD DROP` | `sudo bash /workspace/box-setup/tailscale-exitnode-nat.sh` then `--status` |
 | `missing kernel module` / connmark | tailscaled without nftables env | Kill **that PID**, `start-tailscaled.sh` |
 | Two `tailscaled` | second start / dpkg default | `start-tailscaled.sh` kills every wrong PID. Never `pkill -f`. |

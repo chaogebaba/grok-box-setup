@@ -60,7 +60,19 @@ reason=""
 
 CHK=$(timeout 5 curl -sS --unix-socket /var/run/tailscale/tailscaled.sock \
   http://local-tailscaled.sock/localapi/v0/check-ip-forwarding 2>/dev/null || true)
-if echo "$CHK" | grep -qi 'forwarding is disabled\|Warning'; then
+# Healthy payload is {"Warning":""}. Grep for the key name is always true
+# and spams `tailscale set`, which cancels PollNetMap and marks the node offline.
+WARN=$(printf '%s' "$CHK" | python3 -c '
+import json,sys
+try:
+    w=(json.load(sys.stdin).get("Warning") or "")
+    if isinstance(w, list):
+        w=" ".join(str(x) for x in w)
+    print(str(w).strip())
+except Exception:
+    print("")
+' 2>/dev/null || true)
+if [ -n "$WARN" ]; then
   need=1; reason="check-ip-forwarding warning"
 fi
 
