@@ -4,6 +4,10 @@ You are an agent on a Grok sand box (or SSH'd into one). This is everything
 you run, in order, for every situation. The program is
 `/workspace/box-setup/boxup`; `sudo` is passwordless.
 
+> Driving the whole fleet from a laptop instead of one box? Use `fleetctl`
+> (`fleetctl list|status|check|rollout`) — see the "Fleet operations (laptop)"
+> section in [README.md](../README.md).
+
 ## A. Fresh box (never set up)
 
 ```bash

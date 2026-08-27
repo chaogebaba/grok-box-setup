@@ -53,6 +53,35 @@ SSH password (`[ssh] password`, default `12345678`), pinned tailscale version
 (`[tailscale] version`), update repo (`[update] repo`). See
 [etc/config.example.toml](etc/config.example.toml).
 
+## Fleet operations (laptop)
+
+`boxup` runs on a box; [`fleetctl`](fleetctl) runs on the operator's laptop and
+drives all the boxes at once over the tailnet (needs `tailscale`, `ssh`,
+`sshpass` — `sudo dnf install sshpass` / `sudo apt install sshpass`). It
+discovers every `grok-box-N` peer; it never touches other machines.
+
+```bash
+./fleetctl list                 # name, tailscale IP, online — all grok-box-N peers
+./fleetctl status               # boxup's status line per online box (read-only)
+./fleetctl check                # quiet health gate; exit 1 + prints only problems
+./fleetctl rollout              # deploy current git HEAD to every box (git archive)
+./fleetctl ssh grok-box-3 [cmd] # ssh wrapper
+```
+
+A box is unhealthy for `check` if it is unreachable or its `boxup status` is not
+`backend=Running online=yes exit-node=yes sshd=up` with exactly one worker.
+Password precedence: `FLEET_SSH_PASSWORD` > `~/.config/fleetctl/config.toml`
+`[ssh].password` > `12345678` (never stored in git). `FLEET_BOXES="grok-box-1
+grok-box-2"` bypasses discovery for a fixed list.
+
+Run `check` on a schedule with a systemd **user** timer (every 10 min, desktop
+notification on failure):
+
+```bash
+./fleetctl install-timer        # enables fleetctl-check.timer (check --notify)
+./fleetctl remove-timer         # tears it down
+```
+
 ## House rules
 
 - No systemd, no cron — the platform has neither. tini is PID 1.

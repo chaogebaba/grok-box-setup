@@ -14,13 +14,14 @@ jobs:
         run: |
           set -e
           bash -n boxup
+          bash -n fleetctl
           bash -n install.sh
           bash -n box-bootstrap.sh
       - name: shellcheck
         run: |
           set -e
           sudo apt-get install -y -qq shellcheck
-          shellcheck -S warning boxup install.sh box-bootstrap.sh
+          shellcheck -S warning boxup fleetctl install.sh box-bootstrap.sh
       - name: no identity leaked
         run: |
           set -e
