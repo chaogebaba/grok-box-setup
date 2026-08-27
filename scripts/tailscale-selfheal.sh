@@ -15,20 +15,19 @@ worker_tick() {
 
   if ! pgrep -x sshd >/dev/null 2>&1; then
     if [ -x /usr/sbin/sshd ]; then
-      /usr/sbin/sshd -D 2>/dev/null &
+      /usr/sbin/sshd 2>/dev/null || true
     fi
   fi
 
-  if ! pgrep -n -x tailscaled >/dev/null 2>&1; then
+  if ! pgrep -x tailscaled >/dev/null 2>&1; then
     "$HERE/start-tailscaled.sh" || true
   fi
 
-  # If we already have a grok-box-N name, keep prefs from drifting.
   local name
   name="$(read_box_name || true)"
   case "$name" in
     grok-box-[0-9]*)
-      if pgrep -n -x tailscaled >/dev/null 2>&1; then
+      if pgrep -x tailscaled >/dev/null 2>&1; then
         "$HERE/refresh-exitnode-if-needed.sh" || true
       fi
       ;;
@@ -56,9 +55,15 @@ supervisor_start() {
       return 0
     fi
   fi
-  # sudoers use_pty — setsid so HUP cannot kill the worker.
-  setsid -f "$HERE/tailscale-selfheal.sh" --worker >/dev/null 2>&1
-  sleep 0.3
+  setsid -f bash "$HERE/tailscale-selfheal.sh" --worker >/dev/null 2>&1
+  local i=0
+  while [ "$i" -lt 15 ]; do
+    if [ -f "$SELFHEAL_PID" ] && kill -0 "$(cat "$SELFHEAL_PID" 2>/dev/null)" 2>/dev/null; then
+      break
+    fi
+    sleep 0.2
+    i=$((i + 1))
+  done
   echo "selfheal: started pid=$(cat "$SELFHEAL_PID" 2>/dev/null || echo '?')"
 }
 
@@ -78,7 +83,7 @@ case "$MODE" in
   --tick)   worker_tick ;;
   --stop)   supervisor_stop ;;
   --status)
-    if [ -f "$SELFHEAL_PID" ] && kill -0 "$(cat "$SELFHEAL_PID")" 2>/dev/null; then
+    if [ -f "$SELFHEAL_PID" ] && kill -0 "$(cat "$SELFHEAL_PID" 2>/dev/null)" 2>/dev/null; then
       echo "selfheal=$(cat "$SELFHEAL_PID")"
     else
       echo "selfheal=down"
