@@ -84,11 +84,11 @@ V4_SCRIPTS="start-tailscaled.sh tailscale-selfheal.sh ensure-ip-forward.sh \
   refresh-exitnode-if-needed.sh health-tick-forward.sh \
   tailscale-exitnode-nat.sh pick-name.sh"
 for s in $V4_SCRIPTS; do
-  rm -f "$DEST/$s" "/usr/local/sbin/$s"
+  rm -f "$DEST/$s" "/usr/local/sbin/$s" || true
 done
-rm -f /usr/local/sbin/box-bootstrap.sh /usr/local/sbin/tailscaled
-rm -rf "${DEST:?}/scripts" "${DEST:?}/lib" /usr/local/sbin/lib
-rm -f "$DEST/RUNBOOK.md" "$DEST/etc/default-tailscaled" /etc/default/tailscaled
+rm -f /usr/local/sbin/box-bootstrap.sh /usr/local/sbin/tailscaled || true
+rm -rf "${DEST:?}/scripts" "${DEST:?}/lib" /usr/local/sbin/lib || true
+rm -f "$DEST/RUNBOOK.md" "$DEST/etc/default-tailscaled" /etc/default/tailscaled || true
 
 # Reap any surviving v4 selfheal worker (boxup recognizes the old argv too).
 bash "$DEST/boxup" stop >/dev/null 2>&1 || true

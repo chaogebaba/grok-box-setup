@@ -178,7 +178,7 @@ except Exception:
 PY
   fi
   local n
-  n="$( { wc -c < "$STATE_FILE" || sudo wc -c < "$STATE_FILE"; } 2>/dev/null \
+  n="$( { wc -c < "$STATE_FILE" || sudo sh -c 'wc -c < "$1"' _ "$STATE_FILE"; } 2>/dev/null \
     | tr -d '[:space:]' )"
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
   [ "$n" -ge 1024 ]
@@ -843,7 +843,8 @@ except Exception:
 hb_age() {
   local now prev
   now=$(date +%s)
-  prev=$(tr -d '[:space:]' < "$RUN_DIR/hb" 2>/dev/null || echo 0)
+  prev=0
+  [ -f "$RUN_DIR/hb" ] && prev=$(tr -d '[:space:]' < "$RUN_DIR/hb" 2>/dev/null || echo 0)
   case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
   [ "$prev" -le 0 ] && { echo 0; return; }
   echo $((now - prev))
@@ -872,7 +873,8 @@ PY
 recycled_recently() {
   local now rec
   now=$(date +%s)
-  rec=$(tr -d '[:space:]' < "$RUN_DIR/last-recycle" 2>/dev/null || echo 0)
+  rec=0
+  [ -f "$RUN_DIR/last-recycle" ] && rec=$(tr -d '[:space:]' < "$RUN_DIR/last-recycle" 2>/dev/null || echo 0)
   case "$rec" in ''|*[!0-9]*) rec=0 ;; esac
   [ "$rec" -gt 0 ] && [ $((now - rec)) -lt "$RECYCLE_COOLDOWN" ]
 }
@@ -949,9 +951,11 @@ recycle_offline_tailscaled() {
     return 0
   fi
 
-  last=$(tr -d '[:space:]' < "$RUN_DIR/last-online" 2>/dev/null || echo 0)
+  last=0
+  [ -f "$RUN_DIR/last-online" ] && last=$(tr -d '[:space:]' < "$RUN_DIR/last-online" 2>/dev/null || echo 0)
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
-  ticks=$(tr -d '[:space:]' < "$RUN_DIR/offline-ticks" 2>/dev/null || echo 0)
+  ticks=0
+  [ -f "$RUN_DIR/offline-ticks" ] && ticks=$(tr -d '[:space:]' < "$RUN_DIR/offline-ticks" 2>/dev/null || echo 0)
   case "$ticks" in ''|*[!0-9]*) ticks=0 ;; esac
   ticks=$((ticks + 1))
   echo "$ticks" > "$RUN_DIR/offline-ticks" 2>/dev/null || true
@@ -1137,6 +1141,9 @@ require_root() {
   if [ "$(id -u)" -ne 0 ]; then
     if have sudo; then
       exec sudo env BOX_SETUP_ROOT="$ROOT" \
+        BOX_SETUP_CONFIG="${BOX_SETUP_CONFIG:-}" \
+        BOX_SETUP_RUN="${BOX_SETUP_RUN:-}" \
+        BOX_SETUP_LOG="${BOX_SETUP_LOG:-}" \
         BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" bash "$SELF" "$@"
     fi
     log "boxup: need root" >&2
