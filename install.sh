@@ -69,6 +69,12 @@ chmod 700 "$DEST/state" "$DEST/state/tailscale" "$DEST/secrets" 2>/dev/null || t
 log "installed files:"
 ls -1 "$DEST"/*.sh "$DEST/RUNBOOK.md" 2>/dev/null || true
 
+# Drop the in-memory worker so the next --once loads this script (recycle,
+# time-jump). Does not stop tailscaled.
+if [ -x "$DEST/box-bootstrap.sh" ]; then
+  bash "$DEST/box-bootstrap.sh" --stop >/dev/null 2>&1 || true
+fi
+
 if [ "${BOX_SETUP_ONCE:-}" = 1 ]; then
   log "running box-bootstrap.sh --once"
   bash "$DEST/box-bootstrap.sh" --once
