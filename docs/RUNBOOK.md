@@ -10,7 +10,7 @@ No extra narration when healthy.
 ```bash
 sudo /workspace/box-setup/box-bootstrap.sh --once     # ensure + one tick
 sudo /workspace/box-setup/box-bootstrap.sh --status
-sudo /workspace/box-setup/box-bootstrap.sh --stop     # selfheal only
+sudo /workspace/box-setup/box-bootstrap.sh --stop     # every selfheal worker; tailscaled stays
 sudo /workspace/box-setup/health-tick-forward.sh      # forwarding/NAT/Hostinfo
 ```
 
@@ -96,8 +96,9 @@ If the line is `backend=Running online=yes exit-node=yes sshd=up` and
 forwarding is `4:1,6:1`, stop. No kill commands. No new AuthURL. No hostname bump.
 
 If the line is `backend=Running online=no` after a freeze, `--once`
-recycles **that** `tailscaled` PID (same statedir). Wait for `--status`
-`online=yes`. No new AuthURL. No hostname bump.
+recycles **that** `tailscaled` PID (same statedir). A freeze is also
+detected from hb age ≥ 60s even while `online=yes` (map timeout lags).
+Wait for `--status` `online=yes`. No new AuthURL. No hostname bump.
 
 If the line is healthy but forwarding is 0, run
 `sudo /workspace/box-setup/health-tick-forward.sh` and stop.

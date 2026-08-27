@@ -69,6 +69,34 @@ $(parse_ts)
 EOF
 }
 
+# Kill every bash …/tailscale-selfheal.sh --worker except optional keep PID.
+# Walk /proc cmdline. Never pkill -f. install.sh --stop used to only kill the
+# pidfile PID, so 4.1.0 workers stayed alive next to 4.1.2.
+stop_selfheal_workers() {
+  local keep="${1:-}" pid cmd i
+  for pid in $(pgrep -x bash 2>/dev/null || true); do
+    [ -n "$keep" ] && [ "$pid" = "$keep" ] && continue
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    echo "$cmd" | grep -q -- "tailscale-selfheal.sh --worker" || continue
+    echo "selfheal: stopping leftover worker pid=$pid"
+    kill "$pid" 2>/dev/null || true
+  done
+  i=0
+  while [ "$i" -lt 15 ]; do
+    local leftover=0
+    for pid in $(pgrep -x bash 2>/dev/null || true); do
+      [ -n "$keep" ] && [ "$pid" = "$keep" ] && continue
+      cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+      echo "$cmd" | grep -q -- "tailscale-selfheal.sh --worker" || continue
+      leftover=1
+      kill -9 "$pid" 2>/dev/null || true
+    done
+    [ "$leftover" = 0 ] && break
+    sleep 0.2
+    i=$((i + 1))
+  done
+}
+
 # Kill that PID only, then start-tailscaled.sh. Same statedir. Never pkill -f.
 recycle_tailscaled() {
   local reason="$1" pid cmd i
@@ -91,10 +119,14 @@ recycle_tailscaled() {
   fi
   rm -f "$RUN_DIR/last-online" "$RUN_DIR/offline-ticks"
   "$HERE/start-tailscaled.sh" || true
+  # Hostinfo set is skipped while backend=NoState; wait out the blip.
+  wait_for_backend >/dev/null || true
+  "$HERE/refresh-exitnode-if-needed.sh" || true
 }
 
-# After freeze/thaw, Online=false lags (map long-poll is ~2 min). hb age is
-# the wake signal. Rebind first; recycle immediately if already not in-map.
+# After freeze/thaw, PollNetMap's long-poll is already dead. Self.Online and
+# Health stay green for ~2 min (map timeout), so rebind/restun leaves the
+# admin pane grey. hb age is the wake signal — always recycle that PID.
 maybe_wake_recycle() {
   local age
   age=$(hb_age)
@@ -103,15 +135,7 @@ maybe_wake_recycle() {
   esac
   [ "$age" -ge "$FREEZE_SECS" ] || return 0
 
-  echo "selfheal: time jump ${age}s (hb) — rebind"
-  ts debug rebind >/dev/null 2>&1 || true
-  ts debug restun >/dev/null 2>&1 || true
-
-  read_parsed
-  if [ "$online" = "yes" ] && [ "$mapfail" != "yes" ]; then
-    return 0
-  fi
-  recycle_tailscaled "time jump ${age}s and online=${online:-?} mapfail=${mapfail:-?}"
+  recycle_tailscaled "time jump ${age}s (hb) — map poll dies on freeze"
 }
 
 # Process alive + Running + (Online=false or map-poll Health) after freeze/thaw.
@@ -205,13 +229,10 @@ worker_loop() {
 
 supervisor_start() {
   ensure_dirs
-  if [ -f "$SELFHEAL_PID" ]; then
-    old=$(cat "$SELFHEAL_PID" 2>/dev/null || echo "")
-    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-      echo "selfheal: already running pid=$old"
-      return 0
-    fi
-  fi
+  # Always reap leftovers and start one worker from this file. A pidfile hit
+  # used to keep a 4.1.0 process in memory next to a newer install.
+  stop_selfheal_workers
+  rm -f "$SELFHEAL_PID"
   setsid -f bash "$HERE/tailscale-selfheal.sh" --worker >/dev/null 2>&1
   local i=0
   while [ "$i" -lt 15 ]; do
@@ -232,6 +253,7 @@ supervisor_stop() {
     fi
     rm -f "$SELFHEAL_PID"
   fi
+  stop_selfheal_workers
   echo "selfheal: stopped (tailscaled left running)"
 }
 

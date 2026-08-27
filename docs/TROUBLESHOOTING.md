@@ -6,7 +6,8 @@
 |---|---|
 | Admin: “IP forwarding disabled” / cannot relay | v4 or v6 forwarding 0, or Hostinfo stale | Section G in RUNBOOK |
 | Admin: node **offline**; Health “Unable to connect to the Tailscale coordination server” | `refresh-exitnode` grepped JSON key `Warning` (`{"Warning":""}` still matches) → `tailscale set` every 20s cancels PollNetMap | parse a **non-empty** Warning only; kill **that** `tailscaled` PID, `start-tailscaled.sh`. Not NeedsLogin. |
-| Admin: node **offline** after idle; `time jump detected (slept …)` then `PollNetMap: context canceled`; process still running | Freeze/thaw. Map long-poll dies. `Online=false` lags ~minutes so a recycle that waits for it leaves the admin pane grey. | First tick after hb age ≥ 60s: `debug rebind`/`restun`; recycle **that** PID if already `online=no` or Health not-in-map-poll. `install.sh` `--stop`s the old worker. Same statedir. Not NeedsLogin. |
+| Admin: node **offline** after idle; `time jump detected (slept …)` then `PollNetMap: context canceled`; process still running | Freeze/thaw. Map long-poll dies. `Online=false` lags ~2 min. `debug rebind` does not restart PollNetMap, so a recycle that waits for `online=no` leaves the admin pane grey. | First tick after hb age ≥ 60s: recycle **that** PID. Same statedir. Not NeedsLogin. |
+| Admin: node **offline**; several `bash …/tailscale-selfheal.sh --worker`; pidfile has one | `--stop` only killed the pidfile PID. Older in-memory workers kept ticking. | `--stop` walks `/proc` cmdline and kills every `--worker`. Never `pkill -f`. Then `--once`. |
 | Phone uses exit node, no internet | NAT / Docker `FORWARD DROP` | `sudo bash /workspace/box-setup/tailscale-exitnode-nat.sh` then `--status` |
 | `missing kernel module` / connmark | tailscaled without nftables env | Kill **that PID**, `start-tailscaled.sh` |
 | Two `tailscaled` | second start / dpkg default | `start-tailscaled.sh` kills every wrong PID. Never `pkill -f`. |
