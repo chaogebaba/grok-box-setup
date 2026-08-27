@@ -1,101 +1,62 @@
 # grok-box-setup
 
-OpenSSH + Tailscale **exit node** for a Debian 13 Grok/sand box
-(no systemd, container sleeps, overlay gets wiped).
+Turn a Grok sand box into a self-healing **Tailscale exit node** with password
+SSH, reachable as `grok-box-N` on the tailnet — and keep it that way through
+sleep/thaw cycles and full image swaps.
 
-An AI agent clones this repo, runs `sudo bash install.sh`, and follows
-[`docs/AGENT.md`](docs/AGENT.md) + [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+Everything is one program: [`boxup`](boxup), installed at
+`/workspace/box-setup/boxup`.
 
-```
-hourly keep-alive  →  box-bootstrap.sh --once
-                   →  enable IPv4+IPv6 forwarding
-                   →  nft NAT for Docker FORWARD DROP
-                   →  one tailscaled, statedir under /workspace
-                   →  advertise 0.0.0.0/0 and ::/0
-```
-
-## Why this exists
-
-The admin console dialog *“Unable to relay traffic — This machine has IP
-forwarding disabled”* appears after the box sleeps or the image is swapped.
-Forwarding is per-netns and Docker defaults it to `0`. IPv4-only is not
-enough; IPv6 forwarding must also be `1`. Every health tick re-applies that
-and refreshes Tailscale Hostinfo so the banner clears.
-
-## Quick start (on the box)
+## Quick start (on the box, as the `box` user)
 
 ```bash
 git clone https://github.com/chaogebaba/grok-box-setup.git /tmp/grok-box-setup
 sudo bash /tmp/grok-box-setup/install.sh
-sudo bash /workspace/box-setup/box-bootstrap.sh --once
+sudo /workspace/box-setup/boxup once
 ```
 
-Do this even if `/workspace/box-setup` already exists. That tree is a copy,
-not a git checkout; `install.sh` keeps statedir + hostname and `--stop`s old
-workers. GitHub clone is mode 644 — use `sudo bash`, not `sudo ./install.sh`.
+If the box has never joined the tailnet, `boxup status` prints an `auth=` URL —
+open it, approve the node, run `boxup once` again. With a reusable auth key in
+`secrets/ts-authkey` the join is unattended. Full operator procedure:
+[docs/AGENT.md](docs/AGENT.md).
 
-If the status line contains `auth=https://login.tailscale.com/…`, open it and
-click **Connect**. Then:
-
-```bash
-sudo bash /workspace/box-setup/pick-name.sh
-```
-
-Approve **Use as exit node** in the admin console once.
-
-Human clicks: Connect, then approve exit-node routes. Everything else is scripted.
-
-## Layout
+## Commands
 
 ```
-.
-├── install.sh
-├── docs/           AGENT.md, RUNBOOK.md, ARCHITECTURE.md, NAMING.md, TROUBLESHOOTING.md
-├── scripts/        box-bootstrap.sh, selfheal, forwarding heal, pick-name.sh
-├── etc/default-tailscaled, config.example.toml
-├── config.toml        THIS box's settings — seeded once, never overwritten
-├── state/tailscale/   empty in git — THIS box's login after Connect
-└── secrets/           optional ts-authkey, never committed
+boxup once      full converge + health tick + status   (hourly keep-alive contract)
+boxup ensure    full converge only
+boxup up        converge + start the selfheal worker   (default)
+boxup tick      one health tick
+boxup status    one-line health string
+boxup stop      stop the selfheal worker (tailscaled stays up)
+boxup update    fresh clone from GitHub + reinstall (never git pull)
 ```
 
-## SSH login
+`box-bootstrap.sh` remains as a shim (`--once` → `boxup once`) because the
+external hourly automation calls it by that name.
 
-Password login is on by design: after an image swap, `/etc/shadow` is gone and
-this is the only way back in. Every `--ensure` re-applies the password to
-`root` and `box` and rewrites `/etc/ssh/sshd_config.d/00-box-setup.conf`.
+## How it survives
 
-Default password is `12345678`. To change it, edit `config.toml` on the box:
+| Event | What dies | What brings it back |
+|---|---|---|
+| sleep / thaw | tailscaled's map poll (node goes grey) | selfheal worker: stale-heartbeat freeze detection recycles tailscaled |
+| image swap | everything outside `/workspace`: packages, `/etc/shadow`, sshd config, host keys, nft rules, all processes | hourly `boxup once` re-converges from `/workspace/box-setup`: vendored binaries in `bin/`, node identity in `state/tailscale/`, ssh host keys in `state/ssh/` |
+| process crash | sshd / tailscaled / worker | worker restarts procs; hourly `once` restarts the worker |
 
-```toml
-[ssh]
-password = "something-else"
-```
+Design, environment facts, and the reasoning behind every special case:
+[docs/DESIGN.md](docs/DESIGN.md).
 
-```bash
-sudo /workspace/box-setup/box-bootstrap.sh --once   # applies it
-```
+## Configuration
 
-`install.sh` seeds `config.toml` once and never overwrites it, so the setting
-survives every upgrade. For a single run without editing the file, set
-`BOX_SSH_PASSWORD`. Precedence: `BOX_SSH_PASSWORD` > `config.toml` > default.
+`/workspace/box-setup/config.toml` (seeded once, never overwritten):
+SSH password (`[ssh] password`, default `12345678`), pinned tailscale version
+(`[tailscale] version`), update repo (`[update] repo`). See
+[etc/config.example.toml](etc/config.example.toml).
 
-These boxes are exit nodes on your tailnet, so anyone on the tailnet can reach
-`:22`. Change the default if that matters to you.
+## House rules
 
-## Status line
-
-```
-backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1 tailscaled=… selfheal=… hb=…s
-```
-
-`ipfwd=4:0` or `6:0` is the relay bug. It is not a new login.
-
-## Never
-
-`systemctl`, `pkill -f`, cron, a second `tailscaled`, Tailscale SSH,
-a partial `tailscale up`, copying `state/tailscale` between boxes,
-guessing `grok-box-N` before Connect.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+- No systemd, no cron — the platform has neither. tini is PID 1.
+- Never `pkill -f`; processes are matched by exact argv and killed by PID.
+- `tailscale up` only for the first login; `tailscale set` afterwards.
+- One tailscaled, bound to `--statedir=/workspace/box-setup/state/tailscale`.
+- Box identity (`state/`, `hostname`, auth keys) never enters git.

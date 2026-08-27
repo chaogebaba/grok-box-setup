@@ -1,0 +1,1197 @@
+#!/bin/bash
+# boxup — turn a Grok sand box into a self-healing Tailscale exit node.
+#
+# One file, one copy, installed at /workspace/box-setup/boxup. Everything the
+# old scripts/ tree did lives here as subcommands:
+#
+#   boxup once      full converge + health tick + status   (hourly contract)
+#   boxup ensure    full converge only
+#   boxup up        converge + start the selfheal worker   (default)
+#   boxup tick      one health tick (sysctl / nft / refresh / procs)
+#   boxup status    one-line health string
+#   boxup stop      stop the selfheal worker (tailscaled stays up)
+#   boxup update    fresh clone from GitHub + reinstall (never git pull)
+#   boxup worker    internal: the selfheal loop
+#
+# Environment contract (see docs/DESIGN.md): Debian in a Cursor sand container,
+# PID 1 is tini, no systemd, no cron. The box sleeps when idle and the whole
+# overlay (/etc, /usr, processes, nft rules, /etc/shadow, ssh host keys) is
+# wiped on image swap. Only /workspace is expected back. An external hourly
+# automation runs `box-bootstrap.sh --once` (a shim onto `boxup once`); that is
+# the resurrection path. Between runs, the worker loop heals sleep/thaw.
+#
+# House rules, learned the hard way — keep them:
+#   * never pkill -f (agent -c processes mentioning our names get killed)
+#   * never `tailscale up` after first login (it clobbers unmentioned prefs);
+#     always `tailscale set` with the full flag list
+#   * exactly one tailscaled, bound to the /workspace statedir
+#   * NoState right after daemon start is not NeedsLogin — wait, don't mint
+set -u
+
+BOXUP_VERSION=5.0.0
+
+# The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+umask 022
+
+# --- layout ------------------------------------------------------------------
+# ROOT is always /workspace/box-setup unless BOX_SETUP_ROOT says otherwise.
+# No checkout auto-detection: a dev tree must opt in explicitly, so a stray
+# clone can never silently become the live root.
+ROOT="${BOX_SETUP_ROOT:-/workspace/box-setup}"
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+STATE_DIR="$ROOT/state/tailscale"
+STATE_FILE="$STATE_DIR/tailscaled.state"
+SSH_STATE_DIR="$ROOT/state/ssh"
+HOSTNAME_FILE="$ROOT/hostname"
+SECRETS_DIR="$ROOT/secrets"
+AUTHKEY_FILE="$SECRETS_DIR/ts-authkey"
+BIN_DIR="$ROOT/bin"
+CONFIG_FILE="${BOX_SETUP_CONFIG:-$ROOT/config.toml}"
+
+RUN_DIR="${BOX_SETUP_RUN:-/run/box-setup}"
+LOG_DIR="${BOX_SETUP_LOG:-/var/log}"
+WORKER_PID="/run/tailscale-selfheal.pid"
+WORKER_LOG="$LOG_DIR/boxup-worker.log"
+TAILSCALED_LOG="$LOG_DIR/tailscaled.log"
+START_LOCK="/run/tailscaled.start.lock"
+TS_SOCK="/var/run/tailscale/tailscaled.sock"
+
+DEFAULT_SSH_PASSWORD="12345678"
+DEFAULT_TS_VERSION="1.102.3"
+DEFAULT_REPO_URL="https://github.com/chaogebaba/grok-box-setup.git"
+
+INTERVAL="${BOXUP_INTERVAL:-${SELFHEAL_INTERVAL:-15}}"
+FREEZE_SECS="${BOXUP_FREEZE_SECS:-${SELFHEAL_FREEZE_SECS:-60}}"
+RECYCLE_COOLDOWN="${BOXUP_RECYCLE_COOLDOWN:-${SELFHEAL_RECYCLE_COOLDOWN:-120}}"
+SET_MIN_INTERVAL="${MIN_INTERVAL:-20}"
+WORKER_STARTED=$(date +%s)
+
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- config.toml -------------------------------------------------------------
+# A TOML subset, read with awk so it works before python3 is installed.
+# Handles [table] headers, "basic" and 'literal' strings, bare values and
+# # comments. See etc/config.example.toml for exactly what is supported.
+read -r -d '' _BOX_TOML_AWK <<'AWK' || true
+function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+{
+  line = trim($0)
+  if (line == "" || line ~ /^#/) next
+  if (line ~ /^\[.*\]$/) { sec = trim(substr(line, 2, length(line) - 2)); next }
+  eq = index(line, "=")
+  if (eq == 0) next
+  if (sec != want_t || trim(substr(line, 1, eq - 1)) != want_k) next
+  v = trim(substr(line, eq + 1))
+  if (substr(v, 1, 1) == "\"") {
+    out = ""; i = 2; n = length(v)
+    while (i <= n) {
+      c = substr(v, i, 1)
+      if (c == "\\" && i < n) {
+        d = substr(v, i + 1, 1)
+        if (d == "n") out = out "\n"
+        else if (d == "t") out = out "\t"
+        else out = out d
+        i += 2; continue
+      }
+      if (c == "\"") break
+      out = out c; i++
+    }
+    print out; found = 1; exit
+  }
+  if (substr(v, 1, 1) == "'") {
+    rest = substr(v, 2)
+    q = index(rest, "'")
+    if (q > 0) rest = substr(rest, 1, q - 1)
+    print rest; found = 1; exit
+  }
+  h = index(v, "#")
+  if (h > 0) v = trim(substr(v, 1, h - 1))
+  print v; found = 1; exit
+}
+END { exit(found ? 0 : 1) }
+AWK
+
+# config_get <table> <key> -> prints value, non-zero when unset.
+config_get() {
+  [ -f "$CONFIG_FILE" ] || return 1
+  awk -v want_t="$1" -v want_k="$2" "$_BOX_TOML_AWK" "$CONFIG_FILE" 2>/dev/null
+}
+
+# Password applied to root and box. Precedence: BOX_SSH_PASSWORD env >
+# config.toml [ssh].password > default. chpasswd takes one user:password line;
+# anything that cannot survive that round trip would set an unknown password
+# and lock the box out, so refuse it and keep the documented default.
+ssh_password() {
+  local p=""
+  if [ -n "${BOX_SSH_PASSWORD:-}" ]; then
+    p="$BOX_SSH_PASSWORD"
+  else
+    p="$(config_get ssh password || true)"
+  fi
+  case "$p" in
+    "") p="$DEFAULT_SSH_PASSWORD" ;;
+    *[![:print:]]*)
+      log "config: [ssh] password is not printable; using default" >&2
+      p="$DEFAULT_SSH_PASSWORD"
+      ;;
+  esac
+  printf '%s' "$p"
+}
+
+# --- tailscale binaries ------------------------------------------------------
+tailscale_bin() {
+  if [ -x "$BIN_DIR/tailscale" ]; then echo "$BIN_DIR/tailscale"; return; fi
+  command -v tailscale 2>/dev/null || echo tailscale
+}
+
+tailscaled_bin() {
+  if [ -x "$BIN_DIR/tailscaled" ]; then echo "$BIN_DIR/tailscaled"; return; fi
+  command -v tailscaled 2>/dev/null || echo /usr/sbin/tailscaled
+}
+
+ts() { timeout "${TS_TIMEOUT:-8}" "$(tailscale_bin)" "$@"; }
+
+ensure_dirs() {
+  mkdir -p "$STATE_DIR" "$SSH_STATE_DIR" "$SECRETS_DIR" "$BIN_DIR" \
+    "$RUN_DIR" "$LOG_DIR" /var/run/tailscale /run/sshd 2>/dev/null || true
+  chmod 700 "$ROOT/state" "$STATE_DIR" "$SSH_STATE_DIR" "$SECRETS_DIR" \
+    2>/dev/null || true
+}
+
+# --- tailscaled state --------------------------------------------------------
+state_is_populated() {
+  [ -f "$STATE_FILE" ] || return 1
+  # The state file is JSON with a "_machinekey" entry once a login happened.
+  # Prefer checking that; fall back to the old >=1KB size heuristic when the
+  # file is unreadable or python3 is missing.
+  if [ -r "$STATE_FILE" ] && have python3; then
+    python3 - "$STATE_FILE" <<'PY' 2>/dev/null && return 0 || return 1
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    sys.exit(0 if any(k.startswith("_machinekey") for k in d) else 1)
+except Exception:
+    sys.exit(2)
+PY
+  fi
+  local n
+  n="$( { wc -c < "$STATE_FILE" || sudo wc -c < "$STATE_FILE"; } 2>/dev/null \
+    | tr -d '[:space:]' )"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -ge 1024 ]
+}
+
+read_box_name() {
+  [ -s "$HOSTNAME_FILE" ] && tr -d '[:space:]' < "$HOSTNAME_FILE"
+}
+
+# --- status parsing ----------------------------------------------------------
+# One parser for everything. Prints newline-separated key=value pairs:
+#   backend= online= exitn= mapfail= fwdhealth= routes= auth=
+ts_fields() {
+  ts status --json 2>/dev/null | python3 -c '
+import json, sys
+out = {"backend": "", "online": "no", "exitn": "no", "mapfail": "no",
+       "fwdhealth": "no", "routes": "", "auth": ""}
+try:
+    d = json.load(sys.stdin)
+    s = d.get("Self") or {}
+    health = " ".join(str(x) for x in (d.get("Health") or []))
+    h = health.lower()
+    out["backend"] = str(d.get("BackendState") or "")
+    out["online"] = "yes" if s.get("Online") else "no"
+    out["exitn"] = "yes" if s.get("ExitNodeOption") else "no"
+    out["mapfail"] = "yes" if ("coordination server" in h
+                               or "not-in-map-poll" in h
+                               or "pollnetmap" in h) else "no"
+    out["fwdhealth"] = "yes" if "forward" in h else "no"
+    out["auth"] = (d.get("AuthURL") or "").replace("\n", " ").strip()
+except Exception:
+    pass
+for k, v in out.items():
+    print(f"{k}={v}")
+' 2>/dev/null || true
+}
+
+read_ts_fields() {
+  backend=""; online="no"; exitn="no"; mapfail="no"; fwdhealth="no"; auth=""
+  while IFS= read -r line; do
+    case "$line" in
+      backend=*)   backend="${line#backend=}" ;;
+      online=*)    online="${line#online=}" ;;
+      exitn=*)     exitn="${line#exitn=}" ;;
+      mapfail=*)   mapfail="${line#mapfail=}" ;;
+      fwdhealth=*) fwdhealth="${line#fwdhealth=}" ;;
+      auth=*)      auth="${line#auth=}" ;;
+    esac
+  done <<EOF
+$(ts_fields)
+EOF
+}
+
+advertised_routes() {
+  ts debug prefs 2>/dev/null | python3 -c '
+import json, sys
+try:
+    p = json.load(sys.stdin)
+    print(",".join(str(x) for x in (p.get("AdvertiseRoutes") or [])))
+except Exception:
+    print("")
+' 2>/dev/null || true
+}
+
+prefs_hostname() {
+  ts debug prefs 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print((json.load(sys.stdin).get("Hostname") or "").strip())
+except Exception:
+    print("")
+' 2>/dev/null || true
+}
+
+wait_for_socket() {
+  local i=0
+  while [ "$i" -lt 25 ]; do
+    [ -S "$TS_SOCK" ] || [ -S /run/tailscale/tailscaled.sock ] && return 0
+    sleep 0.2; i=$((i + 1))
+  done
+  return 1
+}
+
+# Wait until backend is Running / NeedsLogin / Stopped / Starting, or timeout.
+# NoState right after start is not NeedsLogin and not a reason to mint AuthURL.
+wait_for_backend() {
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    read_ts_fields
+    case "$backend" in
+      Running|NeedsLogin|Stopped|Starting) echo "$backend"; return 0 ;;
+    esac
+    sleep 0.5; i=$((i + 1))
+  done
+  echo "${backend:-NoState}"
+  return 1
+}
+
+# --- converge: packages ------------------------------------------------------
+ensure_packages() {
+  have apt-get || return 0
+  export DEBIAN_FRONTEND=noninteractive
+  local need=0
+  [ -x /usr/sbin/sshd ] || need=1
+  have nft || need=1
+  have curl || need=1
+  have python3 || need=1
+  [ "$need" = 1 ] || return 0
+  apt-get update -qq || true
+  apt-get install -y -qq --no-install-recommends \
+    openssh-server iptables nftables ca-certificates curl python3 \
+    iproute2 procps sudo 2>/dev/null || true
+}
+
+# --- converge: tailscale binaries -------------------------------------------
+# Vendored static binaries under $BIN_DIR are the primary install: they live
+# in /workspace, so after an image swap the daemon restarts without waiting on
+# apt or the network. Sources, in order: existing bin/, a system install to
+# copy, the official static tarball, and finally the apt repo.
+ts_version_want() { config_get tailscale version || echo "$DEFAULT_TS_VERSION"; }
+
+vendor_from_tarball() {
+  local ver="$1" arch tmp url
+  case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64) arch=arm64 ;;
+    *) return 1 ;;
+  esac
+  have curl || return 1
+  url="https://pkgs.tailscale.com/stable/tailscale_${ver}_${arch}.tgz"
+  tmp="$(mktemp -d)" || return 1
+  if curl -fsSL "$url" | tar -xz -C "$tmp" --strip-components=1 2>/dev/null \
+      && [ -x "$tmp/tailscaled" ] && [ -x "$tmp/tailscale" ] \
+      && "$tmp/tailscaled" --version >/dev/null 2>&1; then
+    install -m 0755 "$tmp/tailscaled" "$BIN_DIR/tailscaled"
+    install -m 0755 "$tmp/tailscale" "$BIN_DIR/tailscale"
+    rm -rf "$tmp"
+    log "vendored tailscale $ver ($arch) into $BIN_DIR"
+    return 0
+  fi
+  rm -rf "$tmp"
+  return 1
+}
+
+vendor_from_apt() {
+  have apt-get || return 1
+  local codename=trixie gpg=/usr/share/keyrings/tailscale-archive-keyring.gpg
+  if [ -f /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    codename="${VERSION_CODENAME:-trixie}"
+  fi
+  if [ ! -f "$gpg" ] && have curl; then
+    curl -fsSL "https://pkgs.tailscale.com/stable/debian/${codename}.noarmor.gpg" \
+      -o "$gpg" 2>/dev/null || true
+  fi
+  if [ -f "$gpg" ]; then
+    echo "deb [signed-by=$gpg] https://pkgs.tailscale.com/stable/debian ${codename} main" \
+      > /etc/apt/sources.list.d/tailscale.list
+    apt-get update -qq || true
+  fi
+  apt-get install -y -qq tailscale 2>/dev/null || return 1
+  [ -x /usr/sbin/tailscaled ] || return 1
+  install -m 0755 /usr/sbin/tailscaled "$BIN_DIR/tailscaled"
+  install -m 0755 /usr/bin/tailscale "$BIN_DIR/tailscale"
+  return 0
+}
+
+ensure_tailscale_bin() {
+  local want
+  want="$(ts_version_want)"
+  if [ -x "$BIN_DIR/tailscaled" ] && [ -x "$BIN_DIR/tailscale" ]; then
+    # Re-vendor only when the config pins a different version.
+    local cur
+    cur="$("$BIN_DIR/tailscale" --version 2>/dev/null | head -1 | tr -d '[:space:]')"
+    if [ -z "$(config_get tailscale version || true)" ] || [ "$cur" = "$want" ]; then
+      return 0
+    fi
+    log "tailscale $cur -> $want (config pin)"
+  elif [ -x /usr/sbin/tailscaled ] && [ -x /usr/bin/tailscale ]; then
+    install -m 0755 /usr/sbin/tailscaled "$BIN_DIR/tailscaled"
+    install -m 0755 /usr/bin/tailscale "$BIN_DIR/tailscale"
+    return 0
+  fi
+  vendor_from_tarball "$want" && return 0
+  vendor_from_apt && return 0
+  [ -x "$BIN_DIR/tailscaled" ] && return 0   # keep what we have
+  log "ensure_tailscale_bin: no tailscale binaries available" >&2
+  return 1
+}
+
+# --- converge: sshd ----------------------------------------------------------
+SSHD_DROPIN="/etc/ssh/sshd_config.d/00-box-setup.conf"
+
+# Password login is the contract for these boxes: after an image swap it is the
+# only way back in. Own it in a drop-in rather than sed-ing the main file —
+# Debian's sshd_config Includes sshd_config.d/*.conf near the top and sshd
+# keeps the FIRST value it obtains, so 00- wins over the main file and over
+# any other drop-in. Falls back to editing the main file on images without
+# Include support.
+write_sshd_config() {
+  local tmp
+  if [ -d /etc/ssh/sshd_config.d ] && \
+     grep -qiE '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' \
+       /etc/ssh/sshd_config 2>/dev/null; then
+    tmp="$(mktemp)" || return 1
+    cat > "$tmp" <<'DROPIN'
+# Managed by grok-box-setup (boxup). Overwritten on every converge.
+# Set the password in /workspace/box-setup/config.toml instead.
+ListenAddress 0.0.0.0
+ListenAddress ::
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+UsePAM yes
+DROPIN
+    if [ -f "$SSHD_DROPIN" ] && cmp -s "$tmp" "$SSHD_DROPIN"; then
+      rm -f "$tmp"
+      return 1          # already correct, no reload needed
+    fi
+    install -m 0644 "$tmp" "$SSHD_DROPIN"
+    rm -f "$tmp"
+    return 0
+  fi
+  [ -f /etc/ssh/sshd_config ] || return 1
+  grep -q '^ListenAddress 0.0.0.0' /etc/ssh/sshd_config 2>/dev/null || \
+    echo 'ListenAddress 0.0.0.0' >> /etc/ssh/sshd_config
+  grep -q '^ListenAddress ::' /etc/ssh/sshd_config 2>/dev/null || \
+    echo 'ListenAddress ::' >> /etc/ssh/sshd_config
+  sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
+  sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
+  return 0
+}
+
+# Host keys live in /etc/ssh, which dies on image swap; clients then see a
+# changed-host-key warning on every swap. Persist the keys in state/ssh and
+# restore them, so each grok-box-N keeps one SSH identity for its lifetime.
+ensure_host_keys() {
+  local k restored=0
+  if [ ! -f /etc/ssh/ssh_host_ed25519_key ] && \
+     [ -f "$SSH_STATE_DIR/ssh_host_ed25519_key" ]; then
+    for k in "$SSH_STATE_DIR"/ssh_host_*; do
+      [ -e "$k" ] || continue
+      cp -a "$k" /etc/ssh/ 2>/dev/null && restored=1
+    done
+    [ "$restored" = 1 ] && log "sshd: restored persisted host keys"
+  fi
+  [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A >/dev/null 2>&1 || true
+  for k in /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub; do
+    [ -f "$k" ] || continue
+    if [ ! -f "$SSH_STATE_DIR/$(basename "$k")" ]; then
+      cp -a "$k" "$SSH_STATE_DIR/" 2>/dev/null || true
+    fi
+  done
+}
+
+ensure_sshd() {
+  local changed=0 pw
+  mkdir -p /run/sshd /etc/ssh
+  ensure_host_keys
+  write_sshd_config && changed=1
+
+  # Grok images ship box/root with a locked shadow entry (* / !) and /etc/shadow
+  # dies on image swap — sshd=up is not a working login. Re-apply every converge.
+  pw="$(ssh_password)"
+  if have chpasswd; then
+    id box >/dev/null 2>&1 && printf 'box:%s\n' "$pw" | chpasswd >/dev/null 2>&1 || true
+    printf 'root:%s\n' "$pw" | chpasswd >/dev/null 2>&1 || true
+  fi
+
+  if [ -x /usr/sbin/sshd ]; then
+    if pgrep -x sshd >/dev/null 2>&1; then
+      # Reload only on config change; a HUP every tick churns sshd for nothing.
+      [ "$changed" = 1 ] && kill -HUP "$(pgrep -n -x sshd)" 2>/dev/null || true
+    else
+      /usr/sbin/sshd 2>/dev/null || true
+    fi
+  fi
+}
+
+# --- converge: forwarding ----------------------------------------------------
+# Admin console "cannot relay traffic" fires if EITHER v4 or v6 forwarding is 0.
+write_proc() {
+  local path="$1" val="$2" cur
+  [ -e "$path" ] || return 0
+  cur=$(tr -d '[:space:]' < "$path" 2>/dev/null || echo "")
+  [ "$cur" = "$val" ] && return 0
+  echo "$val" > "$path" 2>/dev/null && return 0
+  local key="${path#/proc/sys/}"
+  sysctl -w "${key//\//.}=${val}" >/dev/null 2>&1 || return 1
+}
+
+ensure_forwarding() {
+  local changed=0 p before after d v4 v6
+  if [ -d /etc/sysctl.d ] || mkdir -p /etc/sysctl.d 2>/dev/null; then
+    cat > /etc/sysctl.d/99-tailscale-exitnode.conf 2>/dev/null <<'EOF' || true
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv4.conf.default.forwarding = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv6.conf.default.forwarding = 1
+net.ipv4.conf.all.src_valid_mark = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+EOF
+  fi
+  for p in \
+    /proc/sys/net/ipv4/ip_forward \
+    /proc/sys/net/ipv4/conf/all/forwarding \
+    /proc/sys/net/ipv4/conf/default/forwarding \
+    /proc/sys/net/ipv6/conf/all/forwarding \
+    /proc/sys/net/ipv6/conf/default/forwarding \
+    /proc/sys/net/ipv4/conf/all/src_valid_mark
+  do
+    before=$(tr -d '[:space:]' < "$p" 2>/dev/null || echo "")
+    write_proc "$p" 1 || log "forwarding: cannot write $p (need NET_ADMIN)" >&2
+    after=$(tr -d '[:space:]' < "$p" 2>/dev/null || echo "")
+    [ "$before" != "$after" ] && changed=1
+  done
+  write_proc /proc/sys/net/ipv4/conf/all/rp_filter 2 || true
+  write_proc /proc/sys/net/ipv4/conf/default/rp_filter 2 || true
+  # Per-interface v6 forwarding: conf/all does not cover already-up interfaces.
+  for d in /proc/sys/net/ipv6/conf/*/forwarding; do
+    [ -e "$d" ] || continue
+    case "$d" in */lo/forwarding) continue ;; esac
+    write_proc "$d" 1 || true
+  done
+
+  v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
+  v6=$(tr -d '[:space:]' < /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
+  {
+    echo "ipfwd_v4=${v4}"
+    echo "ipfwd_v6=${v6}"
+    echo "changed=${changed}"
+    echo "ts=$(date +%s)"
+  } > "$RUN_DIR/ipfwd.env" 2>/dev/null || true
+  [ "$v4" = 1 ] && [ "$v6" = 1 ]
+}
+
+# --- converge: NAT -----------------------------------------------------------
+# Docker's FORWARD DROP + a missing masquerade = exit node "connected" with no
+# WAN. nft rules die with the overlay, so re-apply every tick. The whole file
+# is one kernel transaction (create-if-absent, delete, redefine) — atomic and
+# idempotent, no grep-the-rule-text games. The ip6 output reject + prohibit
+# default route force-fail IPv6 fast so exit-node clients fall back to v4
+# instead of hanging on a WAN that has no v6.
+ensure_nat() {
+  if have nft; then
+    nft -f - <<'NFT' 2>/dev/null || log "nat: nft apply failed" >&2
+table ip ts-exitfix {}
+delete table ip ts-exitfix
+table ip ts-exitfix {
+  chain postrouting {
+    type nat hook postrouting priority 100;
+    oifname != "lo" masquerade
+  }
+  chain forward {
+    type filter hook forward priority 0;
+    iifname "tailscale0" accept
+    oifname "tailscale0" accept
+  }
+}
+table ip6 ts-exitfix {}
+delete table ip6 ts-exitfix
+table ip6 ts-exitfix {
+  chain postrouting {
+    type nat hook postrouting priority 100;
+    oifname != "lo" masquerade
+  }
+  chain forward {
+    type filter hook forward priority 0;
+    iifname "tailscale0" accept
+    oifname "tailscale0" accept
+  }
+  chain output {
+    type filter hook output priority 0;
+    oifname != "lo" oifname != "tailscale0" reject
+  }
+}
+NFT
+  fi
+  if have iptables-legacy; then
+    iptables-legacy -C DOCKER-USER -j ACCEPT 2>/dev/null || \
+      iptables-legacy -I DOCKER-USER 1 -j ACCEPT 2>/dev/null || \
+      iptables-legacy -A DOCKER-USER -j ACCEPT 2>/dev/null || true
+    iptables-legacy -C FORWARD -i tailscale0 -j ACCEPT 2>/dev/null || \
+      iptables-legacy -I FORWARD 1 -i tailscale0 -j ACCEPT 2>/dev/null || true
+    iptables-legacy -C FORWARD -o tailscale0 -j ACCEPT 2>/dev/null || \
+      iptables-legacy -I FORWARD 1 -o tailscale0 -j ACCEPT 2>/dev/null || true
+  fi
+  if have ip; then
+    ip -6 route show default 2>/dev/null | grep -q prohibit || \
+      ip -6 route replace prohibit default 2>/dev/null || true
+  fi
+}
+
+# --- converge: tailscaled ----------------------------------------------------
+# Exactly one daemon, bound to the workspace statedir. Kill strays (dpkg's
+# default unit uses /var/lib/tailscale) by PID, never pkill -f. The child
+# closes flock fd 8 so a later start is not wedged on the inherited lock.
+start_tailscaled() {
+  local daemon pid cmd keep=""
+  daemon="$(tailscaled_bin)"
+  if [ ! -x "$daemon" ]; then
+    log "start: no tailscaled binary" >&2
+    return 1
+  fi
+  if [ ! -e /dev/net/tun ]; then
+    log "start: /dev/net/tun missing — kernel TUN required" >&2
+    return 1
+  fi
+
+  for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    if echo "$cmd" | grep -q -- "$STATE_DIR"; then
+      if [ -z "$keep" ]; then
+        keep="$pid"
+      else
+        log "start: extra statedir daemon pid=$pid — stopping"
+        kill "$pid" 2>/dev/null || true
+      fi
+    else
+      log "start: stopping stray pid=$pid (wrong statedir)"
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 0.4
+  for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    echo "$cmd" | grep -q -- "$STATE_DIR" && continue
+    kill -9 "$pid" 2>/dev/null || true
+  done
+
+  if [ -n "$keep" ] && kill -0 "$keep" 2>/dev/null; then
+    return 0
+  fi
+
+  touch "$TAILSCALED_LOG" 2>/dev/null || true
+  # Keep the log bounded; it lives on the overlay but a long-lived box would
+  # otherwise grow it without limit.
+  if [ "$(wc -c < "$TAILSCALED_LOG" 2>/dev/null || echo 0)" -gt 52428800 ]; then
+    : > "$TAILSCALED_LOG"
+  fi
+
+  # The flock lives in a subshell so it is released the moment the fork window
+  # closes — a long-lived worker holding it forever would wedge later starts.
+  # The daemon child closes fd 9 itself so it does not inherit the lock.
+  (
+    exec 9>"$START_LOCK"
+    flock -n 9 || exit 3
+    setsid -f env TS_DEBUG_FIREWALL_MODE="${TS_DEBUG_FIREWALL_MODE:-nftables}" \
+      "$daemon" \
+        --statedir="$STATE_DIR" \
+        --socket="$TS_SOCK" \
+        --tun=tailscale0 \
+        --port=41641 \
+        9<&- >>"$TAILSCALED_LOG" 2>&1
+  )
+  if [ "$?" = 3 ]; then
+    wait_for_socket || true
+    if pgrep -x tailscaled >/dev/null 2>&1; then
+      return 0
+    fi
+    log "start: lock busy ($START_LOCK)" >&2
+    return 1
+  fi
+  wait_for_socket || true
+  pid=$(pgrep -n -x tailscaled 2>/dev/null || true)
+  log "start: tailscaled pid=${pid:-?} statedir=$STATE_DIR"
+}
+
+# --- converge: first login ---------------------------------------------------
+# `tailscale up` is allowed here and ONLY here: when the backend needs a login
+# AND the statedir has no identity. Everything after first login goes through
+# `tailscale set` (up resets flags it is not given).
+ensure_login() {
+  local b st
+  st="$(wait_for_backend || true)"
+  case "$st" in Running|Starting) return 0 ;; esac
+  state_is_populated && return 0
+  case "$st" in NeedsLogin|Stopped|"") ;; *) return 0 ;; esac
+
+  b="$(tailscale_bin)"
+  [ -x "$b" ] || return 0
+  local -a up
+  up=("$b" up --ssh=false --advertise-exit-node --accept-dns
+      --snat-subnet-routes=true --timeout=25s)
+  id box >/dev/null 2>&1 && up+=(--operator=box)
+  if [ -s "$AUTHKEY_FILE" ]; then
+    log "login: auth-key join (statedir empty)"
+    "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
+  else
+    log "login: minting AuthURL (statedir empty, no key) — see boxup status"
+    "${up[@]}" || true
+  fi
+}
+
+# --- converge: name ----------------------------------------------------------
+# Pick the lowest free grok-box-N from PEERS only (Self is often still named
+# cursor). Only when logged in and peers are visible; a lone node would always
+# pick grok-box-1 and collide later.
+pick_name() {
+  python3 - <<PY
+import json, re, subprocess
+
+pat = re.compile(r"^grok-box-([0-9]+)\$")
+
+def run(args, timeout=8):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.stdout or ""
+    except Exception:
+        return ""
+
+tsbin = "$(tailscale_bin)"
+raw = run([tsbin, "status", "--json"])
+status_txt = run([tsbin, "status"])
+self_ip = run([tsbin, "ip", "-4"]).strip()
+taken = set()
+
+def take(name):
+    if not name:
+        return
+    name = name.strip().rstrip(".")
+    if "." in name and name.endswith("ts.net"):
+        name = name.split(".")[0]
+    m = pat.match(name)
+    if m:
+        taken.add(int(m.group(1)))
+
+try:
+    d = json.loads(raw) if raw.strip() else {}
+except json.JSONDecodeError:
+    d = {}
+
+peers = d.get("Peer") or {}
+if not peers:
+    raise SystemExit(1)   # no peers visible: do not guess
+
+for peer in peers.values():
+    take(peer.get("HostName") or "")
+    dns = peer.get("DNSName") or ""
+    take(dns.split(".")[0] if dns else "")
+
+for line in status_txt.splitlines():
+    cols = line.split()
+    if len(cols) < 2:
+        continue
+    if self_ip and cols[0] == self_ip:
+        continue
+    take(cols[1])
+
+n = 1
+while n in taken:
+    n += 1
+print(f"grok-box-{n}")
+PY
+}
+
+ensure_name() {
+  local name
+  name="$(read_box_name || true)"
+  case "$name" in grok-box-[0-9]*) return 0 ;; esac
+  read_ts_fields
+  [ "$backend" = Running ] || return 0
+  name="$(pick_name 2>/dev/null || true)"
+  case "$name" in
+    grok-box-[0-9]*)
+      printf '%s\n' "$name" > "$HOSTNAME_FILE"
+      log "name: picked $name"
+      ;;
+  esac
+}
+
+# --- converge: exit-node refresh --------------------------------------------
+# Full flag set. Prefer operator=box; fall back to root if that user cannot
+# talk to the daemon yet (first join, operator not written).
+tailscale_set_full() {
+  local name="$1" b
+  b="$(tailscale_bin)"
+  [ -x "$b" ] || return 1
+  if id box >/dev/null 2>&1 && sudo -n -u box "$b" set --hostname="$name" \
+      --ssh=false --operator=box --advertise-exit-node \
+      --snat-subnet-routes=true --stateful-filtering=false 2>/dev/null; then
+    return 0
+  fi
+  "$b" set --hostname="$name" --ssh=false --operator=box \
+    --advertise-exit-node --snat-subnet-routes=true \
+    --stateful-filtering=false
+}
+
+# Push a full `tailscale set` when the coordination server would show "unable
+# to relay traffic". Never `up`. Rate-limited: an unneeded set every tick
+# cancels PollNetMap and marks the node offline.
+refresh_exitnode() {
+  local name need=0 reason="" chk warn v4 v6 routes now last
+  read_ts_fields
+  case "$backend" in Running) ;; *) return 0 ;; esac
+
+  name="$(read_box_name || true)"
+  case "$name" in
+    grok-box-[0-9]*) ;;
+    *) name="$(prefs_hostname)" ;;
+  esac
+  case "$name" in grok-box-[0-9]*) ;; *) return 0 ;; esac
+
+  # Healthy payload is {"Warning":""}. Parse the value — grepping for the key
+  # name is always true and spammed `tailscale set` (node went offline).
+  chk=$(timeout 5 curl -sS --unix-socket "$TS_SOCK" \
+    http://local-tailscaled.sock/localapi/v0/check-ip-forwarding 2>/dev/null || true)
+  warn=$(printf '%s' "$chk" | python3 -c '
+import json, sys
+try:
+    w = json.load(sys.stdin).get("Warning") or ""
+    if isinstance(w, list):
+        w = " ".join(str(x) for x in w)
+    print(str(w).strip())
+except Exception:
+    print("")
+' 2>/dev/null || true)
+  [ -n "$warn" ] && { need=1; reason="check-ip-forwarding warning"; }
+
+  v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
+  v6=$(tr -d '[:space:]' < /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
+  if [ "$v4" != 1 ] || [ "$v6" != 1 ]; then
+    need=1; reason="kernel ipfwd v4=${v4} v6=${v6}"
+  fi
+  if [ -f "$RUN_DIR/ipfwd.env" ]; then
+    # shellcheck disable=SC1091
+    . "$RUN_DIR/ipfwd.env"
+    [ "${changed:-0}" = 1 ] && { need=1; reason="sysctl just flipped"; }
+  fi
+
+  [ "$exitn" = yes ] || { need=1; reason="ExitNodeOption false"; }
+  [ "$fwdhealth" = yes ] && { need=1; reason="status Health mentions forward"; }
+
+  routes="$(advertised_routes)"
+  echo "$routes" | grep -q '0.0.0.0/0' || { need=1; reason="missing 0.0.0.0/0"; }
+  echo "$routes" | grep -q '::/0' || { need=1; reason="missing ::/0"; }
+
+  [ "$need" = 1 ] || return 0
+
+  now=$(date +%s)
+  if [ -f "$RUN_DIR/last-exitnode-set" ]; then
+    last=$(cat "$RUN_DIR/last-exitnode-set" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ $((now - last)) -lt "$SET_MIN_INTERVAL" ]; then
+      log "refresh: need set ($reason) but rate-limited"
+      return 0
+    fi
+  fi
+  log "refresh: tailscale set ($reason) hostname=$name"
+  if tailscale_set_full "$name"; then
+    echo "$now" > "$RUN_DIR/last-exitnode-set" 2>/dev/null || true
+  else
+    log "refresh: set failed" >&2
+    return 1
+  fi
+}
+
+# --- selfheal: freeze / offline recycle -------------------------------------
+hb_age() {
+  local now prev
+  now=$(date +%s)
+  prev=$(tr -d '[:space:]' < "$RUN_DIR/hb" 2>/dev/null || echo 0)
+  case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+  [ "$prev" -le 0 ] && { echo 0; return; }
+  echo $((now - prev))
+}
+
+recent_time_jump() {
+  python3 - "$TAILSCALED_LOG" <<'PY'
+import datetime, re, sys, time
+try:
+    lines = open(sys.argv[1], errors="replace").read().splitlines()[-150:]
+except Exception:
+    sys.exit(1)
+pat = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}).*time jump detected")
+now = time.time()
+for line in reversed(lines):
+    m = pat.search(line)
+    if not m:
+        continue
+    ts = datetime.datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
+    ts = ts.replace(tzinfo=datetime.timezone.utc)
+    sys.exit(0 if 0 <= now - ts.timestamp() <= 180 else 1)
+sys.exit(1)
+PY
+}
+
+recycled_recently() {
+  local now rec
+  now=$(date +%s)
+  rec=$(tr -d '[:space:]' < "$RUN_DIR/last-recycle" 2>/dev/null || echo 0)
+  case "$rec" in ''|*[!0-9]*) rec=0 ;; esac
+  [ "$rec" -gt 0 ] && [ $((now - rec)) -lt "$RECYCLE_COOLDOWN" ]
+}
+
+# Kill that PID only (must be on our statedir), restart, re-push prefs.
+recycle_tailscaled() {
+  local reason="$1" pid cmd i
+  pid=$(pgrep -n -x tailscaled 2>/dev/null || true)
+  [ -n "$pid" ] || return 0
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+  echo "$cmd" | grep -q -- "$STATE_DIR" || return 0
+
+  log "selfheal: $reason — recycle tailscaled pid=$pid"
+  # Stamp BEFORE the kill: if this tick is slow or dies mid-recycle, the next
+  # tick must still honor the cooldown instead of recycling again.
+  date +%s > "$RUN_DIR/last-recycle" 2>/dev/null || true
+  kill "$pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 20 ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2; i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 0.3
+  fi
+  rm -f "$RUN_DIR/last-online" "$RUN_DIR/offline-ticks"
+  start_tailscaled || true
+  # Hostinfo set is skipped while backend=NoState; wait out the blip.
+  wait_for_backend >/dev/null || true
+  refresh_exitnode || true
+}
+
+# After freeze/thaw, PollNetMap's long-poll is already dead but Self.Online
+# and Health stay green for ~2 min (map timeout). A long-lived worker's stale
+# hb is the wake signal — recycle. A brand-new worker (after stop) also sees
+# leftover hb; only recycle then if tailscaled logged a time jump or the node
+# is already down.
+maybe_wake_recycle() {
+  local age now started
+  age=$(hb_age)
+  case "$age" in ''|*[!0-9]*) age=0 ;; esac
+  [ "$age" -ge "$FREEZE_SECS" ] || return 0
+  recycled_recently && return 0
+
+  now=$(date +%s)
+  started=${WORKER_STARTED:-0}
+  case "$started" in ''|*[!0-9]*) started=0 ;; esac
+  if [ "$started" -gt 0 ] && [ $((now - started)) -lt "$FREEZE_SECS" ]; then
+    read_ts_fields
+    if [ "$online" = yes ] && [ "$mapfail" != yes ] && ! recent_time_jump; then
+      log "selfheal: stale hb ${age}s but worker is new and node is live — skip"
+      return 0
+    fi
+  fi
+  recycle_tailscaled "time jump ${age}s (hb) — map poll dies on freeze"
+}
+
+# Process alive + Running + (Online=false or map-poll Health) after freeze.
+# Not NeedsLogin, not a new AuthURL.
+recycle_offline_tailscaled() {
+  local now last ticks do_recycle=0
+  recycled_recently && return 0
+  read_ts_fields
+  case "$backend" in
+    Running) ;;
+    *) rm -f "$RUN_DIR/offline-ticks"; return 0 ;;
+  esac
+
+  now=$(date +%s)
+  if [ "$online" = yes ] && [ "$mapfail" != yes ]; then
+    echo "$now" > "$RUN_DIR/last-online" 2>/dev/null || true
+    rm -f "$RUN_DIR/offline-ticks"
+    return 0
+  fi
+
+  last=$(tr -d '[:space:]' < "$RUN_DIR/last-online" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  ticks=$(tr -d '[:space:]' < "$RUN_DIR/offline-ticks" 2>/dev/null || echo 0)
+  case "$ticks" in ''|*[!0-9]*) ticks=0 ;; esac
+  ticks=$((ticks + 1))
+  echo "$ticks" > "$RUN_DIR/offline-ticks" 2>/dev/null || true
+
+  if [ "$last" -gt 0 ] && [ $((now - last)) -ge 30 ]; then
+    do_recycle=1
+  elif [ "$ticks" -ge 3 ]; then
+    do_recycle=1
+  fi
+  [ "$do_recycle" = 1 ] || return 0
+  recycle_tailscaled "online=${online} mapfail=${mapfail} after freeze"
+}
+
+# --- selfheal: worker --------------------------------------------------------
+run_tick() {
+  # Freeze checks first — they need the OLD heartbeat.
+  if pgrep -x tailscaled >/dev/null 2>&1; then
+    maybe_wake_recycle || true
+    recycle_offline_tailscaled || true
+  else
+    start_tailscaled || true
+  fi
+  # Write hb immediately after the checks: a slow recycle above must not leave
+  # a stale hb for the next tick to mistake for another freeze.
+  date +%s > "$RUN_DIR/hb" 2>/dev/null || true
+
+  ensure_forwarding || true
+  ensure_nat || true
+
+  if ! pgrep -x sshd >/dev/null 2>&1; then
+    [ -x /usr/sbin/sshd ] && /usr/sbin/sshd 2>/dev/null || true
+  fi
+
+  case "$(read_box_name || true)" in
+    grok-box-[0-9]*)
+      pgrep -x tailscaled >/dev/null 2>&1 && refresh_exitnode || true
+      ;;
+  esac
+  date +%s > "$RUN_DIR/hb" 2>/dev/null || true
+}
+
+# True iff argv is `bash <path>/boxup worker` (or a legacy v4 selfheal worker).
+# Never match `bash -c ...`: flattened cmdline greps used to SIGTERM agent
+# shells that merely mentioned the name.
+is_worker_proc() {
+  local pid="$1" arg have_script=0 have_worker=0 have_c=0
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  while IFS= read -r -d '' arg; do
+    case "$arg" in
+      -c) have_c=1 ;;
+      worker|--worker) have_worker=1 ;;
+      *boxup|*tailscale-selfheal.sh) have_script=1 ;;
+    esac
+  done < "/proc/$pid/cmdline" 2>/dev/null || return 1
+  [ "$have_c" = 0 ] && [ "$have_script" = 1 ] && [ "$have_worker" = 1 ]
+}
+
+stop_workers() {
+  local keep="${1:-}" pid i leftover
+  for pid in $(pgrep -x bash 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
+    [ -n "$keep" ] && [ "$pid" = "$keep" ] && continue
+    is_worker_proc "$pid" || continue
+    log "selfheal: stopping worker pid=$pid"
+    kill "$pid" 2>/dev/null || true
+  done
+  i=0
+  while [ "$i" -lt 15 ]; do
+    leftover=0
+    for pid in $(pgrep -x bash 2>/dev/null || true); do
+      [ "$pid" = "$$" ] && continue
+      [ -n "$keep" ] && [ "$pid" = "$keep" ] && continue
+      is_worker_proc "$pid" || continue
+      leftover=1
+      kill -9 "$pid" 2>/dev/null || true
+    done
+    [ "$leftover" = 0 ] && break
+    sleep 0.2; i=$((i + 1))
+  done
+}
+
+worker_loop() {
+  ensure_dirs
+  echo $$ > "$WORKER_PID"
+  echo "boxup-worker v$BOXUP_VERSION pid=$$ interval=$INTERVAL freeze=${FREEZE_SECS}s" >> "$WORKER_LOG"
+  while true; do
+    run_tick >> "$WORKER_LOG" 2>&1 || true
+    if [ "$(wc -c < "$WORKER_LOG" 2>/dev/null || echo 0)" -gt 10485760 ]; then
+      : > "$WORKER_LOG"
+    fi
+    sleep "$INTERVAL"
+  done
+}
+
+start_daemon() {
+  ensure_dirs
+  # Always reap leftovers and start one worker from THIS file; a pidfile hit
+  # once kept an old version's worker in memory next to a newer install.
+  stop_workers
+  rm -f "$WORKER_PID"
+  setsid -f env BOX_SETUP_ROOT="$ROOT" bash "$SELF" worker >/dev/null 2>&1
+  local i=0
+  while [ "$i" -lt 15 ]; do
+    if [ -f "$WORKER_PID" ] && kill -0 "$(cat "$WORKER_PID" 2>/dev/null)" 2>/dev/null; then
+      break
+    fi
+    sleep 0.2; i=$((i + 1))
+  done
+  log "selfheal: started pid=$(cat "$WORKER_PID" 2>/dev/null || echo '?')"
+}
+
+stop_daemon() {
+  local old
+  if [ -f "$WORKER_PID" ]; then
+    old=$(cat "$WORKER_PID" 2>/dev/null || echo "")
+    [ -n "$old" ] && kill "$old" 2>/dev/null || true
+    rm -f "$WORKER_PID"
+  fi
+  stop_workers
+  log "selfheal: stopped (tailscaled left running)"
+}
+
+# --- status ------------------------------------------------------------------
+print_status() {
+  local sshd=down ts_pid sh_pid="" hb=- v4 v6 name now last
+  v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
+  v6=$(tr -d '[:space:]' < /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
+  ts_pid=$(pgrep -n -x tailscaled 2>/dev/null || echo "")
+  if [ -f "$WORKER_PID" ]; then
+    sh_pid=$(tr -d '[:space:]' < "$WORKER_PID")
+    kill -0 "$sh_pid" 2>/dev/null || sh_pid=""
+  fi
+  if [ -f "$RUN_DIR/hb" ]; then
+    now=$(date +%s)
+    last=$(tr -d '[:space:]' < "$RUN_DIR/hb" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ "$last" -gt 0 ] && hb="$((now - last))s"
+  fi
+  pgrep -x sshd >/dev/null 2>&1 && sshd=up
+  read_ts_fields
+  name="$(read_box_name || true)"
+
+  printf 'backend=%s online=%s exit-node=%s sshd=%s ipfwd=4:%s,6:%s tailscaled=%s selfheal=%s worker=%s hb=%s name=%s v=%s' \
+    "${backend:-unknown}" "${online:-no}" "${exitn:-no}" "$sshd" "$v4" "$v6" \
+    "${ts_pid:--}" "${sh_pid:--}" "${sh_pid:--}" "$hb" "${name:--}" "$BOXUP_VERSION"
+  [ -n "${auth:-}" ] && printf ' auth=%s' "$auth"
+  printf '\n'
+}
+
+# --- converge ----------------------------------------------------------------
+do_ensure() {
+  ensure_dirs
+  ensure_packages
+  ensure_tailscale_bin || true
+  ensure_sshd
+  ensure_forwarding || true
+  start_tailscaled || true
+  wait_for_socket || true
+  ensure_login
+  ensure_name
+  ensure_nat || true
+  refresh_exitnode || true
+}
+
+do_update() {
+  local url tmp
+  url="$(config_get update repo || echo "$DEFAULT_REPO_URL")"
+  have git || { log "update: git missing" >&2; return 1; }
+  tmp="$(mktemp -d)" || return 1
+  log "update: cloning $url"
+  if git clone --depth 1 "$url" "$tmp/repo" >/dev/null 2>&1; then
+    BOX_SETUP_ROOT="$ROOT" bash "$tmp/repo/install.sh"
+    rm -rf "$tmp"
+    log "update: installed $(cat "$ROOT/VERSION" 2>/dev/null || echo '?') — run: boxup once"
+  else
+    rm -rf "$tmp"
+    log "update: clone failed" >&2
+    return 1
+  fi
+}
+
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    if have sudo; then
+      exec sudo env BOX_SETUP_ROOT="$ROOT" \
+        BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" bash "$SELF" "$@"
+    fi
+    log "boxup: need root" >&2
+    exit 1
+  fi
+}
+
+usage() { sed -n '4,15p' "$0"; }
+
+cmd="${1:-up}"
+case "$cmd" in
+  once|--once)
+    require_root once
+    do_ensure
+    start_daemon
+    run_tick
+    print_status
+    ;;
+  ensure|--ensure)
+    require_root ensure
+    do_ensure
+    ;;
+  up|--up|"")
+    require_root up
+    do_ensure
+    start_daemon
+    print_status
+    ;;
+  tick|--tick)
+    require_root tick
+    run_tick
+    ;;
+  status|--status)
+    print_status
+    ;;
+  stop|--stop)
+    require_root stop
+    stop_daemon
+    ;;
+  update|--update)
+    require_root update
+    do_update
+    ;;
+  worker|--worker)
+    worker_loop
+    ;;
+  version|--version)
+    echo "boxup $BOXUP_VERSION"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    echo "boxup: unknown command: $cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

@@ -1,84 +1,82 @@
-# Agent guide — clone this repo and stand up the box
+# AGENT.md — operator runbook
 
-You are an AI agent on a Debian 13 Grok/sand box (PID 1 = tini, **no systemd**).
-Your job: install this repo and keep OpenSSH + a Tailscale **exit node** healthy.
+You are an agent on a Grok sand box (or SSH'd into one). This is everything
+you run, in order, for every situation. The program is
+`/workspace/box-setup/boxup`; `sudo` is passwordless.
 
-Read this file first. Then `docs/RUNBOOK.md`. Do not improvise around the Never list.
-
-## 1. Clone and install
-
-`/workspace/box-setup` is a **copy**, not a git checkout. A dest hit
-(`box-bootstrap.sh` already there) is not "already up to date". grok-box-7
-stayed on 4.1.2 after 4.1.3/4.1.4 merged because this step skipped clone;
-the in-memory worker never loaded the freeze-recycle or `chpasswd` fixes.
-Always clone to a temp dir and re-run `install.sh` (it `--stop`s leftover
-workers and keeps statedir + hostname). Then `--once`. Never
-`git -C /workspace/box-setup pull`.
+## A. Fresh box (never set up)
 
 ```bash
-DEST=/workspace/box-setup
-REPO_URL="${REPO_URL:-https://github.com/chaogebaba/grok-box-setup.git}"
-
-tmp=$(mktemp -d)
-git clone --depth 1 "$REPO_URL" "$tmp/grok-box-setup"
-sudo bash "$tmp/grok-box-setup/install.sh"
-sudo bash "$DEST/box-bootstrap.sh" --once
+git clone https://github.com/chaogebaba/grok-box-setup.git /tmp/grok-box-setup
+sudo bash /tmp/grok-box-setup/install.sh
+sudo /workspace/box-setup/boxup once
 ```
 
-GitHub serves scripts as mode 644. Always `sudo bash …/install.sh`, never `sudo ./install.sh`.
+- If status ends with `auth=https://login.tailscale.com/...`: relay that URL
+  to the human, wait for approval, run `sudo /workspace/box-setup/boxup once`
+  again.
+- To skip the URL dance, put a **reusable, non-ephemeral** auth key in
+  `/workspace/box-setup/secrets/ts-authkey` (mode 600) before `boxup once`,
+  or install with `BOX_SETUP_AUTHKEY=tskey-...`.
+- The box names itself: once logged in with peers visible, `boxup` picks the
+  lowest free `grok-box-N`, stores it in `/workspace/box-setup/hostname`, and
+  pushes it. Do not invent names by hand.
 
-`install.sh` copies scripts + docs into `/workspace/box-setup`. It never copies
-`state/tailscale` or a `hostname` from the repo. One node identity per box.
+## B. Refresh to the latest version
 
-Optional reusable **non-ephemeral** auth key (only used when statedir is empty):
+Always a fresh clone; never `git pull` in place, never trust an existing
+`/tmp` checkout (a stale copy once kept a box on an old version):
 
 ```bash
-sudo BOX_SETUP_AUTHKEY='tskey-auth-…' bash /path/to/install.sh
+sudo /workspace/box-setup/boxup update     # clone + install + tells you next step
+sudo /workspace/box-setup/boxup once
 ```
 
-After Connect, pick the name with:
+(Equivalent by hand: fresh `git clone` to a `mktemp -d`, then
+`sudo bash <tmp>/install.sh`.)
+
+## C. Verify health
 
 ```bash
-sudo bash /workspace/box-setup/pick-name.sh
+sudo /workspace/box-setup/boxup status
 ```
 
-## 2. What you do next
+Healthy: `backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1`
+with numeric pids and a small `hb=` age (≤ ~30s). Cross-check from another
+machine on the tailnet: `tailscale ping grok-box-N` and
+`ssh box@grok-box-N` (password from config.toml, default `12345678`).
 
-Print the `--once` status line. Then follow **exactly one** procedure in
-[`RUNBOOK.md`](RUNBOOK.md):
+## D. Something is wrong
 
-| Status line | Procedure |
-|---|---|
-| `auth=https://login.tailscale.com/…` | A2 — paste URL, stop |
-| `backend=Running` and no `hostname` / not `grok-box-N` | A3 — `pick-name.sh`, write file, `set` |
-| `backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1` | healthy — stop |
-| `ipfwd=4:0` or `ipfwd=6:0` | G — forwarding tick, then stop |
-| statedir kilobytes + image just swapped | C — `--once` only, do not bump N |
-| anything else | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) |
+| Symptom | Meaning | Do |
+|---|---|---|
+| `auth=` URL in status | box needs (re-)login | relay URL to the human, then `boxup once` |
+| `backend=NeedsLogin`, no URL | login flow not started | `boxup once` |
+| `online=no` for >1 min | map poll died (freeze) | wait one worker tick (15s); else `boxup once` |
+| `exit-node=no` | prefs lost after swap | `boxup once` (refresh pushes full `tailscale set`) |
+| `sshd=down` or login refused | swap wiped shadow/config | `boxup once` re-applies password + drop-in |
+| `ipfwd` not `4:1,6:1` | sysctl wiped | `boxup tick` |
+| `hb=-` or huge | worker dead | `boxup once` (restarts it) |
+| tailnet shows two nodes for one box | stale identity got recreated | delete the OLD node in the admin console; never copy `state/` between boxes |
 
-## 3. Hard rules
+Logs: `/var/log/boxup-worker.log`, `/var/log/tailscaled.log`.
 
-- Refresh from GitHub (`clone` + `install.sh`) then `--once`. Dest existing is not current.
-- Do **not** pick `grok-box-N` until `tailscale status` lists Self + peers.
-- Do not ask the human which N to use. Compute it ([`NAMING.md`](NAMING.md)).
-- Do not ask for an auth key when `sudo wc -c state/tailscale/tailscaled.state`
-  is already kilobytes. The file is mode 600 root; a non-sudo read looks empty.
-- Do not run `tailscale login` or a second `tailscale up` after login.
-  `backend=NoState` for a few seconds is not NeedsLogin.
-- Never: `systemctl`, `pkill`, cron, a second `tailscaled`, Tailscale SSH,
-  a **partial** `tailscale up`, invent kill commands.
-- Kill a stray `tailscaled` by **PID only**.
+## E. Never do
 
-## 4. Human clicks (only these)
+- `pkill -f anything` — it kills agent shells that merely mention the name.
+- `tailscale up` on a logged-in box — it resets every flag you didn't pass.
+- `systemctl` / cron — they do not exist here; the hourly automation and the
+  worker loop are the only schedulers.
+- Copy `state/tailscale/`, `hostname`, or an auth key from another box.
+- Run a second tailscaled on a different statedir.
 
-1. Open the AuthURL and click **Connect** (first join, empty statedir).
-2. Admin console → this machine → approve **Use as exit node** for both
-   `0.0.0.0/0` and `::/0` (once per box).
+## F. The hourly keep-alive (already configured, for reference)
 
-You do everything else, including naming.
+An external Grok automation runs, every hour:
 
-## 5. Hourly keep-alive
+```bash
+sudo /workspace/box-setup/box-bootstrap.sh --once
+```
 
-Install a Grok Bot automation named `Box keep-alive`, hourly 24/7, prompt
-verbatim from [`RUNBOOK.md`](RUNBOOK.md) section D. Without it the box sleeps
-after a few idle minutes and will not rebuild after an image swap.
+That shim calls `boxup once`. It is the resurrection path after an image
+swap — do not rename or remove either file.

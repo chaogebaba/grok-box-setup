@@ -25,3 +25,8 @@ Thumbs.db
 .vscode/
 .env
 .env.*
+
+# CAO worker artifacts (session-local, never ship)
+/probes/
+/assets/
+/tmp/

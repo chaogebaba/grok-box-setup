@@ -4,18 +4,17 @@
 # and never overwrites it afterwards, so your edits survive an upgrade.
 # It lives under /workspace, so it also survives an image swap.
 #
-# Re-read on every --ensure. After editing:
-#   sudo /workspace/box-setup/box-bootstrap.sh --once
+# Re-read on every converge. After editing:
+#   sudo /workspace/box-setup/boxup once
 #
-# Read by a small awk reader in scripts/lib/common.sh, not a full TOML
-# library. Supported: [table] headers, "basic strings" (with \\ and \"
-# escapes), 'literal strings', bare values, and # comments. One level of
-# tables. That is everything this file needs.
+# Read by a small awk reader in boxup, not a full TOML library. Supported:
+# [table] headers, "basic strings" (with \\ and \" escapes), 'literal
+# strings', bare values, and # comments. One level of tables.
 
 [ssh]
 # Password for root and box.
 #
-# Re-applied on every --ensure, because the Grok image ships both accounts
+# Re-applied on every converge, because the Grok image ships both accounts
 # with a locked shadow entry (* or !) and an image swap wipes /etc/shadow.
 # Without this, sshd is up but no login works.
 #
@@ -23,7 +22,19 @@
 #password = "12345678"
 #
 # To override for a single run without editing this file:
-#   sudo BOX_SSH_PASSWORD='s3cret' /workspace/box-setup/box-bootstrap.sh --once
+#   sudo BOX_SSH_PASSWORD='s3cret' /workspace/box-setup/boxup once
 #
 # Any printable value is accepted, including spaces and ':'. An empty or
 # non-printable value is refused and the default is used instead.
+
+[tailscale]
+# Pin the vendored tailscale version. When set and different from what is in
+# bin/, the official static tarball for this version is downloaded on the
+# next converge. Leave commented to keep whatever bin/ already has (the
+# built-in default is only used when bin/ is empty).
+#version = "1.102.3"
+
+[update]
+# Repo cloned by `boxup update`. Always a fresh clone to a temp dir + this
+# install.sh — never `git pull` in place.
+#repo = "https://github.com/chaogebaba/grok-box-setup.git"

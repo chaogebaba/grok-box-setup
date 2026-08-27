@@ -1,7 +1,0 @@
-# Installed to /etc/default/tailscaled when the overlay allows it.
-# The live daemon is started by scripts/start-tailscaled.sh, not systemd.
-# Statedir is ALWAYS /workspace/box-setup/state/tailscale (or $BOX_SETUP_ROOT).
-
-TS_DEBUG_FIREWALL_MODE=nftables
-PORT=41641
-FLAGS="--statedir=/workspace/box-setup/state/tailscale"

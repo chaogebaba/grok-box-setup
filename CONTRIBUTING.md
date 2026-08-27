@@ -2,26 +2,26 @@
 
 ## Principles
 
-- Scripts are the source of truth for behavior. Docs describe them; they do
-  not duplicate large command blocks that will drift.
-- `/workspace/box-setup/` is the on-box contract path. Keep `install.sh`
-  flattening `scripts/*.sh` there.
-- Never add `systemctl`, `pkill -f`, Linux cron, Tailscale SSH, or ephemeral
+- `boxup` is the source of truth for behavior; it is ONE file installed in
+  ONE place (`/workspace/box-setup/boxup`). Docs describe it, never duplicate
+  it.
+- The on-box contract paths are frozen: `/workspace/box-setup/` and the
+  `box-bootstrap.sh --once` shim (the external hourly automation calls it).
+- Never add `systemctl`, Linux cron, `pkill -f`, Tailscale SSH, or ephemeral
   auth keys.
-- Identity (`state/tailscale`, `hostname`, Tailscale IPs) is per-box and
+- Identity (`state/`, `hostname`, Tailscale IPs, auth keys) is per-box and
   must stay out of git.
+- `docs/DESIGN.md` lists the incidents behind each special case — read it
+  before "simplifying" one away.
 
 ## Docs map
 
 | Question | File |
 |---|---|
 | I am an agent, what do I run? | `docs/AGENT.md` |
-| Which procedure (A–G)? | `docs/RUNBOOK.md` |
-| Why / platform / persistence | `docs/ARCHITECTURE.md` |
-| How to pick `grok-box-N` | `docs/NAMING.md` |
-| Something is broken | `docs/TROUBLESHOOTING.md` |
+| Why / environment / persistence / rationale | `docs/DESIGN.md` |
 
 ## Checks
 
-Scripts are POSIX-ish bash. Prefer `set -u` over blanket `set -e` in
-daemons that must keep looping. Run `bash -n` on every script before a PR.
+`make lint` (bash -n + shellcheck). boxup uses `set -u`, not blanket
+`set -e` — the worker loop must keep looping past transient failures.
