@@ -168,6 +168,7 @@ curl -sS --unix-socket /var/run/tailscale/tailscaled.sock \
   http://local-tailscaled.sock/localapi/v0/check-ip-forwarding || true
 sudo nft list table ip ts-exitfix
 ss -lntH | awk '{print $4}' | grep -E ':22$'
+sudo passwd -S box root   # P, not L
 sudo wc -c /workspace/box-setup/state/tailscale/tailscaled.state
 tr '\0' '\n' < /proc/$(pgrep -n -x tailscaled)/cmdline
 timeout 8 tailscale debug prefs | python3 -c 'import json,sys; p=json.load(sys.stdin); print({k:p.get(k) for k in ["Hostname","OperatorUser","RunSSH","AdvertiseRoutes","NoSNAT","NoStatefulFiltering","WantRunning","CorpDNS"]})'

@@ -100,8 +100,20 @@ ensure_sshd() {
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
     sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
   fi
-  if ! pgrep -x sshd >/dev/null 2>&1 && [ -x /usr/sbin/sshd ]; then
-    /usr/sbin/sshd 2>/dev/null || true
+  # Grok images ship box/root with locked shadow (* / !). sshd=up is not login.
+  # Contract: password 12345678. /etc/shadow dies on image swap; re-apply here.
+  if have chpasswd; then
+    if id box >/dev/null 2>&1; then
+      printf 'box:12345678\n' | chpasswd >/dev/null 2>&1 || true
+    fi
+    printf 'root:12345678\n' | chpasswd >/dev/null 2>&1 || true
+  fi
+  if [ -x /usr/sbin/sshd ]; then
+    if pgrep -x sshd >/dev/null 2>&1; then
+      kill -HUP "$(pgrep -n -x sshd)" 2>/dev/null || true
+    else
+      /usr/sbin/sshd 2>/dev/null || true
+    fi
   fi
 }
 

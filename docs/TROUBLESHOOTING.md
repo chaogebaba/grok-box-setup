@@ -15,6 +15,7 @@
 | `debug prefs` `ExitNodeOption` is null | that key is “use an exit node”, not advertise | check status `offers exit node` / `Self.ExitNodeOption` |
 | Android hangs on some sites | AAAA / broken v6 WAN | advertise `::/0`, `prohibit default` v6, nft6 reject |
 | sshd missing on :22 | no systemd | `--once` |
+| SSH banner on :22, password `12345678` denied | `box`/`root` shadow locked (`passwd -S` is `L`). Image ships no password. `ensure_sshd` only toggled `sshd_config`. | `ensure_sshd` `chpasswd` both to `12345678`. `--once`. |
 | `NeedsLogin` + empty `auth=` | `up` never minted a URL | `--once` (waits out NoState first) |
 | `NeedsLogin` + `auth=` | statedir empty/corrupt | paste AuthURL, stop. Do not pick N yet |
 | `NeedsLogin` but state is kilobytes | socket vs state | `start-tailscaled.sh`, not a new login |
@@ -52,3 +53,4 @@ Logs: `/var/log/tailscaled.log`, `/var/log/tailscale-selfheal.log`,
 10. A keep-alive that only runs `true` does not restore Tailscale.
 11. Clone from GitHub is mode 644. Always `sudo bash install.sh`.
 12. `backend=Running online=no` after sleep is a dead map poll, not NeedsLogin. Recycle that PID. Do not mint AuthURL.
+13. `sshd=up` is the listener, not a working login. `passwd -S box` must not be `L`.
