@@ -10,8 +10,11 @@
 #   BOX_SETUP_ROOT   install destination (default /workspace/box-setup)
 #   BOX_SETUP_ONCE=1 run --once after install
 #   BOX_SETUP_AUTHKEY=tskey-...   write secrets/ts-authkey (reusable, non-ephemeral)
+#   BOX_SSH_PASSWORD=...          ssh password for root/box (else config.toml,
+#                                 else 12345678)
 #
 # Never copies state/tailscale from the repo. Never copies hostname.
+# Never overwrites an existing config.toml.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -24,6 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo env BOX_SETUP_ROOT="$DEST" \
       BOX_SETUP_ONCE="${BOX_SETUP_ONCE:-}" \
       BOX_SETUP_AUTHKEY="${BOX_SETUP_AUTHKEY:-}" \
+      BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" \
       bash "$0" "$@"
   fi
   echo "install: need root" >&2
@@ -46,6 +50,17 @@ install -m 0644 "$REPO_ROOT/scripts/lib/"*.sh "$DEST/lib/"
 install -m 0644 "$REPO_ROOT/scripts/lib/"*.sh "$DEST/scripts/lib/"
 
 install -m 0644 "$REPO_ROOT/etc/default-tailscaled" "$DEST/etc/default-tailscaled"
+install -m 0644 "$REPO_ROOT/etc/config.example.toml" "$DEST/etc/config.example.toml"
+
+# config.toml is the user's, not ours. Seed it once, never overwrite it, so a
+# custom ssh password survives every later install.sh.
+if [ ! -e "$DEST/config.toml" ]; then
+  install -m 0600 "$REPO_ROOT/etc/config.example.toml" "$DEST/config.toml"
+  log "seeded config.toml (defaults; edit [ssh].password to change the login)"
+else
+  chmod 0600 "$DEST/config.toml" 2>/dev/null || true
+  log "kept existing config.toml"
+fi
 
 install -m 0644 "$REPO_ROOT/docs/"*.md "$DEST/docs/"
 install -m 0644 "$REPO_ROOT/docs/RUNBOOK.md" "$DEST/RUNBOOK.md"
