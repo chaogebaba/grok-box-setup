@@ -11,15 +11,17 @@ Read this file first. Then `docs/RUNBOOK.md`. Do not improvise around the Never 
 DEST=/workspace/box-setup
 REPO_URL="${REPO_URL:-https://github.com/chaogebaba/grok-box-setup.git}"
 
-if [ -x "$DEST/box-bootstrap.sh" ]; then
-  sudo "$DEST/box-bootstrap.sh" --once
+if [ -f "$DEST/box-bootstrap.sh" ]; then
+  sudo bash "$DEST/box-bootstrap.sh" --once
 else
   tmp=$(mktemp -d)
   git clone --depth 1 "$REPO_URL" "$tmp/grok-box-setup"
-  sudo "$tmp/grok-box-setup/install.sh"
-  sudo "$DEST/box-bootstrap.sh" --once
+  sudo bash "$tmp/grok-box-setup/install.sh"
+  sudo bash "$DEST/box-bootstrap.sh" --once
 fi
 ```
+
+GitHub serves scripts as mode 644. Always `sudo bash …/install.sh`, never `sudo ./install.sh`.
 
 `install.sh` copies scripts + docs into `/workspace/box-setup`. It never copies
 `state/tailscale` or a `hostname` from the repo. One node identity per box.
@@ -27,7 +29,13 @@ fi
 Optional reusable **non-ephemeral** auth key (only used when statedir is empty):
 
 ```bash
-sudo BOX_SETUP_AUTHKEY='tskey-auth-…' /path/to/install.sh
+sudo BOX_SETUP_AUTHKEY='tskey-auth-…' bash /path/to/install.sh
+```
+
+After Connect, pick the name with:
+
+```bash
+sudo bash /workspace/box-setup/pick-name.sh
 ```
 
 ## 2. What you do next
@@ -38,7 +46,7 @@ Print the `--once` status line. Then follow **exactly one** procedure in
 | Status line | Procedure |
 |---|---|
 | `auth=https://login.tailscale.com/…` | A2 — paste URL, stop |
-| `backend=Running` and no `hostname` / not `grok-box-N` | A3 — list peers, write next free name, `set` |
+| `backend=Running` and no `hostname` / not `grok-box-N` | A3 — `pick-name.sh`, write file, `set` |
 | `backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1` | healthy — stop |
 | `ipfwd=4:0` or `ipfwd=6:0` | G — forwarding tick, then stop |
 | statedir kilobytes + image just swapped | C — `--once` only, do not bump N |

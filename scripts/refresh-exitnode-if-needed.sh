@@ -17,7 +17,9 @@ MIN_INTERVAL="${MIN_INTERVAL:-20}"
 
 log() { echo "refresh-exitnode: $*" >&2; }
 
-command -v tailscale >/dev/null 2>&1 || { log "no tailscale cli"; exit 0; }
+if ! have_tailscale_cli 2>/dev/null; then
+  command -v tailscale >/dev/null 2>&1 || { log "no tailscale cli"; exit 0; }
+fi
 
 BACKEND=$(timeout 5 tailscale status --json 2>/dev/null | python3 -c '
 import json,sys
@@ -112,8 +114,7 @@ if [ -f "$STAMP" ]; then
 fi
 
 log "tailscale set ($reason) hostname=$NAME"
-if sudo -u box tailscale set --hostname="$NAME" --ssh=false --operator=box \
-    --advertise-exit-node --snat-subnet-routes=true --stateful-filtering=false; then
+if tailscale_set_full "$NAME"; then
   mkdir -p /run/box-setup 2>/dev/null || true
   echo "$now" > "$STAMP" 2>/dev/null || true
   log "set ok"
