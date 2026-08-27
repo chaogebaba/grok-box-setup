@@ -6,6 +6,7 @@
 |---|---|
 | Admin: “IP forwarding disabled” / cannot relay | v4 or v6 forwarding 0, or Hostinfo stale | Section G in RUNBOOK |
 | Admin: node **offline**; Health “Unable to connect to the Tailscale coordination server” | `refresh-exitnode` grepped JSON key `Warning` (`{"Warning":""}` still matches) → `tailscale set` every 20s cancels PollNetMap | parse a **non-empty** Warning only; kill **that** `tailscaled` PID, `start-tailscaled.sh`. Not NeedsLogin. |
+| Admin: node **offline** after idle; `time jump detected (slept …)` then `PollNetMap: context canceled`; process still running, `Online=false` | Freeze/thaw. Map long-poll does not recover. Selfheal used to only restart a *dead* process. | `--once` / selfheal recycles **that** PID via `start-tailscaled.sh`. Same statedir. Not NeedsLogin. |
 | Phone uses exit node, no internet | NAT / Docker `FORWARD DROP` | `sudo bash /workspace/box-setup/tailscale-exitnode-nat.sh` then `--status` |
 | `missing kernel module` / connmark | tailscaled without nftables env | Kill **that PID**, `start-tailscaled.sh` |
 | Two `tailscaled` | second start / dpkg default | `start-tailscaled.sh` kills every wrong PID. Never `pkill -f`. |
@@ -49,3 +50,4 @@ Logs: `/var/log/tailscaled.log`, `/var/log/tailscale-selfheal.log`,
 9. `/etc/sysctl.d` is same-image convenience. The tick must write `/proc`.
 10. A keep-alive that only runs `true` does not restore Tailscale.
 11. Clone from GitHub is mode 644. Always `sudo bash install.sh`.
+12. `backend=Running online=no` after sleep is a dead map poll, not NeedsLogin. Recycle that PID. Do not mint AuthURL.

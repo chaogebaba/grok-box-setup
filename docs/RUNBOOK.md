@@ -95,6 +95,10 @@ sudo /workspace/box-setup/box-bootstrap.sh --once
 If the line is `backend=Running online=yes exit-node=yes sshd=up` and
 forwarding is `4:1,6:1`, stop. No kill commands. No new AuthURL. No hostname bump.
 
+If the line is `backend=Running online=no` after a freeze, `--once`
+recycles **that** `tailscaled` PID (same statedir). Wait for `--status`
+`online=yes`. No new AuthURL. No hostname bump.
+
 If the line is healthy but forwarding is 0, run
 `sudo /workspace/box-setup/health-tick-forward.sh` and stop.
 
@@ -136,6 +140,7 @@ Print the stdout status line and the ipfwd= line.
 
 Rules:
 - If online=yes AND exit-node=yes AND sshd=up AND ipfwd shows 4:1,6:1 (or both /proc/sys forwarding files are 1): stop. No narration.
+- If backend=Running AND online=no: --once recycles that tailscaled PID. Print the new status line. If still online=no after one --once, stop. Not NeedsLogin. Do not invent kill commands.
 - If ipfwd is 4:0 or 6:0: run health-tick-forward.sh one more time. If still 0, say "sysctl write failed — container netns may lack NET_ADMIN" and stop. Do not invent kill commands. Do not treat this as NeedsLogin.
 - If the line has auth=https://login.tailscale.com/ : paste that URL and stop. Do not run tailscale login or tailscale up.
 - If the line has NeedsLogin or backend=NoState: check size with `sudo wc -c /workspace/box-setup/state/tailscale/tailscaled.state` (mode 600 root; a non-sudo read from `box` looks empty). Kilobytes ⇒ login is saved. Wait a few seconds on NoState, then `--status`. Do not ask the human to Connect or for an auth key. --once is enough.

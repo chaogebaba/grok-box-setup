@@ -61,6 +61,16 @@ runs with forwarding already 1.
 
 `health-tick-forward.sh` on every `--once` and every selfheal loop is the fix.
 
+A second “offline after a while” path is freeze/thaw. The box sleeps;
+`tailscaled` stays alive; PollNetMap’s long-poll dies (`time jump detected`,
+`PollNetMap: context canceled`). `Self.Online` is false while
+`BackendState=Running`. Selfheal used to only restart if the process was
+missing. `recycle_offline_tailscaled` kills **that** PID and runs
+`start-tailscaled.sh`. Same statedir. Not NeedsLogin.
+
+The node is unreachable for the minutes the container is actually frozen.
+After wake, `--once` / the worker should bring `online=yes` back.
+
 ## Identity (do not mix boxes)
 
 | Piece | Path | Copy to a new box? |
