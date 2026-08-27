@@ -69,25 +69,41 @@ $(parse_ts)
 EOF
 }
 
-# Kill every bash …/tailscale-selfheal.sh --worker except optional keep PID.
-# Walk /proc cmdline. Never pkill -f. install.sh --stop used to only kill the
-# pidfile PID, so 4.1.0 workers stayed alive next to 4.1.2.
+# True iff argv is bash <path>/tailscale-selfheal.sh --worker.
+# Flattened cmdline greps match agent -c scripts that merely mention the
+# string and SIGTERM the keep-alive. Skip any process with a -c argument.
+is_selfheal_worker() {
+  local pid="$1" arg have_script=0 have_worker=0 have_c=0
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  while IFS= read -r -d '' arg; do
+    case "$arg" in
+      -c) have_c=1 ;;
+      --worker) have_worker=1 ;;
+      *tailscale-selfheal.sh) have_script=1 ;;
+    esac
+  done < "/proc/$pid/cmdline" 2>/dev/null || return 1
+  [ "$have_c" = 0 ] && [ "$have_script" = 1 ] && [ "$have_worker" = 1 ]
+}
+
+# Kill every selfheal worker except optional keep PID. Never pkill -f.
+# install.sh --stop used to only kill the pidfile PID, so 4.1.0 workers
+# stayed alive next to 4.1.2.
 stop_selfheal_workers() {
-  local keep="${1:-}" pid cmd i
+  local keep="${1:-}" pid i leftover
   for pid in $(pgrep -x bash 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
     [ -n "$keep" ] && [ "$pid" = "$keep" ] && continue
-    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-    echo "$cmd" | grep -q -- "tailscale-selfheal.sh --worker" || continue
+    is_selfheal_worker "$pid" || continue
     echo "selfheal: stopping leftover worker pid=$pid"
     kill "$pid" 2>/dev/null || true
   done
   i=0
   while [ "$i" -lt 15 ]; do
-    local leftover=0
+    leftover=0
     for pid in $(pgrep -x bash 2>/dev/null || true); do
+      [ "$pid" = "$$" ] && continue
       [ -n "$keep" ] && [ "$pid" = "$keep" ] && continue
-      cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-      echo "$cmd" | grep -q -- "tailscale-selfheal.sh --worker" || continue
+      is_selfheal_worker "$pid" || continue
       leftover=1
       kill -9 "$pid" 2>/dev/null || true
     done
