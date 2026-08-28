@@ -1067,5 +1067,148 @@ case "$m23" in
 esac
 
 echo "-----"
+# =============================================================================
+# r3 COVERAGE-GAP KILLS — lock the r2-fix safety properties whose mutants (N1,
+# N2, N3, N5, N6) SURVIVED the 81-assertion suite (empirical-gate r3 P1-A..D,
+# P2-A). Each assertion drives the REAL function and was verified to FLIP
+# (PASS->FAIL) under the gate's exact mutant on a scratch copy of fleetctl.
+# See the commit message for the mutant->test ledger.
+# =============================================================================
+
+# --- P1-A / N1: the 90-day clamp must hold on BOTH the mint_payload argument AND
+# the FLEET_KEY_EXPIRY_SECS env. N1 (`clamp_expiry_secs` `-le`->`-ge`) defeats
+# the cap (99999999 stays; a valid 3600 wrongly becomes 7776000). Drive the REAL
+# mint_payload with an OVER-CAP arg + env, and clamp_expiry_secs with a valid
+# in-range value (which N1 corrupts to the cap).
+clamp_over_cap_test() {
+  local mode="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" clamp_expiry_secs)"
+eval "\$(extract_from "\$FLEETCTL" mint_payload)"
+case "$mode" in
+  arg)   mint_payload 99999999 | jq -r '.expirySeconds' ;;
+  env)   FLEET_KEY_EXPIRY_SECS=99999999 mint_payload | jq -r '.expirySeconds' ;;
+  valid) clamp_expiry_secs 3600 ;;
+esac
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(clamp_over_cap_test arg)"   = 7776000 ] && pass "P1-A/N1: mint_payload ARG over 90d is clamped DOWN to 7776000 (cap invariant)" || bad "P1-A/N1: arg over-cap not clamped: [$(clamp_over_cap_test arg)]"
+[ "$(clamp_over_cap_test env)"   = 7776000 ] && pass "P1-A/N1: FLEET_KEY_EXPIRY_SECS over 90d is clamped DOWN to 7776000" || bad "P1-A/N1: env over-cap not clamped: [$(clamp_over_cap_test env)]"
+[ "$(clamp_over_cap_test valid)" = 3600 ]    && pass "P1-A/N1: a valid in-range expiry passes through UNCHANGED (not forced to the cap)" || bad "P1-A/N1: valid expiry corrupted (clamp direction wrong): [$(clamp_over_cap_test valid)]"
+
+# --- P1-C / N2: devices_json_valid must FAIL-CLOSED on a truncated/garbage
+# HTTP-200 body and on a wrong-typed `.devices`. N2 (always-true) accepts them,
+# defeating the B-1 malformed-200 READ-ONLY latch. Drive the REAL function.
+devjson_valid_test() {
+  local body="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" devices_json_valid)"
+if devices_json_valid '$body'; then echo VALID; else echo INVALID; fi
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(devjson_valid_test '{"devices":')"       = INVALID ] && pass "P1-C/N2: a truncated HTTP-200 body is INVALID => forces READ-ONLY (fail-closed)" || bad "P1-C/N2: truncated 200 accepted as valid: [$(devjson_valid_test '{"devices":')]"
+[ "$(devjson_valid_test '{"devices":{"a":1}}')" = INVALID ] && pass "P1-C/N2: a wrong-typed .devices (object, not array) is INVALID" || bad "P1-C/N2: wrong-typed .devices accepted as valid: [$(devjson_valid_test '{"devices":{"a":1}}')]"
+
+# --- P1-D / N5: record_key_meta must REFUSE a blank key id (return non-zero AND
+# write no meta file) — the invariant that a later rotation can revoke the key.
+# N5 (drop the blank-id guard) accepts a blank id and writes a {"id":""} file.
+record_blank_id_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="\$(mktemp -d)"
+FLEET_KEYS_DIR="\$FLEET_STATE/keys"
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in record_key_meta key_meta_file box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+if record_key_meta grok-box-8 "" "2099-01-01T00:00:00Z"; then echo "rc=0"; else echo "rc=1"; fi
+f="\$FLEET_KEYS_DIR/8.json"
+[ -f "\$f" ] && echo "file=present" || echo "file=absent"
+rm -rf "\$FLEET_STATE"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+rkm="$(record_blank_id_test)"
+case "$rkm" in
+  *"rc=1"*"file=absent"*) pass "P1-D/N5: record_key_meta REFUSES a blank id (non-zero, no meta file written)" ;;
+  *) bad "P1-D/N5: record_key_meta accepted a blank id: [$rkm]" ;;
+esac
+
+# --- P2-A / N3: tunnel_deploy_one's OWN push-less guard must refuse (non-zero)
+# and make NO scp/ssh call when FLEET_ROLLOUT_TREE is unset. N3 (drop the guard)
+# scp's the empty/unset tree and proceeds rc=0.
+deploy_pushless_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+BOX_ROOT="/workspace/box-setup"
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+unset FLEET_ROLLOUT_TREE
+cap="\$(mktemp)"
+ssh(){ printf 'SSH %s\n' "\$*" >> "\$cap"; return 0; }
+scp(){ printf 'SCP %s\n' "\$*" >> "\$cap"; return 0; }
+if tunnel_deploy_one grok-box-8 >/dev/null 2>&1; then echo "rc=0"; else echo "rc=1"; fi
+[ -s "\$cap" ] && echo "transport=called" || echo "transport=none"
+rm -f "\$cap"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+dpl="$(deploy_pushless_test)"
+case "$dpl" in
+  *"rc=1"*"transport=none"*) pass "P2-A/N3: tunnel_deploy_one refuses a push-less deploy (non-zero, ZERO scp/ssh) when no tree staged" ;;
+  *) bad "P2-A/N3: tunnel_deploy_one ran push-less (scp'd empty tree): [$dpl]" ;;
+esac
+
+# --- P1-B / N6: the RUN-WIDE READ-ONLY latch inside reconcile_one must suppress
+# a LATER mutation once an EARLIER action latches RECONCILE_READONLY mid-call —
+# even though the per-call `readonly` arg is 0 and apply=1. N6 (drop the
+# `${RECONCILE_READONLY:-0}` check in reconcile_one) runs the 2nd mutation.
+# Drive the REAL reconcile_one loop: reconcile_decide emits TWO mutating actions;
+# reconcile_execute LATCHES on the first and records both attempts.
+readonly_latch_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="\$(mktemp -d)"
+BOX_ROOT="/nonexistent"
+FLEET_TARGET_SHA=""
+MARK="\$(mktemp)"; : > "\$MARK"
+log(){ :; }; notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in reconcile_one box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# Two mutating actions this run; neither is 'mint' (avoid the mint-window guard).
+reconcile_decide(){ printf 'delete-then-rename\nrollout\n'; }
+tunnel_up(){ return 1; }          # tunnel down => no boxup check side effects
+# reconcile_execute: the FIRST action latches the run-wide read-only latch (as a
+# real action-time API failure would), then the SECOND must be SUPPRESSED.
+reconcile_execute(){ echo "EXEC:\$2" >> "\$MARK"; RECONCILE_READONLY=1; return 0; }
+# apply=1, per-call readonly=0 => ONLY the run-wide latch can suppress action 2.
+reconcile_one grok-box-8 '{"devices":[]}' 1 0 >/dev/null 2>&1
+tr '\n' '|' < "\$MARK"; echo
+rm -rf "\$FLEET_STATE" "\$MARK"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+latch="$(readonly_latch_test)"
+case "$latch" in
+  "EXEC:delete-then-rename|") pass "P1-B/N6: an earlier action's mid-call latch suppresses every LATER mutation this run (run-wide read-only latch)" ;;
+  *"EXEC:rollout"*) bad "P1-B/N6: a later mutation RAN after the run-wide latch was set (latch defeated): [$latch]" ;;
+  *) bad "P1-B/N6: unexpected reconcile_one behaviour: [$latch]" ;;
+esac
+
+echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi
 exit "$fail"
