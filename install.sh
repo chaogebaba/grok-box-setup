@@ -23,6 +23,9 @@ DEST="${BOX_SETUP_ROOT:-/workspace/box-setup}"
 
 log() { echo "install: $*"; }
 
+INSTALL_LOG="${BOX_SETUP_INSTALL_LOG:-/var/log/boxup-install.log}"
+STATE_DIR_MIG="$DEST/state/tailscale"
+
 if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     exec sudo env BOX_SETUP_ROOT="$DEST" \
@@ -30,10 +33,88 @@ if [ "$(id -u)" -ne 0 ]; then
       BOX_SETUP_AUTHKEY="${BOX_SETUP_AUTHKEY:-}" \
       BOX_SETUP_GIT_SHA="${BOX_SETUP_GIT_SHA:-}" \
       BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" \
+      BOX_SETUP_INSTALL_LOG="$INSTALL_LOG" \
       bash "$0" "$@"
   fi
   echo "install: need root" >&2
   exit 1
+fi
+
+# F4 (box-8 r4 incident) — the disruptive tail (tailscaled recycle + restart +
+# `boxup once`) tears down the tailnet, which on these boxes is the SAME
+# interface an SSH install rides on. Run inline, the SIGTERM drops the SSH
+# session and HUPs install.sh dead BEFORE it restarts tailscaled — box offline
+# 25+ min, no self-heal until the hourly `once`. So the foreground copies files
+# then re-execs THIS disruptive tail as a session-detached, HUP-immune process
+# (setsid + `trap '' HUP`, output to $INSTALL_LOG) and returns 0 promptly. This
+# branch IS that detached process; it never touches the file copy (already
+# done) — it only performs recycle -> restart -> once and logs DONE.
+#
+# do_migration_recycle: the disruptive E1 recycle. Selects the exact-`--statedir`
+# tailscaled, SIGTERM, poll ≤10s, SIGKILL, verify gone. Defined here so the
+# detached branch can call it without running any foreground code.
+do_migration_recycle() {
+  bash "$DEST/boxup" stop >/dev/null 2>&1 || true
+  local pid match i
+  for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
+    # Exact-token match: split argv on NULs, require a LITERAL
+    # `--statedir=$STATE_DIR_MIG` argument (not a prefix of a longer path, so
+    # `--statedir=$STATE_DIR_MIG-other` is NOT selected).
+    match=0
+    while IFS= read -r -d '' arg; do
+      [ "$arg" = "--statedir=$STATE_DIR_MIG" ] && match=1
+    done < "/proc/$pid/cmdline" 2>/dev/null || true
+    [ "$match" = 1 ] || continue
+    log "E1 migration: SIGTERM tailscaled pid=$pid (exact --statedir=$STATE_DIR_MIG)"
+    kill "$pid" 2>/dev/null || true
+    # Poll up to 10s for graceful exit, then SIGKILL.
+    i=0
+    while [ "$i" -lt 50 ]; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2; i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      log "E1 migration: pid=$pid still alive after 10s — SIGKILL"
+      kill -9 "$pid" 2>/dev/null || true
+      sleep 0.3
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+      log "E1 migration: WARNING pid=$pid STILL alive after SIGKILL — the new daemon may not bind cleanly" >&2
+    else
+      log "E1 migration: pid=$pid gone"
+    fi
+  done
+}
+
+# run_detached_phase: the HUP-immune body. Order (F4): kill old (recycle) ->
+# start new + converge (`boxup once`) -> log DONE. If a build change fired the
+# migration we ALWAYS run `boxup once` afterwards even when BOX_SETUP_ONCE was
+# not requested — otherwise we would have killed tailscaled and never restarted
+# it, which is exactly the box-8 r4 brick. rc of `boxup once` is preserved in
+# the log (201 = converge lock busy — surfaced, not faked).
+run_detached_phase() {
+  trap '' HUP
+  local migrate="${BOX_SETUP_MIGRATE:-0}" want_once="${BOX_SETUP_ONCE:-}" rc=0
+  log "detached phase start (pid=$$, HUP-immune) migrate=$migrate once=${want_once:-0}"
+  if [ "$migrate" = 1 ]; then
+    log "E1 migration: build change ver ${BOX_SETUP_MIG_IVER:-none}->${BOX_SETUP_MIG_NVER:-?} sha ${BOX_SETUP_MIG_ISHA:-none}->${BOX_SETUP_MIG_NSHA:-?} — recycling tailscaled to clear any inherited converge-lock wedge"
+    do_migration_recycle
+  fi
+  if [ "$migrate" = 1 ] || [ "$want_once" = 1 ]; then
+    log "running boxup once"
+    rc=0; bash "$DEST/boxup" once || rc=$?
+    [ "$rc" = 0 ] || log "boxup once exited rc=$rc (201 = converge lock busy — NOT faked)"
+  else
+    log "next: sudo $DEST/boxup once"
+    log "then follow $DEST/docs/AGENT.md"
+  fi
+  log "DONE (rc=$rc)"
+  return 0
+}
+
+if [ "${BOX_SETUP_DETACHED:-}" = 1 ]; then
+  run_detached_phase
+  exit 0
 fi
 
 log "repo=$REPO_ROOT dest=$DEST"
@@ -65,13 +146,28 @@ fi
 # skipped it and left the pre-H1 daemon wedged). NOT a comment-marker heuristic
 # — the marker keys on disk contents while the LIVE daemon is a separate
 # generation. On a change we recycle tailscaled unconditionally: exact-token
-# select, SIGTERM, poll up to 10s, SIGKILL, verify gone; the normal `boxup once`
-# below restarts it via the flock --close path. ~5s connectivity blip, bounded.
-# Runs once per upgrade, never in a tick; no sentinel file. (NB: F1(b) also
-# VERSIONS the lock path — converge.v2.lock — so even if this recycle is somehow
-# skipped, a v2 tick flocks a different file and an inherited pre-H1 daemon can
-# no longer wedge it. Belt AND braces.)
-STATE_DIR_MIG="$DEST/state/tailscale"
+# select, SIGTERM, poll up to 10s, SIGKILL, verify gone; the `boxup once` in the
+# detached phase restarts it via the flock --close path. ~5s connectivity blip,
+# bounded. Runs once per upgrade, never in a tick; no sentinel file. (NB: F1(b)
+# also VERSIONS the lock path — converge.v2.lock — so even if this recycle is
+# somehow skipped, a v2 tick flocks a different file and an inherited pre-H1
+# daemon can no longer wedge it. Belt AND braces.)
+#
+# F4 (box-8 r4 incident): the recycle SIGTERM tears down tailscaled — and on
+# these boxes the ONLY inbound route is the tailnet it serves, so an install
+# run over SSH rides the very interface this kills. Running the recycle
+# SYNCHRONOUSLY in the SSH-attached process dropped the tailnet, killed the SSH
+# session, and HUP'd install.sh (its child) DEAD before it could restart
+# tailscaled — box-8 sat offline 25+ min with no self-heal until the hourly
+# `once`. Every install/update on this fleet rides the tailnet, so that is the
+# NORMAL case. FIX: the recycle + restart + `boxup once` now run inside the
+# SESSION-DETACHED, HUP-IMMUNE re-exec (run_detached_phase, near the top). Here
+# in the foreground we only COMPUTE the migration DECISION — and it MUST happen
+# BEFORE the file copy below overwrites $DEST/VERSION and $DEST/GIT_SHA.
+#
+# Compute the migration DECISION now, from the CURRENTLY installed files.
+# MIGRATE=1 means the detached phase will call do_migration_recycle then
+# `boxup once`.
 installed_ver=""; [ -f "$DEST/VERSION" ] && installed_ver="$(tr -d '[:space:]' < "$DEST/VERSION" 2>/dev/null || true)"
 new_ver=""; [ -f "$REPO_ROOT/VERSION" ] && new_ver="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
 installed_sha=""; [ -f "$DEST/GIT_SHA" ] && installed_sha="$(tr -d '[:space:]' < "$DEST/GIT_SHA" 2>/dev/null || true)"
@@ -79,38 +175,10 @@ installed_sha=""; [ -f "$DEST/GIT_SHA" ] && installed_sha="$(tr -d '[:space:]' <
 # .git); else rev-parse the source tree (a `boxup update` clone has .git).
 new_sha="${BOX_SETUP_GIT_SHA:-}"
 [ -n "$new_sha" ] || new_sha="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+MIGRATE=0
 if [ -f "$DEST/boxup" ] && { { [ -n "$new_ver" ] && [ "$installed_ver" != "$new_ver" ]; } \
      || { [ "$new_sha" != unknown ] && [ "$installed_sha" != "$new_sha" ]; }; }; then
-  log "E1 migration: build change ver ${installed_ver:-none}->${new_ver:-?} sha ${installed_sha:-none}->${new_sha} — recycling tailscaled to clear any inherited converge-lock wedge"
-  bash "$DEST/boxup" stop >/dev/null 2>&1 || true
-  for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
-    # Exact-token match: split argv on NULs, require a LITERAL
-    # `--statedir=$STATE_DIR_MIG` argument (not a prefix of a longer path, so
-    # `--statedir=$STATE_DIR_MIG-other` is NOT selected).
-    match=0
-    while IFS= read -r -d '' arg; do
-      [ "$arg" = "--statedir=$STATE_DIR_MIG" ] && match=1
-    done < "/proc/$pid/cmdline" 2>/dev/null || true
-    [ "$match" = 1 ] || continue
-    log "E1 migration: SIGTERM tailscaled pid=$pid (exact --statedir=$STATE_DIR_MIG)"
-    kill "$pid" 2>/dev/null || true
-    # Poll up to 10s for graceful exit, then SIGKILL.
-    i=0
-    while [ "$i" -lt 50 ]; do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.2; i=$((i + 1))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-      log "E1 migration: pid=$pid still alive after 10s — SIGKILL"
-      kill -9 "$pid" 2>/dev/null || true
-      sleep 0.3
-    fi
-    if kill -0 "$pid" 2>/dev/null; then
-      log "E1 migration: WARNING pid=$pid STILL alive after SIGKILL — the new daemon may not bind cleanly" >&2
-    else
-      log "E1 migration: pid=$pid gone"
-    fi
-  done
+  MIGRATE=1
 fi
 
 mkdir -p "$DEST"/{bin,docs,etc,secrets,state/tailscale,state/ssh}
@@ -207,10 +275,37 @@ bash "$DEST/boxup" stop >/dev/null 2>&1 || true
 
 log "installed boxup $(cat "$DEST/VERSION" 2>/dev/null || echo '?') at $DEST"
 
-if [ "${BOX_SETUP_ONCE:-}" = 1 ]; then
-  log "running boxup once"
-  bash "$DEST/boxup" once
+# F4 — hand the disruptive tail to a session-detached, HUP-immune process.
+# Disruptive work is pending when the build changed (MIGRATE=1 ⇒ tailscaled
+# recycle) OR `boxup once` was requested. Neither is safe to run inline over an
+# SSH session riding the tailnet (box-8 r4). We copied every file already
+# (order: copy files → detach → kill old → start new → once → DONE), so the
+# detached process only needs the recycle decision + the once flag, passed via
+# env. The foreground prints the reconnect guidance BEFORE the tailnet drops
+# and returns 0 promptly with a pointer to the log.
+if [ "$MIGRATE" = 1 ] || [ "${BOX_SETUP_ONCE:-}" = 1 ]; then
+  : > "$INSTALL_LOG" 2>/dev/null || true
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+  if [ "$MIGRATE" = 1 ]; then
+    log "the tailnet will drop for ~20s during the tailscaled recycle; reconnect and run \`sudo $DEST/boxup status\` (progress in $INSTALL_LOG)"
+  else
+    log "converging in the background; reconnect and run \`sudo $DEST/boxup status\` (progress in $INSTALL_LOG)"
+  fi
+  # setsid ⇒ new session, no controlling terminal, immune to the SSH SIGHUP;
+  # run_detached_phase also `trap '' HUP` belt-and-braces. stdio → the log.
+  # setsid appears in install.sh (not boxup); the H9 lint is scoped to boxup.
+  setsid env BOX_SETUP_DETACHED=1 \
+    BOX_SETUP_ROOT="$DEST" \
+    BOX_SETUP_ONCE="${BOX_SETUP_ONCE:-}" \
+    BOX_SETUP_INSTALL_LOG="$INSTALL_LOG" \
+    BOX_SETUP_MIGRATE="$MIGRATE" \
+    BOX_SETUP_MIG_IVER="$installed_ver" BOX_SETUP_MIG_NVER="$new_ver" \
+    BOX_SETUP_MIG_ISHA="$installed_sha" BOX_SETUP_MIG_NSHA="$new_sha" \
+    bash "$DEST/install.sh" >>"$INSTALL_LOG" 2>&1 < /dev/null &
+  log "detached installer running (pid=$!); returning now — see $INSTALL_LOG for DONE"
 else
   log "next: sudo $DEST/boxup once"
   log "then follow $DEST/docs/AGENT.md"
 fi
+
+exit 0
