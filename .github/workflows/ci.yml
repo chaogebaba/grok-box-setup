@@ -31,6 +31,13 @@ jobs:
           boxup_v="$(sed -n 's/^BOXUP_VERSION=//p' boxup | head -1 | tr -d '[:space:]')"
           echo "VERSION=$file_v BOXUP_VERSION=$boxup_v"
           test "$file_v" = "$boxup_v" || { echo "VERSION ($file_v) != BOXUP_VERSION ($boxup_v)" >&2; exit 1; }
+      - name: boxup tail sentinel
+        run: |
+          set -e
+          # D5: the shim's corruption predicate needs '# boxup-eof' as the
+          # literal last line of boxup. Catch an accidental post-sentinel
+          # append in the PR, not mid-rollout.
+          test "$(tail -n1 boxup)" = '# boxup-eof' || { echo "boxup lost its tail sentinel" >&2; exit 1; }
       - name: no identity leaked
         run: |
           set -e

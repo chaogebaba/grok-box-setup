@@ -63,6 +63,18 @@ install_atomic() {
   mv -f "$tmp" "$dst"
 }
 
+# Refuse to install a boxup that lost its tail sentinel (D5): the shim's
+# corruption predicate keys on `# boxup-eof` being the literal last line, and a
+# truncated boxup still parses (bash -n stops at a statement boundary) and
+# execs silently. Refuse LOUDLY and leave the existing installed boxup
+# untouched — we check BEFORE writing, and install_atomic's rename ordering
+# means a refusal never half-replaces the live file.
+if [ "$(tail -n1 "$REPO_ROOT/boxup")" != "# boxup-eof" ]; then
+  echo "install: FATAL — $REPO_ROOT/boxup is missing its '# boxup-eof' tail sentinel;" >&2
+  echo "install: refusing to install a possibly-truncated boxup. Existing install left untouched." >&2
+  exit 1
+fi
+
 install_atomic 0755 "$REPO_ROOT/boxup" "$DEST/boxup"
 install_atomic 0755 "$REPO_ROOT/box-bootstrap.sh" "$DEST/box-bootstrap.sh"
 install_atomic 0755 "$REPO_ROOT/install.sh" "$DEST/install.sh"
