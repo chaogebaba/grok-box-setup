@@ -23,19 +23,22 @@ sudo /workspace/box-setup/boxup once
   `/workspace/box-setup/secrets/ts-authkey` (mode 600) before `boxup once`,
   or install with `BOX_SETUP_AUTHKEY=tskey-...`.
 - **Record the key's expiry (H11).** Tailscale auth keys expire (≤ 90 days) and
-  the date is NOT recoverable from the key, so write it next to the key as a
-  single ISO date:
+  the date is NOT recoverable from the key, so read the key's expiry from the
+  Tailscale admin console (Settings → Keys) and write it next to the key as a
+  single ISO date `YYYY-MM-DD`:
   ```bash
-  # the date the key was minted + its lifetime (90d here) = its expiry
-  echo 2026-11-26 | sudo tee /workspace/box-setup/secrets/ts-authkey.expires
+  # replace with the key's actual expiry shown in the admin console
+  echo "<YYYY-MM-DD>" | sudo tee /workspace/box-setup/secrets/ts-authkey.expires
   sudo chmod 600 /workspace/box-setup/secrets/ts-authkey.expires
   ```
   `boxup check` FAILS on an expired key and WARNs (once/hour, not a failure) if
-  this file is missing/unparseable; `status` shows `authkey=expiring:<date>`
-  (< 7 days), `authkey=EXPIRED:<date>`, or `authkey=unknown-expiry`. When you
-  rotate the key, update this file in the same step. **Assumption (operator-
-  set, not derived):** the current fleet key was minted 2026-08-28 with a
-  90-day lifetime ⇒ expiry `2026-11-26`.
+  a key exists but this file is missing/unparseable; a box with NO key at all
+  shows nothing (URL-dance boxes are legitimate). `status` shows
+  `authkey=expiring:<date>` (< 7 days), `authkey=EXPIRED:<date>`, or
+  `authkey=unknown-expiry`. When you rotate the key, update this file in the
+  same step. **Current-fleet assumption (operator-set, verify in the console —
+  not derived by boxup):** the key in use was minted 2026-08-28 with a 90-day
+  lifetime ⇒ expiry `2026-11-26`.
 - The box names itself: once logged in with peers visible, `boxup` picks the
   lowest free `grok-box-N`, stores it in `/workspace/box-setup/hostname`, and
   pushes it. Do not invent names by hand.
@@ -90,6 +93,8 @@ env form in section D.
 | `authkey=expiring:<date>` in status | seeded auth key expires in < 7 days | mint a new reusable key, write it to `secrets/ts-authkey`, update `secrets/ts-authkey.expires` (see §A) |
 | `authkey=EXPIRED:<date>` in status / `check=FAIL reason=authkey EXPIRED` | the unattended recovery key is dead | rotate the key NOW (§A); until then a state-loss event cannot self-recover |
 | `authkey=unknown-expiry` in status / `check: WARN authkey expiry unknown` | `secrets/ts-authkey.expires` missing or unparseable | seed it (§A); the key may still be valid — this is a warning, not a check failure |
+| `ssh grok-box-N` times out but the node is online under another name (e.g. `cursor`, its OS hostname) | after an auth-key rejoin the box registered under the OS hostname and hasn't been renamed yet (H13) | reach it via its `tailscale status` IP or the wrong name, run `sudo /workspace/box-setup/boxup once` (pushes `set --hostname` from the frozen name file); `check` shows `name: live=cursor want=grok-box-N` until it converges. Then delete the OLD grok-box-N node in the console (or let fleetctl reconcile once it exists) |
+| `check=FAIL reason=name: unnamed` | box is Running with peers visible but never picked a grok-box-N | `boxup once` / wait a tick — it picks the lowest free name from peers and freezes it; if it persists, check peers are actually visible (`tailscale status`) |
 | tailnet shows two nodes for one box | stale identity got recreated | delete the OLD node in the admin console; never copy `state/` between boxes |
 
 Logs: `/var/log/boxup-worker.log`, `/var/log/tailscaled.log`.
@@ -170,7 +175,10 @@ automatic): once the ACL authorizes the tag, run on the box
 
 ```bash
 h="$(cat /workspace/box-setup/hostname 2>/dev/null)"
-[ -n "$h" ] || { echo "unnamed box: run 'sudo /workspace/box-setup/boxup once' first"; exit 1; }
+case "$h" in
+  grok-box-[0-9]*) ;;
+  *) echo "refusing: hostname file is '$h' (want grok-box-N); run 'sudo /workspace/box-setup/boxup once' first"; exit 1 ;;
+esac
 sudo /workspace/box-setup/bin/tailscale up --advertise-tags=tag:grok-box --force-reauth \
   --hostname="$h" \
   --ssh=false --advertise-exit-node --accept-dns --snat-subnet-routes=true --operator=box
