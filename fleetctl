@@ -775,6 +775,24 @@ FLEET_BOX_KEY="${FLEET_BOX_KEY:-$FLEET_ETC/box_access_ed25519}"
 # Key expiry cap: 90 days (Tailscale max). Rotation trigger: < 7 days.
 FLEET_KEY_EXPIRY_SECS="${FLEET_KEY_EXPIRY_SECS:-7776000}"     # 90d
 FLEET_ROTATE_BEFORE_SECS="${FLEET_ROTATE_BEFORE_SECS:-604800}" # 7d
+# Per-box minted-key metadata (id + expires) so a rotation knows the OLD key id
+# to revoke. Written at mint time (row a/c), read on rotate. NOT a secret (the
+# key MATERIAL never lands here — only its id/expiry), so mode 600 is belt-and-
+# braces, not strictly required.
+FLEET_KEYS_DIR="${FLEET_KEYS_DIR:-$FLEET_STATE/keys}"
+
+# key_meta_file <N|grok-box-N> -> /var/lib/grok-fleet/keys/<N>.json
+key_meta_file() {
+  local n; n="$(box_index "$1")" || return 1
+  printf '%s/%s.json' "$FLEET_KEYS_DIR" "$n"
+}
+
+# key_meta_id <box> -> the recorded minted key id, or empty if none/unparseable.
+key_meta_id() {
+  local f; f="$(key_meta_file "$1")" || return 1
+  [ -f "$f" ] || return 1
+  jq -r '.id // empty' "$f" 2>/dev/null
+}
 
 # port_for <N|grok-box-N> -> 20000+N. The deterministic per-box loopback port.
 port_for() {
@@ -1067,6 +1085,7 @@ cmd_mint_key() {
   resp="$(ts_api_body)"
   key="$(printf '%s' "$resp" | jq -r '.key // empty')"
   expires="$(printf '%s' "$resp" | jq -r '.expires // empty')"
+  local keyid; keyid="$(printf '%s' "$resp" | jq -r '.id // empty')"
   if [ -z "$key" ]; then
     log "mint-key: response had no .key — old key on $box left intact"
     return 1
@@ -1082,7 +1101,32 @@ cmd_mint_key() {
   # Record the mint window + expiry AFTER verified seed (never before).
   mkdir -p "$FLEET_STATE" 2>/dev/null || true
   printf '%s\t%s\n' "$box" "$expdate" > "$FLEET_STATE/$box.expires" 2>/dev/null || true
+  # Persist the minted key id + expires so a LATER rotation knows the OLD id to
+  # revoke (task b). Written AFTER the verified seed, atomically (tmp+mv). No key
+  # MATERIAL is stored — only the id/expiry. A missing/blank id is recorded as
+  # empty, which the rotation treats as "unknown old id => skip revoke" (never a
+  # failure). This id is the id of the key we JUST minted; on the NEXT rotation
+  # it becomes the old id to delete.
+  record_key_meta "$box" "$keyid" "$expires"
   log "mint-key: $box seeded a fresh per-box key (expires $expdate); verified via boxup status"
+  return 0
+}
+
+# record_key_meta <box> <id> <expires-iso>: atomically write the per-box minted-
+# key metadata to $FLEET_KEYS_DIR/<N>.json. Best-effort (a write failure is
+# logged, never fails the mint — the key is already seeded + verified). Stores
+# id + expires ONLY; never the key material.
+record_key_meta() {
+  local box="$1" id="$2" expires="$3" f tmp
+  f="$(key_meta_file "$box")" || return 0
+  mkdir -p "$FLEET_KEYS_DIR" 2>/dev/null || { log "mint-key: cannot mkdir $FLEET_KEYS_DIR — key id NOT recorded (rotation will skip revoke)"; return 0; }
+  tmp="$(mktemp "$FLEET_KEYS_DIR/.keymeta.XXXXXX" 2>/dev/null)" || { log "mint-key: mktemp failed — key id NOT recorded"; return 0; }
+  if jq -cn --arg id "$id" --arg exp "$expires" '{id:$id, expires:$exp}' > "$tmp" 2>/dev/null; then
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; log "mint-key: could not install key meta $f"; }
+  else
+    rm -f "$tmp"; log "mint-key: could not encode key meta — rotation will skip revoke"
+  fi
   return 0
 }
 
@@ -1326,20 +1370,172 @@ EOF
 reconcile_execute() {
   local box="$1" action="$2"
   case "$action" in
-    mint|rotate)
-      cmd_mint_key "$box" && [ "$action" = mint ] && tunnel_ssh "$box" "sudo $BOX_ROOT/boxup once" >/dev/null 2>&1
-      # rotate additionally revokes the OLD key — handled inside a full impl via
-      # the recorded old key id; the mint itself already rotated the on-box key.
+    mint)
+      cmd_mint_key "$box" && tunnel_ssh "$box" "sudo $BOX_ROOT/boxup once" >/dev/null 2>&1
+      ;;
+    rotate)
+      reconcile_rotate "$box"
       ;;
     delete-then-rename)
       reconcile_dedup "$box"
       ;;
     rollout)
-      log "reconcile: $box drift — invoking D7 rollout over the tunnel"
-      # Reuse the D7 rollout path; over-tunnel deploy is a follow wiring step.
+      reconcile_rollout "$box"
       ;;
     *) log "reconcile: $box unknown action '$action'" ; return 1 ;;
   esac
+}
+
+# reconcile_rotate <box> (row c): mint+seed a FRESH per-box key, THEN — only
+# after the new key is verified seeded — revoke the OLD key via the API. The
+# OLD id is read BEFORE the mint (cmd_mint_key overwrites the per-box key-meta
+# with the NEW id). A missing/blank old id => log + SKIP the revoke, never fail
+# the rotation (the new key is already in place; a stale old key just lingers
+# until its own expiry). The DELETE NEVER runs before cmd_mint_key returns 0
+# (i.e. before the new key is verified seeded).
+reconcile_rotate() {
+  local box="$1" old_id
+  # Capture the OLD key id BEFORE minting (mint overwrites the meta file).
+  old_id="$(key_meta_id "$box" 2>/dev/null || true)"
+  # Mint + atomically seed + verify the new key. On failure the OLD key is left
+  # intact (cmd_mint_key guarantees this) and we do NOT revoke anything.
+  if ! cmd_mint_key "$box"; then
+    log "reconcile: rotate $box — mint/seed FAILED, old key intact, NOT revoking"
+    return 1
+  fi
+  # New key verified seeded. Now revoke the OLD key (task b).
+  if [ -z "$old_id" ]; then
+    log "reconcile: rotate $box — no recorded old key id; skipping revoke (new key seeded OK)"
+    return 0
+  fi
+  ts_api DELETE "/tailnet/$TS_TAILNET/keys/$old_id" >/dev/null
+  if ts_ok || [ "$TS_API_CODE" = 404 ]; then
+    # 404 = the old key is already gone (already revoked/expired) — idempotent OK.
+    log "reconcile: rotate $box — revoked old key id=$old_id (HTTP $TS_API_CODE)"
+  else
+    # Revoke failed: the NEW key is still seeded + working, so the rotation as a
+    # whole SUCCEEDED. Surface the stale-key leftover but do NOT fail (never
+    # fail the rotation on a revoke miss — the old key expires on its own).
+    log "reconcile: rotate $box — old key id=$old_id revoke FAILED (HTTP $TS_API_CODE); new key OK, old key will lapse at its own expiry"
+  fi
+  return 0
+}
+
+# reconcile_rollout <box> (row d): deploy the target tree to the fleet over the
+# reverse tunnels REUSING the D7 canary-first + abort-on-first-failure control
+# flow. The canary box (config [fleet-brain].canary_box, default 8) goes first
+# and is verified via `boxup check` over its tunnel; on any verified failure the
+# rollout ABORTS (no further boxes touched); the rest roll SERIALLY, each
+# verified by `boxup check`, aborting on the first failure. Drift on ONE box
+# triggers a FLEET rollout (D7 is a fleet operation, canary-first) — the same
+# semantics as the laptop-side `rollout --all`, but the transport is the tunnel
+# (ssh -p 2000N box@127.0.0.1 with the VPS key) instead of tailnet+password.
+reconcile_rollout() {
+  local trigger="$1"
+  local canary; canary="$(reconcile_canary_box)"
+  log "reconcile: rollout triggered by $trigger drift — canary-first over tunnels (canary=$canary)"
+
+  # Ordered target list: canary FIRST, then the rest of the enrolled boxes
+  # (serially). Only boxes whose tunnel is UP are reachable to deploy over.
+  local -a rest=() b
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    [ "$b" = "$canary" ] && continue
+    rest+=("$b")
+  done < <(reconcile_target_boxes)
+
+  # Canary gate: an UNREACHABLE canary ABORTS (mirrors D7 cmd_rollout: rolling
+  # the fleet unverified is worse than stopping).
+  if ! tunnel_up "$canary"; then
+    log "reconcile: rollout ABORT — canary $canary tunnel is DOWN (cannot verify); ZERO boxes deployed"
+    notify warn "rollout aborted: canary $canary unreachable over tunnel"
+    return 1
+  fi
+  if ! tunnel_deploy_one "$canary"; then
+    log "reconcile: rollout ABORT — canary $canary FAILED verification; ZERO other boxes touched"
+    notify warn "rollout aborted: canary $canary failed verification"
+    return 1
+  fi
+  log "reconcile: rollout — canary $canary verified; rolling the rest serially"
+
+  local b2 rc=0
+  for b2 in "${rest[@]}"; do
+    if ! tunnel_up "$b2"; then
+      log "reconcile: rollout — $b2 tunnel down; skipping (not a verified failure, continuing)"
+      continue
+    fi
+    if ! tunnel_deploy_one "$b2"; then
+      log "reconcile: rollout ABORT — $b2 FAILED verification; no further boxes deployed"
+      notify warn "rollout aborted at $b2 (verified failure)"
+      rc=1
+      break
+    fi
+  done
+  [ "$rc" = 0 ] && log "reconcile: rollout complete"
+  return "$rc"
+}
+
+# reconcile_canary_box -> the canary box name. [fleet-brain].canary_box (a bare
+# N or grok-box-N) else default 8.
+reconcile_canary_box() {
+  local c; c="$(config_get fleet-brain canary_box 2>/dev/null || true)"
+  [ -n "$c" ] || c="8"
+  case "$c" in grok-box-*) printf '%s' "$c" ;; *) printf 'grok-box-%s' "${c#grok-box-}" ;; esac
+}
+
+# tunnel_deploy_one <box>: push the target tree over the box's reverse tunnel,
+# run install.sh + boxup once, then VERIFY via `boxup check` over the tunnel.
+# Returns 0 iff the post-deploy `boxup check` passes (the D6 postcondition),
+# 1 on any transport/install/verify failure. The tree is staged from
+# $FLEET_ROLLOUT_TREE (a tarball path) when set — the reconcile caller stages
+# HEAD once; tests stub tunnel_ssh/tunnel_scp and assert the tunnel argv + the
+# canary-first/abort ordering without a real box.
+FLEET_ROLLOUT_TREE="${FLEET_ROLLOUT_TREE:-}"
+tunnel_deploy_one() {
+  local box="$1" remote_tar="/tmp/grok-box-setup-brain.tar" \
+        remote_dir="/tmp/grok-box-setup-brain"
+  # Push the tree (if a tarball was staged) over the tunnel.
+  if [ -n "$FLEET_ROLLOUT_TREE" ] && [ -f "$FLEET_ROLLOUT_TREE" ]; then
+    if ! tunnel_scp "$box" "$FLEET_ROLLOUT_TREE" "$remote_tar"; then
+      log "reconcile: rollout $box — scp over tunnel FAILED"
+      return 1
+    fi
+  fi
+  # Extract + install + converge over the tunnel, then verify with boxup check.
+  if ! tunnel_ssh "$box" "
+    set -e
+    if [ -f '$remote_tar' ]; then
+      rm -rf '$remote_dir'; mkdir -p '$remote_dir'
+      tar -xf '$remote_tar' -C '$remote_dir'
+      sudo env BOX_SETUP_GIT_SHA='${FLEET_TARGET_SHA:-unknown}' bash '$remote_dir/install.sh'
+      rm -rf '$remote_dir' '$remote_tar'
+    fi
+    sudo $BOX_ROOT/boxup once >/dev/null 2>&1 || sudo $BOX_ROOT/boxup once
+  " >/dev/null 2>&1; then
+    log "reconcile: rollout $box — install/once over tunnel FAILED"
+    return 1
+  fi
+  # Postcondition: boxup check over the tunnel (D6, same as D7's verify).
+  if ! tunnel_ssh "$box" "sudo $BOX_ROOT/boxup check" >/dev/null 2>&1; then
+    log "reconcile: rollout $box — post-deploy boxup check FAILED (verify)"
+    return 1
+  fi
+  log "reconcile: rollout $box — deployed + verified over tunnel"
+  return 0
+}
+
+# tunnel_scp <box> <local-src> <remote-dst>: scp over the box's reverse tunnel
+# as box@127.0.0.1 -p 2000N using the VPS's own key (mirrors tunnel_ssh; NO
+# password fallback — R7).
+tunnel_scp() {
+  local box="$1" src="$2" dst="$3"
+  local port; port="$(port_for "$box")" || return 1
+  scp -o StrictHostKeyChecking=accept-new \
+      -o BatchMode=yes \
+      -o ConnectTimeout=8 \
+      -P "$port" \
+      -i "$FLEET_BOX_KEY" \
+      "$src" "box@127.0.0.1:$dst"
 }
 
 # reconcile_dedup <box>: DELETE the older-offline duplicate, THEN POST the live
