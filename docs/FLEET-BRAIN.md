@@ -22,6 +22,13 @@ has three gaps that need an off-box actor:
 3. **The laptop is not always online.** `fleetctl` today runs from the laptop;
    reconciliation, rollout, and alerting stop when the laptop sleeps.
 
+**Measured resurrection latency (r4 truth run):** box-8 was bricked by the r4
+installer at ~11:23Z and came back on its own via the hourly `boxup once` at
+12:18Z — a **~55 min resurrection latency**. That gap is exactly what the
+always-on brain closes: the hourly `once` is the floor (a lone box's only
+scheduler, §5), and a 5-min brain reconcile turns ~55 min of blind downtime
+into at most one 5-min window.
+
 The chosen design: a **VPS brain** (`ssh root@107.172.132.211`, port 22, key
 auth, full-root scope, footprint kept to one dir tree + one systemd unit set)
 that reconciles the fleet on a timer, reaches each box over an **out-of-band
