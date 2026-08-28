@@ -476,7 +476,7 @@ esac
 # not. Drives the REAL name_mismatch with stubbed read_box_name/live_hostname.
 # ---------------------------------------------------------------------------
 h13_test() {
-  local live="$1" inner; inner="$(mktemp)"
+  local live="$1" dns="$2" inner; inner="$(mktemp)"
   cat > "$inner" <<INNER
 set -u
 BOXUP="$BOXUP"
@@ -484,12 +484,17 @@ extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^
 eval "\$(extract_fn name_mismatch)"
 read_box_name(){ echo grok-box-8; }
 live_hostname(){ echo "$live"; }
-if name_mismatch; then echo "mismatch:\$NAME_MISMATCH_LIVE"; else echo match; fi
+live_dnsname_label(){ echo "$dns"; }
+if name_mismatch; then echo "\$NAME_MISMATCH_KIND:\$NAME_MISMATCH_LIVE"; else echo match; fi
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
-case "$(h13_test cursor)" in mismatch:cursor) pass "H13 live=cursor vs file=grok-box-8 => mismatch (check FAIL + set --hostname)" ;; *) bad "H13 mismatch not detected: [$(h13_test cursor)]" ;; esac
-[ "$(h13_test grok-box-8)" = match ] && pass "H13 live==file => no mismatch" || bad "H13 false mismatch on equal names: [$(h13_test grok-box-8)]"
+# hostname mismatch (kind=hostname): live=cursor, dns irrelevant
+case "$(h13_test cursor grok-box-8)" in hostname:cursor) pass "H13 live=cursor => kind=hostname mismatch (set --hostname fixes)" ;; *) bad "H13 hostname mismatch not detected: [$(h13_test cursor grok-box-8)]" ;; esac
+# F2 dns mismatch (kind=dns): HostName already correct, MagicDNS has -1 suffix
+case "$(h13_test grok-box-8 grok-box-8-1)" in dns:grok-box-8-1) pass "F2 HostName ok but MagicDNS grok-box-8-1 => kind=dns (check FAIL name: dns=..., NOT on-box fixable)" ;; *) bad "F2 dns-suffix mismatch not detected: [$(h13_test grok-box-8 grok-box-8-1)]" ;; esac
+# fully aligned: no mismatch
+[ "$(h13_test grok-box-8 grok-box-8)" = match ] && pass "H13 HostName+DNSName both == file => no mismatch" || bad "H13 false mismatch when aligned: [$(h13_test grok-box-8 grok-box-8)]"
 
 # H13/P1-4 — fresh/unnamed: read_box_name not grok-box-N AND peers visible =>
 # check_reason returns `name: unnamed`; no peers => not failed (lone node).
@@ -563,6 +568,45 @@ if grep -q 'E1 migration' "$ROOT/install.sh" \
   pass "E1 install.sh carries the version-triggered migration (SIGTERM->SIGKILL)"
 else
   bad  "E1 install.sh missing the version-triggered migration"
+fi
+
+# ---------------------------------------------------------------------------
+# F1(a) — the migration TRIGGER fires on VERSION diff OR GIT_SHA diff. Replay
+# the exact install.sh gate condition against 4 input combos. Box-8 r3: a
+# same-version (5.1.0) different-sha (059c658->87e783b) upgrade MUST trigger.
+# ---------------------------------------------------------------------------
+f1a_gate() {
+  # $1 iver $2 nver $3 isha $4 nsha  -> "fire" | "skip"
+  local installed_ver="$1" new_ver="$2" installed_sha="$3" new_sha="$4"
+  if { [ -n "$new_ver" ] && [ "$installed_ver" != "$new_ver" ]; } \
+     || { [ "$new_sha" != unknown ] && [ "$installed_sha" != "$new_sha" ]; }; then
+    echo fire; else echo skip; fi
+}
+[ "$(f1a_gate 5.1.0 5.2.0 059c658 059c658)" = fire ] && pass "F1(a) version bump => migration fires" || bad "F1(a) version bump did not fire"
+[ "$(f1a_gate 5.1.0 5.1.0 059c658 87e783b)" = fire ] && pass "F1(a) SAME version, different sha => fires (box-8 r3 gap)" || bad "F1(a) same-version different-sha did NOT fire (the box-8 r3 bug)"
+[ "$(f1a_gate 5.2.0 5.2.0 87e783b 87e783b)" = skip ] && pass "F1(a) identical ver+sha => no recycle" || bad "F1(a) identical build wrongly fired"
+[ "$(f1a_gate 5.1.0 5.1.0 059c658 unknown)" = skip ] && pass "F1(a) unknown new sha + same ver => no spurious recycle" || bad "F1(a) unknown-sha spuriously fired"
+# The real install.sh carries the OR-sha condition.
+if grep -q 'installed_sha' "$ROOT/install.sh" && grep -q 'new_sha' "$ROOT/install.sh"; then
+  pass "F1(a) install.sh gate compares GIT_SHA (not VERSION alone)"
+else
+  bad  "F1(a) install.sh gate does not compare GIT_SHA"
+fi
+
+# ---------------------------------------------------------------------------
+# F1(b) — the converge lock path is VERSIONED (converge.v2.lock) so an inherited
+# older-build daemon (on converge.lock) can never wedge a v2 tick.
+# ---------------------------------------------------------------------------
+if grep -q 'CONVERGE_LOCK="\$RUN_DIR/converge.v2.lock"' "$BOXUP"; then
+  pass "F1(b) converge lock path is versioned (converge.v2.lock)"
+else
+  bad  "F1(b) converge lock path is not versioned"
+fi
+# VERSION bumped to 5.2.0 (file + BOXUP_VERSION constant agree).
+if [ "$(tr -d '[:space:]' < "$ROOT/VERSION")" = 5.2.0 ] && grep -q '^BOXUP_VERSION=5.2.0' "$BOXUP"; then
+  pass "F1 VERSION bumped to 5.2.0 (file + constant agree)"
+else
+  bad  "F1 VERSION mismatch: file=$(tr -d '[:space:]' < "$ROOT/VERSION") constant=$(grep '^BOXUP_VERSION=' "$BOXUP")"
 fi
 
 echo "-----"
