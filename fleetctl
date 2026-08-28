@@ -219,18 +219,53 @@ EOF
 # --- status ------------------------------------------------------------------
 # Print boxup's own status line per box, prefixed by the box name. Offline /
 # unreachable boxes are reported but never fail the command (exit 0 always).
+#
+# Drift detection (D10): parse the v=<version>/<sha> token, compare <sha> to the
+# laptop's git HEAD, and append `sha=<sha> drift=yes|no`. A box with no sha (old
+# boxup, v=<version> with no /sha) renders `sha=unknown drift=unknown` —
+# informational, never a failure. status_one echoes the box's sha as its LAST
+# stdout word via a side channel file so cmd_status can build the fleet summary.
+
+# Extract the sha from a boxup status line's v= token: v=5.1.0/abc123 -> abc123;
+# v=5.1.0 (old) -> unknown.
+status_line_sha() {
+  local line="$1" tok v
+  for tok in $line; do
+    case "$tok" in
+      v=*) v="${tok#v=}"
+           case "$v" in
+             */*) printf '%s' "${v#*/}" ;;
+             *)   printf 'unknown' ;;
+           esac
+           return 0 ;;
+    esac
+  done
+  printf 'unknown'
+}
+
 status_one() {
-  local box="$1" line
+  local box="$1" line sha drift head_sha="$2" shafile="${3:-}"
   if ! box_reachable "$box"; then
     printf '%-14s UNREACHABLE\n' "$box"
+    [ -n "$shafile" ] && printf '%s\t%s\n' "$box" "unreachable" >> "$shafile"
     return 0
   fi
   line="$(box_ssh "$box" "sudo $BOXUP_REMOTE status" 2>/dev/null)"
   if [ -z "$line" ]; then
     printf '%-14s UNREACHABLE (ssh/boxup failed)\n' "$box"
+    [ -n "$shafile" ] && printf '%s\t%s\n' "$box" "unreachable" >> "$shafile"
     return 0
   fi
-  printf '%-14s %s\n' "$box" "$line"
+  sha="$(status_line_sha "$line")"
+  if [ "$sha" = "unknown" ] || [ "$head_sha" = "unknown" ]; then
+    drift="unknown"
+  elif [ "$sha" = "$head_sha" ]; then
+    drift="no"
+  else
+    drift="yes"
+  fi
+  printf '%-14s %s sha=%s drift=%s\n' "$box" "$line" "$sha" "$drift"
+  [ -n "$shafile" ] && printf '%s\t%s\n' "$box" "$sha" >> "$shafile"
 }
 
 cmd_status() {
@@ -240,10 +275,26 @@ cmd_status() {
     echo "(no target boxes)"
     return 0
   fi
+  local head_sha shafile
+  head_sha="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  shafile="$(mktemp 2>/dev/null || echo '')"
   local b
   for b in "${targets[@]}"; do
-    status_one "$b"
+    status_one "$b" "$head_sha" "$shafile"
   done
+  # Fleet drift summary: mixed shas across reachable boxes, or any box behind
+  # laptop HEAD, is worth one summary line. Never a failure (exit 0).
+  if [ -n "$shafile" ] && [ -f "$shafile" ]; then
+    local uniq_shas
+    uniq_shas="$(awk -F'\t' '$2 != "unreachable" && $2 != "unknown" { print $2 }' "$shafile" | sort -u | wc -l)"
+    if [ "$uniq_shas" -gt 1 ]; then
+      log "status: fleet is MIXED-version ($uniq_shas distinct shas); laptop HEAD=$head_sha"
+    elif [ "$head_sha" != "unknown" ] && \
+         awk -F'\t' -v h="$head_sha" '$2 != "unreachable" && $2 != "unknown" && $2 != h { c=1 } END { exit(c?0:1) }' "$shafile"; then
+      log "status: some boxes drift from laptop HEAD=$head_sha"
+    fi
+    rm -f "$shafile"
+  fi
   return 0
 }
 
@@ -394,12 +445,14 @@ rollout_one() {
     return 1
   fi
   # Extract, install, converge, print status; then clean the staging dir.
+  # BOX_SETUP_GIT_SHA is passed via `sudo env` (D10/B3): sudo's env_reset drops
+  # exported vars, and install.sh's git archive carries no .git to rev-parse.
   if ! box_ssh "$box" "
     set -e
     rm -rf '$remote_dir'
     mkdir -p '$remote_dir'
     tar -xf '$remote_tar' -C '$remote_dir'
-    sudo bash '$remote_dir/install.sh'
+    sudo env BOX_SETUP_GIT_SHA='${ROLLOUT_GIT_SHA:-unknown}' bash '$remote_dir/install.sh'
     sudo $BOXUP_REMOTE once >/dev/null 2>&1 || sudo $BOXUP_REMOTE once
   " >/dev/null 2>&1; then
     box_ssh "$box" "rm -rf '$remote_dir' '$remote_tar'" >/dev/null 2>&1 || true
@@ -434,7 +487,11 @@ cmd_rollout() {
     log "rollout: git archive HEAD failed"
     return 1
   fi
-  log "rollout: packaged HEAD $(git rev-parse --short HEAD 2>/dev/null || echo '?') -> $(basename "$tarball")"
+  # Compute the sha at archive time; the archive has no .git, so install.sh
+  # cannot rev-parse it on the box (D10/B3). Threaded to rollout_one via a
+  # module-scope var and passed over ssh as `sudo env BOX_SETUP_GIT_SHA=...`.
+  ROLLOUT_GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  log "rollout: packaged HEAD $ROLLOUT_GIT_SHA -> $(basename "$tarball")"
 
   local -a targets=()
   while IFS= read -r b; do [ -n "$b" ] && targets+=("$b"); done < <(resolve_targets "$@")

@@ -29,7 +29,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.0.0
+BOXUP_VERSION=5.1.0
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -1223,6 +1223,16 @@ stop_daemon() {
 }
 
 # --- status ------------------------------------------------------------------
+# The installed git sha, stamped by install.sh into $ROOT/GIT_SHA. "unknown"
+# when absent (an old-format box, or a source tree with no .git at install
+# time). Never fails.
+boxup_git_sha() {
+  local s=""
+  [ -f "$ROOT/GIT_SHA" ] && s=$(tr -d '[:space:]' < "$ROOT/GIT_SHA" 2>/dev/null || true)
+  [ -n "$s" ] || s="unknown"
+  printf '%s' "$s"
+}
+
 print_status() {
   local sshd=down ts_pid sh_pid="" hb=- v4 v6 name now last
   v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
@@ -1242,9 +1252,11 @@ print_status() {
   read_ts_fields
   name="$(read_box_name || true)"
 
+  local vstr
+  vstr="$BOXUP_VERSION/$(boxup_git_sha)"
   printf 'backend=%s online=%s exit-node=%s sshd=%s ipfwd=4:%s,6:%s tailscaled=%s selfheal=%s worker=%s hb=%s name=%s v=%s' \
     "${backend:-unknown}" "${online:-no}" "${exitn:-no}" "$sshd" "$v4" "$v6" \
-    "${ts_pid:--}" "${sh_pid:--}" "${sh_pid:--}" "$hb" "${name:--}" "$BOXUP_VERSION"
+    "${ts_pid:--}" "${sh_pid:--}" "${sh_pid:--}" "$hb" "${name:--}" "$vstr"
   # refresh backoff visibility (D4): surface a persistently failing refresh only
   # at N>=3 consecutive failures, so a healthy box's status line is unchanged.
   local rf

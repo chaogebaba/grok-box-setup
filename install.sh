@@ -28,6 +28,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo env BOX_SETUP_ROOT="$DEST" \
       BOX_SETUP_ONCE="${BOX_SETUP_ONCE:-}" \
       BOX_SETUP_AUTHKEY="${BOX_SETUP_AUTHKEY:-}" \
+      BOX_SETUP_GIT_SHA="${BOX_SETUP_GIT_SHA:-}" \
       BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" \
       bash "$0" "$@"
   fi
@@ -69,6 +70,19 @@ install -m 0644 "$REPO_ROOT/etc/config.example.toml" "$DEST/etc/config.example.t
 install -m 0644 "$REPO_ROOT/docs/"*.md "$DEST/docs/" 2>/dev/null || true
 install -m 0644 "$REPO_ROOT/README.md" "$DEST/README.md" 2>/dev/null || true
 install -m 0644 "$REPO_ROOT/VERSION" "$DEST/VERSION" 2>/dev/null || true
+
+# Stamp the installed git sha (D10). Sources, in order: $BOX_SETUP_GIT_SHA
+# (set by fleetctl rollout, whose git archive carries no .git); a rev-parse of
+# the source tree ($REPO_ROOT — `boxup update`'s clone has .git); else
+# "unknown". Boxup surfaces it in status as v=<version>/<sha>.
+box_git_sha="${BOX_SETUP_GIT_SHA:-}"
+if [ -z "$box_git_sha" ]; then
+  box_git_sha="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+fi
+[ -n "$box_git_sha" ] || box_git_sha="unknown"
+printf '%s\n' "$box_git_sha" > "$DEST/GIT_SHA"
+chmod 0644 "$DEST/GIT_SHA" 2>/dev/null || true
+log "stamped GIT_SHA=$box_git_sha"
 
 # config.toml is the user's, not ours. Seed it once, never overwrite it, so a
 # custom ssh password survives every later install.
