@@ -111,3 +111,85 @@ last-exitnode-set) is deliberately ephemeral bookkeeping.
 - Auth keys must be reusable and non-ephemeral (ephemeral nodes vanish on
   restart and mint duplicates).
 - `state/`, `secrets/`, `hostname` never enter git (CI enforces).
+
+
+## Decision wall (D8)
+
+One row per load-bearing decision: what it is, the incident/measurement that
+forced it, and what breaks if it is "simplified away". Read this before undoing
+any special case.
+
+| Decision | Forced by | Breaks if undone |
+|---|---|---|
+| No systemd/cron on boxes | platform has neither; PID1 is tini | nothing schedules recovery; box stays dead after swap |
+| Single-file `boxup`, one copy at `/workspace/box-setup/boxup` | v4's 8 scripts installed twice drifted | two copies diverge; stale copy runs |
+| `tailscale up` only in `ensure_login` | `up` resets every unmentioned pref | prefs (exit-node, operator) silently cleared each tick |
+| `tailscale set` (not `up`) for prefs | need-driven refresh must not reset flags | same pref-clobber as above |
+| Never `pkill -f` | flattened-cmdline match once SIGTERM'd agent shells naming a script | agent `-c` shells killed; collateral damage |
+| `00-` sshd drop-in wins | Debian sshd keeps FIRST value; Include is near top | a foreign drop-in overrides our password login |
+| chpasswd every converge | image ships box/root locked; `/etc/shadow` dies on swap | `sshd=up` but no login works after swap |
+| Exactly one tailscaled on the workspace statedir | dpkg's default unit binds `/var/lib/tailscale` | two daemons; split identity; NoState churn |
+| NoState ≠ NeedsLogin | minting on NoState forks a second identity | duplicate node created right after daemon start |
+| Recycle-not-restart on freeze | tailscaled has no reload; long-poll dies on thaw | node stays grey ~2 min every sleep/thaw |
+| Identity out of git | per-box keys/hostname must not leak or collide | two boxes with one identity; key leak (CI enforces) |
+| Frozen shim flag contract | external hourly automation calls `box-bootstrap.sh --once` | the resurrection trigger breaks |
+| Parse the VALUE of check-ip-forwarding, never grep the key | grepping the key is always true; once spammed `set` and marked node offline | `set` every tick → PollNetMap cancelled → node offline |
+| nft applied as one atomic `nft -f` transaction | partial rule state = exit node "connected" with no WAN | half-applied rules; broken forwarding |
+| NAT table + ip6 reject/prohibit forcing v4 fallback | Docker FORWARD DROP + no masquerade; WAN has no v6 | exit clients hang on v6 with no WAN |
+| Name computed from PEERS only, never Self, then frozen | Self is often still `cursor`; a lone node always picks grok-box-1 | name collisions across the fleet |
+| Recycle cooldown stamped BEFORE the kill | a slow/dying recycle tick must still honor the cooldown | recycle storm on every tick |
+| Brand-new-worker leftover-hb guard | a just-started worker sees stale hb from the old one | spurious recycle right after `boxup stop`/start |
+| hb written immediately after freeze checks | a slow recycle must not leave stale hb for the next tick | next tick mistakes it for another freeze |
+| Worker reaper matches exact argv, skips `-c` | same `pkill -f` lesson | agent shells reaped |
+| Reusable non-ephemeral auth keys; Tailscale SSH off | ephemeral nodes vanish on restart and mint duplicates; OpenSSH is the only login | duplicate nodes; lost the only login path |
+| Non-printable config passwords refused | chpasswd round-trip would set an unknown password | box locked out |
+| config.toml seeded once, never overwritten | user's password/pins must survive upgrades | every install resets the login |
+| ROOT never auto-detected from a checkout | a stray clone must not become the live root | dev tree silently drives a real box |
+| Vendored tailscale bins in `bin/` | recovery after swap must not wait on apt/network | daemon can't restart offline |
+| `set -u`, not blanket `set -e` | the worker loop must keep looping past transient failures | one transient error kills the self-heal loop |
+| tailscaled-start flock in a subshell; child closes fd 9 | a long-lived worker holding the lock wedges later starts | daemon restart deadlocks on the inherited lock |
+| **Converge lock: wait-for-ensure, skip-for-tick, fail-open** (D3/B1/S1) | `boxup once`, the tick, and rollout can converge concurrently | `once` silently skipped (operator faked out) OR duplicate concurrent converge |
+| **hb-stamp-on-contention** (D3/B1/N3) — its OWN row | a long `boxup once` starves hb; the next tick would spuriously recycle | it deliberately masks a freeze for the bounded converge duration — do NOT "simplify" it away |
+| **Atomic mktemp+rename install** (D3/M2) | non-atomic copy over a running boxup; two concurrent installs truncate a fixed dotfile | worker reads a half-written/corrupt boxup |
+| **Refresh backoff with env-only human bypass** (D4/F6/M1) | a persistently failing `set` retried every tick forever, invisibly; hourly `once` would reset a cmd-based bypass | silent infinite retry; unattended backoff reset |
+| **Shim tail-sentinel + hardcoded-fallback-URL divergence** (D5/F2/F3) | `bash -n` accepts a boxup truncated at a statement boundary; a corrupt boxup's config parser is unavailable | truncated boxup execs+exits 0 silently; self-heal can't find its repo |
+| **Root-clone sanity gate** (D5/F4) | the shim runs an unpinned clone as root, hourly | executes a partial/hostile clone as root |
+| **`check` exit-2 skew fallback** (D6/B2) | exit 2 = unknown-subcommand = "old boxup"; a check bug emitting 2 downgrades fleetctl | healthy old box reported failing; notify-send spam |
+| **Canary/abort + no-auto-rollback** (D7) | rollout deployed everywhere with no verify/brake; per-box failures discarded | a bad HEAD rolls the whole fleet unverified |
+| **Sudo env sha plumbing** (D10/B3) | sudo env_reset drops exported vars; git archive carries no .git | every box stamps `sha=unknown`; drift detection blind |
+| **`--advertise-tags` first-login only** (tags/F11) | re-auth-time tagging locks a node out (headscale#3374) | unattended re-auth converts node to tag-owned and it can't rejoin |
+
+## Prior art (D11)
+
+What each does, what we borrowed, why we diverged.
+
+- **tailscale `containerboot`** — env-driven `up`, state in a mounted volume.
+  Borrowed: env-configured convergence. Diverged: we have no volume that
+  survives an image swap, so state lives in `/workspace` and we keep a full
+  re-join path (auth key / AuthURL).
+- **runit / s6 supervision** — our worker loop is a poor-man's s6 (supervise +
+  restart). Diverged: we cannot own PID 1 (tini + the sand supervisor do), so
+  the loop is a userspace tick, not a real supervisor.
+- **ansible-pull** — pull-based convergence. Borrowed: the shim's re-clone +
+  reinstall is exactly pull-based self-heal. Diverged: triggered by the hourly
+  automation, not a control node.
+- **`tailscale up --reset`** — resets prefs to flags given. Informs our
+  set-only-after-first-login rule: we never want the reset semantics post-join,
+  so we use `set` and reserve `up` for `ensure_login`.
+- **Kubernetes CrashLoopBackOff + systemd `RestartSec`/`StartLimitBurst`**
+  (D4) — capped exponential backoff, reset on success, never a permanent give
+  up. Borrowed wholesale for the refresh backoff (20→60→180→600s, reset on a
+  successful `set`, no permanent stop).
+- **Docker `HEALTHCHECK` / k8s liveness-readiness** (D6) — one exit-code health
+  predicate owned by the workload, not the orchestrator. Borrowed: `boxup
+  check` is that one predicate; fleetctl (the orchestrator) trusts its exit
+  code instead of reimplementing health.
+- **Ansible `serial:` + `max_fail_percentage`** (D7) — canary-then-batch with
+  an abort. Borrowed: canary-first, verify, abort-on-first-failure. **`kubectl
+  rollout status`/`undo`** — informs the deliberate no-auto-rollback choice
+  (rollback = redeploy a known-good sha; we print the command rather than
+  building undo machinery).
+- **rename-not-truncate self-replace (rustup, dpkg)** (D3) — a running program
+  keeps its fd on the old inode after `rename(2)`. Justifies the atomic
+  mktemp+`mv -f` install: a live worker finishes reading the old boxup
+  uninterrupted while the new file is installed.
