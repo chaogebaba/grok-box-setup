@@ -29,7 +29,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.1.0
+BOXUP_VERSION=5.2.0
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -88,7 +88,12 @@ TS_SOCK="/var/run/tailscale/tailscaled.sock"
 # still closes it so a legacy daemon's inherited fd 8 is never propagated
 # further.
 START_LOCK="/run/tailscaled.start.lock"
-CONVERGE_LOCK="$RUN_DIR/converge.lock"
+# F1(b): the converge lock path is VERSIONED (v2). A pre-H1 daemon that inherited
+# the OLD converge.lock fd (the #7 wedge) can NEVER wedge a v2 boxup, because a
+# v2 tick flocks a DIFFERENT file — decoupled by construction, independent of
+# whether the E1 install migration fired. Bump this suffix again if a future
+# change must guarantee non-interference with an older running daemon.
+CONVERGE_LOCK="$RUN_DIR/converge.v2.lock"
 
 DEFAULT_SSH_PASSWORD="12345678"
 DEFAULT_TS_VERSION="1.102.3"
@@ -1167,21 +1172,54 @@ except Exception:
 ' 2>/dev/null || true
 }
 
-# H13: true (0) iff the frozen file name is a grok-box-N AND the live Self
-# hostname differs from it. Sets NAME_MISMATCH_FILE / NAME_MISMATCH_LIVE for
-# callers to log. A missing file name or unreadable live value ⇒ NOT a mismatch
-# (we only act when we have a concrete intent to enforce).
+# F2: the LIVE MagicDNS first label (Self.DNSName, e.g.
+# "grok-box-8-1.tail8ecb39.ts.net." -> "grok-box-8-1"). This is what peers
+# actually resolve/reach. On a state-loss rejoin while the STALE node still
+# holds `grok-box-8`, the new node's DNSName gets a `-1` suffix even though its
+# Self.HostName is already `grok-box-8` — so a HostName-only comparison passes
+# while the box is unreachable under its intended MagicDNS name.
+live_dnsname_label() {
+  ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = ((json.load(sys.stdin).get("Self") or {}).get("DNSName") or "").strip().rstrip(".")
+    print(d.split(".")[0] if d else "")
+except Exception:
+    print("")
+' 2>/dev/null || true
+}
+
+# H13/F2: true (0) iff the frozen file name is a grok-box-N AND the live control-
+# plane identity differs from it, in EITHER of two ways. Sets NAME_MISMATCH_KIND
+# (hostname|dns), NAME_MISMATCH_FILE, NAME_MISMATCH_LIVE for callers.
+#   * kind=hostname: Self.HostName != file (e.g. `cursor`). Self-FIXABLE on-box
+#     via `tailscale set --hostname=<file>`.
+#   * kind=dns: Self.HostName already == file BUT the MagicDNS first label != file
+#     (e.g. `grok-box-8-1` — the split-brain `-1` suffix). NOT self-fixable:
+#     `tailscale set --hostname` is a no-op when the hostname is unchanged; the
+#     stale device must be deleted then the live device renamed via the API
+#     (brain/operator, FLEET-BRAIN row b). ensure_name reports it, does not spin.
+# HostName mismatch is checked first (it's the fixable one). A missing file name
+# or unreadable live values ⇒ NOT a mismatch (we only act on a concrete intent).
 NAME_MISMATCH_FILE=""
 NAME_MISMATCH_LIVE=""
+NAME_MISMATCH_KIND=""
 name_mismatch() {
-  local f l
+  local f l dns
+  NAME_MISMATCH_FILE=""; NAME_MISMATCH_LIVE=""; NAME_MISMATCH_KIND=""
   f="$(read_box_name || true)"
   case "$f" in grok-box-[0-9]*) ;; *) return 1 ;; esac
   l="$(live_hostname)"
-  [ -n "$l" ] || return 1
-  [ "$f" != "$l" ] || return 1
-  NAME_MISMATCH_FILE="$f"; NAME_MISMATCH_LIVE="$l"
-  return 0
+  if [ -n "$l" ] && [ "$f" != "$l" ]; then
+    NAME_MISMATCH_FILE="$f"; NAME_MISMATCH_LIVE="$l"; NAME_MISMATCH_KIND=hostname
+    return 0
+  fi
+  dns="$(live_dnsname_label)"
+  if [ -n "$dns" ] && [ "$f" != "$dns" ]; then
+    NAME_MISMATCH_FILE="$f"; NAME_MISMATCH_LIVE="$dns"; NAME_MISMATCH_KIND=dns
+    return 0
+  fi
+  return 1
 }
 
 ensure_name() {
@@ -1203,23 +1241,49 @@ ensure_name() {
       esac
       ;;
   esac
-  # H13: the file is the INTENT; enforce it against the LIVE postcondition. If
-  # the control plane has a different Self.HostName (e.g. `cursor` after an
-  # auth-key rejoin), push it — ensure_name no longer trusts the file's mere
-  # existence. `tailscale set --hostname` (not `up`) so no other pref resets.
+  # H13/F2: the file is the INTENT; enforce it against the LIVE postcondition.
   if name_mismatch; then
-    log "name: live=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE — pushing tailscale set --hostname" >&2
-    local b
-    b="$(tailscale_bin)"
-    if [ -x "$b" ]; then
-      if id box >/dev/null 2>&1 && timeout 25 sudo -n -u box "$b" set --hostname="$NAME_MISMATCH_FILE" 2>/dev/null; then
-        :
-      else
-        timeout 25 "$b" set --hostname="$NAME_MISMATCH_FILE" 2>/dev/null || \
-          log "name: tailscale set --hostname=$NAME_MISMATCH_FILE failed" >&2
+    if [ "$NAME_MISMATCH_KIND" = hostname ]; then
+      # Self.HostName differs (e.g. `cursor` after a rejoin) — self-fixable:
+      # push `tailscale set --hostname` (not `up`, so no other pref resets).
+      log "name: live=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE — pushing tailscale set --hostname" >&2
+      local b
+      b="$(tailscale_bin)"
+      if [ -x "$b" ]; then
+        if id box >/dev/null 2>&1 && timeout 25 sudo -n -u box "$b" set --hostname="$NAME_MISMATCH_FILE" 2>/dev/null; then
+          :
+        else
+          timeout 25 "$b" set --hostname="$NAME_MISMATCH_FILE" 2>/dev/null || \
+            log "name: tailscale set --hostname=$NAME_MISMATCH_FILE failed" >&2
+        fi
       fi
+    else
+      # F2 kind=dns: the MagicDNS name carries a `-1` split-brain suffix while
+      # Self.HostName is already correct. `tailscale set --hostname` is a NO-OP
+      # here (hostname unchanged) so we do NOT spin on it — this is NOT fixable
+      # on-box. It needs the brain/operator to DELETE the stale duplicate device
+      # then POST /api/v2/device/<live-id>/name. Log it; `check` reports it.
+      log "name: dns=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE — split-brain MagicDNS suffix, NOT on-box fixable; brain/operator must delete the stale device + POST /device/name" >&2
     fi
   fi
+  # F3 (P2): also set the OS hostname to the frozen grok-box-N. The sand image
+  # ships OS hostname `cursor`; leaving it means prompts, logs, and `hostname`
+  # all say `cursor`, which misleads an operator ssh'd into the box (box-8 test:
+  # the reproducer printed "on cursor"). This is COSMETIC (tailscale identity is
+  # unaffected — that's Self.HostName/prefs, handled above) and BEST-EFFORT
+  # (log, never fail a converge). Re-applied every converge because the overlay
+  # (incl. /etc/hostname) dies on an image swap, same as passwords/nft. Only
+  # when we have a concrete grok-box-N.
+  local want
+  want="$(read_box_name || true)"
+  case "$want" in
+    grok-box-[0-9]*)
+      if [ "$(hostname 2>/dev/null || true)" != "$want" ]; then
+        hostname "$want" 2>/dev/null || log "name: could not set OS hostname to $want (need CAP_SYS_ADMIN)" >&2
+        printf '%s\n' "$want" > /etc/hostname 2>/dev/null || true
+      fi
+      ;;
+  esac
 }
 
 # --- converge: exit-node refresh --------------------------------------------
@@ -1835,7 +1899,11 @@ check_reason() {
   #     visible — the box SHOULD have picked a name by now; `name=-` is NOT
   #     healthy. (We gate on peers so a lone first node isn't failed forever.)
   if [ -z "$reason" ] && name_mismatch; then
-    reason="name: live=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE"
+    if [ "$NAME_MISMATCH_KIND" = dns ]; then
+      reason="name: dns=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE"
+    else
+      reason="name: live=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE"
+    fi
   fi
   if [ -z "$reason" ]; then
     case "$(read_box_name || true)" in

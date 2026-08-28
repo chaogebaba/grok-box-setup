@@ -55,26 +55,33 @@ if [ -x "$DEST/box-bootstrap.sh" ] && [ ! -f "$DEST/boxup" ]; then
   bash "$DEST/box-bootstrap.sh" --stop >/dev/null 2>&1 || true
 fi
 
-# E1 — one-shot version-change tailscaled recycle. Before H1, tailscaled could
-# inherit the converge-lock fd and hold it for life, wedging every tick. flock
-# --close prevents that for NEW daemons but cannot free an ALREADY-leaked fd,
-# and the two runtime detectors we tried were proven inert. P1-3: trigger on ANY
-# VERSION change (installed VERSION != the version being installed), NOT a
-# comment-marker heuristic — the marker keys on disk contents while the LIVE
-# daemon is a separate generation; the two diverge (a box can already have the
-# H1 file on disk from a partial/earlier step while the wedged pre-H1 daemon is
-# still the running process). A version bump is the unambiguous "a new boxup is
-# taking over" signal. On a bump we recycle tailscaled unconditionally: exact-
-# token select, SIGTERM, poll up to 10s, SIGKILL, verify gone; the normal
-# `boxup once` below restarts it via the flock --close path. ~5s connectivity
-# blip per upgrade is acceptable and bounded. Runs once per upgrade, never in a
-# tick; no sentinel file (disk vs live-generation divergence is the whole
-# reason a sentinel/marker cannot be trusted here).
+# E1 — one-shot version/sha-change tailscaled recycle. Before H1, tailscaled
+# could inherit the converge-lock fd and hold it for life, wedging every tick.
+# flock --close prevents that for NEW daemons but cannot free an ALREADY-leaked
+# fd, and the two runtime detectors we tried were proven inert. Trigger on ANY
+# build change — installed VERSION != new VERSION *OR* installed GIT_SHA != new
+# GIT_SHA (F1(a), box-8 r3: a same-version reinstall with a different sha
+# 5.1.0/059c658 -> 5.1.0/87e783b is a REAL upgrade, but a VERSION-only gate
+# skipped it and left the pre-H1 daemon wedged). NOT a comment-marker heuristic
+# — the marker keys on disk contents while the LIVE daemon is a separate
+# generation. On a change we recycle tailscaled unconditionally: exact-token
+# select, SIGTERM, poll up to 10s, SIGKILL, verify gone; the normal `boxup once`
+# below restarts it via the flock --close path. ~5s connectivity blip, bounded.
+# Runs once per upgrade, never in a tick; no sentinel file. (NB: F1(b) also
+# VERSIONS the lock path — converge.v2.lock — so even if this recycle is somehow
+# skipped, a v2 tick flocks a different file and an inherited pre-H1 daemon can
+# no longer wedge it. Belt AND braces.)
 STATE_DIR_MIG="$DEST/state/tailscale"
 installed_ver=""; [ -f "$DEST/VERSION" ] && installed_ver="$(tr -d '[:space:]' < "$DEST/VERSION" 2>/dev/null || true)"
 new_ver=""; [ -f "$REPO_ROOT/VERSION" ] && new_ver="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
-if [ -f "$DEST/boxup" ] && [ -n "$new_ver" ] && [ "$installed_ver" != "$new_ver" ]; then
-  log "E1 migration: version change ${installed_ver:-none} -> $new_ver — recycling tailscaled to clear any inherited converge-lock wedge"
+installed_sha=""; [ -f "$DEST/GIT_SHA" ] && installed_sha="$(tr -d '[:space:]' < "$DEST/GIT_SHA" 2>/dev/null || true)"
+# The new sha: fleetctl rollout sets $BOX_SETUP_GIT_SHA (git archive has no
+# .git); else rev-parse the source tree (a `boxup update` clone has .git).
+new_sha="${BOX_SETUP_GIT_SHA:-}"
+[ -n "$new_sha" ] || new_sha="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ -f "$DEST/boxup" ] && { { [ -n "$new_ver" ] && [ "$installed_ver" != "$new_ver" ]; } \
+     || { [ "$new_sha" != unknown ] && [ "$installed_sha" != "$new_sha" ]; }; }; then
+  log "E1 migration: build change ver ${installed_ver:-none}->${new_ver:-?} sha ${installed_sha:-none}->${new_sha} — recycling tailscaled to clear any inherited converge-lock wedge"
   bash "$DEST/boxup" stop >/dev/null 2>&1 || true
   for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
     # Exact-token match: split argv on NULs, require a LITERAL
