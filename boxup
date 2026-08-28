@@ -131,7 +131,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 run_with_converge_lock() {
   local mode="$1" fn="$2" rc
   if ! have flock; then
-    "$fn"; return
+    # D2: no flock ⇒ we CANNOT guarantee mutual exclusion, so we REFUSE rather
+    # than run the body unlocked (an unlocked converge/tick defeats D3 and can
+    # race a concurrent one). install.sh asserts util-linux flock exists, so
+    # this is a broken-install guard, not an expected path.
+    log "converge-lock: flock not found (util-linux required) — REFUSING to run unlocked (D2)" >&2
+    case "$mode" in try) return 200 ;; *) return 201 ;; esac
   fi
   (
     if ! { exec 9>"$CONVERGE_LOCK"; } 2>/dev/null; then
@@ -174,14 +179,20 @@ run_with_converge_lock() {
   return "$rc"
 }
 
-# H2 (TRANSITIONAL — removable once the whole fleet runs this version): on
-# try-mode lock contention, look for a tailscaled that inherited the converge
-# lock from the OLD daemon and is holding it for life. Act ONLY when the holder
-# is a `tailscaled` process, running on OUR $STATE_DIR, that actually has the
-# lock file open (matched by dev+inode, not path string). Exclude self and our
-# ancestry. When found, RECYCLE it (recycle_tailscaled releases the lock by
-# restarting the daemon through the flock --close path); do NOT run a tick
-# unlocked, and NEVER touch a process that merely has the file open.
+# H2 (TRANSITIONAL — D3 removal condition: remove this function once NO
+# pre-hotfix boxup/tailscaled process remains on ANY box, verified fleet-wide
+# with `pgrep -af boxup` / daemon start-times all POST-DATING this version's
+# install — NOT merely "the fleet runs this version" (a box can run the new
+# boxup while an OLD leaked tailscaled from before the upgrade is still alive
+# holding the inherited fd)): on try-mode lock contention, look for a tailscaled
+# that inherited the converge lock from the OLD daemon and is holding it for
+# life. Act ONLY when the holder is a `tailscaled` process, running on OUR
+# $STATE_DIR, that actually has the lock file open (matched by dev+inode, not
+# path string), AND is not legitimately mid-login (D3 kill guard below).
+# Exclude self and our ancestry. When found, RECYCLE it (recycle_tailscaled
+# releases the lock by restarting the daemon through the flock --close path);
+# do NOT run a tick unlocked, and NEVER touch a process that merely has the file
+# open.
 recover_legacy_wedged_lock() {
   local dev ino st pid comm cmd fd lstat found=""
   st="$(stat -c '%d %i' "$CONVERGE_LOCK" 2>/dev/null || true)"
@@ -204,6 +215,31 @@ recover_legacy_wedged_lock() {
     [ -n "$found" ] && break
   done
   [ -n "$found" ] || return 1
+
+  # D3 kill guard: a matching daemon holding the lock is only a LEGACY WEDGE if
+  # it is not legitimately mid-login. Skip the recycle (and just skip the tick)
+  # when any of these hold — recycling then would stomp a genuine first-login /
+  # re-auth in progress:
+  #   * statedir empty            → first login, not a wedge (nothing to lose to
+  #                                 a restart, but a restart would abort the join)
+  #   * a `tailscale up` in flight → login/re-auth actively running
+  #   * BackendState NeedsLogin/Starting → login transition underway
+  if ! state_is_populated; then
+    log "tick: legacy-wedge candidate pid=$found but statedir is empty (first login) — NOT recycling, skipping tick" >&2
+    return 1
+  fi
+  if pgrep -af 'tailscale.* up( |$)' 2>/dev/null | grep -q -- 'up'; then
+    log "tick: legacy-wedge candidate pid=$found but a 'tailscale up' is in flight — NOT recycling, skipping tick" >&2
+    return 1
+  fi
+  read_ts_fields
+  case "$backend" in
+    NeedsLogin|Starting)
+      log "tick: legacy-wedge candidate pid=$found but backend=$backend (login transition) — NOT recycling, skipping tick" >&2
+      return 1
+      ;;
+  esac
+
   log "tick: LEGACY wedge — tailscaled pid=$found (our statedir) holds the converge lock from a pre-hotfix daemon; recycling to release it (transitional)" >&2
   recycle_tailscaled "legacy converge-lock wedge (pid=$found) — recycle to release inherited fd"
   return 0
@@ -307,28 +343,59 @@ account_unlocked() {
   return 1   # cannot prove it is unlocked → treat as not-unlocked (fail-safe)
 }
 
+# H12: the LOGIN postcondition, probed CHEAPLY (read-only: passwd -S + one
+# stat, NO chpasswd / keygen). do_tick historically only restarted a DEAD sshd,
+# so a LOCKED account or WIPED host keys (image swap / tamper) waited for the
+# hourly `boxup once` (box-8 Stage 1). This lets the 15s tick re-assert the
+# postcondition and repair via ensure_sshd, at ~0 cost when healthy.
+#   * box (and root when present) have a usable password (account_unlocked, H7)
+#   * at least one host key on disk — /etc/ssh/ssh_host_ed25519_key, the SAME
+#     file ensure_host_keys treats as the presence marker, so "present" means
+#     "sshd can start with OUR persisted identity", not "some file exists".
+host_keys_present() {
+  [ -s /etc/ssh/ssh_host_ed25519_key ]
+}
+
+login_postcondition_ok() {
+  id box >/dev/null 2>&1 || return 1          # box account must exist (D8)
+  account_unlocked box || return 1
+  if id root >/dev/null 2>&1; then
+    account_unlocked root || return 1
+  fi
+  host_keys_present || return 1
+  return 0
+}
+
 # H11: classify the seeded auth key's expiry from $AUTHKEY_EXPIRES (a single
 # ISO date YYYY-MM-DD). Prints exactly one of:
-#   none    — no file, unreadable, or unparseable date (FAIL-QUIET: no warning)
-#   ok      — expires in > 14 days
-#   warn    — expires within 14 days (inclusive), not yet past
+#   unknown — no file, unreadable, or unparseable date. D6: this is NOT silent
+#             — status shows authkey=unknown-expiry and check WARNs once/hour
+#             (still NOT a FAIL: the key may well be valid, we just can't prove
+#             it, and an unattended box must not be failed for a missing sidecar
+#             the operator hasn't seeded yet).
+#   ok      — expires in > 7 days
+#   warn    — expires within 7 days (inclusive), not yet past
 #   expired — the date is in the past
-# Days are compared at UTC date granularity. This is the one mechanism; both
-# `boxup check` and `boxup status` consume it.
+# D6: the warn window is 7 days (was 14). Rationale: it is one full hourly-
+# automation-driven day of margin beyond a typical operator's weekly cadence,
+# and it matches the "about a week" urgency band Tailscale itself uses for key-
+# expiry notifications; 14 days produced a fortnight of steady-state warning
+# noise for no added recoverability. Days compared at UTC granularity. One
+# mechanism; both `boxup check` and `boxup status` consume it.
 authkey_expiry_state() {
   local raw exp_epoch now_epoch days
-  [ -f "$AUTHKEY_EXPIRES" ] || { echo none; return 0; }
+  [ -f "$AUTHKEY_EXPIRES" ] || { echo unknown; return 0; }
   raw="$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null || true)"
   case "$raw" in
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
-    *) echo none; return 0 ;;   # unparseable => fail-quiet
+    *) echo unknown; return 0 ;;   # unparseable => unknown (not silent)
   esac
   exp_epoch="$(date -u -d "$raw" +%s 2>/dev/null || true)"
-  case "$exp_epoch" in ''|*[!0-9]*) echo none; return 0 ;; esac
+  case "$exp_epoch" in ''|*[!0-9]*) echo unknown; return 0 ;; esac
   now_epoch="$(date -u +%s)"
   if [ "$now_epoch" -ge "$exp_epoch" ]; then echo expired; return 0; fi
   days=$(( (exp_epoch - now_epoch) / 86400 ))
-  if [ "$days" -lt 14 ]; then echo warn; else echo ok; fi
+  if [ "$days" -lt 7 ]; then echo warn; else echo ok; fi
 }
 
 # --- tailscale binaries ------------------------------------------------------
@@ -685,10 +752,12 @@ ensure_sshd() {
       # Reload only on config change; a HUP every tick churns sshd for nothing.
       [ "$changed" = 1 ] && kill -HUP "$(pgrep -n -x sshd)" 2>/dev/null || true
     else
-      # F7/P0-A: sshd self-daemonizes and would keep an inherited converge-lock
-      # fd open for life (ensure_sshd runs inside the fd-8 lock subshell via
-      # do_ensure_body). Spawn through spawn_detached so it inherits neither
-      # lock fd — same failure class as the tailscaled leak.
+      # H9/D4: route sshd's spawn through spawn_detached for CONSISTENCY and
+      # defense-in-depth — every long-lived spawn goes through one helper that
+      # closes the converge-lock fd (fd 9). NB: a self-daemonizing sshd already
+      # drops inherited fds on its own, and since H1 the converge body runs with
+      # the lock fd closed anyway (flock --close), so sshd was never a CONFIRMED
+      # leak — this is belt-and-braces, not a fix for an observed sshd bug.
       spawn_detached "" /usr/sbin/sshd || true
     fi
   fi
@@ -813,19 +882,21 @@ NFT
 # --- converge: detached long-lived spawns (F7 / #7 + addendum P0-A) ----------
 # THE ONE place that spawns a long-lived, detached child. Every long-lived
 # process boxup starts — tailscaled, sshd (both spawn sites), and the worker —
-# MUST go through here so it inherits NEITHER converge-lock fd. #7 happened
-# because the fd-close was an unenforced per-site convention (the old comment
-# even claimed a close that the code did not do); a hand-appended `8>&- 9>&-`
-# at each call site is exactly how it survived review. One helper = one place
-# to be right, one place to review.
+# goes through here (H9). Since H1 the converge lock is flock --close, so the
+# body already runs with the lock fd CLOSED — this helper is DEFENSE-IN-DEPTH
+# and consistency (one place any future spawn is guaranteed clean), NOT the
+# load-bearing #7 fix. A lint/test rule fails if setsid/nohup/disown appears
+# outside this function.
 #
-# Closes BOTH lock fds on the child:
-#   * fd 8 -> $CONVERGE_LOCK — held by run_with_converge_lock while do_ensure_body
-#     / do_tick run; a child that keeps it holds the converge flock for life and
-#     starves every later tick (the #7 failure, byte-for-byte).
-#   * fd 9 -> $START_LOCK — the tailscaled fork window.
-# Both are write fds, so both closes use `>&-`. setsid -f fully detaches
-# (new session, no controlling tty) so the child outlives this shell.
+# Closes both fds boxup ever flocks, so a child inherits neither regardless of
+# what the caller held:
+#   * fd 9 -> $CONVERGE_LOCK (H1) and $START_LOCK (start_tailscaled's fork
+#     window) — both use fd 9, at different times/subshells.
+#   * fd 8 -> historical converge-lock fd (pre-H1); closed too so a LEGACY
+#     daemon's inherited fd 8 is never propagated further during the transition.
+# All are write fds, so closes use `>&-`. setsid -f fully detaches (new session,
+# no controlling tty) so the child outlives this shell. NB: a self-daemonizing
+# child (sshd) drops fds on its own anyway — the close here is belt-and-braces.
 #
 # Usage: spawn_detached <logfile|""> <cmd> [args...]
 #   logfile: append target for the child's stdout+stderr; "" -> /dev/null.
@@ -1023,7 +1094,7 @@ ensure_login() {
     # of rc — a rc=0 `up` that only printed an AuthURL must not license another
     # attempt next tick.
     if ! reauth_attempt_allowed; then
-      log "login: NeedsLogin but re-auth attempt rate-limited (min ${REAUTH_MIN_INTERVAL}s between attempts, max ${REAUTH_MAX_PER_HOUR}/hour) — skipping this tick" >&2
+      log "login: NeedsLogin but re-auth attempt rate-limited (min ${REAUTH_MIN_INTERVAL}s between attempts) — skipping this tick" >&2
       return 0
     fi
     reauth_attempt_record
@@ -1190,59 +1261,35 @@ refresh_backoff_window() {
 # backoff off rc, but a rc=0 `up` (which returns success while merely PRINTING
 # an AuthURL that no human clicks) reset the counter and left a 20s floor —
 # ~180 attempts/hour. This is a SEPARATE limiter from the D4 failure backoff:
-# it bounds ATTEMPTS regardless of rc.
-#   * hard minimum 30 min between attempts (REAUTH_MIN_INTERVAL)
-#   * absolute cap per rolling hour (REAUTH_MAX_PER_HOUR)
-# Both persisted under $RUN_DIR (ephemeral: a reboot/swap legitimately resets,
-# which is fine — a fresh box may attempt once immediately).
+# it bounds ATTEMPTS regardless of rc, with ONE mechanism:
+#   * a hard minimum interval between attempts (REAUTH_MIN_INTERVAL, 30 min).
+# D6: the earlier per-hour cap was DROPPED as redundant — at the default floor
+# a 30-min minimum already permits at most 2 attempts/hour, so a separate hourly
+# cap adds a second knob that can never bind before the floor does. One knob.
+# Why 30 min: it is comfortably above any tailscale control-plane rate-limit
+# headroom for `up`, and it is > half the hourly-automation period (the external
+# `boxup once` runs hourly), so the hourly `once` and a 15s worker tick can
+# never double-fire a re-auth for the same outage. Persisted under $RUN_DIR
+# (ephemeral: a reboot/swap legitimately resets, so a fresh box may attempt once
+# immediately — which is correct).
 REAUTH_LAST="$RUN_DIR/last-reauth"          # unix ts of the last ATTEMPT
-REAUTH_HOUR="$RUN_DIR/reauth-hour"          # "<hour_start_ts> <count>"
 REAUTH_MIN_INTERVAL="${BOXUP_REAUTH_MIN_INTERVAL:-1800}"   # 30 min
-REAUTH_MAX_PER_HOUR="${BOXUP_REAUTH_MAX_PER_HOUR:-3}"
 
-# 0 (proceed) iff BOTH limiters allow an attempt now; else 1. Read-only — the
-# caller calls reauth_attempt_record() only when it actually attempts.
+# 0 (proceed) iff we are outside the min-interval floor; else 1. Read-only —
+# the caller calls reauth_attempt_record() only when it actually attempts.
 reauth_attempt_allowed() {
-  local now last hstart hcount
+  local now last
   now=$(date +%s)
   last=0
   [ -f "$REAUTH_LAST" ] && last=$(tr -d '[:space:]' < "$REAUTH_LAST" 2>/dev/null || echo 0)
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
-  if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$REAUTH_MIN_INTERVAL" ]; then
-    return 1   # inside the 30-min floor
-  fi
-  hstart=0; hcount=0
-  if [ -f "$REAUTH_HOUR" ]; then
-    read -r hstart hcount < "$REAUTH_HOUR" 2>/dev/null || { hstart=0; hcount=0; }
-  fi
-  case "$hstart" in ''|*[!0-9]*) hstart=0 ;; esac
-  case "$hcount" in ''|*[!0-9]*) hcount=0 ;; esac
-  # Same rolling hour AND already at the cap ⇒ deny.
-  if [ "$hstart" -gt 0 ] && [ $((now - hstart)) -lt 3600 ] \
-     && [ "$hcount" -ge "$REAUTH_MAX_PER_HOUR" ]; then
-    return 1
-  fi
-  return 0
+  [ "$last" -le 0 ] && return 0
+  [ $((now - last)) -ge "$REAUTH_MIN_INTERVAL" ]
 }
 
-# Record that an attempt happened NOW (regardless of its rc). Advances both the
-# min-interval stamp and the per-hour counter (rolling the window when >1h old).
+# Record that an attempt happened NOW (regardless of its rc).
 reauth_attempt_record() {
-  local now hstart hcount
-  now=$(date +%s)
-  echo "$now" > "$REAUTH_LAST" 2>/dev/null || true
-  hstart=0; hcount=0
-  if [ -f "$REAUTH_HOUR" ]; then
-    read -r hstart hcount < "$REAUTH_HOUR" 2>/dev/null || { hstart=0; hcount=0; }
-  fi
-  case "$hstart" in ''|*[!0-9]*) hstart=0 ;; esac
-  case "$hcount" in ''|*[!0-9]*) hcount=0 ;; esac
-  if [ "$hstart" -le 0 ] || [ $((now - hstart)) -ge 3600 ]; then
-    hstart="$now"; hcount=1          # new rolling hour
-  else
-    hcount=$((hcount + 1))
-  fi
-  echo "$hstart $hcount" > "$REAUTH_HOUR" 2>/dev/null || true
+  date +%s > "$REAUTH_LAST" 2>/dev/null || true
 }
 
 # Push a full `tailscale set` when the coordination server would show "unable
@@ -1501,11 +1548,20 @@ do_tick() {
   ensure_forwarding || true
   ensure_nat || true
 
+  # H12: re-assert the LOGIN postcondition every tick, not just hourly. do_tick
+  # historically only restarted a DEAD sshd; a LOCKED account or WIPED host keys
+  # (image swap / tamper — box-8 Stage 1) otherwise waited for the hourly
+  # `boxup once`, while `check` (pre-H7) lied. Cheap probe first (passwd -S +
+  # one stat, ~0 cost when healthy); run the full ensure_sshd (chpasswd +
+  # host-key restore + config + spawn) ONLY when sshd is down OR a login
+  # postcondition has failed. Runs INSIDE this tick's converge lock (H3 — no
+  # unlocked work). ensure_sshd is idempotent and spawns via spawn_detached.
   if ! pgrep -x sshd >/dev/null 2>&1; then
-    # F7/P0-A: do_tick runs under `run_with_converge_lock try`, so this spawn is
-    # inside the fd-8 lock subshell too — route through spawn_detached so sshd
-    # inherits neither lock fd (see ensure_sshd for the same reason).
-    [ -x /usr/sbin/sshd ] && { spawn_detached "" /usr/sbin/sshd || true; }
+    log "tick: sshd down — running ensure_sshd" >&2
+    ensure_sshd || true
+  elif ! login_postcondition_ok; then
+    log "tick: login postcondition FAILED (box/root locked or host keys missing) — running ensure_sshd (H12)" >&2
+    ensure_sshd || true
   fi
 
   case "$(read_box_name || true)" in
@@ -1673,6 +1729,7 @@ print_status() {
   case "$akx" in
     warn)    printf ' authkey=expiring:%s' "$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)" ;;
     expired) printf ' authkey=EXPIRED:%s' "$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)" ;;
+    unknown) printf ' authkey=unknown-expiry' ;;
   esac
   printf '\n'
 }
@@ -1704,9 +1761,14 @@ do_check() {
   if [ -z "$reason" ] && ! pgrep -x sshd >/dev/null 2>&1; then
     reason="sshd=down (want up)"
   fi
-  # H7 (P0): sshd running is not a working login. Verify box (and root, when it
-  # exists) actually have a usable password — the resurrection-path invariant.
-  if [ -z "$reason" ] && id box >/dev/null 2>&1 && ! account_unlocked box; then
+  # H7 (P0): sshd running is not a working login. Verify the login accounts
+  # actually have a usable password — the resurrection-path invariant.
+  # D8: `box` is THE login account; a MISSING box account is a FAILURE, not a
+  # skip (the old `id box && ...` silently passed a box with no box account).
+  if [ -z "$reason" ] && ! id box >/dev/null 2>&1; then
+    reason="login: box account missing"
+  fi
+  if [ -z "$reason" ] && ! account_unlocked box; then
     reason="account box=locked (sshd up but no usable login)"
   fi
   if [ -z "$reason" ] && id root >/dev/null 2>&1 && ! account_unlocked root; then
@@ -1757,9 +1819,25 @@ do_check() {
   fi
   # H11: an EXPIRED auth key means the box's only unattended recovery path is
   # dead — it is not healthy, it just hasn't needed to recover yet. Fail check.
-  # (A key expiring soon is a WARNING, surfaced below, not a check failure.)
-  if [ -z "$reason" ] && [ "$(authkey_expiry_state)" = expired ]; then
+  # (A key expiring soon is a WARNING surfaced in status, not a check failure.)
+  # D6: an UNKNOWN expiry (missing/unparseable .expires sidecar) is NOT a FAIL
+  # — the key may be valid, we just can't prove it — but it is NOT silent
+  # either: WARN once per hour so a never-seeded sidecar stays visible.
+  local akx_check
+  akx_check="$(authkey_expiry_state)"
+  if [ -z "$reason" ] && [ "$akx_check" = expired ]; then
     reason="authkey EXPIRED ($(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)) — unattended recovery path is dead"
+  fi
+  if [ "$akx_check" = unknown ]; then
+    local uxlog now_u last_u
+    uxlog="$RUN_DIR/last-authkey-unknown.log"
+    now_u=$(date +%s); last_u=0
+    [ -f "$uxlog" ] && last_u=$(tr -d '[:space:]' < "$uxlog" 2>/dev/null || echo 0)
+    case "$last_u" in ''|*[!0-9]*) last_u=0 ;; esac
+    if [ $((now_u - last_u)) -ge 3600 ]; then
+      echo "$now_u" > "$uxlog" 2>/dev/null || true
+      log "check: WARN authkey expiry unknown ($AUTHKEY_EXPIRES missing or unparseable) — seed it (see docs/AGENT.md §A); key may still be valid, not failing check" >&2
+    fi
   fi
 
   if [ -n "$reason" ]; then

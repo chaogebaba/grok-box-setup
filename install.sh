@@ -38,6 +38,17 @@ fi
 
 log "repo=$REPO_ROOT dest=$DEST"
 
+# D2: the converge lock requires util-linux flock. Without it boxup would have
+# to run converges/ticks UNLOCKED (mutual exclusion lost) — boxup now REFUSES
+# that at runtime, so a box with no flock cannot converge at all. Fail the
+# install loudly rather than deploy a box that can never self-heal.
+if ! command -v flock >/dev/null 2>&1; then
+  echo "install: FATAL — util-linux 'flock' not found. boxup's converge lock" >&2
+  echo "install: requires it; without flock boxup refuses to run (D2). Install" >&2
+  echo "install: util-linux (apt-get install -y util-linux) and re-run." >&2
+  exit 1
+fi
+
 # Stop the old worker BEFORE replacing files: the running copy knows its own
 # argv shape best. boxup's own reaper also recognizes v4 workers as a backstop.
 if [ -x "$DEST/box-bootstrap.sh" ] && [ ! -f "$DEST/boxup" ]; then
