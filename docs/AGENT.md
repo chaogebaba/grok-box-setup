@@ -73,6 +73,12 @@ sudo /workspace/box-setup/boxup once
 > ```
 > A `DONE (rc=0)` line means the detached install completed cleanly; `rc=201`
 > means the converge lock was busy (retry `boxup once` — NOT a fake success).
+> (History: before 5.2.0 a clean `boxup once` exited **rc=1** — its `once)`/`up)`
+> arms ended on a bare `[ "$_rc" = 201 ] && exit …` test that, on a healthy
+> converge (`_rc=0`), left the arm's status at 1 (no `set -e`). This was a
+> trailing-conditional bug, NOT a `run_tick` converge race — `run_tick` always
+> returns 0. Fixed in 5.2.0: both arms now `exit 0` on the clean path and only
+> propagate 201, so a clean detached install logs `DONE (rc=0)`.)
 > (History, box-8 r4: before F4 the recycle ran inline in the SSH session, so
 > the SIGTERM dropped the tailnet, killed the SSH session, and killed install.sh
 > before it could restart tailscaled — the box sat offline 25+ min. That is what
@@ -90,7 +96,7 @@ sudo /workspace/box-setup/boxup check   # exit 0 healthy / 1 unhealthy (never 2)
 healthy, else exit 1 and `check=FAIL reason=<first-failed-predicate>`.
 
 Healthy: `backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1`
-with numeric pids and a small `hb=` age (≤ ~30s), and `v=5.1.0/<sha>`.
+with numeric pids and a small `hb=` age (≤ ~30s), and `v=5.2.0/<sha>`.
 Cross-check from another machine on the tailnet: `tailscale ping grok-box-N`
 and `ssh box@grok-box-N` (password from config.toml, default `12345678`).
 
@@ -141,7 +147,7 @@ sudo /workspace/box-setup/box-bootstrap.sh --once
 
 That shim calls `boxup once`. It is the resurrection path after an image
 swap — do not rename or remove either file. The two shim files
-(`box-bootstrap.sh`, `boxup`) live in `/workspace/box-setup/` only; **v5.1.0
+(`box-bootstrap.sh`, `boxup`) live in `/workspace/box-setup/` only; **v5.2.0
 installs NOTHING in `/usr/local/sbin`** (the old v4 layout put helper shims
 there — install.sh now actively removes them). Do not look for or recreate
 `/usr/local/sbin` shims; they are not part of v5.
