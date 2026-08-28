@@ -55,7 +55,7 @@ machine on the tailnet: `tailscale ping grok-box-N` and
 | Symptom | Meaning | Do |
 |---|---|---|
 | `auth=` URL in status | box needs (re-)login | relay URL to the human, then `boxup once` |
-| `backend=NeedsLogin`, no URL | login flow not started | `boxup once` |
+| `backend=NeedsLogin`, no URL | node needs (re-)login: first login (empty statedir) or expired/deleted node key (populated statedir) | `boxup once` — starts login/re-auth in both cases (populated statedir re-auths with `--force-reauth`; a seeded auth-key may complete with no URL); if `boxup status` then shows `auth=`, relay that URL |
 | `online=no` for >1 min | map poll died (freeze) | wait one worker tick (15s); else `boxup once` |
 | `exit-node=no` | prefs lost after swap | `boxup once` (refresh pushes full `tailscale set`) |
 | `sshd=down` or login refused | swap wiped shadow/config | `boxup once` re-applies password + drop-in |
