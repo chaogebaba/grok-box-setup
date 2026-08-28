@@ -50,7 +50,9 @@ SECRETS_DIR="$ROOT/secrets"
 AUTHKEY_FILE="$SECRETS_DIR/ts-authkey"
 # H11: optional sidecar recording the auth key's expiry (single ISO date
 # YYYY-MM-DD). Tailscale keys expire (<=90d) and the date is NOT recoverable
-# from the key itself, so it must be recorded next to it. Missing = fail-quiet.
+# from the key itself, so it must be recorded next to it. Missing/unparseable
+# WHILE a key exists => status authkey=unknown-expiry + a once/hour check WARN
+# (D6, not silent, not a FAIL); absent ts-authkey entirely => none (no warn).
 AUTHKEY_EXPIRES="$SECRETS_DIR/ts-authkey.expires"
 BIN_DIR="$ROOT/bin"
 CONFIG_FILE="${BOX_SETUP_CONFIG:-$ROOT/config.toml}"
@@ -297,22 +299,28 @@ host_keys_present() {
 
 # H11: classify the seeded auth key's expiry from $AUTHKEY_EXPIRES (a single
 # ISO date YYYY-MM-DD). Prints exactly one of:
-#   unknown — no file, unreadable, or unparseable date. D6: this is NOT silent
-#             — status shows authkey=unknown-expiry and check WARNs once/hour
-#             (still NOT a FAIL: the key may well be valid, we just can't prove
-#             it, and an unattended box must not be failed for a missing sidecar
-#             the operator hasn't seeded yet).
+#   none    — no auth key present at all ($AUTHKEY_FILE absent). A box run via
+#             the AuthURL dance legitimately has no key; do NOT warn about the
+#             expiry of a key that does not exist. (P2-7)
+#   unknown — a key EXISTS but $AUTHKEY_EXPIRES is missing/unreadable/unparseable.
+#             D6: NOT silent — status shows authkey=unknown-expiry and check
+#             WARNs once/hour — but NOT a FAIL (the key may be valid; an
+#             unattended box must not fail for a sidecar the operator hasn't
+#             seeded yet).
 #   ok      — expires in > 7 days
 #   warn    — expires within 7 days (inclusive), not yet past
 #   expired — the date is in the past
-# D6: the warn window is 7 days (was 14). Rationale: it is one full hourly-
-# automation-driven day of margin beyond a typical operator's weekly cadence,
-# and it matches the "about a week" urgency band Tailscale itself uses for key-
-# expiry notifications; 14 days produced a fortnight of steady-state warning
-# noise for no added recoverability. Days compared at UTC granularity. One
-# mechanism; both `boxup check` and `boxup status` consume it.
+# Warn window = 7 days. Honest rationale: it is one weekly operator pass of
+# margin — nothing authoritative backs a specific number (Tailscale's own
+# KeyExpirationNotice defaults to 24h, which is far too short for an unattended
+# fleet with a weekly human cadence). 14d produced a fortnight of steady-state
+# noise for no added recoverability; 7d is the smallest window a weekly pass
+# reliably catches. Days compared at UTC granularity. One mechanism; both
+# `boxup check` and `boxup status` consume it.
 authkey_expiry_state() {
   local raw exp_epoch now_epoch days
+  # P2-7: no key => none (no warning; URL-dance boxes are legitimate).
+  [ -s "$AUTHKEY_FILE" ] || { echo none; return 0; }
   [ -f "$AUTHKEY_EXPIRES" ] || { echo unknown; return 0; }
   raw="$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null || true)"
   case "$raw" in
@@ -856,12 +864,12 @@ spawn_detached() {
 # --- converge: tailscaled ----------------------------------------------------
 # Exactly one daemon, bound to the workspace statedir. Kill strays (dpkg's
 # default unit uses /var/lib/tailscale) by PID, never pkill -f.
-# F7 (#7): the daemon is spawned via spawn_detached, which closes BOTH lock fds
-# (fd 8 $CONVERGE_LOCK + fd 9 $START_LOCK). start_tailscaled is reachable from
-# under the converge lock (do_tick/do_ensure_body run it while holding fd 8),
-# so a daemon inheriting fd 8 would hold the converge flock for its ENTIRE life
-# — every later `run_tick` then loses `flock -n 8` and logs "converge already
-# running — skipping" forever (observed 256 skips / 77 min on box-8).
+# F7 (#7) history: the daemon is spawned via spawn_detached, which closes the
+# lock fds belt-and-braces. Since H1 the converge lock is fd 9 held under
+# flock --close (the body runs with it already closed), so a daemon can no
+# longer inherit it regardless — the pre-H1 failure was tailscaled inheriting
+# the then-fd-8 converge lock and holding it for life (observed 256 skips /
+# 77 min on box-8). The close in spawn_detached is now defense-in-depth.
 start_tailscaled() {
   local daemon pid cmd keep=""
   daemon="$(tailscaled_bin)"
@@ -1260,23 +1268,20 @@ refresh_backoff_window() {
 }
 
 # --- re-auth ATTEMPT limiter (H5) --------------------------------------------
-# A force-reauth ATTEMPT rewrites the node's registration against the control
-# plane; a storm of them is worse than the bug. The prior design keyed a
-# backoff off rc, but a rc=0 `up` (which returns success while merely PRINTING
-# an AuthURL that no human clicks) reset the counter and left a 20s floor —
-# ~180 attempts/hour. This is a SEPARATE limiter from the D4 failure backoff:
-# it bounds ATTEMPTS regardless of rc, with ONE mechanism:
-#   * a hard minimum interval between attempts (REAUTH_MIN_INTERVAL, 30 min).
-# D6: the earlier per-hour cap was DROPPED as redundant — at the default floor
-# a 30-min minimum already permits at most 2 attempts/hour, so a separate hourly
-# cap adds a second knob that can never bind before the floor does. One knob.
-# Why 30 min: it is comfortably above any tailscale control-plane rate-limit
-# headroom for `up`, and 1800s == the hourly-automation period / 2, so the
-# hourly external `boxup once` and a 15s worker tick can never double-fire a
-# re-auth for the same outage (two attempts can't fall inside one 3600s period).
-# Persisted under $RUN_DIR
-# (ephemeral: a reboot/swap legitimately resets, so a fresh box may attempt once
-# immediately — which is correct).
+# A `tailscale up` ATTEMPT (first-login OR force-reauth) rewrites registration
+# against the control plane; a storm is worse than the bug. The prior design
+# keyed a backoff off rc, but a rc=0 `up` that only PRINTED an AuthURL reset the
+# counter and left a 20s floor (~180 attempts/hour). ONE mechanism now, separate
+# from the D4 refresh backoff: a hard minimum interval between attempts
+# (REAUTH_MIN_INTERVAL, 30 min), rc-independent. (N1/D6: an earlier per-hour cap
+# was removed as redundant — a 30-min floor already caps attempts at 2/hour, so
+# a second knob could never bind first.)
+# Why 30 min: comfortably above tailscale control-plane rate-limit headroom for
+# `up`, and 1800s == the hourly-automation period / 2, so the external hourly
+# `boxup once` and a 15s worker tick can never double-fire a re-auth for one
+# outage (two attempts can't fall inside one 3600s period). Persisted under
+# $RUN_DIR — ephemeral, so a reboot/swap legitimately resets and a fresh box may
+# attempt once immediately.
 REAUTH_LAST="$RUN_DIR/last-reauth"          # unix ts of the last ATTEMPT
 REAUTH_MIN_INTERVAL="${BOXUP_REAUTH_MIN_INTERVAL:-1800}"   # 30 min
 
