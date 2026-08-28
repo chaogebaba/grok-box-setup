@@ -56,6 +56,28 @@ sudo /workspace/box-setup/boxup once
 (Equivalent by hand: fresh `git clone` to a `mktemp -d`, then
 `sudo bash <tmp>/install.sh`.)
 
+> **The tailnet drops ~20s during an upgrade — this is expected, and it will
+> NOT strand the box (F4).** When the build changes, install.sh recycles
+> tailscaled to clear any inherited converge-lock wedge (E1), which briefly
+> drops the tailnet you are almost certainly SSH'd in over. install.sh handles
+> this itself: it copies every file, then runs the disruptive tail (recycle +
+> restart + `boxup once`) inside a **session-detached, HUP-immune** process
+> (progress logged to `/var/log/boxup-install.log`), and the foreground command
+> returns 0 **immediately** with a line like `install: the tailnet will drop for
+> ~20s ...`. So your SSH session dying mid-upgrade no longer kills the upgrade —
+> the detached installer finishes on its own and restarts tailscaled. Just
+> **reconnect after ~20–30s and confirm**:
+> ```bash
+> sudo /workspace/box-setup/boxup status    # v= should show the new version/sha
+> sudo tail -n 40 /var/log/boxup-install.log # ends with 'install: DONE (rc=0)'
+> ```
+> A `DONE (rc=0)` line means the detached install completed cleanly; `rc=201`
+> means the converge lock was busy (retry `boxup once` — NOT a fake success).
+> (History, box-8 r4: before F4 the recycle ran inline in the SSH session, so
+> the SIGTERM dropped the tailnet, killed the SSH session, and killed install.sh
+> before it could restart tailscaled — the box sat offline 25+ min. That is what
+> the detach fixes; do not "simplify" install.sh back to an inline recycle.)
+
 ## C. Verify health
 
 ```bash
