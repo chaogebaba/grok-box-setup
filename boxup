@@ -853,6 +853,31 @@ tailscale_set_full() {
     --stateful-filtering=false
 }
 
+# Refresh-failure backoff (D4). A persistently failing `tailscale set` used to
+# retry on EVERY 15s tick forever (last-set is stamped only on success), with
+# no escalation and no status visibility. Now consecutive failures stretch the
+# effective rate-limit window 20s -> 60s -> 180s -> cap 600s; a success resets
+# both the counter and the window. There is NO permanent give-up.
+#
+# fail.refresh holds the consecutive-failure count (run dir; reset free on
+# recycle/boot). The window is a pure function of that count:
+refresh_fail_count() {
+  local n=0
+  [ -f "$RUN_DIR/fail.refresh" ] && \
+    n=$(tr -d '[:space:]' < "$RUN_DIR/fail.refresh" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
+
+refresh_backoff_window() {
+  local n="$1"
+  if   [ "$n" -le 0 ]; then echo "$SET_MIN_INTERVAL"
+  elif [ "$n" -eq 1 ]; then echo 60
+  elif [ "$n" -eq 2 ]; then echo 180
+  else                      echo 600
+  fi
+}
+
 # Push a full `tailscale set` when the coordination server would show "unable
 # to relay traffic". Never `up`. Rate-limited: an unneeded set every tick
 # cancels PollNetMap and marks the node offline.
@@ -904,20 +929,39 @@ except Exception:
 
   [ "$need" = 1 ] || return 0
 
+  local fails window force=0
+  fails=$(refresh_fail_count)
+  window=$(refresh_backoff_window "$fails")
+
+  # BOXUP_FORCE_REFRESH=1 bypasses the backoff window exactly once (an operator
+  # escape hatch). It is NOT tied to `cmd == once` — the hourly automation runs
+  # `boxup once`, so a cmd-based bypass would reset backoff unattended (F6).
+  # sudo strips the var, so require_root whitelists it and D12 documents the
+  # working form: sudo env BOXUP_FORCE_REFRESH=1 /workspace/box-setup/boxup once
+  if [ "${BOXUP_FORCE_REFRESH:-}" = 1 ]; then
+    force=1
+    log "refresh: BOXUP_FORCE_REFRESH=1 — bypassing backoff window (${window}s, fails=${fails})"
+  fi
+
   now=$(date +%s)
-  if [ -f "$RUN_DIR/last-exitnode-set" ]; then
+  if [ "$force" = 0 ] && [ -f "$RUN_DIR/last-exitnode-set" ]; then
     last=$(cat "$RUN_DIR/last-exitnode-set" 2>/dev/null || echo 0)
     case "$last" in ''|*[!0-9]*) last=0 ;; esac
-    if [ $((now - last)) -lt "$SET_MIN_INTERVAL" ]; then
-      log "refresh: need set ($reason) but rate-limited"
+    if [ $((now - last)) -lt "$window" ]; then
+      log "refresh: need set ($reason) but rate-limited (window=${window}s fails=${fails})"
       return 0
     fi
   fi
   log "refresh: tailscale set ($reason) hostname=$name"
   if tailscale_set_full "$name"; then
     echo "$now" > "$RUN_DIR/last-exitnode-set" 2>/dev/null || true
+    # Success resets the failure counter and window.
+    echo 0 > "$RUN_DIR/fail.refresh" 2>/dev/null || true
   else
-    log "refresh: set failed" >&2
+    fails=$((fails + 1))
+    echo "$fails" > "$RUN_DIR/fail.refresh" 2>/dev/null || true
+    window=$(refresh_backoff_window "$fails")
+    log "refresh: set failed (consecutive=${fails}, next window=${window}s)" >&2
     return 1
   fi
 }
@@ -1201,6 +1245,11 @@ print_status() {
   printf 'backend=%s online=%s exit-node=%s sshd=%s ipfwd=4:%s,6:%s tailscaled=%s selfheal=%s worker=%s hb=%s name=%s v=%s' \
     "${backend:-unknown}" "${online:-no}" "${exitn:-no}" "$sshd" "$v4" "$v6" \
     "${ts_pid:--}" "${sh_pid:--}" "${sh_pid:--}" "$hb" "${name:--}" "$BOXUP_VERSION"
+  # refresh backoff visibility (D4): surface a persistently failing refresh only
+  # at N>=3 consecutive failures, so a healthy box's status line is unchanged.
+  local rf
+  rf=$(refresh_fail_count)
+  [ "$rf" -ge 3 ] && printf ' refresh=failing:%s' "$rf"
   [ -n "${auth:-}" ] && printf ' auth=%s' "$auth"
   printf '\n'
 }
@@ -1335,7 +1384,8 @@ require_root() {
         BOX_SETUP_CONFIG="${BOX_SETUP_CONFIG:-}" \
         BOX_SETUP_RUN="${BOX_SETUP_RUN:-}" \
         BOX_SETUP_LOG="${BOX_SETUP_LOG:-}" \
-        BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" bash "$SELF" "$@"
+        BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" \
+        BOXUP_FORCE_REFRESH="${BOXUP_FORCE_REFRESH:-}" bash "$SELF" "$@"
     fi
     log "boxup: need root" >&2
     exit 1
