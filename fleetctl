@@ -834,31 +834,43 @@ api_token() {
   tr -d '[:space:]' < "$f"
 }
 
-# ts_api <method> <path> [json-body] -> response body on stdout; sets the
-# global TS_API_CODE to the HTTP status. Non-2xx is NOT fatal here — the caller
-# decides (S3: any non-2xx makes the run READ-ONLY). The token is passed via
-# the CURL_TOKEN env in a header, never argv (never visible in ps/logs).
+# ts_api <method> <path> [json-body]: perform the request. The response BODY is
+# written to $TS_API_LAST_BODY and the HTTP status to $TS_API_CODE. It ALSO
+# echoes the body on stdout for convenience — BUT because a `$(...)` capture
+# runs in a subshell where the TS_API_CODE global assignment would be LOST, the
+# reliable pattern for callers that need the code is:
+#     ts_api GET /path            # no $() capture
+#     [ "$TS_API_CODE" -ge 200 ] && body="$(ts_api_body)"
+# ts_api_body reads the file, so it survives the subshell problem. The token is
+# passed via an Authorization header (env-fed), never on argv (never in ps/logs).
 TS_API_CODE=0
+TS_API_LAST_BODY=""
 ts_api() {
-  local method="$1" path="$2" body="${3:-}" tok tmp code
+  local method="$1" path="$2" body="${3:-}" tok code
   have curl || { log "api: curl not found"; TS_API_CODE=0; return 1; }
   tok="$(api_token)" || { TS_API_CODE=0; return 1; }
-  tmp="$(mktemp)" || return 1
+  [ -n "$TS_API_LAST_BODY" ] || TS_API_LAST_BODY="$(mktemp)"
   local -a args=(-fsS -X "$method" --max-time 30
-    -o "$tmp" -w '%{http_code}'
+    -o "$TS_API_LAST_BODY" -w '%{http_code}'
     -H "Authorization: Bearer $tok")
   if [ -n "$body" ]; then
     args+=(-H "Content-Type: application/json" -d "$body")
   fi
   # -f makes curl exit non-zero on HTTP >=400 but -w still prints the code; we
   # read the code from -w regardless of curl's own rc.
-  code="$(CURL_TOKEN="$tok" curl "${args[@]}" "$TS_API$path" 2>/dev/null || true)"
+  code="$(curl "${args[@]}" "$TS_API$path" 2>/dev/null || true)"
   case "$code" in ''|*[!0-9]*) code=0 ;; esac
   TS_API_CODE="$code"
-  cat "$tmp"
-  rm -f "$tmp"
+  cat "$TS_API_LAST_BODY" 2>/dev/null
   [ "$code" -ge 200 ] && [ "$code" -lt 300 ]
 }
+
+# ts_api_body: the body of the LAST ts_api call (survives a subshell capture of
+# ts_api's stdout, which loses the TS_API_CODE global).
+ts_api_body() { [ -n "$TS_API_LAST_BODY" ] && cat "$TS_API_LAST_BODY" 2>/dev/null; }
+
+# ts_ok: 0 iff the last TS_API_CODE was 2xx.
+ts_ok() { [ "$TS_API_CODE" -ge 200 ] 2>/dev/null && [ "$TS_API_CODE" -lt 300 ] 2>/dev/null; }
 
 # --- enroll ------------------------------------------------------------------
 # fleetctl enroll <box>: brain-initiated, tailnet-gated, one-time.
@@ -879,9 +891,9 @@ authorized_keys_line() {
 # for "tag:fleet-brain". The ACL is HuJSON; jq tolerates the // comments the
 # API strips on GET (the API returns parsed JSON for Accept: application/json).
 acl_has_fleet_brain_tagowner() {
-  local body
-  body="$(ts_api GET "/tailnet/$TS_TAILNET/acl")" || return 2   # API failure
-  printf '%s' "$body" | jq -e '.tagOwners | has("tag:fleet-brain")' >/dev/null 2>&1
+  ts_api GET "/tailnet/$TS_TAILNET/acl" >/dev/null
+  ts_ok || return 2                                   # API failure (fail-closed)
+  ts_api_body | jq -e '.tagOwners | has("tag:fleet-brain")' >/dev/null 2>&1
 }
 
 cmd_enroll() {
@@ -1046,11 +1058,13 @@ cmd_mint_key() {
   case "$box" in grok-box-[0-9]*) : ;; *) log "mint-key: refusing non-grok box '$box'"; return 2 ;; esac
 
   local resp key expires
-  resp="$(mint_create)"
-  if [ "$TS_API_CODE" -lt 200 ] || [ "$TS_API_CODE" -ge 300 ]; then
+  # Call bare (no $() capture) so TS_API_CODE survives; read the body from file.
+  mint_create >/dev/null
+  if ! ts_ok; then
     log "mint-key: key-create FAILED (HTTP $TS_API_CODE) — old key on $box left intact"
     return 1
   fi
+  resp="$(ts_api_body)"
   key="$(printf '%s' "$resp" | jq -r '.key // empty')"
   expires="$(printf '%s' "$resp" | jq -r '.expires // empty')"
   if [ -z "$key" ]; then
@@ -1145,13 +1159,20 @@ reconcile_decide() {
     echo "rollout"
     acted=1
   fi
-  # Row e: BOTH paths dead.
-  if { [ "$online" = no ] || [ "$lastseen_fresh" = no ]; } && [ "$tunnel" = down ]; then
-    # Incoherent split: API says online/fresh yet both dead -> immediate incident.
-    if [ "$online" = yes ]; then
-      echo "alert-incident:incoherent-both-dead"
-    else
+  # Row e: tunnel is DOWN and we HAVE an API reading (online known). Two
+  # sub-cases (Q1 ruling):
+  #   * API says the device is OFFLINE / stale too  -> BOTH paths dead -> asleep
+  #     (informational after T=2h; a sand box legitimately sleeps).
+  #   * API says the device is ONLINE / lastSeen fresh yet the tunnel is dead
+  #     -> INCOHERENT split (something is lying) -> immediate actionable incident.
+  # When online is UNKNOWN (no API data this run, e.g. an API-failure read-only
+  # run), row e does NOT classify — we cannot tell asleep from incoherent
+  # without the device list (never alert on no-data).
+  if [ "$tunnel" = down ] && [ "$online" != unknown ]; then
+    if [ "$online" = no ] || [ "$lastseen_fresh" = no ]; then
       echo "alert-asleep"
+    else
+      echo "alert-incident:incoherent-both-dead"
     fi
     acted=1
   fi
@@ -1185,16 +1206,18 @@ cmd_reconcile() {
   local mode="DRY-RUN"; [ "$apply" = 1 ] && mode="APPLY"
   log "reconcile: start ($mode)"
 
-  # Fetch the device list. Any non-2xx => READ-ONLY run (S3).
+  # Fetch the device list. Any non-2xx => READ-ONLY run (S3). Call bare so
+  # TS_API_CODE survives (a $() capture would run devices_json in a subshell).
   local devs readonly=0
-  devs="$(devices_json)"
-  if [ "$TS_API_CODE" -lt 200 ] || [ "$TS_API_CODE" -ge 300 ]; then
+  devices_json >/dev/null
+  if ! ts_ok; then
     reconcile_record_api_failure
     log "reconcile: device list HTTP $TS_API_CODE — READ-ONLY run (no mint/delete/rename)"
     readonly=1
     devs=""      # never act on a partial/absent list (never a spurious delete/mint)
   else
     reconcile_reset_api_failure
+    devs="$(ts_api_body)"
   fi
 
   # Enumerate enrolled boxes (from enroll state, or FLEET_BOXES override for tests).
@@ -1324,19 +1347,22 @@ reconcile_execute() {
 # both are online (decided upstream). Uses the recorded device ids.
 reconcile_dedup() {
   local box="$1" devs stale live
-  devs="$(devices_json)"
-  [ "$TS_API_CODE" -ge 200 ] && [ "$TS_API_CODE" -lt 300 ] || { log "reconcile: dedup $box API read failed — skip"; return 1; }
+  devices_json >/dev/null
+  ts_ok || { log "reconcile: dedup $box API read failed — skip"; return 1; }
+  devs="$(ts_api_body)"
   stale="$(dev_field "$devs" "$box" stale_id)"
   live="$(dev_field "$devs" "$box" live_id)"
   [ -n "$stale" ] || { log "reconcile: dedup $box no stale id"; return 1; }
   ts_api DELETE "/device/$stale" >/dev/null
-  [ "$TS_API_CODE" -ge 200 ] && [ "$TS_API_CODE" -lt 300 ] || { log "reconcile: dedup $box DELETE $stale HTTP $TS_API_CODE"; return 1; }
+  ts_ok || { log "reconcile: dedup $box DELETE $stale HTTP $TS_API_CODE"; return 1; }
   log "reconcile: dedup $box deleted stale device $stale"
   if [ -n "$live" ]; then
     ts_api POST "/device/$live/name" "$(jq -cn --arg n "$box" '{name:$n}')" >/dev/null
-    [ "$TS_API_CODE" -ge 200 ] && [ "$TS_API_CODE" -lt 300 ] && \
-      log "reconcile: dedup $box renamed live $live -> $box" || \
+    if ts_ok; then
+      log "reconcile: dedup $box renamed live $live -> $box"
+    else
       log "reconcile: dedup $box rename HTTP $TS_API_CODE"
+    fi
   fi
 }
 
@@ -1405,9 +1431,9 @@ dev_field() {
 # The brain adds `fleet-status`: API online/lastSeen + tunnel up + boxup check
 # + authkey expiry + version, one row per enrolled box.
 cmd_fleet_status() {
-  local devs; devs="$(devices_json)"
+  local devs=""; devices_json >/dev/null
   local api_ok=1
-  { [ "$TS_API_CODE" -ge 200 ] && [ "$TS_API_CODE" -lt 300 ]; } || { api_ok=0; devs=""; }
+  if ts_ok; then devs="$(ts_api_body)"; else api_ok=0; devs=""; fi
   printf '%-14s %-7s %-7s %-7s %-12s %-10s\n' NAME API TUNNEL CHECK AUTHKEY VERSION
   local -a boxes=(); local b
   while IFS= read -r b; do [ -n "$b" ] && boxes+=("$b"); done < <(reconcile_target_boxes)
