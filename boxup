@@ -9,6 +9,7 @@
 #   boxup up        converge + start the selfheal worker   (default)
 #   boxup tick      one health tick (sysctl / nft / refresh / procs)
 #   boxup status    one-line health string
+#   boxup check     health gate: exit 0 healthy / 1 unhealthy (never 2)
 #   boxup stop      stop the selfheal worker (tailscaled stays up)
 #   boxup update    fresh clone from GitHub + reinstall (never git pull)
 #   boxup worker    internal: the selfheal loop
@@ -1204,6 +1205,86 @@ print_status() {
   printf '\n'
 }
 
+# --- check: the single health predicate (D6) ---------------------------------
+# `boxup check`: exit 0 iff the box is healthy, else exit 1 printing
+# `check=FAIL reason=<first-failed-predicate>`. On success prints
+# `check=OK ` + the normal status line. This is THE definition of "healthy";
+# fleetctl and D7 rollout verification delegate to it instead of reimplementing
+# health parsing laptop-side.
+#
+# check MUST NEVER exit 2 — exit 2 is the unknown-subcommand dispatch arm and
+# is fleetctl's "old boxup" signal (B2). A check bug emitting 2 would silently
+# downgrade a new fleetctl to the legacy status parse. Every failure here is
+# exit 1; the dispatch arm below runs do_check and translates its rc to 0/1.
+do_check() {
+  local reason="" v4 v6 hb_secs now last ts_count pid cmd routes
+  v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
+  v6=$(tr -d '[:space:]' < /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
+  read_ts_fields
+
+  # Predicates in order; first failure wins.
+  if [ -z "$reason" ] && [ "${backend:-}" != Running ]; then
+    reason="backend=${backend:-unknown} (want Running)"
+  fi
+  if [ -z "$reason" ] && [ "${online:-no}" != yes ]; then
+    reason="online=${online:-no} (want yes)"
+  fi
+  if [ -z "$reason" ] && ! pgrep -x sshd >/dev/null 2>&1; then
+    reason="sshd=down (want up)"
+  fi
+  if [ -z "$reason" ] && { [ "$v4" != 1 ] || [ "$v6" != 1 ]; }; then
+    reason="ipfwd=4:${v4},6:${v6} (want 4:1,6:1)"
+  fi
+  if [ -z "$reason" ]; then
+    # Exactly one tailscaled bound to the workspace statedir.
+    ts_count=0
+    for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
+      cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+      echo "$cmd" | grep -q -- "$STATE_DIR" && ts_count=$((ts_count + 1))
+    done
+    if [ "$ts_count" != 1 ]; then
+      reason="tailscaled=${ts_count} on statedir (want exactly 1)"
+    fi
+  fi
+  if [ -z "$reason" ]; then
+    # Worker alive with a fresh heartbeat (< FREEZE_SECS).
+    if [ ! -f "$WORKER_PID" ] || \
+       ! kill -0 "$(tr -d '[:space:]' < "$WORKER_PID" 2>/dev/null)" 2>/dev/null; then
+      reason="worker=dead (want alive)"
+    else
+      hb_secs=-1
+      if [ -f "$RUN_DIR/hb" ]; then
+        now=$(date +%s)
+        last=$(tr -d '[:space:]' < "$RUN_DIR/hb" 2>/dev/null || echo 0)
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        [ "$last" -gt 0 ] && hb_secs=$((now - last))
+      fi
+      if [ "$hb_secs" -lt 0 ] || [ "$hb_secs" -ge "$FREEZE_SECS" ]; then
+        reason="hb=${hb_secs}s (want < ${FREEZE_SECS}s)"
+      fi
+    fi
+  fi
+  if [ -z "$reason" ]; then
+    # Exit-node advertised (ExitNodeOption + both default routes present).
+    if [ "${exitn:-no}" != yes ]; then
+      reason="exit-node=${exitn:-no} (want yes)"
+    else
+      routes="$(advertised_routes)"
+      if ! echo "$routes" | grep -q '0.0.0.0/0' || ! echo "$routes" | grep -q '::/0'; then
+        reason="exit-node routes missing 0.0.0.0/0 or ::/0"
+      fi
+    fi
+  fi
+
+  if [ -n "$reason" ]; then
+    echo "check=FAIL reason=$reason"
+    return 1
+  fi
+  printf 'check=OK '
+  print_status
+  return 0
+}
+
 # --- converge ----------------------------------------------------------------
 # The converge body. Runs under the converge lock (via do_ensure).
 do_ensure_body() {
@@ -1288,6 +1369,11 @@ case "$cmd" in
     ;;
   status|--status)
     print_status
+    ;;
+  check|--check)
+    # Read-only health gate. Delegate to do_check; force the exit code into
+    # {0,1} so a bug can never surface as 2 (B2: 2 = "old boxup" to fleetctl).
+    if do_check; then exit 0; else exit 1; fi
     ;;
   stop|--stop)
     require_root stop

@@ -248,17 +248,21 @@ cmd_status() {
 }
 
 # --- check -------------------------------------------------------------------
-# Quiet health gate. A box is UNHEALTHY if any of: unreachable, backend not
-# Running, online != yes, exit-node not advertised, sshd not up, or worker
-# (selfheal) count != 1. Prints only problems. Exit 0 if all healthy, else 1.
-# --notify additionally fires notify-send -u critical per problem.
-check_one() {
-  # echoes "OK" or "<box>: <problem>" lines to stdout; returns 0 healthy.
+# Quiet health gate. The single health definition lives in `boxup check` on the
+# box (D6); fleetctl delegates to it and trusts its exit code (0 healthy,
+# 1 unhealthy). fleetctl keeps only reachability (ssh failure) as its own layer.
+#
+# Version-skew fallback (B2): an OLD boxup has no `check` subcommand, so its
+# dispatch exits 2 on the unknown command. fleetctl MUST treat exit 2 (or
+# unknown-command output) as "old boxup" and fall back to the legacy laptop-side
+# parse of `boxup status` — never report a healthy old box as failing (the
+# README:77-81 timer fires notify-send -u critical every 10 min, and D7's
+# canary-first flow guarantees a mixed-version window).
+
+# Legacy laptop-side parse of `boxup status` — the pre-D6 health definition,
+# kept ONLY as the skew fallback for boxes running an old boxup.
+check_one_legacy() {
   local box="$1" line
-  if ! box_reachable "$box"; then
-    echo "$box: unreachable"
-    return 1
-  fi
   line="$(box_ssh "$box" "sudo $BOXUP_REMOTE status" 2>/dev/null)"
   if [ -z "$line" ]; then
     echo "$box: unreachable (ssh/boxup failed)"
@@ -295,6 +299,47 @@ check_one() {
   for p in "${problems[@]}"; do
     echo "$box: $p"
   done
+  return 1
+}
+
+check_one() {
+  # echoes nothing when healthy; "<box>: <problem>" lines otherwise.
+  # returns 0 healthy, 1 unhealthy/unreachable.
+  local box="$1" out rc
+  if ! box_reachable "$box"; then
+    echo "$box: unreachable"
+    return 1
+  fi
+
+  # Delegate to `boxup check`. Capture stdout + exit code together.
+  out="$(box_ssh "$box" "sudo $BOXUP_REMOTE check" 2>/dev/null)"
+  rc=$?
+
+  # ssh connection failure (255): unreachable, not unhealthy.
+  if [ "$rc" = 255 ]; then
+    echo "$box: unreachable (ssh failed)"
+    return 1
+  fi
+
+  # B2 skew fallback: an old boxup exits 2 (unknown subcommand) and/or prints
+  # an "unknown command" usage line. Fall back to the legacy status parse so a
+  # healthy old box is never reported as failing.
+  if [ "$rc" = 2 ] || printf '%s' "$out" | grep -qi 'unknown command'; then
+    check_one_legacy "$box"
+    return $?
+  fi
+
+  if [ "$rc" = 0 ]; then
+    return 0
+  fi
+
+  # rc == 1 (or any other non-2/255): boxup check said unhealthy. Surface its
+  # reason line prefixed by the box name.
+  if [ -n "$out" ]; then
+    printf '%s: %s\n' "$box" "$out"
+  else
+    printf '%s: check=FAIL (no output, rc=%s)\n' "$box" "$rc"
+  fi
   return 1
 }
 
