@@ -33,7 +33,12 @@ BOXUP_REMOTE="/workspace/box-setup/boxup"
 BOX_USER="box"
 
 # Laptop-side config, distinct from the box's config.toml.
-CONFIG_FILE="${FLEET_CONFIG:-$HOME/.config/fleetctl/config.toml}"
+# HOME guard (breaks-if-undone): under `set -u` a bare $HOME here aborts the
+# whole script at load — before dispatch — when HOME is unset. The VPS
+# fleet-reconcile.service sets FLEET_CONFIG but not HOME, so the default arm is
+# never taken there; ${HOME:-} keeps this a plain (possibly empty) expansion
+# instead of an "unbound variable" fatal. See docs/FLEET-BRAIN.md decision wall.
+CONFIG_FILE="${FLEET_CONFIG:-${HOME:-}/.config/fleetctl/config.toml}"
 DEFAULT_SSH_PASSWORD="12345678"
 
 # Concurrency cap for the fan-out commands.
@@ -702,7 +707,12 @@ cmd_ssh() {
 }
 
 # --- systemd user timer ------------------------------------------------------
-UNIT_DIR="$HOME/.config/systemd/user"
+# HOME guard (breaks-if-undone): top-level assignment, evaluated at load under
+# `set -u`. A bare $HOME aborts the whole script (incl. the reconcile path,
+# which runs under systemd with no HOME) before any command dispatch. The
+# install-timer/remove-timer commands that USE this are only ever run
+# interactively with a real HOME; ${HOME:-} just keeps load-time safe.
+UNIT_DIR="${HOME:-}/.config/systemd/user"
 UNIT_SERVICE="$UNIT_DIR/fleetctl-check.service"
 UNIT_TIMER="$UNIT_DIR/fleetctl-check.timer"
 
@@ -886,6 +896,13 @@ ts_api() {
   # in a 600 file, never in argv/env-visible-to-children.
   {
     printf 'header = "Authorization: Bearer %s"\n' "$tok"
+    # BUG-D (breaks-if-undone): without an explicit `Accept: application/json`,
+    # the Tailscale API serves the ACL endpoint (GET /tailnet/-/acl) as HuJSON
+    # (leading // comments, trailing commas) — which `jq -e` rejects rc=5, so
+    # acl_has_fleet_brain_tagowner() fails and `enroll` refuses even when
+    # tagOwners is correct (proven live on the VPS). Send Accept on EVERY call
+    # so every endpoint returns strict JSON.
+    printf 'header = "Accept: application/json"\n'
     if [ -n "$body" ]; then
       printf 'header = "Content-Type: application/json"\n'
     fi
@@ -929,8 +946,11 @@ authorized_keys_line() {
 }
 
 # acl_has_fleet_brain_tagowner: GET /acl, return 0 iff tagOwners has an entry
-# for "tag:fleet-brain". The ACL is HuJSON; jq tolerates the // comments the
-# API strips on GET (the API returns parsed JSON for Accept: application/json).
+# for "tag:fleet-brain". The ACL is stored as HuJSON (// comments, trailing
+# commas) which jq CANNOT parse — so ts_api MUST send `Accept: application/json`
+# (BUG-D) to make the API return strict JSON on GET. Without that header the
+# body is HuJSON, jq -e exits rc=5, and enroll refuses even when the tagOwner
+# entry is present.
 acl_has_fleet_brain_tagowner() {
   ts_api GET "/tailnet/$TS_TAILNET/acl" >/dev/null
   ts_ok || return 2                                   # API failure (fail-closed)
@@ -1403,7 +1423,15 @@ cmd_reconcile() {
   mkdir -p "$FLEET_STATE" 2>/dev/null || true
   local lock="$FLEET_STATE/reconcile.lock"
   # Per-run flock — never two reconciles at once (idempotency + safety row).
-  exec 9>"$lock" 2>/dev/null || { log "reconcile: cannot open lock $lock"; return 1; }
+  # breaks-if-undone: do NOT write `exec 9>"$lock" 2>/dev/null` — an `exec` with
+  # redirections and NO command makes 2>/dev/null PERMANENT for the whole
+  # process, so every subsequent log() (all of which write to stderr) is
+  # silently swallowed and interactive `reconcile` exits 0 with no output. Open
+  # the fd WITHOUT a persistent stderr redirect; scope any error suppression to
+  # the exec itself via a brace group so it cannot leak past this line.
+  if ! { exec 9>"$lock"; } 2>/dev/null; then
+    log "reconcile: cannot open lock $lock"; return 1
+  fi
   if ! flock -n 9; then
     log "reconcile: another reconcile holds the lock — skipping this run"
     return 0
