@@ -150,15 +150,12 @@ run_with_converge_lock() {
     case "$mode" in
       try)
         if ! flock -n 9; then
-          # Contended. flock --close means a NEW daemon can no longer wedge the
-          # lock, so genuine contention is another live boxup converge — skip.
-          # H2 (TRANSITIONAL): but a box already wedged by the OLD (pre-hotfix)
-          # daemon still has that tailscaled holding fd 8/9; flock --close does
-          # not free an already-leaked fd. Detect that ONE specific case via
-          # /proc/*/fd (which DOES see the inheritor, unlike /proc/locks) and
-          # RECYCLE the daemon — a recycle actually releases the lock. We never
-          # break for an arbitrary opener, and never run a tick unlocked.
-          recover_legacy_wedged_lock || true
+          # Contended. Since H1 (flock --close) a NEW daemon can no longer wedge
+          # the lock, so genuine contention is another live boxup converge —
+          # skip. (Legacy pre-H1 wedges are handled ONCE at upgrade time by the
+          # install.sh migration, not by any runtime detector — see E1: two
+          # rounds of a runtime detector were proven inert, and a one-time
+          # migration is one-shot by nature, not a per-tick job.)
           exit 200
         fi
         ;;
@@ -179,71 +176,15 @@ run_with_converge_lock() {
   return "$rc"
 }
 
-# H2 (TRANSITIONAL — D3 removal condition: remove this function once NO
-# pre-hotfix boxup/tailscaled process remains on ANY box, verified fleet-wide
-# with `pgrep -af boxup` / daemon start-times all POST-DATING this version's
-# install — NOT merely "the fleet runs this version" (a box can run the new
-# boxup while an OLD leaked tailscaled from before the upgrade is still alive
-# holding the inherited fd)): on try-mode lock contention, look for a tailscaled
-# that inherited the converge lock from the OLD daemon and is holding it for
-# life. Act ONLY when the holder is a `tailscaled` process, running on OUR
-# $STATE_DIR, that actually has the lock file open (matched by dev+inode, not
-# path string), AND is not legitimately mid-login (D3 kill guard below).
-# Exclude self and our ancestry. When found, RECYCLE it (recycle_tailscaled
-# releases the lock by restarting the daemon through the flock --close path);
-# do NOT run a tick unlocked, and NEVER touch a process that merely has the file
-# open.
-recover_legacy_wedged_lock() {
-  local dev ino st pid comm cmd fd lstat found=""
-  st="$(stat -c '%d %i' "$CONVERGE_LOCK" 2>/dev/null || true)"
-  dev="${st% *}"; ino="${st#* }"
-  case "$dev" in ''|*[!0-9]*) return 1 ;; esac
-  case "$ino" in ''|*[!0-9]*) return 1 ;; esac
-  for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
-    [ "$pid" = "$$" ] && continue
-    [ "$pid" = "$BASHPID" ] && continue
-    comm="$(tr -d '\0\n' < "/proc/$pid/comm" 2>/dev/null || true)"
-    [ "$comm" = tailscaled ] || continue
-    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-    echo "$cmd" | grep -q -- "$STATE_DIR" || continue   # must be OUR daemon
-    for fd in "/proc/$pid/fd/"*; do
-      [ -e "$fd" ] || continue
-      lstat="$(stat -c '%d %i' "$fd" 2>/dev/null || true)"
-      [ "$lstat" = "$dev $ino" ] || continue
-      found="$pid"; break
-    done
-    [ -n "$found" ] && break
-  done
-  [ -n "$found" ] || return 1
-
-  # D3 kill guard: a matching daemon holding the lock is only a LEGACY WEDGE if
-  # it is not legitimately mid-login. Skip the recycle (and just skip the tick)
-  # when any of these hold — recycling then would stomp a genuine first-login /
-  # re-auth in progress:
-  #   * statedir empty            → first login, not a wedge (nothing to lose to
-  #                                 a restart, but a restart would abort the join)
-  #   * a `tailscale up` in flight → login/re-auth actively running
-  #   * BackendState NeedsLogin/Starting → login transition underway
-  if ! state_is_populated; then
-    log "tick: legacy-wedge candidate pid=$found but statedir is empty (first login) — NOT recycling, skipping tick" >&2
-    return 1
-  fi
-  if pgrep -af 'tailscale.* up( |$)' 2>/dev/null | grep -q -- 'up'; then
-    log "tick: legacy-wedge candidate pid=$found but a 'tailscale up' is in flight — NOT recycling, skipping tick" >&2
-    return 1
-  fi
-  read_ts_fields
-  case "$backend" in
-    NeedsLogin|Starting)
-      log "tick: legacy-wedge candidate pid=$found but backend=$backend (login transition) — NOT recycling, skipping tick" >&2
-      return 1
-      ;;
-  esac
-
-  log "tick: LEGACY wedge — tailscaled pid=$found (our statedir) holds the converge lock from a pre-hotfix daemon; recycling to release it (transitional)" >&2
-  recycle_tailscaled "legacy converge-lock wedge (pid=$found) — recycle to release inherited fd"
-  return 0
-}
+# E1: a runtime legacy-wedge detector was tried for two rounds and DELETED — it
+# was proven inert twice (`stat` without -L stats the /proc/PID/fd symlink not
+# its target; then it re-picked the daemon via `pgrep -n` instead of the found
+# pid; and its $STATE_DIR match was a substring, so `$STATE_DIR-other` counted
+# as ours). A runtime detector for a ONE-TIME migration is the wrong shape.
+# Pre-H1 wedges are cleared ONCE, at upgrade, by the migration in install.sh
+# (stop the old worker; kill only a tailscaled whose argv carries the exact
+# `--statedir=$STATE_DIR` token; the normal `boxup once` then restarts it via
+# the flock --close path). Nothing runs in a tick.
 
 # --- config.toml -------------------------------------------------------------
 # A TOML subset, read with awk so it works before python3 is installed.
@@ -1195,19 +1136,73 @@ print(f"grok-box-{n}")
 PY
 }
 
+# H13: the LIVE hostname the control plane currently has for Self (status JSON
+# Self.HostName). The frozen $HOSTNAME_FILE is the INTENT; this is the observed
+# POSTCONDITION. After an auth-key rejoin the node can register under the OS
+# hostname (`cursor`) even though the file says grok-box-8 — box-8 Stage 3.
+live_hostname() {
+  ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(((json.load(sys.stdin).get("Self") or {}).get("HostName") or "").strip())
+except Exception:
+    print("")
+' 2>/dev/null || true
+}
+
+# H13: true (0) iff the frozen file name is a grok-box-N AND the live Self
+# hostname differs from it. Sets NAME_MISMATCH_FILE / NAME_MISMATCH_LIVE for
+# callers to log. A missing file name or unreadable live value ⇒ NOT a mismatch
+# (we only act when we have a concrete intent to enforce).
+NAME_MISMATCH_FILE=""
+NAME_MISMATCH_LIVE=""
+name_mismatch() {
+  local f l
+  f="$(read_box_name || true)"
+  case "$f" in grok-box-[0-9]*) ;; *) return 1 ;; esac
+  l="$(live_hostname)"
+  [ -n "$l" ] || return 1
+  [ "$f" != "$l" ] || return 1
+  NAME_MISMATCH_FILE="$f"; NAME_MISMATCH_LIVE="$l"
+  return 0
+}
+
 ensure_name() {
   local name
   name="$(read_box_name || true)"
-  case "$name" in grok-box-[0-9]*) return 0 ;; esac
-  read_ts_fields
-  [ "$backend" = Running ] || return 0
-  name="$(pick_name 2>/dev/null || true)"
+  # First: pick + freeze a name if we don't have one yet.
   case "$name" in
-    grok-box-[0-9]*)
-      printf '%s\n' "$name" > "$HOSTNAME_FILE"
-      log "name: picked $name"
+    grok-box-[0-9]*) ;;
+    *)
+      read_ts_fields
+      [ "$backend" = Running ] || return 0
+      name="$(pick_name 2>/dev/null || true)"
+      case "$name" in
+        grok-box-[0-9]*)
+          printf '%s\n' "$name" > "$HOSTNAME_FILE"
+          log "name: picked $name"
+          ;;
+        *) return 0 ;;   # couldn't pick yet
+      esac
       ;;
   esac
+  # H13: the file is the INTENT; enforce it against the LIVE postcondition. If
+  # the control plane has a different Self.HostName (e.g. `cursor` after an
+  # auth-key rejoin), push it — ensure_name no longer trusts the file's mere
+  # existence. `tailscale set --hostname` (not `up`) so no other pref resets.
+  if name_mismatch; then
+    log "name: live=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE — pushing tailscale set --hostname" >&2
+    local b
+    b="$(tailscale_bin)"
+    if [ -x "$b" ]; then
+      if id box >/dev/null 2>&1 && timeout 25 sudo -n -u box "$b" set --hostname="$NAME_MISMATCH_FILE" 2>/dev/null; then
+        :
+      else
+        timeout 25 "$b" set --hostname="$NAME_MISMATCH_FILE" 2>/dev/null || \
+          log "name: tailscale set --hostname=$NAME_MISMATCH_FILE failed" >&2
+      fi
+    fi
+  fi
 }
 
 # --- converge: exit-node refresh --------------------------------------------
@@ -1548,28 +1543,73 @@ do_tick() {
   ensure_forwarding || true
   ensure_nat || true
 
-  # H12: re-assert the LOGIN postcondition every tick, not just hourly. do_tick
-  # historically only restarted a DEAD sshd; a LOCKED account or WIPED host keys
-  # (image swap / tamper — box-8 Stage 1) otherwise waited for the hourly
-  # `boxup once`, while `check` (pre-H7) lied. Cheap probe first (passwd -S +
-  # one stat, ~0 cost when healthy); run the full ensure_sshd (chpasswd +
-  # host-key restore + config + spawn) ONLY when sshd is down OR a login
-  # postcondition has failed. Runs INSIDE this tick's converge lock (H3 — no
-  # unlocked work). ensure_sshd is idempotent and spawns via spawn_detached.
-  if ! pgrep -x sshd >/dev/null 2>&1; then
-    log "tick: sshd down — running ensure_sshd" >&2
-    ensure_sshd || true
-  elif ! login_postcondition_ok; then
-    log "tick: login postcondition FAILED (box/root locked or host keys missing) — running ensure_sshd (H12)" >&2
-    ensure_sshd || true
+  # H12 (GENERALIZED — box-8 Stage 1 + Stage 3): do_tick must not hand-pick
+  # WHICH repair it may run. It evaluates the convergence postconditions and, if
+  # ANY fails, runs the FULL do_ensure_body under this tick's lock — so a locked
+  # account, wiped host keys, a NeedsLogin/empty-statedir first-login, a lost
+  # exit-node, or a name mismatch all self-heal within one 15s tick instead of
+  # waiting for the hourly `boxup once`. Rate-limited to once / 60s so a
+  # PERSISTENTLY failing predicate cannot hammer the control plane or churn.
+  # The probe is cheap (read_ts_fields once + passwd -S + a couple stats); the
+  # expensive do_ensure_body runs ONLY on a real failure. ensure_login itself
+  # carries the re-auth attempt-limiter (H5), so first-login/re-auth is safe.
+  if tick_repair_needed; then
+    if tick_repair_allowed; then
+      log "tick: a convergence postcondition failed — running full do_ensure_body (H12) [reason=$TICK_REPAIR_REASON]" >&2
+      date +%s > "$RUN_DIR/last-tick-repair" 2>/dev/null || true
+      do_ensure_body || true
+    else
+      log "tick: postcondition failed (reason=$TICK_REPAIR_REASON) but repair rate-limited (<${TICK_REPAIR_MIN}s since last) — skipping" >&2
+    fi
+  else
+    # Healthy steady state: only the cheap, idempotent per-tick maintenance.
+    case "$(read_box_name || true)" in
+      grok-box-[0-9]*)
+        pgrep -x tailscaled >/dev/null 2>&1 && refresh_exitnode || true
+        ;;
+    esac
   fi
-
-  case "$(read_box_name || true)" in
-    grok-box-[0-9]*)
-      pgrep -x tailscaled >/dev/null 2>&1 && refresh_exitnode || true
-      ;;
-  esac
   date +%s > "$RUN_DIR/hb" 2>/dev/null || true
+}
+
+# H12: minimum seconds between full do_ensure_body repairs driven by a failing
+# tick postcondition — a persistently failing predicate must not hammer.
+TICK_REPAIR_MIN="${BOXUP_TICK_REPAIR_MIN:-60}"
+
+# True (0) iff the last tick-driven repair is far enough in the past.
+tick_repair_allowed() {
+  local now last
+  now=$(date +%s); last=0
+  [ -f "$RUN_DIR/last-tick-repair" ] && \
+    last=$(tr -d '[:space:]' < "$RUN_DIR/last-tick-repair" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ "$last" -le 0 ] && return 0
+  [ $((now - last)) -ge "$TICK_REPAIR_MIN" ]
+}
+
+# True (0) iff SOME convergence postcondition is currently unmet, setting
+# TICK_REPAIR_REASON. These mirror the substantive `boxup check` predicates
+# (NOT the worker/hb self-checks — a tick must not try to repair its own
+# liveness). Read-only + cheap: one read_ts_fields, passwd -S, a couple stats.
+TICK_REPAIR_REASON=""
+tick_repair_needed() {
+  TICK_REPAIR_REASON=""
+  # sshd must be running (the login path).
+  if ! pgrep -x sshd >/dev/null 2>&1; then TICK_REPAIR_REASON="sshd=down"; return 0; fi
+  # Login postcondition (H7/H12): accounts unlocked + host keys present.
+  if ! login_postcondition_ok; then TICK_REPAIR_REASON="login"; return 0; fi
+  read_ts_fields
+  # Not logged in / not fully online ⇒ ensure_login (first-login or re-auth).
+  case "$backend" in
+    Running) ;;
+    *) TICK_REPAIR_REASON="backend=$backend"; return 0 ;;
+  esac
+  if [ "$online" != yes ]; then TICK_REPAIR_REASON="online=$online"; return 0; fi
+  # H13: live hostname must match the frozen intent file.
+  if name_mismatch; then TICK_REPAIR_REASON="name"; return 0; fi
+  # Exit-node advertised with both default routes (the box's whole purpose).
+  if [ "$exitn" != yes ]; then TICK_REPAIR_REASON="exit-node=$exitn"; return 0; fi
+  return 1
 }
 
 # run_tick: take the converge lock with flock -n (skip on contention). A tick
@@ -1757,6 +1797,12 @@ do_check() {
   fi
   if [ -z "$reason" ] && [ "${online:-no}" != yes ]; then
     reason="online=${online:-no} (want yes)"
+  fi
+  # H13: the live hostname must match the frozen intent (file = intent, live
+  # Self.HostName = postcondition). A rejoin that registered as `cursor` while
+  # the file says grok-box-8 is a FAIL, not a pass.
+  if [ -z "$reason" ] && name_mismatch; then
+    reason="name: live=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE"
   fi
   if [ -z "$reason" ] && ! pgrep -x sshd >/dev/null 2>&1; then
     reason="sshd=down (want up)"

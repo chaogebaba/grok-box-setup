@@ -55,6 +55,34 @@ if [ -x "$DEST/box-bootstrap.sh" ] && [ ! -f "$DEST/boxup" ]; then
   bash "$DEST/box-bootstrap.sh" --stop >/dev/null 2>&1 || true
 fi
 
+# E1 — one-shot pre-H1 wedge migration. Before H1, tailscaled could inherit the
+# converge-lock fd and hold it for life, wedging every tick. flock --close
+# prevents that for NEW daemons but cannot free an ALREADY-leaked fd, and the
+# two runtime detectors we tried were proven inert. So clear it ONCE, here, on
+# upgrade from a pre-H1 boxup: detect by the ABSENCE of the H1 marker in the
+# currently-installed boxup, stop the old worker, then kill ONLY a tailscaled
+# whose argv carries the EXACT token `--statedir=$STATE_DIR` (word-split match,
+# never a substring — so `--statedir=$STATE_DIR-other` is NOT killed). The
+# normal `boxup once` below restarts the daemon via the flock --close path.
+# Runs once per upgrade, never in a tick.
+STATE_DIR_MIG="$DEST/state/tailscale"
+if [ -f "$DEST/boxup" ] && ! grep -q 'flock --close' "$DEST/boxup" 2>/dev/null; then
+  log "E1 migration: upgrading from a pre-H1 boxup — clearing any inherited converge-lock wedge"
+  bash "$DEST/boxup" stop >/dev/null 2>&1 || true
+  for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
+    # Exact-token match: split argv on NULs, require a literal
+    # `--statedir=$STATE_DIR_MIG` argument (not a prefix of a longer path).
+    match=0
+    while IFS= read -r -d '' arg; do
+      [ "$arg" = "--statedir=$STATE_DIR_MIG" ] && match=1
+    done < "/proc/$pid/cmdline" 2>/dev/null || true
+    if [ "$match" = 1 ]; then
+      log "E1 migration: killing pre-H1 tailscaled pid=$pid (exact --statedir=$STATE_DIR_MIG)"
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+fi
+
 mkdir -p "$DEST"/{bin,docs,etc,secrets,state/tailscale,state/ssh}
 
 # Atomic executable install (D3/M2): write to a UNIQUE mktemp file INSIDE $DEST
