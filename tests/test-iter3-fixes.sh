@@ -845,6 +845,334 @@ u_busy="$(p2_2_arm_test up 201)"
 [ "$u_busy" = 201 ]  && pass "P2-2 \`boxup up\` converge lock busy (do_ensure rc=201) exits 201" \
                      || bad  "P2-2 \`boxup up\` lock-busy exited [$u_busy] want 201"
 
+# ===========================================================================
+# r7 — close the empirical-gate coverage gaps (M5, M8, M9, M10, M13, M17).
+# Every one drives the REAL function/block text (extracted from boxup /
+# install.sh and eval'd with collaborators stubbed), so applying the gate's
+# exact mutation to that real code flips a distinct test here. No inline
+# reimplementation, no whole-file greps.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# M8 (BLOCKER-candidate) — install.sh's E1 migration gate (VERSION-OR-SHA) must
+# be guarded against the REAL file. The gate is a top-level decision block, not
+# a function, so we extract the exact source lines (`installed_ver=...` through
+# the `MIGRATE=1` `fi`) out of install.sh and eval them with $DEST / $REPO_ROOT
+# pointed at fixture dirs and `git` stubbed. Box-8 r3: SAME version (5.1.0),
+# different GIT_SHA must set MIGRATE=1. Reverting the live gate to VERSION-ONLY
+# (dropping the `|| { sha diff }` arm) makes the same-ver/diff-sha case NOT
+# migrate → this test FAILS. (M8→ "M8 install.sh REAL gate: same-ver diff-sha".)
+# ---------------------------------------------------------------------------
+m8_gate_test() {
+  # $1 iver $2 nver $3 isha $4 nsha -> "MIGRATE=<0|1>"
+  local iver="$1" nver="$2" isha="$3" nsha="$4" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+INSTALL="$INSTALL"
+DEST="\$(mktemp -d)"; REPO_ROOT="\$(mktemp -d)"
+# A real installed boxup must exist for the gate's \`[ -f "\$DEST/boxup" ]\` guard.
+: > "\$DEST/boxup"
+[ -n "$iver" ] && printf '%s\n' "$iver" > "\$DEST/VERSION"
+[ -n "$nver" ] && printf '%s\n' "$nver" > "\$REPO_ROOT/VERSION"
+[ -n "$isha" ] && printf '%s\n' "$isha" > "\$DEST/GIT_SHA"
+# new_sha comes from \$BOX_SETUP_GIT_SHA (fleetctl path); set it so \`git\` is
+# never consulted. When we want "unknown", leave it empty AND stub git to fail.
+BOX_SETUP_GIT_SHA="$nsha"
+git(){ echo unknown; return 1; }   # only reached if BOX_SETUP_GIT_SHA empty
+# Extract the REAL top-level gate block from install.sh: the contiguous source
+# from the \`installed_ver=\` assignment down to the \`fi\` that closes MIGRATE=1.
+gate="\$(awk '/^installed_ver=""/{i=1} i{print} i && p && /^fi\$/{exit} /MIGRATE=1/{p=1}' "\$INSTALL")"
+eval "\$gate"
+echo "MIGRATE=\$MIGRATE"
+rm -rf "\$DEST" "\$REPO_ROOT"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+# same version, different sha (box-8 r3) — the arm the VERSION-ONLY regression drops.
+m8_samever="$(m8_gate_test 5.1.0 5.1.0 059c658 87e783b)"
+# version bump (still fires under either gate — sanity anchor).
+m8_verbump="$(m8_gate_test 5.1.0 5.2.0 059c658 059c658)"
+# identical build — must not fire.
+m8_same="$(m8_gate_test 5.2.0 5.2.0 87e783b 87e783b)"
+[ "$m8_samever" = "MIGRATE=1" ] \
+  && pass "M8 install.sh REAL gate: same-ver (5.1.0) diff-sha (059c658->87e783b) => MIGRATE=1 (VERSION-ONLY regression fails here)" \
+  || bad  "M8 install.sh REAL gate did NOT migrate on same-ver diff-sha: [$m8_samever] (the box-8 r3 regression is UNGUARDED)"
+[ "$m8_verbump" = "MIGRATE=1" ] \
+  && pass "M8 install.sh REAL gate: version bump => MIGRATE=1" \
+  || bad  "M8 install.sh REAL gate did not fire on version bump: [$m8_verbump]"
+[ "$m8_same" = "MIGRATE=0" ] \
+  && pass "M8 install.sh REAL gate: identical ver+sha => MIGRATE=0 (no spurious recycle)" \
+  || bad  "M8 install.sh REAL gate spuriously migrated on identical build: [$m8_same]"
+
+# ---------------------------------------------------------------------------
+# M9 — install.sh's exact `--statedir` NUL-token selector must be guarded
+# against the REAL do_migration_recycle. We drive the REAL function with
+# pgrep/kill/log stubbed so only the SELECTOR runs, against two fake
+# /proc/PID/cmdline files: one with the exact `--statedir=$STATE_DIR_MIG`
+# token and a decoy with `--statedir=$STATE_DIR_MIG-other`. The stub `kill`
+# records which pids the selector chose. A live selector loosened to a
+# substring/prefix match would ALSO SIGTERM the decoy → this test FAILS.
+# (M9→ "M9 real do_migration_recycle selector: exact token only".)
+# ---------------------------------------------------------------------------
+m9_selector_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+INSTALL="$INSTALL"
+WORK="\$(mktemp -d)"
+STATE_DIR_MIG="/tmp/m9-state"
+DEST="\$WORK/dest"; mkdir -p "\$DEST"
+: > "\$DEST/boxup"
+# Fabricate two fake /proc/<pid>/cmdline blobs (NUL-separated argv). We map
+# pgrep to emit pseudo-pids and redirect /proc reads by overriding the path via
+# a wrapper: since the real fn reads "/proc/\$pid/cmdline", we place our fakes
+# at that literal path is impossible, so we instead stub the loop's data source
+# by shadowing \`pgrep\` to emit our OWN pid-like tokens AND providing cmdline
+# files through a \`proc\` dir the fn can reach — done by rewriting the fn's
+# hard path via a tiny FD trick: we can't, so we drive real /proc with two live
+# sleeps carrying the tokens (same technique as the E1 selector test, but here
+# against the REAL function).
+bash -c 'sleep 30; :' _ "--statedir=\$STATE_DIR_MIG" &
+right=\$!
+bash -c 'sleep 30; :' _ "--statedir=\$STATE_DIR_MIG-other" &
+wrong=\$!
+export STATE_DIR_MIG right wrong
+sleep 0.3
+selected="\$WORK/selected"; : > "\$selected"
+log(){ :; }
+# pgrep -x tailscaled -> our two real pids.
+pgrep(){ printf '%s\n%s\n' "\$right" "\$wrong"; }
+# kill records the target pid(s) the selector chose, then really terminates.
+kill(){
+  case "\$1" in
+    -0) command kill -0 "\$2" 2>/dev/null; return \$? ;;
+    -9) command kill -9 "\$2" 2>/dev/null; return 0 ;;
+    *)  echo "\$1" >> "\$selected"; command kill "\$1" 2>/dev/null; return 0 ;;
+  esac
+}
+extract_fn_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_fn_from "\$INSTALL" do_migration_recycle)"
+do_migration_recycle
+sel="\$(tr '\n' ' ' < "\$selected")"
+command kill "\$right" "\$wrong" 2>/dev/null || true
+# Normalise: did the selector pick EXACTLY the right pid and NOT the wrong one?
+picked_right=no; picked_wrong=no
+for p in \$sel; do [ "\$p" = "\$right" ] && picked_right=yes; [ "\$p" = "\$wrong" ] && picked_wrong=yes; done
+echo "right=\$picked_right wrong=\$picked_wrong"
+rm -rf "\$WORK"
+INNER
+  timeout 25 bash "$inner"; rm -f "$inner"
+}
+m9res="$(m9_selector_test)"
+case "$m9res" in
+  "right=yes wrong=no") pass "M9 REAL do_migration_recycle selector SIGTERMs the exact --statedir token daemon and NOT the -other decoy" ;;
+  *) bad "M9 REAL selector wrong: [$m9res] want [right=yes wrong=no] (a loosened prefix/substring match would flip this)" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# M10 — install.sh's SIGKILL escalation must be guarded against the REAL
+# do_migration_recycle. Drive the REAL function against ONE fake daemon that
+# IGNORES SIGTERM (survives the graceful poll) and assert the function
+# escalates to `kill -9`. We shorten the poll by stubbing `sleep` to a no-op so
+# the ≤10s wait collapses. Stubbed `kill` records whether a `-9` was issued.
+# Removing the `kill -9` escalation → the survivor is never SIGKILLed → FAILS.
+# (M10→ "M10 real do_migration_recycle escalates SIGTERM->SIGKILL".)
+# ---------------------------------------------------------------------------
+m10_sigkill_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+INSTALL="$INSTALL"
+WORK="\$(mktemp -d)"
+STATE_DIR_MIG="/tmp/m10-state"
+DEST="\$WORK/dest"; mkdir -p "\$DEST"; : > "\$DEST/boxup"
+# A SIGTERM-immune daemon carrying the exact token: trap TERM so plain kill
+# does nothing; only kill -9 (untrappable) ends it.
+bash -c 'trap "" TERM; sleep 30; :' _ "--statedir=\$STATE_DIR_MIG" &
+victim=\$!
+export STATE_DIR_MIG victim
+sleep 0.3
+events="\$WORK/events"; : > "\$events"
+log(){ :; }
+sleep(){ :; }                 # collapse the ≤10s graceful poll
+pgrep(){ printf '%s\n' "\$victim"; }
+kill(){
+  case "\$1" in
+    -0) command kill -0 "\$2" 2>/dev/null; return \$? ;;
+    -9) echo "SIGKILL:\$2" >> "\$events"; command kill -9 "\$2" 2>/dev/null; return 0 ;;
+    *)  echo "SIGTERM:\$1" >> "\$events"; command kill "\$1" 2>/dev/null; return 0 ;;
+  esac
+}
+extract_fn_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_fn_from "\$INSTALL" do_migration_recycle)"
+do_migration_recycle
+command kill -9 "\$victim" 2>/dev/null || true
+term=no; k9=no
+grep -q '^SIGTERM:' "\$events" && term=yes
+grep -q "^SIGKILL:\$victim" "\$events" && k9=yes
+echo "term=\$term sigkill=\$k9"
+rm -rf "\$WORK"
+INNER
+  timeout 25 bash "$inner"; rm -f "$inner"
+}
+m10res="$(m10_sigkill_test)"
+case "$m10res" in
+  "term=yes sigkill=yes") pass "M10 REAL do_migration_recycle escalates SIGTERM->SIGKILL on a TERM-immune daemon" ;;
+  *) bad "M10 REAL SIGKILL escalation missing: [$m10res] want [term=yes sigkill=yes] (dropping kill -9 flips this)" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# M13 — run_detached_phase's load-bearing `trap '' HUP` must be asserted INSIDE
+# the function body, not by a whole-file grep (two comments also mention it).
+# We extract the REAL run_detached_phase body and confirm a `trap '' HUP` (or
+# `trap "" HUP`) statement appears WITHIN it. Stronger: we eval the real body
+# with `trap` shadowed to record its args and every collaborator stubbed, run
+# it (migrate=0, once unset — the cheap branch), and assert the recorded trap
+# args are exactly `<empty> HUP`. Removing the real trap (line 97) → the
+# recorded-trap assertion FAILS even though comments elsewhere still say HUP.
+# (M13→ "M13 run_detached_phase body installs trap '' HUP".)
+# ---------------------------------------------------------------------------
+m13_body_has_trap() {
+  # Static: the trap statement is inside the FUNCTION body (not a comment, not
+  # elsewhere in the file). Extract the body, drop comment lines, grep.
+  local body
+  body="$(extract_fn_from "$INSTALL" run_detached_phase)"
+  printf '%s\n' "$body" \
+    | sed 's/#.*$//' \
+    | grep -Eq "trap +('' *|\"\" *)HUP"
+}
+if m13_body_has_trap; then
+  pass "M13 run_detached_phase BODY contains the trap '' HUP statement (not just a comment/whole-file match)"
+else
+  bad  "M13 run_detached_phase body is missing trap '' HUP (the whole-file grep would still pass on the comments)"
+fi
+# Dynamic: eval the REAL body with `trap` shadowed; assert it fires with '' HUP.
+m13_trap_runtime() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+INSTALL="$INSTALL"
+WORK="\$(mktemp -d)"; DEST="\$WORK/dest"; mkdir -p "\$DEST"; : > "\$DEST/boxup"
+INSTALL_LOG="\$WORK/log"; : > "\$INSTALL_LOG"
+seen="\$WORK/trap"; : > "\$seen"
+log(){ :; }
+# Shadow the trap builtin to RECORD its arguments. bash lets a function named
+# 'trap' shadow the builtin for unqualified calls in this eval'd body.
+trap(){ printf '%s\n' "\$*" >> "\$seen"; }
+BOX_SETUP_MIGRATE=0; BOX_SETUP_ONCE=
+extract_fn_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_fn_from "\$INSTALL" run_detached_phase)"
+run_detached_phase >/dev/null 2>&1 || true
+# Did the body install an empty-action HUP trap?
+if grep -Eq "^'?'? *HUP\$|^ *HUP\$|^ HUP\$" "\$seen" || grep -q ' HUP\$' "\$seen" || grep -qx 'HUP' "\$seen"; then
+  echo yes; else echo "no:[\$(tr '\n' '|' < "\$seen")]"; fi
+rm -rf "\$WORK"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+m13rt="$(m13_trap_runtime)"
+case "$m13rt" in
+  yes) pass "M13 run_detached_phase at RUNTIME installs an empty-action HUP trap (trap '' HUP fired)" ;;
+  *)   bad "M13 run_detached_phase did NOT install trap '' HUP at runtime: [$m13rt] (removing line 97 flips this; comments cannot)" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# M17 — first-login `up` rc propagation. Drive the REAL ensure_login through the
+# EMPTY-statedir (first-login) branch with a FAILING `tailscale up` (rc 7) and
+# assert ensure_login RETURNS 7. The existing h12_join test stubs `up` to exit 0
+# (argv only) and H5/E3 drives the POPULATED branch, so neither guards this.
+# Forcing `urc=0` after the first-login `up` invocations → ensure_login returns
+# 0 → this test FAILS. (M17→ "M17 ensure_login propagates failing first-login up rc".)
+# ---------------------------------------------------------------------------
+m17_first_login_rc() {
+  local has_key="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+RUN_DIR="\$(mktemp -d)"
+REAUTH_LAST="\$RUN_DIR/last-reauth"
+REAUTH_MIN_INTERVAL=1800
+if [ "$has_key" = yes ]; then
+  AUTHKEY_FILE="\$RUN_DIR/key"; echo tskey-abc > "\$AUTHKEY_FILE"
+else
+  AUTHKEY_FILE="\$RUN_DIR/nokey"
+fi
+log(){ :; }
+have(){ command -v "\$1" >/dev/null 2>&1; }
+id(){ return 1; }
+wait_for_backend(){ echo NeedsLogin; }
+state_is_populated(){ return 1; }          # EMPTY statedir => first-login branch
+config_get(){ [ "\$1 \$2" = "tailscale tags" ] && echo "tag:grok-box"; }
+# The first-login branch runs "\${up[@]}" directly; up[0] is \$(tailscale_bin).
+# Point it at a FAILING binary that exits 7 so urc=7 must be captured+returned.
+FAILBIN="\$RUN_DIR/fail-up"
+cat > "\$FAILBIN" <<'FB'
+#!/bin/sh
+echo "simulated up failure" >&2
+exit 7
+FB
+chmod +x "\$FAILBIN"
+tailscale_bin(){ echo "\$FAILBIN"; }
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+for f in reauth_attempt_allowed reauth_attempt_record run_reauth_up ensure_login; do eval "\$(extract_fn "\$f")"; done
+ensure_login; echo "rc=\$?"
+rm -rf "\$RUN_DIR"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+m17_key="$(m17_first_login_rc yes)"
+m17_nokey="$(m17_first_login_rc no)"
+[ "$m17_key" = "rc=7" ] \
+  && pass "M17 ensure_login (first-login, auth-key) propagates a FAILING up rc (returns 7, not swallowed)" \
+  || bad  "M17 first-login auth-key up rc swallowed: [$m17_key] want rc=7 (forcing urc=0 flips this)"
+[ "$m17_nokey" = "rc=7" ] \
+  && pass "M17 ensure_login (first-login, AuthURL/no-key) propagates a FAILING up rc (returns 7)" \
+  || bad  "M17 first-login no-key up rc swallowed: [$m17_nokey] want rc=7"
+
+# ---------------------------------------------------------------------------
+# M5 — the account_unlocked predicate must be exercised as the REAL fn (both
+# check_reason tests STUB it, so it had no live coverage). Drive the REAL
+# account_unlocked from boxup with `passwd` stubbed to report P (unlocked) /
+# L (locked), and assert it returns 0 for unlocked and 1 for locked. Mutating
+# the real fn to `account_unlocked(){ return 0; }` makes the LOCKED case return
+# 0 → this test FAILS. (M5→ "M5 real account_unlocked distinguishes locked").
+# ---------------------------------------------------------------------------
+m5_account_test() {
+  local status="$1" inner; inner="$(mktemp)"   # status: P (unlocked) | L (locked)
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+BIN="\$(mktemp -d)"
+# Stub passwd so \`passwd -S <user>\` prints "<user> <ST> ...". The real fn
+# reads field 2 (the status) and maps P=>unlocked(0), L/NP=>locked(1). ST is
+# exported and read by the stub at run time (quoted heredoc => no premature
+# expansion of the stub body).
+export ST="$status"
+cat > "\$BIN/passwd" <<'PW'
+#!/bin/sh
+# args: -S <user>
+printf '%s %s 01/01/2020 0 99999 7 -1\n' "\$2" "\$ST"
+PW
+chmod +x "\$BIN/passwd"
+export PATH="\$BIN:\$PATH"
+have(){ command -v "\$1" >/dev/null 2>&1; }
+id(){ return 0; }                     # user exists
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn account_unlocked)"
+if account_unlocked box; then echo unlocked; else echo locked; fi
+rm -rf "\$BIN"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+m5_p="$(m5_account_test P)"
+m5_l="$(m5_account_test L)"
+[ "$m5_p" = unlocked ] \
+  && pass "M5 REAL account_unlocked: passwd -S 'P' => unlocked (return 0)" \
+  || bad  "M5 REAL account_unlocked wrong on P: [$m5_p] want unlocked"
+[ "$m5_l" = locked ] \
+  && pass "M5 REAL account_unlocked: passwd -S 'L' => LOCKED (return 1) — neutering to 'return 0' flips this" \
+  || bad  "M5 REAL account_unlocked wrong on L: [$m5_l] want locked (the predicate is unguarded/neutered)"
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit "$fail"
