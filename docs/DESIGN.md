@@ -64,6 +64,18 @@ last-exitnode-set) is deliberately ephemeral bookkeeping.
    silently, so `boxup once` re-auths with `--force-reauth`; the AuthURL
    appears in `status` as `auth=`. Re-auth reuses the existing machine key, so
    it is the same identity — no new node is forked.
+   - **nodegone (F8/#8):** a node deleted server-side does NOT always land in
+     NeedsLogin. Observed on box-8: LocalAPI kept `BackendState=Running` while
+     tailscaled logged `PollNetMap: initial fetch failed 404: node not found`.
+     `ensure_login` now detects this `nodegone` state (Health strings, or a
+     bounded `tailscaled.log` tail gated on `Self.Online=false`) and re-auths
+     even at Running — rate-limited to once per D4 backoff window so it never
+     storms control.
+   - **re-auth `up` mentions (F9/#9):** current tailscale (1.102.x) refuses an
+     `up` that omits an already-set non-default flag, so the `--force-reauth`
+     branch MENTIONS the current `--hostname` and the tags the device ALREADY
+     carries (from live prefs, never config.toml — see the F11 distinction on
+     the decision wall). Never `--reset`.
 
 ## Convergence rules that encode past incidents
 
@@ -158,6 +170,13 @@ any special case.
 | **Canary/abort + no-auto-rollback** (D7) | rollout deployed everywhere with no verify/brake; per-box failures discarded | a bad HEAD rolls the whole fleet unverified |
 | **Sudo env sha plumbing** (D10/B3) | sudo env_reset drops exported vars; git archive carries no .git | every box stamps `sha=unknown`; drift detection blind |
 | **`--advertise-tags` first-login only** (tags/F11) | re-auth-time tagging locks a node out (headscale#3374) | unattended re-auth converts node to tag-owned and it can't rejoin |
+| **Daemon child closes BOTH lock fds (fd 8 + fd 9)** (F7/#7) | `start_tailscaled` runs under the converge lock (fd 8); the old code closed only fd 9, so tailscaled inherited fd 8 and held converge.lock for its whole life → every tick skipped forever (256 skips/77 min, box-8) | one leaked fd wedges all converge; box looks "healthy-ish" (hb fresh) while ticks are no-ops |
+| **Stale converge-lock self-heal: break after ≥5 non-boxup skips** (F7/#7) | field boxes already wedged with tailscaled holding fd 8 need to recover without a manual restart; a genuine concurrent `boxup` must never be stomped | either the wedge is permanent until reboot (no self-heal), or a real concurrent converge gets stomped (no boxup-holder check / no threshold). Counter is ephemeral ($RUN_DIR/converge-skip.count); fail-open — no counter/holder ⇒ no break. Holder identity comes from **/proc/locks** (the kernel flock table, keyed by dev:inode), NOT /proc/*/fd: /proc/*/fd answers "who has the file open" and self-includes the very lock-check subshell that just lost `flock -n 8`, defeating the break. **Verified 2026-08-28 on grok-box-1** (shared pid namespace, tini as pid 1): /proc/locks pids resolve to /proc/PID/comm inside the container (holder pid 1123910 → comm `flock`, inode 527804 matched `00:27:527804`). If the platform ever moves the boxes into their OWN pid namespace, holders stop resolving, an unresolvable holder is treated as unproven (never broken, fail-safe), and this self-heal degrades to a silent no-op — so that case is logged once per window, never silent |
+| **`nodegone` ≠ logged-in: re-auth on deleted node even at backend=Running** (F8/#8) | control plane deleted the node but LocalAPI kept `BackendState=Running` while PollNetMap 404'd; `ensure_login` returned 0 on Running and never re-authed → box sat online=no with fresh hb forever (box-8) | a server-deleted node never recovers; `wait_for_backend` is untouched (Running is legitimately terminal for IT — the judgement lives in ensure_login). Rate-limited via the D4 window (once per window; loud once-per-window log when only an unclickable AuthURL can be minted) so re-auth never storms control |
+| **Re-auth `up` MENTIONS current hostname + already-set tags** (F9/#9, reverses F11's blanket rule) | tailscale 1.102.x refuses `up` that omits any already-set non-default flag ("requires mentioning all non-default flags"); `--force-reauth` with no `--hostname`/`--advertise-tags` was a silent no-op (box-8, reproduced by hand) | re-auth is a no-op and the box never rejoins. **Distinction from F11:** F11 forbids *introducing* tags on re-auth (locks node out); this MENTIONS tags the device ALREADY carries (sourced from live prefs/`Self.Tags`, NEVER config.toml) — a mention is not an introduction. Never `--reset`. The `up` failure is no longer swallowed by `\|\| true`: combined output is captured and the tailscale error is logged at ERROR, naming the mentioning-flags case explicitly |
+| **One `spawn_detached()` for ALL long-lived spawns** (F7/#7 P0-A) | #7 was a per-site fd-close convention nobody enforced — the comment even claimed a close the code skipped. tailscaled, sshd (ensure_sshd AND do_tick), and the worker each spawn under/near the converge-lock subshell; any that keeps fd 8 open holds the flock for life | a second/third instance of #7 (sshd self-daemonizes holding fd 8; observed-class failure). Routing all four spawns through one helper that owns the `8>&- 9>&-` closes = one place to be right, one to review. Do NOT re-inline per-site closes |
+| **`refresh_exitnode` skips on nodegone** (F8/#8 P0-B) | a node deleted server-side stays backend=Running (nodegone); the old `case Running) ;;` gate let a `tailscale set` fire against a dead identity, a no-op that can cancel the in-flight map poll | pushing prefs to a gone node fights the re-auth path; re-auth (ensure_login) is the only correct actor on a gone node. (ensure_name needs NO guard: a nodegone box already has a frozen grok-box-N and short-circuits before reading fields.) |
+| **Converge `degraded` marker, return-neutral** (P1) | `do_ensure_body` was all-`\|\| true`, so a converge reported success even if every step failed, invisibly | each step's non-zero rc is now logged and stamps `$RUN_DIR/degraded` (cleared on a clean pass). RETURN SEMANTICS UNCHANGED — the marker is visibility only, never a gate on a tick (callers depend on a converge not failing a tick) |
 
 ## Prior art (D11)
 
