@@ -91,7 +91,8 @@ do_migration_recycle() {
 # migration we ALWAYS run `boxup once` afterwards even when BOX_SETUP_ONCE was
 # not requested — otherwise we would have killed tailscaled and never restarted
 # it, which is exactly the box-8 r4 brick. rc of `boxup once` is preserved in
-# the log (201 = converge lock busy — surfaced, not faked).
+# the log (201 = converge lock busy — surfaced, not faked; a clean once now
+# exits 0 → DONE (rc=0), P2-2 5.2.0).
 run_detached_phase() {
   trap '' HUP
   local migrate="${BOX_SETUP_MIGRATE:-0}" want_once="${BOX_SETUP_ONCE:-}" rc=0
@@ -103,7 +104,7 @@ run_detached_phase() {
   if [ "$migrate" = 1 ] || [ "$want_once" = 1 ]; then
     log "running boxup once"
     rc=0; bash "$DEST/boxup" once || rc=$?
-    [ "$rc" = 0 ] || log "boxup once exited rc=$rc (201 = converge lock busy — NOT faked)"
+    [ "$rc" = 0 ] || log "boxup once exited rc=$rc (rc≠0; 201 = converge lock busy — surfaced, not faked)"
   else
     log "next: sudo $DEST/boxup once"
     log "then follow $DEST/docs/AGENT.md"

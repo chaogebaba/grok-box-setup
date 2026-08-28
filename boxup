@@ -2111,7 +2111,12 @@ case "$cmd" in
     start_daemon
     run_tick
     print_status
-    [ "$_once_rc" = 201 ] && exit "$_once_rc"
+    # Propagate a busy converge lock (201) so hourly automation sees a failed
+    # converge; a clean run must exit 0 explicitly. Without this, the trailing
+    # `[ … = 201 ]` test would be the arm's last status and a healthy converge
+    # (_once_rc=0) would make `boxup once` exit 1 (no set -e). (P2-2, 5.2.0)
+    if [ "$_once_rc" = 201 ]; then exit "$_once_rc"; fi
+    exit 0
     ;;
   ensure|--ensure)
     require_root ensure
@@ -2122,7 +2127,10 @@ case "$cmd" in
     do_ensure; _up_rc=$?
     start_daemon
     print_status
-    [ "$_up_rc" = 201 ] && exit "$_up_rc"
+    # Same trailing-conditional trap as `once`: exit 0 on the clean path, only
+    # propagate a busy converge lock (201). (P2-2, 5.2.0)
+    if [ "$_up_rc" = 201 ]; then exit "$_up_rc"; fi
+    exit 0
     ;;
   tick|--tick)
     require_root tick
