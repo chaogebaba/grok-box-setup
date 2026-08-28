@@ -7,6 +7,15 @@ hostname
 *.pre-v4
 *.v4tmp
 
+# H10: auth keys must never land in the tree even if dropped OUTSIDE secrets/.
+# A live tailnet key was once left at the repo root as auth_key.txt (untracked
+# but not ignored). Belt-and-braces filename patterns — no hook, no scanner.
+auth_key.txt
+*authkey*
+*auth_key*
+tskey-*
+*.authkey
+
 # Logs and pid files
 *.log
 *.pid
