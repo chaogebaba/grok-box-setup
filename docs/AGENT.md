@@ -22,6 +22,20 @@ sudo /workspace/box-setup/boxup once
 - To skip the URL dance, put a **reusable, non-ephemeral** auth key in
   `/workspace/box-setup/secrets/ts-authkey` (mode 600) before `boxup once`,
   or install with `BOX_SETUP_AUTHKEY=tskey-...`.
+- **Record the key's expiry (H11).** Tailscale auth keys expire (≤ 90 days) and
+  the date is NOT recoverable from the key, so write it next to the key as a
+  single ISO date:
+  ```bash
+  # the date the key was minted + its lifetime (90d here) = its expiry
+  echo 2026-11-26 | sudo tee /workspace/box-setup/secrets/ts-authkey.expires
+  sudo chmod 600 /workspace/box-setup/secrets/ts-authkey.expires
+  ```
+  `boxup check` FAILS on an expired key and WARNs (once/hour, not a failure) if
+  this file is missing/unparseable; `status` shows `authkey=expiring:<date>`
+  (< 7 days), `authkey=EXPIRED:<date>`, or `authkey=unknown-expiry`. When you
+  rotate the key, update this file in the same step. **Assumption (operator-
+  set, not derived):** the current fleet key was minted 2026-08-28 with a
+  90-day lifetime ⇒ expiry `2026-11-26`.
 - The box names itself: once logged in with peers visible, `boxup` picks the
   lowest free `grok-box-N`, stores it in `/workspace/box-setup/hostname`, and
   pushes it. Do not invent names by hand.
@@ -73,6 +87,9 @@ env form in section D.
 | `check=FAIL reason=...` | that predicate is unhealthy | act on the named predicate (its own row here); most are fixed by `boxup once` |
 | `refresh=failing:N` in status | exit-node `tailscale set` has failed N times in a row (backoff 20→60→180→600s) | check `/var/log/boxup-worker.log`; force one immediate retry with `sudo env BOXUP_FORCE_REFRESH=1 /workspace/box-setup/boxup once` |
 | `hb=-` or huge | worker dead | `boxup once` (restarts it) |
+| `authkey=expiring:<date>` in status | seeded auth key expires in < 7 days | mint a new reusable key, write it to `secrets/ts-authkey`, update `secrets/ts-authkey.expires` (see §A) |
+| `authkey=EXPIRED:<date>` in status / `check=FAIL reason=authkey EXPIRED` | the unattended recovery key is dead | rotate the key NOW (§A); until then a state-loss event cannot self-recover |
+| `authkey=unknown-expiry` in status / `check: WARN authkey expiry unknown` | `secrets/ts-authkey.expires` missing or unparseable | seed it (§A); the key may still be valid — this is a warning, not a check failure |
 | tailnet shows two nodes for one box | stale identity got recreated | delete the OLD node in the admin console; never copy `state/` between boxes |
 
 Logs: `/var/log/boxup-worker.log`, `/var/log/tailscaled.log`.
@@ -95,7 +112,11 @@ sudo /workspace/box-setup/box-bootstrap.sh --once
 ```
 
 That shim calls `boxup once`. It is the resurrection path after an image
-swap — do not rename or remove either file.
+swap — do not rename or remove either file. The two shim files
+(`box-bootstrap.sh`, `boxup`) live in `/workspace/box-setup/` only; **v5.1.0
+installs NOTHING in `/usr/local/sbin`** (the old v4 layout put helper shims
+there — install.sh now actively removes them). Do not look for or recreate
+`/usr/local/sbin` shims; they are not part of v5.
 
 **Self-heal (since v5.1):** the shim now also repairs a missing or corrupt
 `boxup`. If `/workspace/box-setup/boxup` is absent, fails `bash -n`, or has
@@ -149,6 +170,7 @@ automatic): once the ACL authorizes the tag, run on the box
 
 ```bash
 sudo /workspace/box-setup/bin/tailscale up --advertise-tags=tag:grok-box --force-reauth \
+  --hostname="$(cat /workspace/box-setup/hostname)" \
   --ssh=false --advertise-exit-node --accept-dns --snat-subnet-routes=true --operator=box
 ```
 
