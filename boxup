@@ -741,6 +741,12 @@ ensure_login() {
   # An empty statedir is a first login and must NOT get --force-reauth.
   if state_is_populated; then
     up+=(--force-reauth)
+    # Tags are auth-time-only and NEVER added on the --force-reauth branch
+    # (F11): an unattended ~180-day key-expiry re-auth must not convert a
+    # user-owned node to tag-owned (ACL semantics change, tagged keys stop
+    # expiring, and an unauthorized tag is REJECTED after --force-reauth
+    # already rotated keys — leaving the box locked out, headscale#3374).
+    # Retagging an existing node is a documented MANUAL operator step.
     if [ -s "$AUTHKEY_FILE" ]; then
       log "login: re-auth existing identity with auth-key (--force-reauth)"
       "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
@@ -749,11 +755,17 @@ ensure_login() {
       "${up[@]}" || true
     fi
   else
+    # First login (empty statedir). This is the ONLY place --advertise-tags is
+    # added: config [tailscale] tags, when non-empty, tags the node at initial
+    # registration. Default unset => flag omitted => byte-identical to before.
+    local tags
+    tags="$(config_get tailscale tags || true)"
+    [ -n "$tags" ] && up+=(--advertise-tags="$tags")
     if [ -s "$AUTHKEY_FILE" ]; then
-      log "login: auth-key join (statedir empty)"
+      log "login: auth-key join (statedir empty)${tags:+ tags=$tags}"
       "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
     else
-      log "login: minting AuthURL (statedir empty, no key) — see boxup status"
+      log "login: minting AuthURL (statedir empty, no key)${tags:+ tags=$tags} — see boxup status"
       "${up[@]}" || true
     fi
   fi
