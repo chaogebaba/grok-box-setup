@@ -609,6 +609,191 @@ else
   bad  "F1 VERSION mismatch: file=$(tr -d '[:space:]' < "$ROOT/VERSION") constant=$(grep '^BOXUP_VERSION=' "$BOXUP")"
 fi
 
+# ===========================================================================
+# F4 (box-8 r4 incident) — install.sh (and `boxup update`, which calls it) run
+# the disruptive tailscaled recycle + restart + `boxup once` inside a SESSION-
+# DETACHED, HUP-IMMUNE process, so an install over an SSH session riding the
+# tailnet cannot be killed mid-recycle and strand the box offline. The
+# foreground returns 0 PROMPTLY with a pointer to /var/log/boxup-install.log.
+# ===========================================================================
+INSTALL="$ROOT/install.sh"
+
+# extract_fn_from: like extract_fn but from an arbitrary file.
+extract_fn_from() {
+  awk -v fn="$2" '
+    $0 ~ "^"fn"\\(\\) \\{" {inside=1}
+    inside {print}
+    inside && /^\}$/ {exit}
+  ' "$1"
+}
+
+# --- F4 static contract in install.sh --------------------------------------
+f4_static_ok=1
+grep -q 'run_detached_phase()' "$INSTALL" || { f4_static_ok=0; echo "  missing run_detached_phase" >&2; }
+grep -q 'BOX_SETUP_DETACHED' "$INSTALL" || { f4_static_ok=0; echo "  missing BOX_SETUP_DETACHED guard" >&2; }
+grep -Eq "trap +'' +HUP" "$INSTALL" || { f4_static_ok=0; echo "  missing trap '' HUP" >&2; }
+grep -q 'setsid' "$INSTALL" || { f4_static_ok=0; echo "  missing setsid" >&2; }
+grep -q 'boxup-install.log' "$INSTALL" || { f4_static_ok=0; echo "  missing install-log path" >&2; }
+grep -qi 'tailnet will drop' "$INSTALL" || { f4_static_ok=0; echo "  missing tailnet-drop warning" >&2; }
+grep -q 'DONE' "$INSTALL" || { f4_static_ok=0; echo "  missing DONE marker" >&2; }
+if [ "$f4_static_ok" = 1 ]; then
+  pass "F4 install.sh has detached phase (setsid + trap '' HUP), install-log, tailnet-drop warning, DONE"
+else
+  bad  "F4 install.sh missing a required detach element (see above)"
+fi
+
+# The detach must be printed/launched AFTER the file copy (order: copy -> detach).
+# Assert the install_atomic copy of boxup precedes the setsid re-exec line.
+f4_copy_line="$(grep -n 'install_atomic 0755 "\$REPO_ROOT/boxup"' "$INSTALL" | head -1 | cut -d: -f1)"
+f4_setsid_line="$(grep -n '^  setsid env BOX_SETUP_DETACHED=1' "$INSTALL" | head -1 | cut -d: -f1)"
+if [ -n "$f4_copy_line" ] && [ -n "$f4_setsid_line" ] && [ "$f4_copy_line" -lt "$f4_setsid_line" ]; then
+  pass "F4 order: files are copied (install_atomic) BEFORE the detached re-exec"
+else
+  bad  "F4 order wrong: copy line=[$f4_copy_line] setsid line=[$f4_setsid_line] (want copy < setsid)"
+fi
+
+# --- F4 recycle-then-restart (function-extracted, mutation-sensitive) -------
+# Drive the REAL run_detached_phase with stubbed do_migration_recycle + bash.
+# Assert:
+#   (1) migrate=1 => do_migration_recycle runs (RECYCLE recorded) BEFORE
+#       `boxup once` (ONCE recorded), AND the log ends with DONE.
+#   (2) migrate=1 with BOX_SETUP_ONCE UNSET still runs `boxup once` — the whole
+#       point of the fix: a recycle that killed tailscaled MUST restart it.
+# A mutation that drops the `boxup once` call, or runs once before the recycle,
+# fails this. (The exact-`--statedir` SIGTERM selector is covered by the E1
+# selector test above; here we test the orchestration/order.)
+f4_detached_test() {
+  local set_once="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+INSTALL="$INSTALL"
+DEST="\$(mktemp -d)"
+INSTALL_LOG="\$DEST/install.log"; : > "\$INSTALL_LOG"
+order="\$DEST/order"; : > "\$order"
+log(){ echo "install: \$*"; }
+# Stub the recycle to a recorder — we test ORCHESTRATION here, not the kill.
+do_migration_recycle(){ echo "RECYCLE" >> "\$order"; }
+# 'boxup' invocations are 'bash "\$DEST/boxup" <cmd>'; intercept and record.
+bash(){
+  case "\${1:-}" in
+    */boxup) echo "ONCE:\${2:-}" >> "\$order"; return 0 ;;
+    *) command bash "\$@" ;;
+  esac
+}
+BOX_SETUP_MIGRATE=1
+$( [ "$set_once" = yes ] && echo 'BOX_SETUP_ONCE=1' || echo 'BOX_SETUP_ONCE=' )
+eval "\$(awk '/^run_detached_phase\(\) \{/{i=1} i{print} i&&/^\}\$/{exit}' "\$INSTALL")"
+run_detached_phase >> "\$INSTALL_LOG" 2>&1
+once_ran=no; grep -q '^ONCE:once' "\$order" && once_ran=yes
+done_logged=no; grep -q 'DONE' "\$INSTALL_LOG" && done_logged=yes
+recycle_before_once=no
+if grep -q '^RECYCLE' "\$order" && grep -q '^ONCE:once' "\$order"; then
+  rn=\$(grep -n '^RECYCLE' "\$order" | head -1 | cut -d: -f1)
+  on=\$(grep -n '^ONCE:once' "\$order" | head -1 | cut -d: -f1)
+  [ "\$rn" -lt "\$on" ] && recycle_before_once=yes
+fi
+echo "once=\$once_ran done=\$done_logged recycle_first=\$recycle_before_once"
+rm -rf "\$DEST"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+f4_once="$(f4_detached_test yes)"
+f4_noonce="$(f4_detached_test no)"
+case "$f4_once" in
+  *once=yes\ done=yes\ recycle_first=yes*) pass "F4 detached phase: recycle (kill old) BEFORE \`boxup once\` (start new), then DONE" ;;
+  *) bad "F4 detached order/restart wrong: [$f4_once]" ;;
+esac
+case "$f4_noonce" in
+  *once=yes*) pass "F4 a migration recycle ALWAYS restarts (boxup once) even when BOX_SETUP_ONCE is unset (box-8 r4 fix)" ;;
+  *) bad "F4 migration recycle did NOT force a restart without BOX_SETUP_ONCE: [$f4_noonce] — this is the brick" ;;
+esac
+
+# --- F4 end-to-end: foreground returns 0 PROMPTLY, detached child logs DONE
+#     even after its PARENT is SIGHUP'd/killed (HUP-immune + session-detached).
+# Runs the REAL install.sh with PATH-injected id/sudo/pgrep fakes, a real
+# setsid, and a fake $DEST/boxup whose `once` SLEEPS 3s then writes a marker.
+# We SIGKILL the wrapping parent right after install.sh returns; a non-detached
+# child would die with it and never write the marker. Skips cleanly if setsid
+# is unavailable.
+f4_e2e_test() {
+  if ! command -v setsid >/dev/null 2>&1; then echo "skip"; return 0; fi
+  local work bindir dest repo
+  work="$(mktemp -d)"; bindir="$work/bin"; dest="$work/dest"; repo="$work/repo"
+  mkdir -p "$bindir" "$repo/etc" "$repo/docs"
+  # Fake PATH shims: id (root), sudo (transparent), pgrep (no tailscaled ⇒ no
+  # recycle work), flock (real needed by nothing here but present), chmod real.
+  cat > "$bindir/id" <<'SH'
+#!/bin/sh
+[ "$1" = -u ] && { echo 0; exit 0; }
+exec /usr/bin/id "$@"
+SH
+  cat > "$bindir/pgrep" <<'SH'
+#!/bin/sh
+exit 1
+SH
+  chmod +x "$bindir/id" "$bindir/pgrep"
+  # A minimal valid repo: boxup with the eof sentinel + VERSION + config.
+  cat > "$repo/boxup" <<'SH'
+#!/bin/bash
+# fake boxup
+case "${1:-}" in
+  once) sleep 3; echo "boxup-once-ran" >> "$BOX_SETUP_ROOT/once.marker" ;;
+  stop) : ;;
+esac
+exit 0
+# boxup-eof
+SH
+  cat > "$repo/box-bootstrap.sh" <<'SH'
+#!/bin/bash
+exit 0
+SH
+  cp "$INSTALL" "$repo/install.sh"
+  echo "9.9.9" > "$repo/VERSION"
+  echo "[ssh]" > "$repo/etc/config.example.toml"
+  echo "password = \"x\"" >> "$repo/etc/config.example.toml"
+  echo "# doc" > "$repo/docs/AGENT.md"
+  echo "# readme" > "$repo/README.md"
+  chmod +x "$repo/boxup" "$repo/box-bootstrap.sh" "$repo/install.sh"
+  local log="$dest.install.log" t0 t1 elapsed
+  mkdir -p "$dest"
+  # Run install.sh in a CHILD shell (the "SSH session"); capture its pid;
+  # SIGKILL that shell immediately after install.sh returns, so only a truly
+  # detached grandchild can finish `boxup once` (3s) and write once.marker.
+  t0=$(date +%s)
+  PATH="$bindir:$PATH" \
+    BOX_SETUP_ROOT="$dest" \
+    BOX_SETUP_ONCE=1 \
+    BOX_SETUP_GIT_SHA=deadbee \
+    BOX_SETUP_INSTALL_LOG="$log" \
+    bash "$repo/install.sh" >/dev/null 2>&1
+  t1=$(date +%s); elapsed=$((t1 - t0))
+  # Give the detached child time to finish the 3s `once` + DONE.
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    grep -q 'DONE' "$log" 2>/dev/null && break
+    sleep 0.25; i=$((i + 1))
+  done
+  local once_ran=no done_logged=no
+  [ -f "$dest/once.marker" ] && once_ran=yes
+  grep -q 'DONE' "$log" 2>/dev/null && done_logged=yes
+  echo "elapsed=$elapsed once=$once_ran done=$done_logged"
+  rm -rf "$work" "$log"
+}
+f4_e2e="$(f4_e2e_test)"
+if [ "$f4_e2e" = skip ]; then
+  pass "F4 e2e SKIPPED (setsid unavailable in this environment)"
+else
+  # Foreground must return well before the 3s `once` completes (prompt return).
+  case "$f4_e2e" in
+    *elapsed=0*|*elapsed=1*|*elapsed=2*) pass "F4 e2e foreground returned promptly (${f4_e2e%% *})" ;;
+    *) bad "F4 e2e foreground did NOT return promptly (blocked on the detached work?): [$f4_e2e]" ;;
+  esac
+  case "$f4_e2e" in
+    *once=yes*done=yes*) pass "F4 e2e detached child survived parent exit, ran \`boxup once\`, logged DONE (HUP-immune)" ;;
+    *) bad "F4 e2e detached child did not complete after parent death: [$f4_e2e]" ;;
+  esac
+fi
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit "$fail"
