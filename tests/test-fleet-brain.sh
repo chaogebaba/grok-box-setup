@@ -133,6 +133,7 @@ set -u
 FLEETCTL="$FLEETCTL"
 FLEET_KEY_EXPIRY_SECS=7776000
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" clamp_expiry_secs)"
 eval "\$(extract_from "\$FLEETCTL" mint_payload)"
 mint_payload
 INNER
@@ -166,6 +167,7 @@ BOX_AUTHKEY_EXPIRES="$BOXROOT/secrets/ts-authkey.expires"
 log(){ :; }
 extract_from(){ awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$1"; }
 eval "$(extract_from "$FLEETCTL" seed_key_over_tunnel)"
+eval "$(extract_from "$FLEETCTL" seed_status_converged)"
 # tunnel_ssh stub: for the seed heredoc, CORRUPT the stdin so the remote sha
 # never matches want_sha (the remote script rm's the .tmp and exits 3). For a
 # `boxup status` call, print a benign line.
@@ -217,6 +219,7 @@ BOX_AUTHKEY_EXPIRES="$BOXROOT/secrets/ts-authkey.expires"
 log(){ :; }
 extract_from(){ awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$1"; }
 eval "$(extract_from "$FLEETCTL" seed_key_over_tunnel)"
+eval "$(extract_from "$FLEETCTL" seed_status_converged)"
 tunnel_ssh(){ shift; local s="$*"; case "$s" in *"boxup status"*) echo "backend=Running tunnel=up"; return 0 ;; *) bash -c "$s" ;; esac; }
 if seed_key_over_tunnel grok-box-8 "FRESH-KEY" "2099-01-01"; then echo "seed=OK"; else echo "seed=FAIL"; fi
 echo "onbox=$(cat "$BOX_AUTHKEY")"
@@ -345,7 +348,7 @@ TS_TAILNET="-"
 TS_API_CODE=0
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_dedup dev_field ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in reconcile_dedup dev_field ts_ok devices_json_valid; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 FLEET_STALE_SECS=600
 seq="\$(mktemp)"; BODYF="\$(mktemp)"
 DEVS='{"devices":[{"hostname":"grok-box-8","nodeId":"LIVE","online":true,"lastSeen":"2999-01-01T00:00:00Z"},{"hostname":"grok-box-8-1","nodeId":"STALE","online":false,"lastSeen":"2000-01-01T00:00:00Z"}]}'
@@ -496,6 +499,8 @@ notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
 for fn in reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }           # no canary_box configured => default 8
+reconcile_stage_rollout_tree(){ FLEET_ROLLOUT_TREE_STAGED=0; return 0; }  # a tree is staged
+reconcile_cleanup_rollout_tree(){ :; }
 tunnel_up(){ return 0; }            # every tunnel up
 seq="\$(mktemp)"
 # tunnel_deploy_one records the box, returns the per-box verdict.
@@ -550,6 +555,8 @@ notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
 for fn in reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
+reconcile_stage_rollout_tree(){ FLEET_ROLLOUT_TREE_STAGED=0; return 0; }
+reconcile_cleanup_rollout_tree(){ :; }
 tunnel_up(){ [ "\$1" = grok-box-8 ] && return 1 || return 0; }   # canary down
 seq="\$(mktemp)"
 tunnel_deploy_one(){ echo "DEPLOY \$1" >> "\$seq"; return 0; }
@@ -596,30 +603,36 @@ INNER
 [ "$(rollout_canary_default_test)" = grok-box-8 ] && pass "rollout: canary_box default => grok-box-8" || bad "canary_box default wrong: [$(rollout_canary_default_test)]"
 
 # Tunnel argv: tunnel_deploy_one drives the box over ssh -p 2000N box@127.0.0.1
-# -i <vps-key>, and VERIFIES with `boxup check`. Stub ssh (via tunnel_ssh's ssh
-# call) to capture the argv of the LAST call (the boxup check verify).
+# -i <vps-key>, and VERIFIES with `boxup check`. B-2: a rollout MUST push a real
+# artifact, so we stage a real tarball and assert the scp push happened. Stub
+# ssh AND scp to capture argv.
 rollout_tunnel_argv_test() {
   local inner; inner="$(mktemp)"
   cat > "$inner" <<INNER
 set -u
 FLEETCTL="$FLEETCTL"
 FLEET_BOX_KEY="/etc/grok-fleet/box_access_ed25519"
-FLEET_ROLLOUT_TREE=""     # no tarball => converge+verify only (no scp)
+FLEET_ROLLOUT_TREE="\$(mktemp --suffix=.tar)"; printf 'ARTIFACT' > "\$FLEET_ROLLOUT_TREE"   # a real staged artifact
 BOX_ROOT="/workspace/box-setup"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in tunnel_deploy_one tunnel_ssh port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
-cap="\$(mktemp)"
-# ssh stub: append the full argv of each invocation (one line per call).
-ssh(){ printf '%s\n' "\$*" >> "\$cap"; return 0; }
+for fn in tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+cap="\$(mktemp)"; scpcap="\$(mktemp)"
+# ssh stub: append the full argv of each invocation (one line per call). The
+# 'boxup check' verify + the extract/install/once step both come through here.
+# The extract step checks '[ -f remote_tar ]' — make that TRUE so install runs.
+ssh(){ printf 'SSH %s\n' "\$*" >> "\$cap"; case "\$*" in *"[ -f '/tmp/grok-box-setup-brain.tar' ]"*) return 0 ;; esac; return 0; }
+scp(){ printf 'SCP %s\n' "\$*" >> "\$scpcap"; return 0; }
 tunnel_deploy_one grok-box-8 >/dev/null 2>&1
+echo "rc=\$?"
 # Emit the LAST ssh argv (the boxup check verify) + whether any call carried the
-# tunnel identity.
+# tunnel identity, and whether an artifact was PUSHED over scp.
 tail -1 "\$cap"
 grep -q -- "-p 20008 box@127.0.0.1" "\$cap" && echo "PORTHOST-OK" || echo "PORTHOST-MISSING"
 grep -q -- "-i /etc/grok-fleet/box_access_ed25519" "\$cap" && echo "KEY-OK" || echo "KEY-MISSING"
 grep -q "boxup check" "\$cap" && echo "VERIFY-OK" || echo "VERIFY-MISSING"
-rm -f "\$cap"
+grep -q -- "-P 20008" "\$scpcap" && grep -q "box@127.0.0.1:/tmp/grok-box-setup-brain.tar" "\$scpcap" && echo "PUSH-OK" || echo "PUSH-MISSING"
+rm -f "\$cap" "\$scpcap" "\$FLEET_ROLLOUT_TREE"
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
@@ -627,6 +640,7 @@ ro_argv="$(rollout_tunnel_argv_test)"
 case "$ro_argv" in *"PORTHOST-OK"*) pass "rollout tunnel argv: ssh -p 20008 box@127.0.0.1 (port 20000+8)" ;; *) bad "rollout tunnel argv port/host wrong: [$ro_argv]" ;; esac
 case "$ro_argv" in *"KEY-OK"*) pass "rollout tunnel argv: -i <VPS box-access key> (no password fallback, R7)" ;; *) bad "rollout tunnel argv key missing: [$ro_argv]" ;; esac
 case "$ro_argv" in *"VERIFY-OK"*) pass "rollout tunnel: verifies via boxup check over the tunnel (D6 postcondition)" ;; *) bad "rollout tunnel verify missing: [$ro_argv]" ;; esac
+case "$ro_argv" in *"PUSH-OK"*) pass "rollout tunnel: PUSHES the staged artifact over scp -P 20008 (B-2: no push-less rollout)" ;; *) bad "rollout tunnel did NOT push an artifact (B-2): [$ro_argv]" ;; esac
 
 # =============================================================================
 # TUNNEL — boxup supervision: unconfigured no-op, respawn argv, status field.
@@ -756,12 +770,13 @@ installer_tree_test() {
   rm -rf "$pfx"
 }
 tree="$(installer_tree_test)"
-expected="etc/grok-fleet/|etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/config.toml|opt/grok-fleet/fleetctl|"
 # etc/grok-fleet is a dir (no file) — normalize by removing the trailing dir slash entry if present.
 tree_norm="$(printf '%s' "$tree" | sed 's#etc/grok-fleet/|##')"
-expected_norm="etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/config.toml|opt/grok-fleet/fleetctl|"
+# The sanctioned footprint: fleetctl + config.toml + service + timer + the ONE
+# sshd drop-in (B-3). Nothing else.
+expected_norm="etc/ssh/sshd_config.d/50-grok-fleet.conf|etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/config.toml|opt/grok-fleet/fleetctl|"
 if [ "$tree_norm" = "$expected_norm" ]; then
-  pass "installer: installs exactly fleetctl + config.toml + service + timer"
+  pass "installer: installs exactly fleetctl + config.toml + service + timer + one sshd drop-in"
 else
   bad "installer tree unexpected: [$tree_norm] want [$expected_norm]"
 fi
@@ -800,6 +815,256 @@ if [ -z "$mutate_lines" ]; then
 else
   bad "installer appears to MUTATE sshd/xray/hysteria/wg0: $mutate_lines"
 fi
+
+echo "-----"
+# =============================================================================
+# SURVIVOR KILLS — a behavioural test for every mutant that survived r2
+# (M01,M02,M03,M11,M13,M19,M20,M21,M23). Each was verified to FLIP (PASS->FAIL)
+# when its mutation is applied to a scratch copy of fleetctl / install-vps.sh.
+# See the commit message for the survivor->test ledger.
+# =============================================================================
+
+# --- M01: cmd_reconcile default apply=0 (NOT 1). Drive the REAL cmd_reconcile
+# with everything stubbed; a mint-worthy box must be WOULD-logged (dry-run), and
+# reconcile_execute must NEVER be called by default. If the default flipped to
+# apply=1, reconcile_execute would fire (command-not-found -> observable).
+m01_test() {
+  local args="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="\$(mktemp -d)"
+FLEET_BOXES="grok-box-8"
+BOX_ROOT="/nonexistent"
+FLEET_TARGET_SHA=""
+MARK="\$(mktemp)"; : > "\$MARK"
+log(){ :; }
+notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in cmd_reconcile reconcile_one reconcile_decide reconcile_target_boxes box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent reconcile_alert_asleep reconcile_alert_incoherent mint_window_valid days_until reconcile_record_api_failure reconcile_reset_api_failure reconcile_backoff_active devices_json_valid key_meta_id key_meta_file ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# API returns a healthy list where box-8 is OFFLINE (mint-worthy with tunnel up).
+BODYF="\$(mktemp)"
+devices_json(){ TS_API_CODE=200; printf '%s' '{"devices":[]}' > "\$BODYF"; }
+ts_api_body(){ cat "\$BODYF"; }
+dev_field(){ case "\$3" in online) echo no;; fresh) echo no;; dupcount) echo 0;; both_online) echo no;; *) echo "";; esac; }
+tunnel_up(){ return 0; }
+tunnel_ssh(){ return 0; }
+reconcile_execute(){ echo "EXECUTED:\$2" >> "\$MARK"; return 0; }   # must NOT run by default
+cmd_reconcile $args >/dev/null 2>&1
+if grep -q EXECUTED "\$MARK"; then echo "EXECUTED"; else echo "DRYRUN"; fi
+rm -rf "\$FLEET_STATE" "\$BODYF" "\$MARK"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+[ "$(m01_test "")" = DRYRUN ] && pass "M01: bare reconcile defaults to DRY-RUN (never executes a mutation)" || bad "M01: default is not dry-run: [$(m01_test "")]"
+[ "$(m01_test "--apply")" = EXECUTED ] && pass "M01: reconcile --apply DOES execute (guards against a no-op default)" || bad "M01: --apply did not execute: [$(m01_test "--apply")]"
+
+# --- M02: defeat the readonly=1 suppression gate. A READ-ONLY run where the box
+# decision WOULD be `mint` (offline + tunnel up) must STILL suppress the mutation.
+# Unlike the old test (empty inputs => noop), this feeds a mint-worthy decision.
+m02_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="\$(mktemp -d)"
+BOX_ROOT="/nonexistent"
+FLEET_TARGET_SHA=""
+RECONCILE_READONLY=1
+MARK="\$(mktemp)"; : > "\$MARK"
+log(){ :; }; notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in reconcile_one reconcile_decide box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# Feed a mint-worthy decision: online=no, tunnel up. dev_field is unused because
+# devs is non-empty here; provide it. But make it read-only (arg 4 = 1) AND apply=1.
+dev_field(){ case "\$3" in online) echo no;; fresh) echo yes;; dupcount) echo 1;; both_online) echo no;; *) echo "";; esac; }
+tunnel_up(){ return 0; }
+tunnel_ssh(){ return 0; }
+reconcile_execute(){ echo "EXECUTED:\$2" >> "\$MARK"; return 0; }
+# apply=1 but readonly=1 => the readonly gate MUST suppress the mint.
+reconcile_one grok-box-8 '{"devices":[]}' 1 1 >/dev/null 2>&1
+if grep -q EXECUTED "\$MARK"; then echo "EXECUTED"; else echo "SUPPRESSED"; fi
+rm -rf "\$FLEET_STATE" "\$MARK"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+[ "$(m02_test)" = SUPPRESSED ] && pass "M02: read-only run suppresses a mint-worthy decision (readonly gate holds)" || bad "M02: readonly gate defeated: [$(m02_test)]"
+
+# --- M03: the stale-device selector must pick the OLDER *OFFLINE* device, never
+# the oldest overall. Fixture: an OLDER device that is ONLINE + a NEWER device
+# that is OFFLINE. stale_id must be the OFFLINE (newer) one, NOT the older online.
+# If the `.online != true` filter is removed, stale_id would be the older online.
+m03_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STALE_SECS=600
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" dev_field)"
+# OLDER = online (earliest lastSeen so it sorts FIRST if the filter is removed),
+# NEWER = offline (the corpse to delete). With the offline-only filter, stale is
+# NEW_OFFLINE; if the filter is removed (M03), sort-by-lastSeen picks OLD_ONLINE.
+devs='{"devices":[
+  {"hostname":"grok-box-8","nodeId":"OLD_ONLINE","online":true,"created":"2000-01-01T00:00:00Z","lastSeen":"2000-01-01T00:00:00Z"},
+  {"hostname":"grok-box-8-1","nodeId":"NEW_OFFLINE","online":false,"created":"2020-01-01T00:00:00Z","lastSeen":"2020-01-01T00:00:00Z"}
+]}'
+echo "stale=\$(dev_field "\$devs" grok-box-8 stale_id)"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(m03_test)" = "stale=NEW_OFFLINE" ] && pass "M03: stale selector picks the OFFLINE duplicate, never an older ONLINE node" || bad "M03: stale selector wrong (offline-only filter defeated): [$(m03_test)]"
+
+# --- M11: the auth key must NEVER appear in the remote SSH command ARGV (it is
+# streamed on stdin only). Capture tunnel_ssh's remote command string and assert
+# the key material is absent from it. If the key were appended to argv (M11),
+# the capture would contain it.
+m11_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<'INNER'
+set -u
+FLEETCTL="__FLEETCTL__"
+BOXROOT="$(mktemp -d)"; mkdir -p "$BOXROOT/secrets"
+BOX_ROOT="$BOXROOT"
+BOX_AUTHKEY="$BOXROOT/secrets/ts-authkey"
+BOX_AUTHKEY_TMP="$BOXROOT/secrets/.ts-authkey.tmp"
+BOX_AUTHKEY_EXPIRES="$BOXROOT/secrets/ts-authkey.expires"
+log(){ :; }
+extract_from(){ awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$1"; }
+eval "$(extract_from "$FLEETCTL" seed_key_over_tunnel)"
+eval "$(extract_from "$FLEETCTL" seed_status_converged)"
+cap="$(mktemp)"
+# tunnel_ssh stub: record the remote command ARGV, and for the seed run consume
+# stdin so the write still succeeds (so we exercise the real code path).
+tunnel_ssh(){
+  shift
+  printf 'ARGV:%s\n' "$*" >> "$cap"
+  case "$*" in
+    *"boxup status"*) echo "backend=Running tunnel=up"; return 0 ;;
+    *) bash -c "$*" ;;   # runs the seed heredoc; key arrives on stdin
+  esac
+}
+seed_key_over_tunnel grok-box-8 "SENTINEL_SECRET_KEY_MATERIAL" "2099-01-01" >/dev/null 2>&1
+if grep -q "SENTINEL_SECRET_KEY_MATERIAL" "$cap"; then echo "KEY-IN-ARGV"; else echo "KEY-ABSENT"; fi
+rm -rf "$BOXROOT" "$cap"
+INNER
+  sed -i "s#__FLEETCTL__#$FLEETCTL#" "$inner"
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+[ "$(m11_test)" = "KEY-ABSENT" ] && pass "M11: the auth key never appears in the remote SSH argv (stdin-only)" || bad "M11: key leaked into the SSH command argv: [$(m11_test)]"
+
+# --- M13: the seeded auth key file must be chmod 600, not 644. Drive the REAL
+# seed against a fake box tree and stat the resulting file mode.
+m13_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<'INNER'
+set -u
+FLEETCTL="__FLEETCTL__"
+BOXROOT="$(mktemp -d)"; mkdir -p "$BOXROOT/secrets"
+BOX_ROOT="$BOXROOT"
+BOX_AUTHKEY="$BOXROOT/secrets/ts-authkey"
+BOX_AUTHKEY_TMP="$BOXROOT/secrets/.ts-authkey.tmp"
+BOX_AUTHKEY_EXPIRES="$BOXROOT/secrets/ts-authkey.expires"
+log(){ :; }
+extract_from(){ awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$1"; }
+eval "$(extract_from "$FLEETCTL" seed_key_over_tunnel)"
+eval "$(extract_from "$FLEETCTL" seed_status_converged)"
+tunnel_ssh(){ shift; case "$*" in *"boxup status"*) echo "backend=Running tunnel=up"; return 0 ;; *) bash -c "$*" ;; esac; }
+seed_key_over_tunnel grok-box-8 "FRESH" "2099-01-01" >/dev/null 2>&1
+stat -c '%a' "$BOX_AUTHKEY" 2>/dev/null
+rm -rf "$BOXROOT"
+INNER
+  sed -i "s#__FLEETCTL__#$FLEETCTL#" "$inner"
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+[ "$(m13_test)" = 600 ] && pass "M13: the seeded auth key is chmod 600 (not 644)" || bad "M13: auth key mode wrong: [$(m13_test)]"
+
+# --- M19: the REAL-install path must never RESTART sshd (only reload). A restart
+# drops every live reverse tunnel. Scan the installer: no `systemctl restart`
+# targeting ssh/sshd anywhere; reload is the only permitted sshd action.
+if grep -nE 'systemctl[[:space:]]+restart[[:space:]]+(ssh|sshd)\b' "$VPS_INSTALL" >/dev/null 2>&1; then
+  bad "M19: installer RESTARTS sshd (drops tunnels) — must only reload"
+else
+  # And it MUST reload (proving the sshd path is a reload, not a no-op).
+  if grep -qE 'systemctl[[:space:]]+reload[[:space:]]+(ssh|sshd)\b' "$VPS_INSTALL"; then
+    pass "M19: installer reloads (never restarts) sshd after the drop-in"
+  else
+    bad "M19: installer does not reload sshd after installing the drop-in"
+  fi
+fi
+
+# --- M20: the reconcile timer fires every 5min (OnUnitActiveSec=5min). Assert on
+# the INSTALLED unit, so a change to 10min is caught.
+m20_test() {
+  local pfx; pfx="$(mktemp -d)"
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  grep -E '^OnUnitActiveSec=' "$pfx/etc/systemd/system/fleet-reconcile.timer" | tr -d ' '
+  rm -rf "$pfx"
+}
+[ "$(m20_test)" = "OnUnitActiveSec=5min" ] && pass "M20: reconcile timer OnUnitActiveSec=5min (5-min reconcile cadence)" || bad "M20: timer cadence wrong: [$(m20_test)]"
+
+# --- M21: the service ExecStart wrapper adds --apply IFF config apply=true, and
+# NOT when apply=false. Execute the wrapper's shell logic against both configs.
+# If the grep gate is inverted (M21), apply=false would wrongly add --apply.
+m21_test() {
+  local applyval="$1" pfx; pfx="$(mktemp -d)"
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  local cfg="$pfx/opt/grok-fleet/config.toml"
+  # Force the config's apply value.
+  sed -i "s/^apply = .*/apply = $applyval/" "$cfg"
+  # Extract the ExecStart command line and run its inner `bash -c '...'` with a
+  # fleetctl stub that just echoes its args, capturing whether --apply is added.
+  local execline
+  execline="$(grep -E '^ExecStart=' "$pfx/etc/systemd/system/fleet-reconcile.service" | sed 's/^ExecStart=//')"
+  # Replace the real fleetctl path invocation with an echo shim by shadowing PATH:
+  # simplest is to run the inner bash -c payload directly with a fake fleetctl.
+  local payload
+  payload="$(printf '%s' "$execline" | sed -E "s#^/bin/bash -c '##; s#'\$##")"
+  # Provide a fleetctl shim on PATH.
+  local bindir="$pfx/bin"; mkdir -p "$bindir"
+  # The payload calls $OPT_DIR/fleetctl reconcile $apply; shadow that exact path.
+  cat > "$pfx/opt/grok-fleet/fleetctl" <<'SHIM'
+#!/bin/bash
+echo "FLEETCTL-ARGS:$*"
+SHIM
+  chmod +x "$pfx/opt/grok-fleet/fleetctl"
+  bash -c "$payload" 2>/dev/null
+  rm -rf "$pfx"
+}
+case "$(m21_test true)" in *"FLEETCTL-ARGS:reconcile --apply"*) pass "M21: config apply=true => wrapper runs reconcile --apply" ;; *) bad "M21: apply=true did not add --apply: [$(m21_test true)]" ;; esac
+case "$(m21_test false)" in
+  *"--apply"*) bad "M21: config apply=false WRONGLY added --apply (gate inverted): [$(m21_test false)]" ;;
+  *"FLEETCTL-ARGS:reconcile"*) pass "M21: config apply=false => wrapper runs reconcile (no --apply)" ;;
+  *) bad "M21: apply=false wrapper wrong: [$(m21_test false)]" ;;
+esac
+
+# --- M23: the API-failure notify fires at the 3rd consecutive failure (>=3), not
+# the 4th. Drive the REAL reconcile_record_api_failure three times against a
+# clean state and assert notify() fired exactly on the 3rd call.
+m23_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="\$(mktemp -d)"
+log(){ :; }
+notify(){ echo "NOTIFY:\$*" >> "\$FLEET_STATE/notes"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" reconcile_record_api_failure)"
+: > "\$FLEET_STATE/notes"
+reconcile_record_api_failure; n1=\$(grep -c NOTIFY "\$FLEET_STATE/notes"); :
+reconcile_record_api_failure; n2=\$(grep -c NOTIFY "\$FLEET_STATE/notes"); :
+reconcile_record_api_failure; n3=\$(grep -c NOTIFY "\$FLEET_STATE/notes"); :
+echo "after1=\$n1 after2=\$n2 after3=\$n3"
+rm -rf "\$FLEET_STATE"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+m23="$(m23_test)"
+case "$m23" in
+  "after1=0 after2=0 after3=1") pass "M23: API-failure notify fires at the 3rd consecutive failure (>=3, not >=4)" ;;
+  *) bad "M23: API alert threshold wrong: [$m23]" ;;
+esac
 
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi

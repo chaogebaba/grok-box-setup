@@ -1,6 +1,10 @@
 # FLEET-BRAIN.md — always-on VPS brain + out-of-band reverse-SSH channel
 
-**Status: BLUEPRINT (design only — no code in this branch).** This is the
+**Status: PHASE 1 IMPLEMENTED on `feat/fleet-brain`.** This began as the design
+wall (design only) and now also carries the phase-1 implementation (`fleetctl`
+brain subcommands, `vps/install-vps.sh`, and the `tests/test-fleet-brain.sh`
+suite). The wall below remains the AUTHORITY: where the code disagrees with a
+row, the code is wrong and is fixed to match. This is the
 design wall for moving fleet reconciliation off the (not-always-online) laptop
 onto a 24/7 VPS, reachable to every box over an out-of-band reverse-SSH tunnel,
 with per-box tag-scoped Tailscale auth keys minted via the API. Same schema as

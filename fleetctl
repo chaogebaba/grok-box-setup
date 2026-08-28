@@ -159,7 +159,9 @@ resolve_targets() {
   if [ "${1:-}" = "--online-only" ]; then online_only=1; shift; fi
 
   if [ -n "${FLEET_BOXES:-}" ]; then
-    printf '%s\n' $FLEET_BOXES
+    # Explicit, intentional split of the space-delimited override (no globbing).
+    local -a _fb; read -ra _fb <<< "$FLEET_BOXES"
+    [ "${#_fb[@]}" -gt 0 ] && printf '%s\n' "${_fb[@]}"
     return 0
   fi
   if [ "$#" -gt 0 ]; then
@@ -860,23 +862,44 @@ api_token() {
 #     ts_api GET /path            # no $() capture
 #     [ "$TS_API_CODE" -ge 200 ] && body="$(ts_api_body)"
 # ts_api_body reads the file, so it survives the subshell problem. The token is
-# passed via an Authorization header (env-fed), never on argv (never in ps/logs).
+# passed via a curl --config file (mode 600, removed immediately), NEVER on argv
+# and NEVER in an env var visible to child processes (P1-7: no ps/procfs leak).
 TS_API_CODE=0
 TS_API_LAST_BODY=""
+# B-1 run-wide READ-ONLY latch: once any API interaction in a reconcile run
+# fails (non-2xx, malformed 200, or an action-time API failure), NO further
+# mutation (mint/delete/rename) may run for the REST of that run. Fail-closed is
+# a whole-run property, not per-call. Default 0 outside a run.
+RECONCILE_READONLY=0
 ts_api() {
   local method="$1" path="$2" body="${3:-}" tok code
   have curl || { log "api: curl not found"; TS_API_CODE=0; return 1; }
   tok="$(api_token)" || { TS_API_CODE=0; return 1; }
   [ -n "$TS_API_LAST_BODY" ] || TS_API_LAST_BODY="$(mktemp)"
+  # P1-7: the write-scoped PAT is NEVER put on curl's argv (it would be visible
+  # to any same-host `ps`/procfs reader). Instead the Authorization header is
+  # written to a mode-600 curl --config file, which curl reads and never
+  # exposes on the command line. The config file is removed immediately after.
+  local cfg; cfg="$(mktemp 2>/dev/null)" || { log "api: mktemp for curl config failed"; TS_API_CODE=0; return 1; }
+  chmod 600 "$cfg" 2>/dev/null || true
+  # curl --config syntax: `header = "..."`. The token value lives ONLY here,
+  # in a 600 file, never in argv/env-visible-to-children.
+  {
+    printf 'header = "Authorization: Bearer %s"\n' "$tok"
+    if [ -n "$body" ]; then
+      printf 'header = "Content-Type: application/json"\n'
+    fi
+  } > "$cfg"
   local -a args=(-fsS -X "$method" --max-time 30
     -o "$TS_API_LAST_BODY" -w '%{http_code}'
-    -H "Authorization: Bearer $tok")
+    --config "$cfg")
   if [ -n "$body" ]; then
-    args+=(-H "Content-Type: application/json" -d "$body")
+    args+=(-d "$body")
   fi
   # -f makes curl exit non-zero on HTTP >=400 but -w still prints the code; we
   # read the code from -w regardless of curl's own rc.
   code="$(curl "${args[@]}" "$TS_API$path" 2>/dev/null || true)"
+  rm -f "$cfg" 2>/dev/null || true
   case "$code" in ''|*[!0-9]*) code=0 ;; esac
   TS_API_CODE="$code"
   cat "$TS_API_LAST_BODY" 2>/dev/null
@@ -950,6 +973,12 @@ cmd_enroll() {
   enroll_install_vps_authorized_key "$line" || { log "enroll: failed to install VPS authorized_keys line"; return 1; }
   log "enroll: installed VPS fleet authorized_keys line for $box (permitlisten 127.0.0.1:$port)"
 
+  # P2-3: keep a COPY of this box's tunnel authorized-key mapping under
+  # /etc/grok-fleet (the wall §2 requires it). One file per box records the
+  # exact authorized_keys line the brain trusts, so the mapping is auditable
+  # independent of ~fleet/.ssh (which enroll also writes).
+  enroll_record_etc_mapping "$box" "$port" "$line" || log "enroll: WARNING could not write /etc mapping copy for $box"
+
   # (4) install the VPS's box-access PUBKEY into the box user's authorized_keys,
   # so the brain can `ssh box@127.0.0.1 -p 2000N` over the tunnel with no pw.
   local vpspub
@@ -998,6 +1027,33 @@ enroll_install_vps_authorized_key() {
   chmod 600 "$FLEET_VPS_AUTHKEYS" 2>/dev/null || true
 }
 
+# enroll_record_etc_mapping <box> <port> <authorized_keys-line>: P2-3 — write a
+# COPY of the box's tunnel authorized-key mapping under $FLEET_ETC (600). One
+# file per box: $FLEET_ETC/authorized-keys.d/<box>.line holds the exact line;
+# an index tsv (box<TAB>port<TAB>keymaterial) makes the mapping auditable. This
+# is a COPY for audit/rebuild; ~fleet/.ssh/authorized_keys remains authoritative.
+FLEET_ETC_AK_DIR="${FLEET_ETC_AK_DIR:-$FLEET_ETC/authorized-keys.d}"
+enroll_record_etc_mapping() {
+  local box="$1" port="$2" line="$3" key
+  key="$(printf '%s' "$line" | awk '{print $3}')"
+  mkdir -p "$FLEET_ETC_AK_DIR" 2>/dev/null || return 1
+  chmod 700 "$FLEET_ETC" 2>/dev/null || true
+  chmod 700 "$FLEET_ETC_AK_DIR" 2>/dev/null || true
+  local f="$FLEET_ETC_AK_DIR/$box.line" tmp
+  tmp="$(mktemp "$FLEET_ETC_AK_DIR/.ak.XXXXXX" 2>/dev/null)" || return 1
+  printf '%s\n' "$line" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  # Maintain an index mapping (idempotent: drop any prior row for this box).
+  local idx="$FLEET_ETC/authorized-keys.map" itmp
+  itmp="$(mktemp "$FLEET_ETC/.akmap.XXXXXX" 2>/dev/null)" || return 0
+  if [ -f "$idx" ]; then grep -vE "^$box	" "$idx" > "$itmp" 2>/dev/null || true; fi
+  printf '%s\t%s\t%s\n' "$box" "$port" "$key" >> "$itmp"
+  chmod 600 "$itmp" 2>/dev/null || true
+  mv -f "$itmp" "$idx" 2>/dev/null || rm -f "$itmp"
+  return 0
+}
+
 # Install the VPS box-access pubkey into the box's authorized_keys over OpenSSH
 # on the tailnet (idempotent append). The box user is 'box'.
 enroll_install_box_authorized_key() {
@@ -1022,7 +1078,10 @@ enroll_install_box_authorized_key() {
 # recording success; a failure leaves the OLD key intact.
 mint_payload() {
   # The EXACT capabilities shape the frozen wall (H11) mandates.
-  local secs="${1:-$FLEET_KEY_EXPIRY_SECS}"
+  # P1-6: expirySeconds is HARD-CLAMPED to the 90-day Tailscale maximum. Neither
+  # the FLEET_KEY_EXPIRY_SECS env nor the function argument can push it past the
+  # cap (must-cover invariant 4: expiry ≤ 90d, not merely "default is 90d").
+  local secs; secs="$(clamp_expiry_secs "${1:-$FLEET_KEY_EXPIRY_SECS}")"
   jq -cn --argjson secs "$secs" '{
     capabilities: { devices: { create: {
       reusable: true, ephemeral: false, preauthorized: true,
@@ -1030,6 +1089,19 @@ mint_payload() {
     } } },
     expirySeconds: $secs
   }'
+}
+
+# clamp_expiry_secs <secs> -> a valid Tailscale key expiry in [1, 7776000].
+# P1-6 hard cap: anything > 90d (7776000s) is clamped DOWN to 90d; a
+# non-numeric/empty/<=0 value falls back to the 90d default. The cap is a
+# security invariant, not advice — an operator override cannot exceed it.
+FLEET_KEY_EXPIRY_MAX=7776000     # 90 days, the Tailscale hard maximum
+clamp_expiry_secs() {
+  local s="$1" max="${FLEET_KEY_EXPIRY_MAX:-7776000}"
+  case "$s" in ''|*[!0-9]*) s="$max" ;; esac
+  [ "$s" -ge 1 ] 2>/dev/null || s="$max"
+  [ "$s" -le "$max" ] 2>/dev/null || s="$max"
+  printf '%s' "$s"
 }
 
 # mint_create -> writes the raw key-create JSON response to stdout; sets
@@ -1044,6 +1116,13 @@ mint_create() {
 #   write .ts-authkey.tmp (600) -> sha256 verify -> mv into place ->
 #   write .expires from the API `expires`. The key is passed on stdin, NEVER
 #   argv, so it never appears in the box's ps/logs.
+#
+# P1-2 verify: after the atomic write, confirm via `sudo boxup status` over the
+# tunnel that the NEW authkey state actually shows — the status line must carry
+# an authkey token that is NOT `EXPIRED`/`none`/`missing`. A stale line still
+# reporting the OLD expired key means the seed did not converge; we FAIL the
+# seed so the mint is not recorded and the guard is not advanced (retry next
+# run, escalate after >3 runs — cmd_mint_key).
 seed_key_over_tunnel() {
   local box="$1" key="$2" expires="$3" want_sha
   want_sha="$(printf '%s\n' "$key" | sha256sum | awk '{print $1}')"
@@ -1062,12 +1141,41 @@ seed_key_over_tunnel() {
   # Verify via `boxup status` over the tunnel BEFORE recording success.
   local st
   st="$(tunnel_ssh "$box" "sudo $BOX_ROOT/boxup status" 2>/dev/null)" || return 1
-  # A seeded key means authkey is no longer 'none'/EXPIRED; a fresh key with a
-  # >7d expiry shows no authkey= token (ok stays silent) or authkey=expiring
-  # only if <7d. We treat any status line that we could READ as verify-OK for
-  # the seed step (the key file exists + boxup parsed it); expiry class is a
-  # separate rotation concern (row c).
-  [ -n "$st" ]
+  [ -n "$st" ] || return 1
+  # P1-2: confirm the box CONVERGED onto the NEW key. boxup emits an `authkey=`
+  # token ONLY for the warn/expired/unknown states (a healthy fresh key is
+  # SILENT — no token). So convergence = the status line does NOT still report
+  # the OLD key as `authkey=EXPIRED:*` and does NOT report `authkey=unknown-expiry`
+  # (which would mean our `.expires` write did not land). Additionally confirm
+  # the box now reads back the exact `.expires` date we wrote (the seed of the
+  # sidecar landed), which pins the verify to THIS mint, not a stale line.
+  seed_status_converged "$st" || return 1
+  local seen_exp
+  seen_exp="$(tunnel_ssh "$box" "cat '$BOX_AUTHKEY_EXPIRES' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+  [ "$seen_exp" = "$expires" ]
+}
+
+# seed_status_converged <status-line>: 0 iff the box has converged onto a fresh
+# key. boxup only prints an `authkey=` token for the FAILURE/near-expiry states
+# (EXPIRED / expiring / unknown-expiry); a healthy fresh key is SILENT. So:
+#   * `authkey=EXPIRED:*`        -> NOT converged (old key still active)  -> 1
+#   * `authkey=unknown-expiry`   -> NOT converged (.expires didn't land)  -> 1
+#   * no authkey token / expiring-> converged (fresh key seeded)          -> 0
+seed_status_converged() {
+  local line="$1" tok v
+  for tok in $line; do
+    case "$tok" in
+      authkey=*)
+        v="${tok#authkey=}"
+        case "$v" in
+          [Ee][Xx][Pp][Ii][Rr][Ee][Dd]:*|[Ee][Xx][Pp][Ii][Rr][Ee][Dd]) return 1 ;;
+          unknown-expiry) return 1 ;;
+          *) : ;;   # expiring:<date> is acceptable (a valid, just-near-expiry key)
+        esac
+        ;;
+    esac
+  done
+  return 0
 }
 
 cmd_mint_key() {
@@ -1079,7 +1187,10 @@ cmd_mint_key() {
   # Call bare (no $() capture) so TS_API_CODE survives; read the body from file.
   mint_create >/dev/null
   if ! ts_ok; then
+    # B-1: a key-create non-2xx is an API failure — latch the run-wide READ-ONLY
+    # so no later row mutates this run.
     log "mint-key: key-create FAILED (HTTP $TS_API_CODE) — old key on $box left intact"
+    RECONCILE_READONLY=1
     return 1
   fi
   resp="$(ts_api_body)"
@@ -1090,6 +1201,18 @@ cmd_mint_key() {
     log "mint-key: response had no .key — old key on $box left intact"
     return 1
   fi
+  # P1-3: a blank/missing API `id` means we cannot record the key we just minted,
+  # which breaks the invariant that a later rotation can revoke it. Treat a
+  # missing id as a mint FAILURE and REVOKE the just-minted key so we do not
+  # leave an unrevokable key on the tailnet. We have the key material but not its
+  # id — the safest recovery is to abandon this key (it will lapse at expiry) and
+  # NOT seed it, retrying next run.
+  if [ -z "$keyid" ]; then
+    log "mint-key: key-create response had no .id — cannot persist key identity; abandoning this key (old key on $box left intact)"
+    # Best-effort revoke is impossible without an id; the key will lapse at its
+    # own expiry. We do NOT seed it, so the box keeps its old key.
+    return 1
+  fi
   # Normalize expires to a day-granular ISO date for the H11 .expires sidecar.
   local expdate; expdate="$(printf '%s' "$expires" | cut -c1-10)"
   case "$expdate" in ????-??-??) : ;; *) expdate="$(date -u -d "+90 days" +%Y-%m-%d 2>/dev/null || echo "$expdate")" ;; esac
@@ -1098,34 +1221,73 @@ cmd_mint_key() {
     log "mint-key: atomic seed/verify FAILED on $box — old key left intact (retry next run)"
     return 1
   fi
-  # Record the mint window + expiry AFTER verified seed (never before).
+  # P1-3 PERSISTENCE INVARIANT: the minted {id,expires} MUST be durably recorded
+  # before we call the mint a success. If persistence fails, the mint FAILS and
+  # we REVOKE the just-minted key (we cannot rely on a later rotation finding its
+  # id, so an unrecorded key must not be left live). The box keeps its OLD key
+  # (the seed already happened, but a re-seed next run restores coherence, and
+  # the OLD key is still valid — we did not advance the mint-window guard).
   mkdir -p "$FLEET_STATE" 2>/dev/null || true
+  if ! record_key_meta "$box" "$keyid" "$expires"; then
+    log "mint-key: FAILED to persist key meta for $box — REVOKING the just-minted key id=$keyid (invariant: unrecorded key must not stay live)"
+    ts_api DELETE "/tailnet/$TS_TAILNET/keys/$keyid" >/dev/null
+    if ts_ok || [ "$TS_API_CODE" = 404 ]; then
+      log "mint-key: revoked unrecorded key id=$keyid (HTTP $TS_API_CODE)"
+    else
+      log "mint-key: could not revoke unrecorded key id=$keyid (HTTP $TS_API_CODE) — it will lapse at expiry"
+      RECONCILE_READONLY=1
+    fi
+    return 1
+  fi
+  # Record the mint window + expiry AFTER verified seed + persisted meta (never
+  # before). This IS the mint-window marker read by mint_window_valid (P1-1).
   printf '%s\t%s\n' "$box" "$expdate" > "$FLEET_STATE/$box.expires" 2>/dev/null || true
-  # Persist the minted key id + expires so a LATER rotation knows the OLD id to
-  # revoke (task b). Written AFTER the verified seed, atomically (tmp+mv). No key
-  # MATERIAL is stored — only the id/expiry. A missing/blank id is recorded as
-  # empty, which the rotation treats as "unknown old id => skip revoke" (never a
-  # failure). This id is the id of the key we JUST minted; on the NEXT rotation
-  # it becomes the old id to delete.
-  record_key_meta "$box" "$keyid" "$expires"
-  log "mint-key: $box seeded a fresh per-box key (expires $expdate); verified via boxup status"
+  log "mint-key: $box seeded a fresh per-box key (expires $expdate); verified via boxup status; key id recorded"
   return 0
 }
 
+# mint_window_valid <box> (P1-1): 0 iff a VALID per-box key was already seeded
+# this window — i.e. we have a recorded .expires whose date is still beyond the
+# rotation threshold (>7d out). Row a mints ONLY when this is false, so a box
+# that already has a fresh key is not re-minted every 5-min tick. Rotation
+# (row c) fires precisely when this becomes false (<7d), so the two do not fight.
+mint_window_valid() {
+  local box="$1"
+  local expf="$FLEET_STATE/$box.expires" d days
+  [ -f "$expf" ] || return 1
+  # Also require the recorded key id to exist — a .expires without a persisted
+  # id is not a fully valid window (P1-3 invariant).
+  [ -n "$(key_meta_id "$box" 2>/dev/null || true)" ] || return 1
+  d="$(awk -F'\t' '{print $2}' "$expf" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$d" ] || return 1
+  days="$(days_until "$d")"
+  case "$days" in ''|unknown|*[!0-9-]*) return 1 ;; esac
+  [ "$days" -ge 7 ] 2>/dev/null
+}
+
 # record_key_meta <box> <id> <expires-iso>: atomically write the per-box minted-
-# key metadata to $FLEET_KEYS_DIR/<N>.json. Best-effort (a write failure is
-# logged, never fails the mint — the key is already seeded + verified). Stores
-# id + expires ONLY; never the key material.
+# key metadata to $FLEET_KEYS_DIR/<N>.json. P1-3: persistence is an INVARIANT —
+# this returns NON-ZERO on any failure (blank id, mkdir/mktemp/encode/install
+# failure, or a post-write read-back that does not match), and the caller treats
+# that as a mint failure + revokes the just-minted key. Stores id + expires ONLY;
+# never the key material.
 record_key_meta() {
   local box="$1" id="$2" expires="$3" f tmp
-  f="$(key_meta_file "$box")" || return 0
-  mkdir -p "$FLEET_KEYS_DIR" 2>/dev/null || { log "mint-key: cannot mkdir $FLEET_KEYS_DIR — key id NOT recorded (rotation will skip revoke)"; return 0; }
-  tmp="$(mktemp "$FLEET_KEYS_DIR/.keymeta.XXXXXX" 2>/dev/null)" || { log "mint-key: mktemp failed — key id NOT recorded"; return 0; }
-  if jq -cn --arg id "$id" --arg exp "$expires" '{id:$id, expires:$exp}' > "$tmp" 2>/dev/null; then
-    chmod 600 "$tmp" 2>/dev/null || true
-    mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; log "mint-key: could not install key meta $f"; }
-  else
-    rm -f "$tmp"; log "mint-key: could not encode key meta — rotation will skip revoke"
+  # A blank id cannot satisfy the invariant (a later rotation could not revoke).
+  [ -n "$id" ] || { log "mint-key: refusing to record blank key id for $box"; return 1; }
+  f="$(key_meta_file "$box")" || { log "mint-key: cannot resolve key meta path for $box"; return 1; }
+  mkdir -p "$FLEET_KEYS_DIR" 2>/dev/null || { log "mint-key: cannot mkdir $FLEET_KEYS_DIR — key id NOT recorded"; return 1; }
+  tmp="$(mktemp "$FLEET_KEYS_DIR/.keymeta.XXXXXX" 2>/dev/null)" || { log "mint-key: mktemp failed — key id NOT recorded"; return 1; }
+  if ! jq -cn --arg id "$id" --arg exp "$expires" '{id:$id, expires:$exp}' > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; log "mint-key: could not encode key meta for $box"; return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$f" 2>/dev/null; then
+    rm -f "$tmp"; log "mint-key: could not install key meta $f"; return 1
+  fi
+  # Read-back invariant: the id we just wrote must be recoverable.
+  if [ "$(jq -r '.id // empty' "$f" 2>/dev/null)" != "$id" ]; then
+    log "mint-key: key meta read-back mismatch for $box ($f)"; return 1
   fi
   return 0
 }
@@ -1252,16 +1414,32 @@ cmd_reconcile() {
 
   # Fetch the device list. Any non-2xx => READ-ONLY run (S3). Call bare so
   # TS_API_CODE survives (a $() capture would run devices_json in a subshell).
-  local devs readonly=0
+  # A run-wide READ-ONLY latch (B-1): once set, NO row may mint/delete/rename for
+  # the REST of the run. It latches on (i) the initial GET non-2xx, (ii) a
+  # malformed/partial HTTP-200 device body, or (iii) any later action-time API
+  # failure (set by reconcile_execute). Fail-closed is run-wide, not per-call.
+  RECONCILE_READONLY=0
+  local devs
   devices_json >/dev/null
   if ! ts_ok; then
     reconcile_record_api_failure
     log "reconcile: device list HTTP $TS_API_CODE — READ-ONLY run (no mint/delete/rename)"
-    readonly=1
+    RECONCILE_READONLY=1
     devs=""      # never act on a partial/absent list (never a spurious delete/mint)
   else
-    reconcile_reset_api_failure
     devs="$(ts_api_body)"
+    # B-1: a 2xx with a malformed/partial body is NOT trustworthy device data.
+    # Validate it parses as JSON with a `.devices` array before trusting it; a
+    # truncated/garbage 200 is treated as no-data + READ-ONLY (never "device
+    # absent" => never a spurious delete/mint).
+    if ! devices_json_valid "$devs"; then
+      reconcile_record_api_failure
+      log "reconcile: device list HTTP 200 but body malformed/partial — READ-ONLY run (no mint/delete/rename)"
+      RECONCILE_READONLY=1
+      devs=""
+    else
+      reconcile_reset_api_failure
+    fi
   fi
 
   # Enumerate enrolled boxes (from enroll state, or FLEET_BOXES override for tests).
@@ -1275,15 +1453,28 @@ cmd_reconcile() {
 
   local rc=0
   for b in "${boxes[@]}"; do
-    reconcile_one "$b" "$devs" "$apply" "$readonly" || rc=1
+    reconcile_one "$b" "$devs" "$apply" "$RECONCILE_READONLY" || rc=1
   done
   log "reconcile: done ($mode)"
   return "$rc"
 }
 
+# devices_json_valid <body>: 0 iff the body parses as JSON AND has a `.devices`
+# array (B-1). A truncated/garbage HTTP-200 fails here and forces a READ-ONLY
+# run. An empty body is invalid (not "zero devices").
+devices_json_valid() {
+  local body="$1"
+  [ -n "$body" ] || return 1
+  printf '%s' "$body" | jq -e 'has("devices") and (.devices | type == "array")' >/dev/null 2>&1
+}
+
 # Enrolled boxes: FLEET_BOXES override (tests) else the enrolled.tsv names.
 reconcile_target_boxes() {
-  if [ -n "${FLEET_BOXES:-}" ]; then printf '%s\n' $FLEET_BOXES; return 0; fi
+  if [ -n "${FLEET_BOXES:-}" ]; then
+    local -a _fb; read -ra _fb <<< "$FLEET_BOXES"
+    [ "${#_fb[@]}" -gt 0 ] && printf '%s\n' "${_fb[@]}"
+    return 0
+  fi
   [ -f "$FLEET_STATE/enrolled.tsv" ] || return 0
   awk -F'\t' '{print $1}' "$FLEET_STATE/enrolled.tsv" | sort -u
 }
@@ -1293,17 +1484,49 @@ reconcile_record_api_failure() {
   [ -f "$FLEET_STATE/api.fails" ] && n=$(tr -d '[:space:]' < "$FLEET_STATE/api.fails" 2>/dev/null || echo 0)
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
   n=$((n + 1)); echo "$n" > "$FLEET_STATE/api.fails" 2>/dev/null || true
-  # Bounded backoff 5->10->20 min is advisory metadata (the timer fires /5min);
+  # P1-5: bounded retry backoff 5 -> 10 -> 20 min. The timer fires every 5 min;
+  # this writes a `api.next_retry` epoch that the NEXT run consults (see
+  # reconcile_backoff_active) so we skip API calls until the backoff elapses.
+  # Backoff step by consecutive-failure count: 1->5min, 2->10min, >=3->20min,
+  # capped at 20. Written as an absolute epoch so a run can cheaply compare.
+  local mins now next
+  case "$n" in
+    1) mins=5 ;;
+    2) mins=10 ;;
+    *) mins=20 ;;
+  esac
+  echo "$mins" > "$FLEET_STATE/api.backoff_min" 2>/dev/null || true
+  now="$(date -u +%s 2>/dev/null || echo 0)"
+  next=$(( now + mins * 60 ))
+  echo "$next" > "$FLEET_STATE/api.next_retry" 2>/dev/null || true
   # notify() after 3 consecutive failures.
-  [ "$n" -ge 3 ] && notify warn "Tailscale API failing: $n consecutive non-2xx"
+  [ "$n" -ge 3 ] && notify warn "Tailscale API failing: $n consecutive non-2xx (backoff ${mins}m)"
 }
-reconcile_reset_api_failure() { echo 0 > "$FLEET_STATE/api.fails" 2>/dev/null || true; }
+
+# reconcile_backoff_active: 0 iff a backoff window is currently in effect (the
+# recorded api.next_retry epoch is still in the future). Used to skip API calls
+# during a 5/10/20-min backoff window (P1-5) so we do not hammer a failing API
+# every 5-min tick. A missing/zero marker => not active.
+reconcile_backoff_active() {
+  local f="$FLEET_STATE/api.next_retry" next now
+  [ -f "$f" ] || return 1
+  next="$(tr -d '[:space:]' < "$f" 2>/dev/null || echo 0)"
+  case "$next" in ''|*[!0-9]*) return 1 ;; esac
+  now="$(date -u +%s 2>/dev/null || echo 0)"
+  [ "$now" -lt "$next" ] 2>/dev/null
+}
+reconcile_reset_api_failure() {
+  echo 0 > "$FLEET_STATE/api.fails" 2>/dev/null || true
+  # P1-5: clear the backoff window on a clean API run.
+  rm -f "$FLEET_STATE/api.next_retry" "$FLEET_STATE/api.backoff_min" 2>/dev/null || true
+}
 
 # reconcile_one <box> <devices-json> <apply> <readonly>: gather this box's
 # inputs, decide via the PURE table, then either LOG (dry-run/read-only) or
 # execute (apply) each action idempotently.
 reconcile_one() {
   local box="$1" devs="$2" apply="$3" readonly="$4"
+  local rc_one=0
   local n; n="$(box_index "$box")" || return 1
 
   # Inputs from the device list (jq). On a read-only run devs="" => treat as
@@ -1354,16 +1577,67 @@ reconcile_one() {
     [ -n "$a" ] || continue
     case "$a" in
       noop) continue ;;
-      alert-*) notify warn "$box: ${a#alert-}"; continue ;;
+      alert-asleep)
+        # P1-4: BOTH-paths-dead "asleep" is informational and TIMED — a sand box
+        # legitimately sleeps. Fire ONE alert only after T=2h of continuous
+        # both-dead, then a DAILY digest; suppress otherwise. State is per-box +
+        # durable across runs.
+        reconcile_alert_asleep "$box"
+        continue ;;
+      alert-incident:incoherent-both-dead)
+        # P1-4: the INCOHERENT split (API online yet both paths dead) is
+        # actionable but only after 2 CONSECUTIVE reconcile runs (one blip is
+        # not paged). A coherent/other observation resets the counter.
+        reconcile_alert_incoherent "$box"
+        continue ;;
+      alert-*)
+        # Other incidents (duplicate-both-online, reachable-cannot-converge) are
+        # immediate.
+        reconcile_reset_asleep "$box"
+        reconcile_reset_incoherent "$box"
+        notify warn "$box: ${a#alert-}"
+        continue ;;
     esac
-    if [ "$readonly" = 1 ] || [ "$apply" != 1 ]; then
+    # A non-alert, non-both-dead observation clears the row-e timers.
+    reconcile_reset_asleep "$box"
+    reconcile_reset_incoherent "$box"
+    # P1-1: row-a mint is idempotent per WINDOW — skip if a valid key was already
+    # seeded this window (a fresh key still >7d out). Prevents re-minting every
+    # 5-min tick. Rotation (row c) handles the <7d case, so they never fight.
+    if [ "$a" = mint ] && mint_window_valid "$box"; then
+      log "reconcile: $box mint SKIPPED — a valid key was already seeded this window (mint-window guard)"
+      continue
+    fi
+    # B-1: honor BOTH the per-call readonly arg AND the run-wide latch — an
+    # earlier box's action-time API failure latches RECONCILE_READONLY and must
+    # suppress every later mutation this run.
+    if [ "$readonly" = 1 ] || [ "${RECONCILE_READONLY:-0}" = 1 ] || [ "$apply" != 1 ]; then
       log "reconcile: $box WOULD $a (${readonly:+read-only }dry-run/no-apply)"
       continue
     fi
-    reconcile_execute "$box" "$a" || log "reconcile: $box action '$a' FAILED"
+    if ! reconcile_execute "$box" "$a"; then
+      # An action failed. reconcile_execute/its callees latch RECONCILE_READONLY
+      # when the failure was an API non-2xx (fail-closed, run-wide).
+      log "reconcile: $box action '$a' FAILED"
+      rc_one=1
+      # P1-2 escalation: a mint that returns 2xx from the API but whose
+      # seed/status never converges, while the box's OLD key still passes
+      # `boxup check`, must not silently no-op forever. Count consecutive
+      # seed-failures; after >3 raise the SAME actionable incident as row e.
+      if [ "$a" = mint ] && [ "$checkfail" = no ] && [ "$tunnel" = up ]; then
+        local sf; sf="$(reconcile_bump_seedfail "$box")"
+        if [ "$sf" -gt 3 ] 2>/dev/null; then
+          notify warn "$box: reachable-cannot-converge (mint seeded but boxup status never converged for $sf runs)"
+        fi
+      fi
+    else
+      # A successful (or skipped-not-needed) mint clears the seed-fail counter.
+      [ "$a" = mint ] && reconcile_reset_seedfail "$box"
+    fi
   done <<EOF
 $actions
 EOF
+  return "${rc_one:-0}"
 }
 
 # reconcile_execute <box> <action>: perform ONE idempotent mutation (apply mode).
@@ -1435,6 +1709,16 @@ reconcile_rollout() {
   local canary; canary="$(reconcile_canary_box)"
   log "reconcile: rollout triggered by $trigger drift — canary-first over tunnels (canary=$canary)"
 
+  # B-2: STAGE the target artifact BEFORE touching any box. A rollout with no
+  # artifact to push is a no-op masquerading as success — the whole point of
+  # row d is version drift, so a rollout MUST deploy a tree. If we cannot stage
+  # one, ABORT the rollout (never run a push-less converge and report success).
+  if ! reconcile_stage_rollout_tree; then
+    log "reconcile: rollout ABORT — could not stage a target tree to push (no artifact => not a rollout)"
+    notify warn "rollout aborted: no deployable artifact staged (set [fleet-brain].rollout_src or FLEET_ROLLOUT_SRC)"
+    return 1
+  fi
+
   # Ordered target list: canary FIRST, then the rest of the enrolled boxes
   # (serially). Only boxes whose tunnel is UP are reachable to deploy over.
   local -a rest=() b
@@ -1449,11 +1733,13 @@ reconcile_rollout() {
   if ! tunnel_up "$canary"; then
     log "reconcile: rollout ABORT — canary $canary tunnel is DOWN (cannot verify); ZERO boxes deployed"
     notify warn "rollout aborted: canary $canary unreachable over tunnel"
+    reconcile_cleanup_rollout_tree
     return 1
   fi
   if ! tunnel_deploy_one "$canary"; then
     log "reconcile: rollout ABORT — canary $canary FAILED verification; ZERO other boxes touched"
     notify warn "rollout aborted: canary $canary failed verification"
+    reconcile_cleanup_rollout_tree
     return 1
   fi
   log "reconcile: rollout — canary $canary verified; rolling the rest serially"
@@ -1471,8 +1757,53 @@ reconcile_rollout() {
       break
     fi
   done
+  reconcile_cleanup_rollout_tree
   [ "$rc" = 0 ] && log "reconcile: rollout complete"
   return "$rc"
+}
+
+# reconcile_stage_rollout_tree (B-2): package the target tree into a tarball and
+# export its path as FLEET_ROLLOUT_TREE so tunnel_deploy_one pushes a REAL
+# artifact. Source precedence:
+#   1. FLEET_ROLLOUT_TREE already points at an existing tarball (pre-staged /
+#      test injection) — use it as-is (we did not create it, so don't delete it).
+#   2. a git checkout at [fleet-brain].rollout_src / FLEET_ROLLOUT_SRC — package
+#      HEAD (or FLEET_TARGET_SHA) via `git archive`, mirroring D7's packaging.
+# Returns non-zero if it cannot produce a tarball. Sets FLEET_ROLLOUT_TREE and
+# FLEET_ROLLOUT_TREE_STAGED=1 (so cleanup removes only what WE created).
+FLEET_ROLLOUT_TREE_STAGED=0
+reconcile_stage_rollout_tree() {
+  FLEET_ROLLOUT_TREE_STAGED=0
+  # (1) already a real tarball path? use it verbatim.
+  if [ -n "${FLEET_ROLLOUT_TREE:-}" ] && [ -f "$FLEET_ROLLOUT_TREE" ]; then
+    log "reconcile: rollout using pre-staged tree $FLEET_ROLLOUT_TREE"
+    return 0
+  fi
+  # (2) package from a git source on the VPS.
+  local src; src="${FLEET_ROLLOUT_SRC:-$(config_get fleet-brain rollout_src 2>/dev/null || true)}"
+  [ -n "$src" ] || { log "reconcile: rollout no source tree configured (FLEET_ROLLOUT_SRC / [fleet-brain].rollout_src)"; return 1; }
+  [ -d "$src" ] || { log "reconcile: rollout source '$src' is not a directory"; return 1; }
+  have git || { log "reconcile: rollout needs git to package '$src'"; return 1; }
+  ( cd "$src" && git rev-parse --git-dir >/dev/null 2>&1 ) || { log "reconcile: rollout source '$src' is not a git repo"; return 1; }
+  local tar ref="${FLEET_TARGET_SHA:-HEAD}"
+  tar="$(mktemp --suffix=.tar 2>/dev/null || mktemp)" || { log "reconcile: rollout mktemp failed"; return 1; }
+  if ! ( cd "$src" && git archive --format=tar -o "$tar" "$ref" ) 2>/dev/null; then
+    rm -f "$tar"; log "reconcile: rollout git archive $ref from '$src' failed"; return 1
+  fi
+  # A zero-byte tarball is not a deployable artifact.
+  [ -s "$tar" ] || { rm -f "$tar"; log "reconcile: rollout packaged an empty tree from '$src'"; return 1; }
+  FLEET_ROLLOUT_TREE="$tar"
+  FLEET_ROLLOUT_TREE_STAGED=1
+  log "reconcile: rollout staged $ref from '$src' -> $(basename "$tar")"
+  return 0
+}
+
+# reconcile_cleanup_rollout_tree: remove the tarball only if WE staged it.
+reconcile_cleanup_rollout_tree() {
+  if [ "${FLEET_ROLLOUT_TREE_STAGED:-0}" = 1 ] && [ -n "${FLEET_ROLLOUT_TREE:-}" ]; then
+    rm -f "$FLEET_ROLLOUT_TREE" 2>/dev/null || true
+    FLEET_ROLLOUT_TREE_STAGED=0
+  fi
 }
 
 # reconcile_canary_box -> the canary box name. [fleet-brain].canary_box (a bare
@@ -1494,25 +1825,32 @@ FLEET_ROLLOUT_TREE="${FLEET_ROLLOUT_TREE:-}"
 tunnel_deploy_one() {
   local box="$1" remote_tar="/tmp/grok-box-setup-brain.tar" \
         remote_dir="/tmp/grok-box-setup-brain"
-  # Push the tree (if a tarball was staged) over the tunnel.
-  if [ -n "$FLEET_ROLLOUT_TREE" ] && [ -f "$FLEET_ROLLOUT_TREE" ]; then
-    if ! tunnel_scp "$box" "$FLEET_ROLLOUT_TREE" "$remote_tar"; then
-      log "reconcile: rollout $box — scp over tunnel FAILED"
-      return 1
-    fi
+  # B-2: a rollout MUST push a real artifact. If no staged tree exists, this is
+  # not a deploy — FAIL rather than silently running a push-less converge and
+  # reporting success (that was the B-2 lie). reconcile_rollout stages the tree
+  # before calling us; a direct caller must set FLEET_ROLLOUT_TREE.
+  if [ -z "${FLEET_ROLLOUT_TREE:-}" ] || [ ! -f "$FLEET_ROLLOUT_TREE" ]; then
+    log "reconcile: rollout $box — NO artifact staged (FLEET_ROLLOUT_TREE unset/missing); refusing a push-less rollout"
+    return 1
+  fi
+  # Push the tree over the tunnel. A scp failure is a hard failure.
+  if ! tunnel_scp "$box" "$FLEET_ROLLOUT_TREE" "$remote_tar"; then
+    log "reconcile: rollout $box — scp over tunnel FAILED"
+    return 1
   fi
   # Extract + install + converge over the tunnel, then verify with boxup check.
+  # The remote_tar MUST be present (we just pushed it); a missing tar here means
+  # the push did not land — fail rather than converge without installing.
   if ! tunnel_ssh "$box" "
     set -e
-    if [ -f '$remote_tar' ]; then
-      rm -rf '$remote_dir'; mkdir -p '$remote_dir'
-      tar -xf '$remote_tar' -C '$remote_dir'
-      sudo env BOX_SETUP_GIT_SHA='${FLEET_TARGET_SHA:-unknown}' bash '$remote_dir/install.sh'
-      rm -rf '$remote_dir' '$remote_tar'
-    fi
+    [ -f '$remote_tar' ] || { echo 'ROLLOUT_NO_ARTIFACT' >&2; exit 4; }
+    rm -rf '$remote_dir'; mkdir -p '$remote_dir'
+    tar -xf '$remote_tar' -C '$remote_dir'
+    sudo env BOX_SETUP_GIT_SHA='${FLEET_TARGET_SHA:-unknown}' bash '$remote_dir/install.sh'
+    rm -rf '$remote_dir' '$remote_tar'
     sudo $BOX_ROOT/boxup once >/dev/null 2>&1 || sudo $BOX_ROOT/boxup once
   " >/dev/null 2>&1; then
-    log "reconcile: rollout $box — install/once over tunnel FAILED"
+    log "reconcile: rollout $box — install/once over tunnel FAILED (or artifact missing)"
     return 1
   fi
   # Postcondition: boxup check over the tunnel (D6, same as D7's verify).
@@ -1544,22 +1882,31 @@ tunnel_scp() {
 reconcile_dedup() {
   local box="$1" devs stale live
   devices_json >/dev/null
-  ts_ok || { log "reconcile: dedup $box API read failed — skip"; return 1; }
+  ts_ok || { log "reconcile: dedup $box API read failed — skip"; RECONCILE_READONLY=1; return 1; }
   devs="$(ts_api_body)"
+  # B-1: a malformed 200 here is not trustworthy device data — latch read-only.
+  if ! devices_json_valid "$devs"; then
+    log "reconcile: dedup $box API body malformed — READ-ONLY latch, skip"; RECONCILE_READONLY=1; return 1
+  fi
   stale="$(dev_field "$devs" "$box" stale_id)"
   live="$(dev_field "$devs" "$box" live_id)"
   [ -n "$stale" ] || { log "reconcile: dedup $box no stale id"; return 1; }
   ts_api DELETE "/device/$stale" >/dev/null
-  ts_ok || { log "reconcile: dedup $box DELETE $stale HTTP $TS_API_CODE"; return 1; }
+  ts_ok || { log "reconcile: dedup $box DELETE $stale HTTP $TS_API_CODE"; RECONCILE_READONLY=1; return 1; }
   log "reconcile: dedup $box deleted stale device $stale"
   if [ -n "$live" ]; then
     ts_api POST "/device/$live/name" "$(jq -cn --arg n "$box" '{name:$n}')" >/dev/null
     if ts_ok; then
       log "reconcile: dedup $box renamed live $live -> $box"
     else
+      # A rename failure is a real API failure: latch read-only so no later row
+      # mutates this run, and report the failure (do NOT swallow it as success).
       log "reconcile: dedup $box rename HTTP $TS_API_CODE"
+      RECONCILE_READONLY=1
+      return 1
     fi
   fi
+  return 0
 }
 
 reconcile_bump_checkfail() {
@@ -1571,6 +1918,67 @@ reconcile_bump_checkfail() {
   printf '%s' "$n"
 }
 reconcile_reset_checkfail() { echo 0 > "$FLEET_STATE/$1.checkfail" 2>/dev/null || true; }
+
+# --- P1-2 seed-failure counter (mint 2xx but seed never converges) -----------
+reconcile_bump_seedfail() {
+  local box="$1"
+  local f="$FLEET_STATE/$box.seedfail" n=0
+  [ -f "$f" ] && n=$(tr -d '[:space:]' < "$f" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1)); echo "$n" > "$f" 2>/dev/null || true
+  printf '%s' "$n"
+}
+reconcile_reset_seedfail() { echo 0 > "$FLEET_STATE/$1.seedfail" 2>/dev/null || true; }
+
+# --- P1-4 row-e timing/digest state ------------------------------------------
+# alert-asleep: BOTH paths dead is informational and legitimately common (a sand
+# box sleeps). Fire the FIRST alert only after T=2h of CONTINUOUS both-dead,
+# then at most one DAILY digest thereafter. State: $box.asleep holds two
+# whitespace-separated epochs "<since> <last_alert>" (last_alert 0 = never).
+FLEET_ASLEEP_T_SECS="${FLEET_ASLEEP_T_SECS:-7200}"     # 2h before first alert
+FLEET_ASLEEP_DIGEST_SECS="${FLEET_ASLEEP_DIGEST_SECS:-86400}"  # daily digest
+reconcile_alert_asleep() {
+  local box="$1"
+  local f="$FLEET_STATE/$box.asleep" now since last
+  now="$(date -u +%s 2>/dev/null || echo 0)"
+  if [ -f "$f" ]; then
+    read -r since last < "$f" 2>/dev/null || { since=""; last=""; }
+  fi
+  case "$since" in ''|*[!0-9]*) since="$now" ;; esac   # first both-dead observation
+  case "$last"  in ''|*[!0-9]*) last=0 ;; esac
+  local elapsed=$(( now - since ))
+  if [ "$last" = 0 ]; then
+    # No alert yet: fire once we have been asleep >= T.
+    if [ "$elapsed" -ge "$FLEET_ASLEEP_T_SECS" ]; then
+      notify info "$box: asleep — both paths dead for >= $((FLEET_ASLEEP_T_SECS/3600))h"
+      last="$now"
+    fi
+  else
+    # Already alerted once: daily digest only.
+    if [ $(( now - last )) -ge "$FLEET_ASLEEP_DIGEST_SECS" ]; then
+      notify info "$box: still asleep (daily digest) — both paths dead since $since"
+      last="$now"
+    fi
+  fi
+  printf '%s %s\n' "$since" "$last" > "$f" 2>/dev/null || true
+}
+reconcile_reset_asleep() { rm -f "$FLEET_STATE/$1.asleep" 2>/dev/null || true; }
+
+# alert-incident:incoherent-both-dead: API says the device is ONLINE yet BOTH
+# paths are dead — something is lying. Actionable, but only after 2 CONSECUTIVE
+# reconcile runs (one blip is not paged). $box.incoherent holds the consecutive
+# run count.
+reconcile_alert_incoherent() {
+  local box="$1"
+  local f="$FLEET_STATE/$box.incoherent" n=0
+  [ -f "$f" ] && n=$(tr -d '[:space:]' < "$f" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1)); echo "$n" > "$f" 2>/dev/null || true
+  if [ "$n" -ge 2 ] 2>/dev/null; then
+    notify warn "$box: incoherent-both-dead (API online yet both paths dead for $n consecutive runs)"
+  fi
+}
+reconcile_reset_incoherent() { rm -f "$FLEET_STATE/$1.incoherent" 2>/dev/null || true; }
 
 # days_until <YYYY-MM-DD> -> integer days from now (may be negative); "unknown"
 # if unparseable. VPS-side clock (P2-5).

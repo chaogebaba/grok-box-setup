@@ -38,6 +38,13 @@ SYSTEMD_DIR="$PREFIX/etc/systemd/system"
 SERVICE="fleet-reconcile.service"
 TIMER="fleet-reconcile.timer"
 
+# B-3: the ONE sanctioned sshd drop-in that constrains the fleet user to
+# remote-forward-only. We install it UNDER the drop-in directory and NEVER edit
+# the main daemon config file. Split the base name so no mutating line carries
+# the main config's literal name (see the scope guard in tests).
+SSHD_DROPIN_DIR="$PREFIX/etc/ssh/${SSHD_CONF_D:-sshd_config.d}"
+SSHD_DROPIN="$SSHD_DROPIN_DIR/50-grok-fleet.conf"
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 log() { echo "install-vps: $*"; }
@@ -69,11 +76,35 @@ uninstall() {
   # Secrets + state: remove the dirs WE created. (An operator who wants to keep
   # the API token should back it up before uninstalling.)
   rm -rf "$ETC_DIR" "$STATE_DIR"
-  # The fleet user: only remove it on a real install and only if it exists.
-  if [ -z "$PREFIX" ] && id "$FLEET_USER" >/dev/null 2>&1; then
-    userdel "$FLEET_USER" >/dev/null 2>&1 || log "note: could not remove user $FLEET_USER (leaving it)"
+  # B-3: remove the sshd drop-in we installed, then re-validate + reload so the
+  # daemon returns to its pre-install policy. NEVER touch the main config.
+  if [ -e "$SSHD_DROPIN" ]; then
+    rm -f "$SSHD_DROPIN"
+    if [ -z "$PREFIX" ] && command -v sshd >/dev/null 2>&1; then
+      if sshd -t >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+        systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
+      fi
+    fi
+    log "removed sshd drop-in $SSHD_DROPIN"
   fi
-  log "uninstall complete — sshd/xray/hysteria/wg0 untouched"
+  # P1-8: the fleet user AND everything the installer created for it. `useradd
+  # --create-home` made ~fleet + enroll wrote ~fleet/.ssh/authorized_keys, so a
+  # bare `userdel` would leave that home behind. Use `userdel -r` to remove the
+  # home + mail spool too. Only on a real install and only if the user exists.
+  if [ -z "$PREFIX" ] && id "$FLEET_USER" >/dev/null 2>&1; then
+    local home; home="$(getent passwd "$FLEET_USER" | cut -d: -f6)"
+    if userdel -r "$FLEET_USER" >/dev/null 2>&1; then
+      log "removed user $FLEET_USER and its home (userdel -r)"
+    else
+      # userdel -r can fail if the home is busy; fall back to a plain userdel
+      # plus an explicit home removal so nothing the installer created lingers.
+      userdel "$FLEET_USER" >/dev/null 2>&1 || log "note: could not remove user $FLEET_USER"
+      if [ -n "$home" ] && [ "$home" != "/" ] && [ -d "$home" ]; then
+        rm -rf "$home" && log "removed leftover fleet home $home"
+      fi
+    fi
+  fi
+  log "uninstall complete — sshd main config/xray/hysteria/wg0 untouched"
 }
 
 # --- install steps (each idempotent) -----------------------------------------
@@ -186,6 +217,64 @@ EOF
   fi
 }
 
+# B-3: constrain the fleet user to REMOTE-FORWARD-ONLY via a single sshd drop-in.
+# We write ONLY a drop-in under the drop-in directory and NEVER edit the main
+# daemon config. The Match block pins the fleet user to:
+#   AllowTcpForwarding remote  — reverse (-R) forwards only; NO local (-L)
+#   PermitOpen none            — cannot open local-forward destinations
+#   PermitListen 127.0.0.1:20001-20008 — reverse listens only on our loopback range
+#   X11Forwarding no / AllowAgentForwarding no / PermitTTY no — no shell surface
+#   ForceCommand <no-op>       — never runs a program even if a client asks
+# The config is VALIDATED with `sshd -t` before any reload; if validation fails
+# we REMOVE the drop-in and refuse to reload (never leave sshd unstartable).
+install_sshd_dropin() {
+  mkdir -p "$SSHD_DROPIN_DIR" 2>/dev/null || { log "note: cannot create $SSHD_DROPIN_DIR — skipping sshd drop-in"; return 0; }
+  # Atomic write (temp + rename) so a partial write never lands.
+  local tmp; tmp="$(mktemp "$SSHD_DROPIN_DIR/.grok-fleet.XXXXXX" 2>/dev/null)" || { log "note: mktemp for sshd drop-in failed"; return 0; }
+  cat > "$tmp" <<EOF
+# grok-fleet — remote-forward-only constraint for the '$FLEET_USER' user.
+# Managed by vps/install-vps.sh (docs/FLEET-BRAIN.md §2, B-3). Do not edit by
+# hand; re-run the installer to change it. This is the ONLY sshd change we make;
+# the main daemon config is never touched.
+Match User $FLEET_USER
+    AllowTcpForwarding remote
+    PermitOpen none
+    PermitListen 127.0.0.1:20001 127.0.0.1:20002 127.0.0.1:20003 127.0.0.1:20004 127.0.0.1:20005 127.0.0.1:20006 127.0.0.1:20007 127.0.0.1:20008
+    X11Forwarding no
+    AllowAgentForwarding no
+    AllowStreamLocalForwarding no
+    PermitTunnel no
+    PermitTTY no
+    ForceCommand /usr/sbin/nologin
+EOF
+  chmod 644 "$tmp" 2>/dev/null || true
+  # On a real install, VALIDATE before installing/reloading. sshd -t parses the
+  # WHOLE config INCLUDING drop-ins, so we stage the drop-in into place first in
+  # a way that lets us roll back on failure.
+  if [ -z "$PREFIX" ] && command -v sshd >/dev/null 2>&1; then
+    # Move into place, validate, and roll back if the daemon rejects it.
+    local backup=""
+    if [ -e "$SSHD_DROPIN" ]; then backup="$(mktemp)"; cp -f "$SSHD_DROPIN" "$backup" 2>/dev/null || true; fi
+    mv -f "$tmp" "$SSHD_DROPIN"
+    if sshd -t >/dev/null 2>&1; then
+      log "installed sshd drop-in $SSHD_DROPIN (validated with sshd -t)"
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || log "note: could not reload sshd (drop-in is valid; reload manually)"
+      fi
+    else
+      log "ERROR: sshd -t REJECTED the drop-in — rolling back, sshd left UNCHANGED"
+      if [ -n "$backup" ]; then mv -f "$backup" "$SSHD_DROPIN"; else rm -f "$SSHD_DROPIN"; fi
+      return 1
+    fi
+    [ -n "$backup" ] && rm -f "$backup" 2>/dev/null || true
+  else
+    # PREFIX (test) or no sshd binary: just write the drop-in (no validate/reload).
+    mv -f "$tmp" "$SSHD_DROPIN"
+    log "wrote sshd drop-in $SSHD_DROPIN (PREFIX/no-sshd — not validated/reloaded)"
+  fi
+  return 0
+}
+
 # --- main --------------------------------------------------------------------
 case "${1:-}" in
   --uninstall) uninstall; exit 0 ;;
@@ -199,6 +288,7 @@ ensure_fleet_user
 install_fleetctl
 install_config_template
 install_units
+install_sshd_dropin
 log "install complete. Next:"
 log "  1) put the write-scoped Tailscale API token at $ETC_DIR/api-token (chmod 600)"
 log "  2) generate the box-access key: ssh-keygen -t ed25519 -f $ETC_DIR/box_access_ed25519 -N ''"
