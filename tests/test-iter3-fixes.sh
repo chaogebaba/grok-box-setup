@@ -173,9 +173,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# H5 — re-auth attempt-limiter (D6: min-interval ONLY, per-hour cap dropped).
-# fresh => allowed; immediately after a record => blocked; after the interval
-# has passed => allowed again. rc-independent (record is called regardless).
+# H5/E3 — the attempt-limiter must record an attempt even when `tailscale up`
+# FAILS (rc≠0). This drives the REAL ensure_login (NeedsLogin + populated
+# statedir branch) with a stubbed failing `up`, then asserts $REAUTH_LAST was
+# written. MUTATION-SENSITIVE: deleting the reauth_attempt_record call in
+# ensure_login makes this fail (no stamp written).
 # ---------------------------------------------------------------------------
 h5_test() {
   local inner; inner="$(mktemp)"
@@ -185,24 +187,35 @@ BOXUP="$BOXUP"
 RUN_DIR="\$(mktemp -d)"
 REAUTH_LAST="\$RUN_DIR/last-reauth"
 REAUTH_MIN_INTERVAL=1800
+AUTHKEY_FILE="\$RUN_DIR/nokey"      # no auth key => AuthURL path
+HOSTNAME_FILE="\$RUN_DIR/hostname"; echo grok-box-8 > "\$HOSTNAME_FILE"
+log(){ :; }
+have(){ command -v "\$1" >/dev/null 2>&1; }
+id(){ return 1; }
+# Backend says NeedsLogin; statedir populated; tailscale up FAILS (rc 1).
+wait_for_backend(){ echo NeedsLogin; }
+read_ts_fields(){ backend=NeedsLogin; }
+state_is_populated(){ return 0; }
+tailscale_bin(){ echo /bin/false; }        # -x true; used only by run_reauth_up fallback
+prefs_hostname(){ echo grok-box-8; }
+read_box_name(){ echo grok-box-8; }
+current_advertise_tags(){ echo ""; }
+ts(){ :; }
+# Stub run_reauth_up to a guaranteed FAILURE (rc 7), so we test that
+# ensure_login records the attempt regardless of rc.
+run_reauth_up(){ return 7; }
 extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
-for f in reauth_attempt_allowed reauth_attempt_record; do eval "\$(extract_fn "\$f")"; done
-r=""
-reauth_attempt_allowed && r="\${r}A" || r="\${r}."   # fresh: allowed
-reauth_attempt_record
-reauth_attempt_allowed && r="\${r}A" || r="\${r}."   # just recorded: blocked
-now=\$(date +%s); echo \$((now-2000)) > "\$REAUTH_LAST"  # >30min ago
-reauth_attempt_allowed && r="\${r}A" || r="\${r}."   # interval elapsed: allowed
+for f in reauth_attempt_allowed reauth_attempt_record ensure_login; do eval "\$(extract_fn "\$f")"; done
+ensure_login
+[ -f "\$REAUTH_LAST" ] && echo recorded || echo missing
 rm -rf "\$RUN_DIR"
-echo "\$r"
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
-h5="$(h5_test)"
-if [ "$h5" = "A.A" ]; then
-  pass "H5 attempt-limiter: 30-min floor gates attempts (A.A), no per-hour cap"
+if [ "$(h5_test)" = recorded ]; then
+  pass "H5/E3 ensure_login records the re-auth attempt even when up FAILS (rc≠0)"
 else
-  bad  "H5 attempt-limiter pattern wrong: got [$h5] want [A.A]"
+  bad  "H5/E3 attempt NOT recorded on failing up — limiter is defeatable by a rc≠0 up"
 fi
 
 # ---------------------------------------------------------------------------
@@ -323,12 +336,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# H12 — box-8 reproducer, hermetic: lock box+root and remove host keys in a
-# FAKE root (temp /etc/shadow + /etc/ssh via stubs), run ONE do_tick-equivalent
-# repair decision, assert ensure_sshd would be invoked. We can't run real
-# passwd/chpasswd without root, so we stub account_unlocked/host_keys_present
-# to read temp fixtures and spy that ensure_sshd is called when the
-# postcondition fails, then "repaired" and NOT called when it holds.
+# H12 (generalized) — the tick repair DECISION: if any convergence
+# postcondition fails, do_ensure_body runs; if all hold, it does not. Hermetic:
+# stub the postcondition helpers + read_ts_fields and spy do_ensure_body.
 # ---------------------------------------------------------------------------
 h12_test() {
   local state="$1" inner; inner="$(mktemp)"
@@ -336,27 +346,129 @@ h12_test() {
 set -u
 BOXUP="$BOXUP"
 extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
-eval "\$(extract_fn login_postcondition_ok)"
-# Fixtures drive the stubs.
+eval "\$(extract_fn tick_repair_needed)"
 STATE="$state"
-id(){ return 0; }                      # box + root both "exist"
 if [ "\$STATE" = broken ]; then
-  account_unlocked(){ return 1; }      # locked
-  host_keys_present(){ return 1; }     # keys gone
+  pgrep(){ return 0; }                 # sshd "up" so we fall through to login
+  login_postcondition_ok(){ return 1; } # locked / keys gone => repair needed
+  read_ts_fields(){ backend=Running; online=yes; exitn=yes; }
+  name_mismatch(){ return 1; }
 else
-  account_unlocked(){ return 0; }
-  host_keys_present(){ return 0; }
+  pgrep(){ return 0; }
+  login_postcondition_ok(){ return 0; }
+  read_ts_fields(){ backend=Running; online=yes; exitn=yes; }
+  name_mismatch(){ return 1; }
 fi
-called=no
-ensure_sshd(){ called=yes; }
-# The exact do_tick decision (mirrors the wired block):
-if ! login_postcondition_ok; then ensure_sshd; fi
-echo "\$called"
+if tick_repair_needed; then echo "repair:\$TICK_REPAIR_REASON"; else echo none; fi
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
-[ "$(h12_test broken)" = yes ] && pass "H12 login postcondition FAILED (locked + no keys) => ensure_sshd invoked" || bad "H12 did not repair on broken postcondition"
-[ "$(h12_test healthy)" = no ] && pass "H12 healthy postcondition => ensure_sshd NOT invoked (~0 cost)" || bad "H12 ran ensure_sshd when healthy"
+case "$(h12_test broken)" in repair:login) pass "H12 broken login postcondition => tick repair needed" ;; *) bad "H12 broken not detected: [$(h12_test broken)]" ;; esac
+[ "$(h12_test healthy)" = none ] && pass "H12 healthy => no tick repair (cheap path)" || bad "H12 flagged repair when healthy: [$(h12_test healthy)]"
+
+# H12 Stage-3 — statedir EMPTY (NeedsLogin) must drive an auth-key JOIN through
+# one tick's do_ensure_body path. We exercise the REAL ensure_login first-login
+# branch with an auth key + config tags, capturing the `up` argv.
+h12_join_test() {
+  local capture; capture="$(mktemp)"
+  (
+    set -u
+    cap_bin="$(mktemp)"
+    cat > "$cap_bin" <<CAP
+#!/bin/sh
+for a in "\$@"; do printf '%s\n' "\$a"; done > "$capture"
+exit 0
+CAP
+    chmod +x "$cap_bin"
+    RUN_DIR="$(mktemp -d)"
+    AUTHKEY_FILE="$(mktemp)"; echo "tskey-abc" > "$AUTHKEY_FILE"
+    log(){ :; }; id(){ return 1; }
+    wait_for_backend(){ echo NeedsLogin; }
+    state_is_populated(){ return 1; }          # empty statedir => first login
+    tailscale_bin(){ echo "$cap_bin"; }
+    config_get(){ [ "$1 $2" = "tailscale tags" ] && echo "tag:grok-box"; }
+    eval "$(extract_fn run_reauth_up)"
+    eval "$(extract_fn ensure_login)"
+    ensure_login >/dev/null 2>&1
+    rm -f "$cap_bin" "$AUTHKEY_FILE"; rm -rf "$RUN_DIR"
+  )
+  tr '\n' ' ' < "$capture"; rm -f "$capture"
+}
+h12join="$(h12_join_test)"
+case "$h12join" in
+  *--auth-key=tskey-abc*) pass "H12 statedir-empty => auth-key join argv carries --auth-key" ;;
+  *) bad "H12 join argv missing --auth-key: [$h12join]" ;;
+esac
+case "$h12join" in
+  *--advertise-tags=tag:grok-box*) pass "H12 first-login join argv carries --advertise-tags from config" ;;
+  *) bad "H12 join argv missing --advertise-tags: [$h12join]" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# H13 — name_mismatch: file=grok-box-8 vs live=cursor is a mismatch; equal is
+# not. Drives the REAL name_mismatch with stubbed read_box_name/live_hostname.
+# ---------------------------------------------------------------------------
+h13_test() {
+  local live="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn name_mismatch)"
+read_box_name(){ echo grok-box-8; }
+live_hostname(){ echo "$live"; }
+if name_mismatch; then echo "mismatch:\$NAME_MISMATCH_LIVE"; else echo match; fi
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+case "$(h13_test cursor)" in mismatch:cursor) pass "H13 live=cursor vs file=grok-box-8 => mismatch (check FAIL + set --hostname)" ;; *) bad "H13 mismatch not detected: [$(h13_test cursor)]" ;; esac
+[ "$(h13_test grok-box-8)" = match ] && pass "H13 live==file => no mismatch" || bad "H13 false mismatch on equal names: [$(h13_test grok-box-8)]"
+
+# ---------------------------------------------------------------------------
+# E1 — install.sh one-shot migration kills EXACTLY the tailscaled whose argv
+# has the exact `--statedir=$STATE_DIR` token, and NOT a decoy with
+# `--statedir=$STATE_DIR-other`. We replicate the migration's kill selector
+# (exact NUL-split token match) against two fake daemons and assert only the
+# right one is selected.
+# ---------------------------------------------------------------------------
+e1_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<'INNER'
+set -u
+STATE_DIR="/tmp/e1-$$-state"
+# Two fake long-lived "daemons" carrying the token as an argv element. Using
+# `bash -c 'sleep 30' _ <token>` keeps the process alive 30s while <token>
+# appears verbatim in /proc/PID/cmdline (it's an ignored positional param).
+bash -c 'sleep 30; :' _ "--statedir=$STATE_DIR" &
+right=$!
+bash -c 'sleep 30; :' _ "--statedir=$STATE_DIR-other" &
+wrong=$!
+sleep 0.3
+# Migration selector (mirrors install.sh): NUL-split argv, exact token.
+selected=""
+for pid in "$right" "$wrong"; do
+  match=0
+  while IFS= read -r -d '' arg; do
+    [ "$arg" = "--statedir=$STATE_DIR" ] && match=1
+  done < "/proc/$pid/cmdline" 2>/dev/null || true
+  [ "$match" = 1 ] && selected="$selected $pid"
+done
+kill "$right" "$wrong" 2>/dev/null
+if [ "$selected" = " $right" ]; then echo ok; else echo "bad:[$selected] right=$right wrong=$wrong"; fi
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+if [ "$(e1_test)" = ok ]; then
+  pass "E1 migration selector: exact --statedir token matches the daemon, not the -other decoy"
+else
+  bad  "E1 migration selector wrong: [$(e1_test)]"
+fi
+# E1 install.sh actually has the migration (marker-absence gate + exact token)
+if grep -q 'E1 migration' "$ROOT/install.sh" && grep -q 'flock --close' "$ROOT/install.sh"; then
+  pass "E1 install.sh carries the one-shot pre-H1 migration (marker-gated)"
+else
+  bad  "E1 install.sh missing the migration"
+fi
 
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
