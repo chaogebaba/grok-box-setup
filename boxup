@@ -285,26 +285,14 @@ account_unlocked() {
 }
 
 # H12: the LOGIN postcondition, probed CHEAPLY (read-only: passwd -S + one
-# stat, NO chpasswd / keygen). do_tick historically only restarted a DEAD sshd,
-# so a LOCKED account or WIPED host keys (image swap / tamper) waited for the
-# hourly `boxup once` (box-8 Stage 1). This lets the 15s tick re-assert the
-# postcondition and repair via ensure_sshd, at ~0 cost when healthy.
-#   * box (and root when present) have a usable password (account_unlocked, H7)
-#   * at least one host key on disk — /etc/ssh/ssh_host_ed25519_key, the SAME
-#     file ensure_host_keys treats as the presence marker, so "present" means
-#     "sshd can start with OUR persisted identity", not "some file exists".
+# stat, NO chpasswd / keygen). do_tick historically only restarted a DEAD sshd.
+# H12: at least one host key on disk — /etc/ssh/ssh_host_ed25519_key, the SAME
+# file ensure_host_keys treats as the presence marker, so "present" means "sshd
+# can start with OUR persisted identity", not "some file exists". A check_reason
+# predicate (P1-1): the tick and `boxup check` both catch wiped host keys
+# (box-8 Stage 1) and repair via do_ensure_body → ensure_sshd.
 host_keys_present() {
   [ -s /etc/ssh/ssh_host_ed25519_key ]
-}
-
-login_postcondition_ok() {
-  id box >/dev/null 2>&1 || return 1          # box account must exist (D8)
-  account_unlocked box || return 1
-  if id root >/dev/null 2>&1; then
-    account_unlocked root || return 1
-  fi
-  host_keys_present || return 1
-  return 0
 }
 
 # H11: classify the seeded auth key's expiry from $AUTHKEY_EXPIRES (a single
@@ -440,6 +428,20 @@ try:
 except Exception:
     print("")
 ' 2>/dev/null || true
+}
+
+# H13 (P1-4): true (0) iff the tailnet shows at least one PEER. Naming is
+# computed from peers only (Self is often still `cursor`), so `name: unnamed` is
+# only a health FAILURE once peers are visible — a genuinely lone first node has
+# nothing to pick against and must not be failed forever.
+has_peers() {
+  ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print("yes" if (json.load(sys.stdin).get("Peer") or {}) else "no")
+except Exception:
+    print("no")
+' 2>/dev/null | grep -q yes
 }
 
 prefs_hostname() {
@@ -1020,6 +1022,16 @@ ensure_login() {
   local b
   b="$(tailscale_bin)"
   [ -x "$b" ] || return 0
+  # P1-1: ONE attempt limiter for ALL `tailscale up` invocations — first-login
+  # AND re-auth. Every `up` (re-register OR fresh join) rewrites registration
+  # against the control plane; a rc=0 `up` that only printed an AuthURL must not
+  # license another attempt next tick. 30-min floor, rc-independent (H5).
+  if ! reauth_attempt_allowed; then
+    log "login: backend=$st but a tailscale up was attempted <${REAUTH_MIN_INTERVAL}s ago — rate-limited, skipping this tick" >&2
+    return 0
+  fi
+  reauth_attempt_record
+  local urc=0
   # A populated statedir at NeedsLogin means an existing identity whose node
   # key expired or was revoked; --force-reauth re-auths it in place (same key).
   # An empty statedir is a first login and must NOT get --force-reauth.
@@ -1031,26 +1043,16 @@ ensure_login() {
     # (from live prefs, never config.toml) because current tailscale refuses an
     # up that omits an already-set non-default flag. Mentioning is not
     # introducing. Retagging is still a documented MANUAL operator step.
-    # H5: bound force-reauth ATTEMPTS (30-min floor + per-hour cap), regardless
-    # of rc — a rc=0 `up` that only printed an AuthURL must not license another
-    # attempt next tick.
-    if ! reauth_attempt_allowed; then
-      log "login: NeedsLogin but re-auth attempt rate-limited (min ${REAUTH_MIN_INTERVAL}s between attempts) — skipping this tick" >&2
-      return 0
-    fi
-    reauth_attempt_record
     # P0-C (#9): do NOT swallow the re-auth rc with `|| true`. run_reauth_up
-    # already logs the tailscale error text; the CALLER also records the
-    # outcome so a persistent NeedsLogin re-auth failure is visible, not silent.
-    local rrc
+    # already logs the tailscale error text; the CALLER also records the outcome.
     if [ -s "$AUTHKEY_FILE" ]; then
       run_reauth_up "re-auth existing identity with auth-key" \
-        --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")"; rrc=$?
+        --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")"; urc=$?
     else
-      run_reauth_up "re-auth existing identity, minting AuthURL — see boxup status"; rrc=$?
+      run_reauth_up "re-auth existing identity, minting AuthURL — see boxup status"; urc=$?
     fi
-    if [ "$rrc" -ne 0 ]; then
-      log "login: re-auth (NeedsLogin, populated statedir) FAILED rc=$rrc — see the tailscale error above; node stays NeedsLogin, will retry after the attempt-limiter window" >&2
+    if [ "$urc" -ne 0 ]; then
+      log "login: re-auth (NeedsLogin, populated statedir) FAILED rc=$urc — see the tailscale error above; node stays NeedsLogin, will retry after the attempt-limiter window" >&2
     fi
   else
     # First login (empty statedir). This is the ONLY place --advertise-tags is
@@ -1061,17 +1063,24 @@ ensure_login() {
     up=("$b" up --ssh=false --advertise-exit-node --accept-dns
         --snat-subnet-routes=true --timeout=25s)
     id box >/dev/null 2>&1 && up+=(--operator=box)
-    local tags
+    local tags out
     tags="$(config_get tailscale tags || true)"
     [ -n "$tags" ] && up+=(--advertise-tags="$tags")
+    # P1-1: do NOT swallow the first-login `up` rc with `|| true`. Capture the
+    # combined output, log it, and surface a non-zero rc so a failing first
+    # login is visible (a `check` FAIL + a degraded converge), not silent.
     if [ -s "$AUTHKEY_FILE" ]; then
       log "login: auth-key join (statedir empty)${tags:+ tags=$tags}"
-      "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
+      out="$("${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" 2>&1)"; urc=$?
     else
       log "login: minting AuthURL (statedir empty, no key)${tags:+ tags=$tags} — see boxup status"
-      "${up[@]}" || true
+      out="$("${up[@]}" 2>&1)"; urc=$?
+    fi
+    if [ "$urc" -ne 0 ]; then
+      log "login: first-login tailscale up FAILED rc=$urc: $out" >&2
     fi
   fi
+  return "$urc"
 }
 
 # --- converge: name ----------------------------------------------------------
@@ -1262,9 +1271,10 @@ refresh_backoff_window() {
 # a 30-min minimum already permits at most 2 attempts/hour, so a separate hourly
 # cap adds a second knob that can never bind before the floor does. One knob.
 # Why 30 min: it is comfortably above any tailscale control-plane rate-limit
-# headroom for `up`, and it is > half the hourly-automation period (the external
-# `boxup once` runs hourly), so the hourly `once` and a 15s worker tick can
-# never double-fire a re-auth for the same outage. Persisted under $RUN_DIR
+# headroom for `up`, and 1800s == the hourly-automation period / 2, so the
+# hourly external `boxup once` and a 15s worker tick can never double-fire a
+# re-auth for the same outage (two attempts can't fall inside one 3600s period).
+# Persisted under $RUN_DIR
 # (ephemeral: a reboot/swap legitimately resets, so a fresh box may attempt once
 # immediately — which is correct).
 REAUTH_LAST="$RUN_DIR/last-reauth"          # unix ts of the last ATTEMPT
@@ -1543,26 +1553,44 @@ do_tick() {
   ensure_forwarding || true
   ensure_nat || true
 
-  # H12 (GENERALIZED — box-8 Stage 1 + Stage 3): do_tick must not hand-pick
-  # WHICH repair it may run. It evaluates the convergence postconditions and, if
-  # ANY fails, runs the FULL do_ensure_body under this tick's lock — so a locked
-  # account, wiped host keys, a NeedsLogin/empty-statedir first-login, a lost
-  # exit-node, or a name mismatch all self-heal within one 15s tick instead of
-  # waiting for the hourly `boxup once`. Rate-limited to once / 60s so a
-  # PERSISTENTLY failing predicate cannot hammer the control plane or churn.
-  # The probe is cheap (read_ts_fields once + passwd -S + a couple stats); the
-  # expensive do_ensure_body runs ONLY on a real failure. ensure_login itself
-  # carries the re-auth attempt-limiter (H5), so first-login/re-auth is safe.
-  if tick_repair_needed; then
-    if tick_repair_allowed; then
-      log "tick: a convergence postcondition failed — running full do_ensure_body (H12) [reason=$TICK_REPAIR_REASON]" >&2
-      date +%s > "$RUN_DIR/last-tick-repair" 2>/dev/null || true
-      do_ensure_body || true
+  # P1-1 (H12, unified): the tick's health probe IS `check_reason` — the SINGLE
+  # health predicate, so the tick and `boxup check` can never diverge. If any
+  # predicate fails, run the FULL do_ensure_body under this tick's lock (stop
+  # hand-picking which repair a tick may run: the tick's job is "if not
+  # converged, converge"). A persistently UNSATISFIABLE predicate is bounded by
+  # the SAME backoff shape as refresh (20→60→180→600s cap) with `repair=failing:N`
+  # in status and a log line naming the reason — never a blind fixed loop. The
+  # freeze/recycle above stays: it handles sleep/thaw liveness that check can't
+  # express, and it must run every tick regardless of the backoff window.
+  local reason
+  reason="$(check_reason)"
+  if [ -n "$reason" ]; then
+    local fails window now last
+    fails=$(repair_fail_count)
+    window=$(refresh_backoff_window "$fails")
+    now=$(date +%s); last=0
+    [ -f "$RUN_DIR/last-repair" ] && last=$(tr -d '[:space:]' < "$RUN_DIR/last-repair" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$window" ]; then
+      log "tick: unhealthy (reason=$reason) but repair backing off (window=${window}s fails=${fails})" >&2
     else
-      log "tick: postcondition failed (reason=$TICK_REPAIR_REASON) but repair rate-limited (<${TICK_REPAIR_MIN}s since last) — skipping" >&2
+      log "tick: unhealthy (reason=$reason) — running full do_ensure_body under the lock" >&2
+      echo "$now" > "$RUN_DIR/last-repair" 2>/dev/null || true
+      do_ensure_body || true
+      # Re-evaluate: a cleared predicate resets the backoff, a persistent one
+      # stretches it (bounded, visible via repair=failing:N in status).
+      if [ -n "$(check_reason)" ]; then
+        fails=$((fails + 1))
+        echo "$fails" > "$RUN_DIR/fail.repair" 2>/dev/null || true
+        window=$(refresh_backoff_window "$fails")
+        log "tick: still unhealthy after repair (consecutive=${fails}, next window=${window}s)" >&2
+      else
+        echo 0 > "$RUN_DIR/fail.repair" 2>/dev/null || true
+      fi
     fi
   else
-    # Healthy steady state: only the cheap, idempotent per-tick maintenance.
+    # Healthy: reset the repair backoff and do the cheap idempotent maintenance.
+    echo 0 > "$RUN_DIR/fail.repair" 2>/dev/null || true
     case "$(read_box_name || true)" in
       grok-box-[0-9]*)
         pgrep -x tailscaled >/dev/null 2>&1 && refresh_exitnode || true
@@ -1572,44 +1600,15 @@ do_tick() {
   date +%s > "$RUN_DIR/hb" 2>/dev/null || true
 }
 
-# H12: minimum seconds between full do_ensure_body repairs driven by a failing
-# tick postcondition — a persistently failing predicate must not hammer.
-TICK_REPAIR_MIN="${BOXUP_TICK_REPAIR_MIN:-60}"
-
-# True (0) iff the last tick-driven repair is far enough in the past.
-tick_repair_allowed() {
-  local now last
-  now=$(date +%s); last=0
-  [ -f "$RUN_DIR/last-tick-repair" ] && \
-    last=$(tr -d '[:space:]' < "$RUN_DIR/last-tick-repair" 2>/dev/null || echo 0)
-  case "$last" in ''|*[!0-9]*) last=0 ;; esac
-  [ "$last" -le 0 ] && return 0
-  [ $((now - last)) -ge "$TICK_REPAIR_MIN" ]
-}
-
-# True (0) iff SOME convergence postcondition is currently unmet, setting
-# TICK_REPAIR_REASON. These mirror the substantive `boxup check` predicates
-# (NOT the worker/hb self-checks — a tick must not try to repair its own
-# liveness). Read-only + cheap: one read_ts_fields, passwd -S, a couple stats.
-TICK_REPAIR_REASON=""
-tick_repair_needed() {
-  TICK_REPAIR_REASON=""
-  # sshd must be running (the login path).
-  if ! pgrep -x sshd >/dev/null 2>&1; then TICK_REPAIR_REASON="sshd=down"; return 0; fi
-  # Login postcondition (H7/H12): accounts unlocked + host keys present.
-  if ! login_postcondition_ok; then TICK_REPAIR_REASON="login"; return 0; fi
-  read_ts_fields
-  # Not logged in / not fully online ⇒ ensure_login (first-login or re-auth).
-  case "$backend" in
-    Running) ;;
-    *) TICK_REPAIR_REASON="backend=$backend"; return 0 ;;
-  esac
-  if [ "$online" != yes ]; then TICK_REPAIR_REASON="online=$online"; return 0; fi
-  # H13: live hostname must match the frozen intent file.
-  if name_mismatch; then TICK_REPAIR_REASON="name"; return 0; fi
-  # Exit-node advertised with both default routes (the box's whole purpose).
-  if [ "$exitn" != yes ]; then TICK_REPAIR_REASON="exit-node=$exitn"; return 0; fi
-  return 1
+# P1-1: consecutive tick-repair failures (a persistently UNSATISFIABLE check
+# predicate). Reuses refresh_backoff_window (20→60→180→600s). Ephemeral run-dir
+# state (resets free on reboot/recycle), like fail.refresh.
+repair_fail_count() {
+  local n=0
+  [ -f "$RUN_DIR/fail.repair" ] && \
+    n=$(tr -d '[:space:]' < "$RUN_DIR/fail.repair" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
 }
 
 # run_tick: take the converge lock with flock -n (skip on contention). A tick
@@ -1761,6 +1760,12 @@ print_status() {
   local rf
   rf=$(refresh_fail_count)
   [ "$rf" -ge 3 ] && printf ' refresh=failing:%s' "$rf"
+  # P1-1: a persistently unsatisfiable tick-repair predicate is bounded by the
+  # same backoff as refresh; surface it at N>=1 so an unhealthy-but-backing-off
+  # box is visible (unlike refresh, ANY repair failure is worth showing).
+  local rp
+  rp=$(repair_fail_count)
+  [ "$rp" -ge 1 ] && printf ' repair=failing:%s' "$rp"
   [ -n "${auth:-}" ] && printf ' auth=%s' "$auth"
   # H11: surface auth-key expiry (warn/expired only; ok/none stay silent so a
   # healthy box's status line is unchanged).
@@ -1786,6 +1791,26 @@ print_status() {
 # downgrade a new fleetctl to the legacy status parse. Every failure here is
 # exit 1; the dispatch arm below runs do_check and translates its rc to 0/1.
 do_check() {
+  local reason
+  reason="$(check_reason)"
+  if [ -n "$reason" ]; then
+    echo "check=FAIL reason=$reason"
+    return 1
+  fi
+  printf 'check=OK '
+  print_status
+  return 0
+}
+
+# check_reason: the SINGLE health predicate, factored out so BOTH `boxup check`
+# and the worker tick (P1-1) use the exact same list — no parallel/forked
+# predicate set can drift. Prints the first-failed-predicate string (empty ⇒
+# healthy). Read-only apart from the once/hour unknown-expiry warn. Cost: one
+# read_ts_fields (ts status --json + python), one advertised_routes (ts debug
+# prefs + python) only on the happy path, passwd -S x1-2, a few pgrep — ~2
+# tailscale calls, well within a 15s tick (measured acceptable; if a future
+# tailscale makes status slow, cache it, do NOT fork the list).
+check_reason() {
   local reason="" v4 v6 hb_secs now last ts_count pid cmd routes
   v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
   v6=$(tr -d '[:space:]' < /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
@@ -1798,11 +1823,20 @@ do_check() {
   if [ -z "$reason" ] && [ "${online:-no}" != yes ]; then
     reason="online=${online:-no} (want yes)"
   fi
-  # H13: the live hostname must match the frozen intent (file = intent, live
-  # Self.HostName = postcondition). A rejoin that registered as `cursor` while
-  # the file says grok-box-8 is a FAIL, not a pass.
+  # H13 (P1-4): the name postcondition has TWO failure modes.
+  #   * rejoin/wrong-name: file says grok-box-N but live Self.HostName differs
+  #     (e.g. `cursor` after an auth-key rejoin) — name_mismatch.
+  #   * fresh/unnamed: no grok-box-N frozen yet while backend=Running with peers
+  #     visible — the box SHOULD have picked a name by now; `name=-` is NOT
+  #     healthy. (We gate on peers so a lone first node isn't failed forever.)
   if [ -z "$reason" ] && name_mismatch; then
     reason="name: live=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE"
+  fi
+  if [ -z "$reason" ]; then
+    case "$(read_box_name || true)" in
+      grok-box-[0-9]*) ;;
+      *) has_peers && reason="name: unnamed" ;;
+    esac
   fi
   if [ -z "$reason" ] && ! pgrep -x sshd >/dev/null 2>&1; then
     reason="sshd=down (want up)"
@@ -1819,6 +1853,12 @@ do_check() {
   fi
   if [ -z "$reason" ] && id root >/dev/null 2>&1 && ! account_unlocked root; then
     reason="account root=locked (sshd up but no usable login)"
+  fi
+  # H12: sshd up + accounts unlocked is still not a working login without host
+  # keys on disk (box-8 Stage 1 wiped them). Same file ensure_host_keys treats
+  # as the presence marker, so "present" means sshd can start with OUR identity.
+  if [ -z "$reason" ] && ! host_keys_present; then
+    reason="host keys missing (/etc/ssh/ssh_host_ed25519_key)"
   fi
   if [ -z "$reason" ] && { [ "$v4" != 1 ] || [ "$v6" != 1 ]; }; then
     reason="ipfwd=4:${v4},6:${v6} (want 4:1,6:1)"
@@ -1885,15 +1925,9 @@ do_check() {
       log "check: WARN authkey expiry unknown ($AUTHKEY_EXPIRES missing or unparseable) — seed it (see docs/AGENT.md §A); key may still be valid, not failing check" >&2
     fi
   fi
-
-  if [ -n "$reason" ]; then
-    echo "check=FAIL reason=$reason"
-    return 1
-  fi
-  printf 'check=OK '
-  print_status
-  return 0
+  printf '%s' "$reason"
 }
+
 
 # --- converge ----------------------------------------------------------------
 # The converge body. Runs under the converge lock (via do_ensure).
