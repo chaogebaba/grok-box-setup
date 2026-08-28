@@ -22,15 +22,44 @@ has three gaps that need an off-box actor:
 3. **The laptop is not always online.** `fleetctl` today runs from the laptop;
    reconciliation, rollout, and alerting stop when the laptop sleeps.
 
-The chosen design: a **VPS brain** (`ssh -p 26333 root@199.180.115.53`,
-full-root scope, footprint kept to one dir tree + one systemd unit set) that
-reconciles the fleet on a timer, reaches each box over an **out-of-band
+The chosen design: a **VPS brain** (`ssh root@107.172.132.211`, port 22, key
+auth, full-root scope, footprint kept to one dir tree + one systemd unit set)
+that reconciles the fleet on a timer, reaches each box over an **out-of-band
 reverse-SSH tunnel** (independent of tailnet health), and mints **per-box
-tag-scoped auth keys via the Tailscale API** (write-scoped token; laptop copy
-at `~/.grok-box-apitoken`, never printed). Alerts go to Telegram via a
-pluggable `notify()` stub (journal-only until the bot token exists).
+tag-scoped auth keys via the Tailscale API** (write-scoped token; laptop copy at
+`~/.grok-box-apitoken`, never printed). Alerts go to Telegram via a pluggable
+`notify()` stub (journal-only until the bot token exists).
 
 ---
+
+## VPS ground truth (inventoried read-only 2026-08-28 — do not re-probe blindly)
+
+Design against THESE facts, not assumptions:
+
+- **Reach:** `ssh root@107.172.132.211` (port **22**, key auth works). The
+  earlier `199.180.115.53:26333` address is **DEAD — never use it.**
+- **Host:** Ubuntu 24.04.4, kernel 6.8, uptime ~6d.
+- **Budget (TIGHT):** **1 vCPU, ~961 MB RAM (~590 MB available), 30 GB disk
+  (21 GB free).** ⇒ brain is **bash + curl + jq + ssh only** — NO extra
+  daemons beyond sshd (the inbound tunnels) + one systemd timer. Budget the
+  reverse tunnels: ~a few MB RSS per idle `sshd: fleet` session × 8 boxes =
+  low tens of MB, acceptable; do NOT add anything memory-hungry (no node/python
+  service, no DB).
+- **Tailscale:** 1.102.3 installed, `tailscaled.service` running but
+  `BackendState=NeedsLogin` (0 peers — NOT in any tailnet). ⇒ "VPS joins the
+  tailnet" (§2) is a ONE-TIME `tailscale up` with a **tagged** key
+  (`tag:fleet-brain`; needs the ACL `tagOwners` entry first — OQ #3).
+- **Do NOT disturb these running services:** xray (ports 1001/1002/1006/1080/
+  1234), hysteria (443), WireGuard `wg0` 10.66.0.1/24, cron,
+  unattended-upgrades, rsyslog. Our reverse ports (20001–20008) and anything we
+  add must not collide with these.
+- **sshd:** port 22, `PermitRootLogin yes`, `PasswordAuthentication yes`,
+  `AllowTcpForwarding yes`, **`GatewayPorts no`** (GOOD — reverse forwards bind
+  `127.0.0.1` only, exactly the design), **`ClientAliveInterval 0`** (so the
+  VPS will NOT reap dead tunnels — **liveness MUST be client-driven**:
+  `ServerAliveInterval`/`ServerAliveCountMax` from the box, plus a VPS-side
+  `ss -tln` probe on `127.0.0.1:2000N` in reconcile). No fail2ban. No existing
+  `/opt/*` and no systemd timers — `/opt/grok-fleet` + our timer are greenfield.
 
 ## Decision wall
 
@@ -40,7 +69,7 @@ Schema: **Decision | Alternatives considered / why they lost | Breaks if undone 
 
 | Decision | Alternatives considered / why lost | Breaks if undone | Prior art |
 |---|---|---|---|
-| **The `boxup` tick supervises a plain `ssh -N` reverse tunnel in a loop** — NOT autossh, NOT a systemd unit. Each tick: if no live tunnel process for this box, (re)spawn `ssh -N -T -o exit-on-forward-failure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes -R 127.0.0.1:$((20000+N)):localhost:22 -p 26333 fleet@199.180.115.53`, detached via `spawn_detached` (flock --close safe). Liveness = the ssh pid alive AND the forward is up (VPS side is authoritative — see §3). | (a) **autossh** — LOST on the BOX: autossh is a separate package not guaranteed present after an image swap (DESIGN.md: overlay wiped, only `/workspace` returns), and it is one more binary to vendor. Its whole job (respawn on death) is something the 15s tick ALREADY does for tailscaled/sshd/worker — one supervision model, not two. (b) **systemd unit on the box** — LOST: there is NO systemd running in the sand container (DESIGN.md §environment: PID 1 is tini, systemd on disk but inactive). A `.service` would never start. (c) **`ssh -f` (background itself)** — LOST: `-f` detaches from boxup's supervision so the tick can't track/replace it; use `-N` foreground under `spawn_detached` and let the tick own the lifecycle. | Boxes behind the sand NAT are unreachable when the tailnet is down — which is exactly when the brain most needs to reach them (to re-mint a key). No tunnel ⇒ the brain is blind precisely during the outage it exists to fix. | autossh-vs-systemd survey confirms both are viable ON A HOST but both assume a process supervisor exists: [systemd persistent tunnel](https://blog.kylemanna.com/linux/ssh-reverse-tunnel-on-linux-with-systemd/), [autossh systemd unit](https://gist.github.com/ntrepid8/0af12c012dd2567c800799d86eb44f90), [supervisord tunnel precedent (imbue-ai latchkey)](https://github.com/imbue-ai/mngr/issues/2423). We have no supervisor on the box except the boxup tick, so the tick IS the supervisor. `-o ExitOnForwardFailure=yes` + `ServerAlive*` from [ssh_config(5)] make a dead tunnel exit promptly so the next tick respawns it. |
+| **The `boxup` tick supervises a plain `ssh -N` reverse tunnel in a loop** — NOT autossh, NOT a systemd unit. Each tick: if no live tunnel process for this box, (re)spawn `ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes -i /workspace/box-setup/secrets/tunnel_ed25519 -R 127.0.0.1:$((20000+N)):localhost:22 -p 22 fleet@107.172.132.211`, detached via `spawn_detached` (flock --close safe). Liveness is **client-driven** — the VPS has `ClientAliveInterval 0` and will NOT reap a dead tunnel, so `ServerAliveInterval/CountMax` on the box side must drop a stale link (and the VPS reconcile cross-checks with `ss -tln`). Box-side liveness = the ssh pid alive AND (VPS-side) the port is listening. | (a) **autossh** — LOST on the BOX: autossh is a separate package not guaranteed present after an image swap (DESIGN.md: overlay wiped, only `/workspace` returns), and it is one more binary to vendor. Its whole job (respawn on death) is something the 15s tick ALREADY does for tailscaled/sshd/worker — one supervision model, not two. (b) **systemd unit on the box** — LOST: there is NO systemd running in the sand container (DESIGN.md §environment: PID 1 is tini, systemd on disk but inactive). A `.service` would never start. (c) **`ssh -f` (background itself)** — LOST: `-f` detaches from boxup's supervision so the tick can't track/replace it; use `-N` foreground under `spawn_detached` and let the tick own the lifecycle. | Boxes behind the sand NAT are unreachable when the tailnet is down — which is exactly when the brain most needs to reach them (to re-mint a key). No tunnel ⇒ the brain is blind precisely during the outage it exists to fix. | autossh-vs-systemd survey confirms both are viable ON A HOST but both assume a process supervisor exists: [systemd persistent tunnel](https://blog.kylemanna.com/linux/ssh-reverse-tunnel-on-linux-with-systemd/), [autossh systemd unit](https://gist.github.com/ntrepid8/0af12c012dd2567c800799d86eb44f90), [supervisord tunnel precedent (imbue-ai latchkey)](https://github.com/imbue-ai/mngr/issues/2423). We have no supervisor on the box except the boxup tick, so the tick IS the supervisor. `ExitOnForwardFailure=yes` + `ServerAlive*` from [ssh_config(5)] make a dead tunnel exit promptly so the next tick respawns it — mandatory here because the VPS's `ClientAliveInterval 0` won't. |
 | **Per-box ed25519 key at `/workspace/box-setup/secrets/tunnel_ed25519{,.pub}`** (mode 600, generated on the box, never leaves it as a private key). Survives image swaps because it lives under `/workspace`. | (a) reuse the tailscale node key / ssh host key — LOST: different trust domain; the tunnel key authenticates the box TO THE VPS, and rotating one must not disturb the others. (b) a shared fleet tunnel key — LOST: one leaked box key would grant every box's tunnel identity; per-box keys keep a box compromise to its own port (see §4). | Without a persistent per-box key the tunnel can't re-establish after a swap without re-enrollment every time. | [OpenSSH key management]; per-box-key isolation mirrors the per-box tailscale identity rule (DESIGN.md "Identity out of git"). |
 | **Enrollment (chicken-and-egg): the box's tunnel PUBKEY first reaches the VPS over Tailscale SSH, via `fleetctl enroll <box>`** run from the brain (or laptop) WHILE the box is still on the tailnet. fleetctl reads the pubkey over `tailscale ssh grok-box-N cat /workspace/box-setup/secrets/tunnel_ed25519.pub` and appends a locked-down `authorized_keys` line (see §2) for `fleet@vps`. A box generates its keypair on first `boxup once` if absent. | (a) ship the pubkey in git / config.toml — LOST: per-box, generated on the box, must not be committed (same rule as identity). (b) have the box POST its own pubkey to the VPS — LOST: the box would need a VPS credential, widening blast radius; enrollment is a brain-initiated, one-time, tailnet-gated action. | No enrollment path ⇒ a fresh box's tunnel is never trusted by the VPS and the OOB channel never forms. | Tailscale SSH as the bootstrap channel: [Tailscale SSH docs](https://tailscale.com/kb/1193/tailscale-ssh). |
 | **HONEST LIMIT: if `/workspace` itself is wiped, the tunnel key AND the frozen hostname are gone.** The box then has no tunnel identity and no name. Recovery REQUIRES a tailnet-side action (re-enrollment over Tailscale SSH, or a fresh auth-key join that the brain drives once the box reappears on the tailnet). The OOB tunnel is a second path for the *node-deleted-but-workspace-intact* case, NOT a workspace-loss backstop. | pretend the tunnel survives a workspace wipe — LOST: dishonest; `/workspace` is "probably persistent" (DESIGN.md) but not guaranteed, and the key/name live there. | Overstating the tunnel's coverage would hide the one failure it can't handle, inviting a false sense of recovery. | DESIGN.md §persistence-model ("keep a full re-join path for the day /workspace isn't"). |
@@ -51,16 +80,19 @@ Schema: **Decision | Alternatives considered / why they lost | Breaks if undone 
 |---|---|---|---|
 | **Footprint: one tree + one unit set.** Code+config at `/opt/grok-fleet` (fleetctl from THIS repo + `config.toml`), mutable state at `/var/lib/grok-fleet` (device cache, per-box last-seen, run locks), secrets mode 600 at `/etc/grok-fleet` (API token, and a COPY of each box's tunnel authorized-keys mapping). systemd `fleet-reconcile.timer` (OnUnitActiveSec=5min) → `fleet-reconcile.service` (Type=oneshot, runs `fleetctl reconcile`). | (a) cron — LOST: no per-run logging/lock/￼status the way a systemd oneshot + journal gives; the VPS HAS systemd (unlike the box), so use it. (b) a long-running daemon — LOST: a 5-min oneshot under a timer is crash-simple, has no in-memory state to corrupt, and each run re-reads truth from the API + tunnels. | Sprawl across the VPS makes the footprint unauditable and violates the "one dir + one unit set" scope the user granted. | systemd timer-vs-daemon for periodic reconcile: [systemd.timer(5)](https://www.freedesktop.org/software/systemd/man/systemd.timer.html); oneshot reconcile pattern mirrors DESIGN.md's D6 "one predicate, orchestrator trusts it". |
 | **`fleet` user is shell-less and forward-only.** Each box's `~fleet/.ssh/authorized_keys` line is `restrict,port-forwarding,permitlisten="127.0.0.1:<20000+N>" <box pubkey>`. `restrict` disables pty/agent/X11/forwarding then `port-forwarding` re-enables ONLY forwarding; `permitlisten` pins the box to its OWN port and 127.0.0.1 only. `sshd_config` for that Match block: `PermitOpen none` (no local forwarding), `AllowTcpForwarding remote`, `PermitTTY no`, `ForceCommand /usr/sbin/nologin` (or `command="false"`). | (a) a real login user — LOST: a box compromise would get a VPS shell. (b) `no-pty,no-agent-forwarding,...` enumerated — LOST: `restrict` is allow-list-by-default (future-proof: new dangerous features are off unless re-enabled), the enumerated form is deny-list (a new feature defaults ON). (c) omit `permitlisten` — LOST: any box could then bind ANY loopback port and impersonate another box's tunnel. | Without `restrict`+`permitlisten` a single box key could open a shell or hijack another box's port on the brain — the brain becomes the fleet's single point of total compromise. | `restrict`/`permitlisten` semantics (allow-list, per-key port pin): [sshd(8) AUTHORIZED_KEYS](https://man.openbsd.org/OpenBSD-current/sshd) (note: `ssh -R` sends listen host "localhost" when unspecified, so pin `127.0.0.1:<port>` and have the box request `127.0.0.1:` explicitly); reverse-tunnel bastion hardening: [restrict on a bastion](https://blog.vitalvas.com/post/2026/02/04/reverse-ssh-tunnels/), [permitlisten Q&A](https://superuser.com/questions/1552105/). |
-| **Deterministic port map: box N → VPS loopback port `20000+N`.** fleetctl derives it from `grok-box-N`; the same N is pinned in `permitlisten`. | a dynamic/negotiated port — LOST: then `permitlisten` can't be a fixed per-key pin and the brain can't address a box without a lookup handshake. | Non-deterministic ports break the per-key `permitlisten` pin (the security control) and make `fleetctl` unable to find a box's tunnel. | static allocation is the norm for named backends; mirrors DESIGN.md naming ("lowest free grok-box-N, then frozen"). |
+| **Deterministic port map: box N → VPS loopback port `20000+N` (range 20001–20008 for boxes 1–8).** fleetctl derives it from `grok-box-N`; the same N is pinned in `permitlisten`. This range is confirmed clear of the VPS's existing listeners (xray 1001/1002/1006/1080/1234, hysteria 443, wg0) — see VPS ground truth. | a dynamic/negotiated port — LOST: then `permitlisten` can't be a fixed per-key pin and the brain can't address a box without a lookup handshake. | Non-deterministic ports break the per-key `permitlisten` pin (the security control) and make `fleetctl` unable to find a box's tunnel; a colliding port would clash with xray/hysteria. | static allocation is the norm for named backends; mirrors DESIGN.md naming ("lowest free grok-box-N, then frozen"). |
 | **The VPS ALSO joins the tailnet, tagged `tag:fleet-brain`, as a SECOND path — DECIDED: YES.** The tunnel is the out-of-band primary (works when the tailnet is down); the tailnet membership gives the brain (a) the enrollment channel (Tailscale SSH, §1), (b) a health cross-check (can the box reach the brain over BOTH paths?), and (c) a path to run `tailscale ssh` for first-contact before a tunnel exists. `tag:fleet-brain` gets NO exit-node/subnet rights in the ACL — it is a management identity only. | (a) tunnel-only, VPS off the tailnet — LOST: then enrollment has no bootstrap channel and the brain can't distinguish "tailnet down" from "this box down" (no second observation). (b) tailnet-only, no tunnel — LOST: the tailnet is exactly what fails in the case the brain exists to fix; the brain would be blind during the outage. | Tunnel-only loses the enrollment bootstrap and the two-path health signal; tailnet-only loses the brain during a tailnet outage. Both paths together are the design. | Two-path management (in-band + OOB) is standard for out-of-band mgmt; Tailscale tags as a management-only identity: [Tailscale ACL tags](https://tailscale.com/kb/1068/acl-tags). |
 
 ### 3. `fleetctl reconcile` — decision table
 
 Runs every 5 min under the timer. **Inputs** per box: (i) the Tailscale API
 device list (`GET /api/v2/tailnet/-/devices?fields=all` — `lastSeen`, `nodeId`,
-`tags`, `keyExpiryDisabled`, `expires`, `hostname`); (ii) tunnel liveness (is
-`127.0.0.1:20000+N` connectable on the VPS?); (iii) `boxup check` run OVER the
-tunnel (`ssh -p 20000+N box@127.0.0.1 sudo /workspace/box-setup/boxup check`).
+`tags`, `keyExpiryDisabled`, `expires`, `hostname`); (ii) tunnel liveness — a
+VPS-side `ss -tln` check that `127.0.0.1:2000N` is LISTENING (the VPS has
+`ClientAliveInterval 0`, so a listening port is the authoritative "tunnel up"
+signal, cross-checked by whether a `boxup check` over it succeeds); (iii)
+`boxup check` run OVER the tunnel (`ssh -p 2000N box@127.0.0.1 sudo
+/workspace/box-setup/boxup check`).
 
 | # | Condition | Action | Notes / API |
 |---|---|---|---|
@@ -167,8 +199,9 @@ last-seeded key until it expires.
    (same first-login ordering rule as `tag:grok-box`).
 4. **Telegram**: confirm `notify()` stays a journal-only stub in this iteration
    (bot token + chat id land later), so nothing blocks on the bot existing.
-5. **Port base** (§2): confirm `20000+N` (box-8 → 20008) is free on the VPS and
-   doesn't collide with anything already listening on loopback there.
+5. **Port base** (§2): `20000+N` (boxes 1–8 → 20001–20008) is confirmed clear
+   of the VPS's current loopback listeners (xray/hysteria/wg0). Confirm you're
+   happy pinning this range (it's baked into every box's `permitlisten`).
 6. **Duplicate-both-online (row b)**: confirm the brain should NEVER auto-delete
    when both duplicates are online (flag a human) — i.e. we accept a rare
    manual step over a wrong auto-delete.
