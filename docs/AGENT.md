@@ -110,9 +110,32 @@ else the built-in default.
 ## G. Tags (`[tailscale] tags`) and manual retag
 
 `[tailscale] tags` (e.g. `tags = "tag:grok-box"`) is added to `tailscale up`
-**only at first login** (empty statedir). It is deliberately NEVER applied on
-the ~180-day key-expiry re-auth path, because converting a live user-owned node
-to tag-owned during an unattended re-auth can lock it out of the tailnet.
+**only at first login** (empty statedir). It is deliberately NEVER *introduced*
+on the key-expiry / re-auth path, because converting a live user-owned node to
+tag-owned during an unattended re-auth can lock it out of the tailnet.
+
+**Mention vs introduce (reconciles the old blanket rule with #9).** There are
+two different operations that both touch `--advertise-tags` on a re-auth `up`,
+and they are NOT the same:
+
+- *Introducing* a tag the node does not currently carry — forbidden on re-auth
+  (the lock-out above). Still a manual operator step.
+- *Mentioning* a tag the node ALREADY carries — required by current tailscale
+  CLI, which refuses an `up` that omits any already-set non-default flag
+  ("requires mentioning all non-default flags"). Restating the current value is
+  not a change. boxup's re-auth path (`run_reauth_up`) therefore MENTIONS the
+  tags read from the device's LIVE prefs / `Self.Tags` (never from
+  config.toml), and mentions the current `--hostname`, so the `up` is accepted.
+  If the device has no tags, none are mentioned.
+
+**Control-plane scope (this is load-bearing).** We run **login.tailscale.com**
+(Tailscale's hosted control plane), where mentioning already-held tags on
+re-auth is correct and required. The old "never pass tags on re-auth at all"
+rule was written for **headscale < 0.29.3**, which rejects `--advertise-tags`
+even for tags the node already holds (headscale#3374) — on that control plane
+the mention itself fails. If this fleet is ever pointed at a headscale < 0.29.3
+server, revert `run_reauth_up` to omit `--advertise-tags` entirely. As long as
+we are on login.tailscale.com, mention-current-tags is the correct behaviour.
 
 Ordering (do this before enabling tags): the tailnet ACL `tagOwners`
 (and `autoApprovers` for the exit routes) for the tag MUST exist BEFORE you seed
