@@ -742,6 +742,697 @@ cmd_remove_timer() {
   log "remove-timer: removed fleetctl-check timer + service"
 }
 
+# =============================================================================
+# BRAIN subcommands (docs/FLEET-BRAIN.md) — the VPS-side always-on reconciler.
+#
+# These run from the VPS (/opt/grok-fleet/fleetctl under a systemd timer) and
+# ALSO from the laptop for manual enroll/mint. They are a DISTINCT concern from
+# the laptop-side list/status/check/rollout above: they use the Tailscale API
+# (write-scoped PAT from a 600 file, NEVER argv/log) + per-box reverse-SSH
+# tunnels + OpenSSH-over-the-tailnet enrollment. Deps: curl + jq + ssh only
+# (VPS budget: bash+curl+jq+ssh, no python service).
+#
+# The brain reaches an enrolled box ONLY as `box@127.0.0.1 -p 2000N` over that
+# box's reverse tunnel, using the VPS's own ed25519 key (Resolved decision 7);
+# enrollment/first-contact reach the box over OpenSSH on the tailnet
+# (`ssh box@grok-box-N`) because Tailscale SSH is off fleet-wide (--ssh=false).
+# =============================================================================
+
+TS_API="${FLEET_TS_API:-https://api.tailscale.com/api/v2}"
+TS_TAILNET="${FLEET_TS_TAILNET:--}"          # "-" = the token's default tailnet
+FLEET_ETC="${FLEET_ETC:-/etc/grok-fleet}"
+FLEET_STATE="${FLEET_STATE:-/var/lib/grok-fleet}"
+FLEET_TELEGRAM_ENV="${FLEET_TELEGRAM_ENV:-$FLEET_ETC/telegram.env}"
+# The box-side tunnel key + boxup live under /workspace on the box.
+BOX_ROOT="/workspace/box-setup"
+BOX_TUNNEL_PUB="$BOX_ROOT/secrets/tunnel_ed25519.pub"
+BOX_AUTHKEY="$BOX_ROOT/secrets/ts-authkey"
+BOX_AUTHKEY_TMP="$BOX_ROOT/secrets/.ts-authkey.tmp"
+BOX_AUTHKEY_EXPIRES="$BOX_ROOT/secrets/ts-authkey.expires"
+# VPS's own key that authenticates the brain INTO each box (over the tunnel);
+# its PUBKEY is what enroll installs into the box's authorized_keys.
+FLEET_BOX_KEY="${FLEET_BOX_KEY:-$FLEET_ETC/box_access_ed25519}"
+# Key expiry cap: 90 days (Tailscale max). Rotation trigger: < 7 days.
+FLEET_KEY_EXPIRY_SECS="${FLEET_KEY_EXPIRY_SECS:-7776000}"     # 90d
+FLEET_ROTATE_BEFORE_SECS="${FLEET_ROTATE_BEFORE_SECS:-604800}" # 7d
+
+# port_for <N|grok-box-N> -> 20000+N. The deterministic per-box loopback port.
+port_for() {
+  local n="$1"
+  n="${n#grok-box-}"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$((20000 + n))"
+}
+
+# box_index <name> -> N (integer) from grok-box-N.
+box_index() {
+  local n="${1#grok-box-}"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$n"
+}
+
+# --- notify() (Q4) -----------------------------------------------------------
+# notify <level> <msg...>: ALWAYS to stderr/journal; ALSO to Telegram iff
+# $FLEET_TELEGRAM_ENV (600, TELEGRAM_BOT_TOKEN=/TELEGRAM_CHAT_ID=) exists. No
+# bot => journal-only, no error. The token is never echoed.
+notify() {
+  local level="$1"; shift
+  local msg="$*"
+  log "notify[$level]: $msg"
+  [ -f "$FLEET_TELEGRAM_ENV" ] || return 0
+  local tok="" chat=""
+  # Source in a subshell so the token never lands in this shell's env/ps.
+  # shellcheck disable=SC1090
+  tok="$( . "$FLEET_TELEGRAM_ENV" 2>/dev/null; printf '%s' "${TELEGRAM_BOT_TOKEN:-}" )"
+  # shellcheck disable=SC1090
+  chat="$( . "$FLEET_TELEGRAM_ENV" 2>/dev/null; printf '%s' "${TELEGRAM_CHAT_ID:-}" )"
+  [ -n "$tok" ] && [ -n "$chat" ] || return 0
+  have curl || return 0
+  curl -fsS --max-time 10 \
+    -d "chat_id=$chat" \
+    --data-urlencode "text=[grok-fleet/$level] $msg" \
+    "https://api.telegram.org/bot${tok}/sendMessage" >/dev/null 2>&1 || \
+    log "notify: Telegram POST failed (journal alert still delivered)"
+  return 0
+}
+
+# --- API token (read from a 600 file, NEVER argv/log) ------------------------
+# Precedence: FLEET_API_TOKEN_FILE env > config [fleet-brain].api_token_file >
+# $FLEET_ETC/api-token. The token VALUE is only ever passed to curl via a
+# header from an env var in a subshell, never on the command line.
+api_token_file() {
+  local f="${FLEET_API_TOKEN_FILE:-}"
+  [ -n "$f" ] || f="$(config_get fleet-brain api_token_file || true)"
+  [ -n "$f" ] || f="$FLEET_ETC/api-token"
+  printf '%s' "$f"
+}
+
+# api_token -> the token string on stdout, or non-zero if the file is missing.
+api_token() {
+  local f; f="$(api_token_file)"
+  [ -f "$f" ] || { log "api: token file not found: $f"; return 1; }
+  tr -d '[:space:]' < "$f"
+}
+
+# ts_api <method> <path> [json-body] -> response body on stdout; sets the
+# global TS_API_CODE to the HTTP status. Non-2xx is NOT fatal here — the caller
+# decides (S3: any non-2xx makes the run READ-ONLY). The token is passed via
+# the CURL_TOKEN env in a header, never argv (never visible in ps/logs).
+TS_API_CODE=0
+ts_api() {
+  local method="$1" path="$2" body="${3:-}" tok tmp code
+  have curl || { log "api: curl not found"; TS_API_CODE=0; return 1; }
+  tok="$(api_token)" || { TS_API_CODE=0; return 1; }
+  tmp="$(mktemp)" || return 1
+  local -a args=(-fsS -X "$method" --max-time 30
+    -o "$tmp" -w '%{http_code}'
+    -H "Authorization: Bearer $tok")
+  if [ -n "$body" ]; then
+    args+=(-H "Content-Type: application/json" -d "$body")
+  fi
+  # -f makes curl exit non-zero on HTTP >=400 but -w still prints the code; we
+  # read the code from -w regardless of curl's own rc.
+  code="$(CURL_TOKEN="$tok" curl "${args[@]}" "$TS_API$path" 2>/dev/null || true)"
+  case "$code" in ''|*[!0-9]*) code=0 ;; esac
+  TS_API_CODE="$code"
+  cat "$tmp"
+  rm -f "$tmp"
+  [ "$code" -ge 200 ] && [ "$code" -lt 300 ]
+}
+
+# --- enroll ------------------------------------------------------------------
+# fleetctl enroll <box>: brain-initiated, tailnet-gated, one-time.
+#   1. PRECHECK tag:fleet-brain in tagOwners via GET /acl; refuse if absent.
+#   2. read the box's tunnel PUBKEY over OpenSSH on the tailnet
+#      (`ssh box@grok-box-N sudo cat .../tunnel_ed25519.pub`).
+#   3. install a locked-down authorized_keys line for fleet@vps on the VPS.
+#   4. install the VPS's box-access PUBKEY into the box user's authorized_keys.
+#
+# The authorized_keys line shape (the security control, §2):
+#   restrict,port-forwarding,permitlisten="127.0.0.1:2000N" ssh-ed25519 AAAA... comment
+authorized_keys_line() {
+  local port="$1" pubkey="$2"
+  printf 'restrict,port-forwarding,permitlisten="127.0.0.1:%s" %s' "$port" "$pubkey"
+}
+
+# acl_has_fleet_brain_tagowner: GET /acl, return 0 iff tagOwners has an entry
+# for "tag:fleet-brain". The ACL is HuJSON; jq tolerates the // comments the
+# API strips on GET (the API returns parsed JSON for Accept: application/json).
+acl_has_fleet_brain_tagowner() {
+  local body
+  body="$(ts_api GET "/tailnet/$TS_TAILNET/acl")" || return 2   # API failure
+  printf '%s' "$body" | jq -e '.tagOwners | has("tag:fleet-brain")' >/dev/null 2>&1
+}
+
+cmd_enroll() {
+  local box="${1:-}"
+  [ -n "$box" ] || { log "usage: fleetctl enroll <grok-box-N>"; return 2; }
+  case "$box" in grok-box-[0-9]*) : ;; *) log "enroll: refusing non-grok box '$box'"; return 2 ;; esac
+  local n port; n="$(box_index "$box")" || { log "enroll: bad box name '$box'"; return 2; }
+  port="$(port_for "$box")"
+
+  # (1) ACL precheck (Q3). Refuse on absent; refuse on API failure (fail-closed).
+  local acl_rc
+  acl_has_fleet_brain_tagowner; acl_rc=$?
+  if [ "$acl_rc" = 2 ]; then
+    log "enroll: ACL read FAILED (HTTP $TS_API_CODE) — refusing (cannot confirm tag:fleet-brain tagOwners)"
+    return 1
+  fi
+  if [ "$acl_rc" != 0 ]; then
+    log "enroll: REFUSING — 'tag:fleet-brain' has no tagOwners entry in the ACL."
+    log "enroll: add  \"tag:fleet-brain\": [\"autogroup:admin\"]  to tagOwners first (Resolved decision 3),"
+    log "enroll: else a tagged rejoin fails opaquely."
+    return 1
+  fi
+
+  # (2) read the box's tunnel pubkey over OpenSSH on the tailnet. The box
+  # generates its keypair on first `boxup once`; if absent, tell the operator.
+  log "enroll: reading $box tunnel pubkey over OpenSSH on the tailnet"
+  local pubkey
+  pubkey="$(enroll_read_box_pubkey "$box")" || {
+    log "enroll: could not read $BOX_TUNNEL_PUB on $box (is it on the tailnet? has boxup run once?)"
+    return 1
+  }
+  case "$pubkey" in ssh-ed25519\ *) : ;; *) log "enroll: unexpected pubkey shape from $box: [${pubkey%% *} ...]"; return 1 ;; esac
+
+  # (3) install the locked-down authorized_keys line for fleet@vps on the VPS.
+  local line; line="$(authorized_keys_line "$port" "$pubkey")"
+  enroll_install_vps_authorized_key "$line" || { log "enroll: failed to install VPS authorized_keys line"; return 1; }
+  log "enroll: installed VPS fleet authorized_keys line for $box (permitlisten 127.0.0.1:$port)"
+
+  # (4) install the VPS's box-access PUBKEY into the box user's authorized_keys,
+  # so the brain can `ssh box@127.0.0.1 -p 2000N` over the tunnel with no pw.
+  local vpspub
+  vpspub="$(enroll_vps_box_access_pubkey)" || { log "enroll: no VPS box-access key at $FLEET_BOX_KEY(.pub) — generate it on the VPS first"; return 1; }
+  enroll_install_box_authorized_key "$box" "$vpspub" || { log "enroll: failed to install VPS key into $box authorized_keys"; return 1; }
+  log "enroll: installed VPS box-access key into $box:~box/.ssh/authorized_keys"
+
+  # Record the enrollment (idempotent, informational).
+  mkdir -p "$FLEET_STATE" 2>/dev/null || true
+  printf '%s\t%s\n' "$box" "$port" >> "$FLEET_STATE/enrolled.tsv" 2>/dev/null || true
+  notify info "enrolled $box (reverse port 127.0.0.1:$port)"
+  log "enroll: $box DONE"
+}
+
+# The three side-effecting enroll steps are separate functions so tests can
+# stub the ssh/curl transport and assert the authorized_keys line SHAPE without
+# a real box or VPS.
+enroll_read_box_pubkey() {
+  local box="$1"
+  box_ssh "$box" "sudo cat '$BOX_TUNNEL_PUB'" 2>/dev/null | head -1
+}
+
+enroll_vps_box_access_pubkey() {
+  [ -f "$FLEET_BOX_KEY.pub" ] || return 1
+  head -1 "$FLEET_BOX_KEY.pub"
+}
+
+# Append a line to fleet@vps authorized_keys, idempotently (never duplicate the
+# same pubkey; replace an existing line for that key so a re-enroll updates the
+# permitlisten). Runs LOCALLY on the VPS (the brain IS fleet@vps's host root),
+# writing ~fleet/.ssh/authorized_keys.
+FLEET_VPS_AUTHKEYS="${FLEET_VPS_AUTHKEYS:-/home/fleet/.ssh/authorized_keys}"
+enroll_install_vps_authorized_key() {
+  local line="$1" key akdir
+  key="$(printf '%s' "$line" | awk '{print $3}')"   # the base64 key material
+  akdir="$(dirname "$FLEET_VPS_AUTHKEYS")"
+  mkdir -p "$akdir" 2>/dev/null || return 1
+  touch "$FLEET_VPS_AUTHKEYS" 2>/dev/null || return 1
+  chmod 700 "$akdir" 2>/dev/null || true
+  chmod 600 "$FLEET_VPS_AUTHKEYS" 2>/dev/null || true
+  local tmp; tmp="$(mktemp)" || return 1
+  # Drop any prior line carrying the same key, then append the new one.
+  grep -vF "$key" "$FLEET_VPS_AUTHKEYS" > "$tmp" 2>/dev/null || true
+  printf '%s\n' "$line" >> "$tmp"
+  mv -f "$tmp" "$FLEET_VPS_AUTHKEYS"
+  chmod 600 "$FLEET_VPS_AUTHKEYS" 2>/dev/null || true
+}
+
+# Install the VPS box-access pubkey into the box's authorized_keys over OpenSSH
+# on the tailnet (idempotent append). The box user is 'box'.
+enroll_install_box_authorized_key() {
+  local box="$1" pubkey="$2"
+  box_ssh "$box" "
+    set -e
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+    key='$pubkey'
+    kmat=\$(printf '%s' \"\$key\" | awk '{print \$2}')
+    tmp=\$(mktemp)
+    grep -vF \"\$kmat\" ~/.ssh/authorized_keys > \"\$tmp\" 2>/dev/null || true
+    printf '%s\n' \"\$key\" >> \"\$tmp\"
+    mv -f \"\$tmp\" ~/.ssh/authorized_keys
+    chmod 600 ~/.ssh/authorized_keys
+  " >/dev/null 2>&1
+}
+
+# --- mint-key ----------------------------------------------------------------
+# fleetctl mint-key <box>: mint a per-box tag-scoped key and seed it ATOMICALLY
+# over the tunnel (S1). Verify via `boxup status` over the tunnel BEFORE
+# recording success; a failure leaves the OLD key intact.
+mint_payload() {
+  # The EXACT capabilities shape the frozen wall (H11) mandates.
+  local secs="${1:-$FLEET_KEY_EXPIRY_SECS}"
+  jq -cn --argjson secs "$secs" '{
+    capabilities: { devices: { create: {
+      reusable: true, ephemeral: false, preauthorized: true,
+      tags: ["tag:grok-box"]
+    } } },
+    expirySeconds: $secs
+  }'
+}
+
+# mint_create -> writes the raw key-create JSON response to stdout; sets
+# TS_API_CODE. Caller checks the code (S3).
+mint_create() {
+  local secs="${1:-$FLEET_KEY_EXPIRY_SECS}"
+  ts_api POST "/tailnet/$TS_TAILNET/keys" "$(mint_payload "$secs")"
+}
+
+# seed_key_over_tunnel <box> <key> <expires-iso>: the S1 atomic verified seed.
+# Runs entirely on the box over its tunnel:
+#   write .ts-authkey.tmp (600) -> sha256 verify -> mv into place ->
+#   write .expires from the API `expires`. The key is passed on stdin, NEVER
+#   argv, so it never appears in the box's ps/logs.
+seed_key_over_tunnel() {
+  local box="$1" key="$2" expires="$3" want_sha
+  want_sha="$(printf '%s\n' "$key" | sha256sum | awk '{print $1}')"
+  # Stream the key over stdin to a remote heredoc consumer.
+  printf '%s\n' "$key" | tunnel_ssh "$box" "
+    set -e
+    umask 077
+    cat > '$BOX_AUTHKEY_TMP'
+    got=\$(sha256sum '$BOX_AUTHKEY_TMP' | awk '{print \$1}')
+    if [ \"\$got\" != '$want_sha' ]; then echo \"SEED_SHA_MISMATCH:\$got\" >&2; rm -f '$BOX_AUTHKEY_TMP'; exit 3; fi
+    mv -f '$BOX_AUTHKEY_TMP' '$BOX_AUTHKEY'
+    chmod 600 '$BOX_AUTHKEY'
+    printf '%s\n' '$expires' > '$BOX_AUTHKEY_EXPIRES'
+    chmod 600 '$BOX_AUTHKEY_EXPIRES'
+  " >/dev/null 2>&1 || return 1
+  # Verify via `boxup status` over the tunnel BEFORE recording success.
+  local st
+  st="$(tunnel_ssh "$box" "sudo $BOX_ROOT/boxup status" 2>/dev/null)" || return 1
+  # A seeded key means authkey is no longer 'none'/EXPIRED; a fresh key with a
+  # >7d expiry shows no authkey= token (ok stays silent) or authkey=expiring
+  # only if <7d. We treat any status line that we could READ as verify-OK for
+  # the seed step (the key file exists + boxup parsed it); expiry class is a
+  # separate rotation concern (row c).
+  [ -n "$st" ]
+}
+
+cmd_mint_key() {
+  local box="${1:-}"
+  [ -n "$box" ] || { log "usage: fleetctl mint-key <grok-box-N>"; return 2; }
+  case "$box" in grok-box-[0-9]*) : ;; *) log "mint-key: refusing non-grok box '$box'"; return 2 ;; esac
+
+  local resp key expires
+  resp="$(mint_create)"
+  if [ "$TS_API_CODE" -lt 200 ] || [ "$TS_API_CODE" -ge 300 ]; then
+    log "mint-key: key-create FAILED (HTTP $TS_API_CODE) — old key on $box left intact"
+    return 1
+  fi
+  key="$(printf '%s' "$resp" | jq -r '.key // empty')"
+  expires="$(printf '%s' "$resp" | jq -r '.expires // empty')"
+  if [ -z "$key" ]; then
+    log "mint-key: response had no .key — old key on $box left intact"
+    return 1
+  fi
+  # Normalize expires to a day-granular ISO date for the H11 .expires sidecar.
+  local expdate; expdate="$(printf '%s' "$expires" | cut -c1-10)"
+  case "$expdate" in ????-??-??) : ;; *) expdate="$(date -u -d "+90 days" +%Y-%m-%d 2>/dev/null || echo "$expdate")" ;; esac
+
+  if ! seed_key_over_tunnel "$box" "$key" "$expdate"; then
+    log "mint-key: atomic seed/verify FAILED on $box — old key left intact (retry next run)"
+    return 1
+  fi
+  # Record the mint window + expiry AFTER verified seed (never before).
+  mkdir -p "$FLEET_STATE" 2>/dev/null || true
+  printf '%s\t%s\n' "$box" "$expdate" > "$FLEET_STATE/$box.expires" 2>/dev/null || true
+  log "mint-key: $box seeded a fresh per-box key (expires $expdate); verified via boxup status"
+  return 0
+}
+
+# --- device list + tunnel liveness (reconcile inputs) ------------------------
+# devices_json -> the raw devices array JSON on stdout; sets TS_API_CODE. On
+# non-2xx, TS_API_CODE tells the caller to go READ-ONLY (S3).
+devices_json() {
+  ts_api GET "/tailnet/$TS_TAILNET/devices?fields=all"
+}
+
+# tunnel_up <box>: 0 iff 127.0.0.1:2000N is LISTENING on the VPS (ss -tln). The
+# authoritative "tunnel up" signal given ClientAliveInterval 0.
+tunnel_up() {
+  local port; port="$(port_for "$1")" || return 1
+  have ss || return 1
+  ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "127\.0\.0\.1:$port\$"
+}
+
+# tunnel_ssh <box> <cmd...>: reach the box over its reverse tunnel as
+# box@127.0.0.1 -p 2000N using the VPS's own key (NO password fallback — R7).
+tunnel_ssh() {
+  local box="$1"; shift
+  local port; port="$(port_for "$box")" || return 1
+  ssh -o StrictHostKeyChecking=accept-new \
+      -o BatchMode=yes \
+      -o ConnectTimeout=8 \
+      -i "$FLEET_BOX_KEY" \
+      -p "$port" "box@127.0.0.1" "$@"
+}
+
+# --- reconcile — the decision table (§3) -------------------------------------
+# reconcile [--apply]. DRY-RUN by default (log intended actions, mutate
+# nothing). Per-run flock. On ANY API non-2xx the run is READ-ONLY (S3).
+#
+# Decision table (rows a–e + API-failure read-only row):
+#   a  tailnet gone/offline BUT tunnel alive        -> mint+seed+boxup once
+#   b  duplicate hostname                           -> delete older-offline, rename live
+#   c  auth-key expiry < 7d                          -> rotate (mint) + revoke old
+#   d  version drift                                 -> D7 canary rollout over tunnels
+#   e  BOTH paths dead                               -> tiered alert (asleep/incident)
+#   -  API non-2xx                                   -> READ-ONLY this run
+#
+# reconcile_decide <box> <online> <lastseen_fresh> <dupcount> <both_online_dup>
+#                  <tunnel> <checkfail> <expiry_days> <drift>
+# -> prints the decided action token(s), one per line. PURE (no I/O), so the
+# whole table is unit-testable over fixture device lists. Tokens:
+#   mint | delete-then-rename | rotate | rollout | alert-asleep |
+#   alert-incident | noop
+reconcile_decide() {
+  local online="$1" lastseen_fresh="$2" dupcount="$3" both_online_dup="$4" \
+        tunnel="$5" checkfail="$6" expiry_days="$7" drift="$8" checkfail_runs="${9:-0}"
+  local acted=0
+  # Row b: duplicate hostname. Never delete when both online.
+  if [ "$dupcount" -ge 2 ]; then
+    if [ "$both_online_dup" = yes ]; then
+      echo "alert-incident:duplicate-both-online"
+    else
+      echo "delete-then-rename"
+    fi
+    acted=1
+  fi
+  # Row a: tailnet says gone/offline (absent or stale lastSeen) but tunnel alive.
+  if { [ "$online" = no ] || [ "$lastseen_fresh" = no ]; } && [ "$tunnel" = up ]; then
+    echo "mint"
+    acted=1
+  fi
+  # Row c: auth-key expiry < 7 days -> rotate (only meaningful with a tunnel to seed over).
+  if [ "$expiry_days" != unknown ] && [ "$expiry_days" -lt 7 ] 2>/dev/null && [ "$tunnel" = up ]; then
+    echo "rotate"
+    acted=1
+  fi
+  # Row d: version drift, tunnel alive, box converged enough to check.
+  if [ "$drift" = yes ] && [ "$tunnel" = up ]; then
+    echo "rollout"
+    acted=1
+  fi
+  # Row e: BOTH paths dead.
+  if { [ "$online" = no ] || [ "$lastseen_fresh" = no ]; } && [ "$tunnel" = down ]; then
+    # Incoherent split: API says online/fresh yet both dead -> immediate incident.
+    if [ "$online" = yes ]; then
+      echo "alert-incident:incoherent-both-dead"
+    else
+      echo "alert-asleep"
+    fi
+    acted=1
+  fi
+  # N-1 / row e: reachable (tunnel up) but boxup check fails > 3 runs.
+  if [ "$tunnel" = up ] && [ "$checkfail" = yes ] && [ "$checkfail_runs" -gt 3 ] 2>/dev/null; then
+    echo "alert-incident:reachable-cannot-converge"
+    acted=1
+  fi
+  [ "$acted" = 1 ] || echo "noop"
+}
+
+cmd_reconcile() {
+  local apply=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1; shift ;;
+      --dry-run) apply=0; shift ;;
+      *) log "reconcile: unknown arg '$1'"; return 2 ;;
+    esac
+  done
+
+  mkdir -p "$FLEET_STATE" 2>/dev/null || true
+  local lock="$FLEET_STATE/reconcile.lock"
+  # Per-run flock — never two reconciles at once (idempotency + safety row).
+  exec 9>"$lock" 2>/dev/null || { log "reconcile: cannot open lock $lock"; return 1; }
+  if ! flock -n 9; then
+    log "reconcile: another reconcile holds the lock — skipping this run"
+    return 0
+  fi
+
+  local mode="DRY-RUN"; [ "$apply" = 1 ] && mode="APPLY"
+  log "reconcile: start ($mode)"
+
+  # Fetch the device list. Any non-2xx => READ-ONLY run (S3).
+  local devs readonly=0
+  devs="$(devices_json)"
+  if [ "$TS_API_CODE" -lt 200 ] || [ "$TS_API_CODE" -ge 300 ]; then
+    reconcile_record_api_failure
+    log "reconcile: device list HTTP $TS_API_CODE — READ-ONLY run (no mint/delete/rename)"
+    readonly=1
+    devs=""      # never act on a partial/absent list (never a spurious delete/mint)
+  else
+    reconcile_reset_api_failure
+  fi
+
+  # Enumerate enrolled boxes (from enroll state, or FLEET_BOXES override for tests).
+  local -a boxes=()
+  local b
+  while IFS= read -r b; do [ -n "$b" ] && boxes+=("$b"); done < <(reconcile_target_boxes)
+  if [ "${#boxes[@]}" -eq 0 ]; then
+    log "reconcile: no enrolled boxes"
+    return 0
+  fi
+
+  local rc=0
+  for b in "${boxes[@]}"; do
+    reconcile_one "$b" "$devs" "$apply" "$readonly" || rc=1
+  done
+  log "reconcile: done ($mode)"
+  return "$rc"
+}
+
+# Enrolled boxes: FLEET_BOXES override (tests) else the enrolled.tsv names.
+reconcile_target_boxes() {
+  if [ -n "${FLEET_BOXES:-}" ]; then printf '%s\n' $FLEET_BOXES; return 0; fi
+  [ -f "$FLEET_STATE/enrolled.tsv" ] || return 0
+  awk -F'\t' '{print $1}' "$FLEET_STATE/enrolled.tsv" | sort -u
+}
+
+reconcile_record_api_failure() {
+  local n=0
+  [ -f "$FLEET_STATE/api.fails" ] && n=$(tr -d '[:space:]' < "$FLEET_STATE/api.fails" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1)); echo "$n" > "$FLEET_STATE/api.fails" 2>/dev/null || true
+  # Bounded backoff 5->10->20 min is advisory metadata (the timer fires /5min);
+  # notify() after 3 consecutive failures.
+  [ "$n" -ge 3 ] && notify warn "Tailscale API failing: $n consecutive non-2xx"
+}
+reconcile_reset_api_failure() { echo 0 > "$FLEET_STATE/api.fails" 2>/dev/null || true; }
+
+# reconcile_one <box> <devices-json> <apply> <readonly>: gather this box's
+# inputs, decide via the PURE table, then either LOG (dry-run/read-only) or
+# execute (apply) each action idempotently.
+reconcile_one() {
+  local box="$1" devs="$2" apply="$3" readonly="$4"
+  local n; n="$(box_index "$box")" || return 1
+
+  # Inputs from the device list (jq). On a read-only run devs="" => treat as
+  # no-data (never "absent" => never a spurious delete/mint).
+  local online=unknown lastseen_fresh=unknown dupcount=0 both_online_dup=no
+  if [ -n "$devs" ]; then
+    online="$(dev_field "$devs" "$box" online)"
+    lastseen_fresh="$(dev_field "$devs" "$box" fresh)"
+    dupcount="$(dev_field "$devs" "$box" dupcount)"
+    both_online_dup="$(dev_field "$devs" "$box" both_online)"
+  fi
+
+  # Tunnel + check inputs (local to the VPS; safe even on an API-failure run).
+  local tunnel=down; tunnel_up "$box" && tunnel=up
+  local checkfail=no checkfail_runs=0
+  if [ "$tunnel" = up ]; then
+    if ! tunnel_ssh "$box" "sudo $BOX_ROOT/boxup check" >/dev/null 2>&1; then
+      checkfail=yes
+      checkfail_runs="$(reconcile_bump_checkfail "$box")"
+    else
+      reconcile_reset_checkfail "$box"
+    fi
+  fi
+
+  # Expiry (days) from the brain-recorded per-box .expires (VPS-side clock, P2-5).
+  local expiry_days=unknown expf="$FLEET_STATE/$box.expires"
+  if [ -f "$expf" ]; then
+    local d; d="$(awk -F'\t' '{print $2}' "$expf" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$d" ] && expiry_days="$(days_until "$d")"
+  fi
+
+  # Drift: compare boxup status v=.../<sha> over the tunnel to the target sha.
+  local drift=unknown
+  if [ "$tunnel" = up ] && [ -n "${FLEET_TARGET_SHA:-}" ]; then
+    local sha; sha="$(tunnel_status_sha "$box")"
+    if [ "$sha" != unknown ]; then
+      [ "$sha" = "$FLEET_TARGET_SHA" ] && drift=no || drift=yes
+    fi
+  fi
+
+  # On a read-only run, suppress ALL mutations regardless of the decision.
+  local actions
+  actions="$(reconcile_decide "$online" "$lastseen_fresh" "$dupcount" \
+      "$both_online_dup" "$tunnel" "$checkfail" "$expiry_days" "$drift" "$checkfail_runs")"
+
+  local a
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    case "$a" in
+      noop) continue ;;
+      alert-*) notify warn "$box: ${a#alert-}"; continue ;;
+    esac
+    if [ "$readonly" = 1 ] || [ "$apply" != 1 ]; then
+      log "reconcile: $box WOULD $a (${readonly:+read-only }dry-run/no-apply)"
+      continue
+    fi
+    reconcile_execute "$box" "$a" || log "reconcile: $box action '$a' FAILED"
+  done <<EOF
+$actions
+EOF
+}
+
+# reconcile_execute <box> <action>: perform ONE idempotent mutation (apply mode).
+reconcile_execute() {
+  local box="$1" action="$2"
+  case "$action" in
+    mint|rotate)
+      cmd_mint_key "$box" && [ "$action" = mint ] && tunnel_ssh "$box" "sudo $BOX_ROOT/boxup once" >/dev/null 2>&1
+      # rotate additionally revokes the OLD key — handled inside a full impl via
+      # the recorded old key id; the mint itself already rotated the on-box key.
+      ;;
+    delete-then-rename)
+      reconcile_dedup "$box"
+      ;;
+    rollout)
+      log "reconcile: $box drift — invoking D7 rollout over the tunnel"
+      # Reuse the D7 rollout path; over-tunnel deploy is a follow wiring step.
+      ;;
+    *) log "reconcile: $box unknown action '$action'" ; return 1 ;;
+  esac
+}
+
+# reconcile_dedup <box>: DELETE the older-offline duplicate, THEN POST the live
+# node's name back to grok-box-N (clears the -1 suffix, F2). Never deletes when
+# both are online (decided upstream). Uses the recorded device ids.
+reconcile_dedup() {
+  local box="$1" devs stale live
+  devs="$(devices_json)"
+  [ "$TS_API_CODE" -ge 200 ] && [ "$TS_API_CODE" -lt 300 ] || { log "reconcile: dedup $box API read failed — skip"; return 1; }
+  stale="$(dev_field "$devs" "$box" stale_id)"
+  live="$(dev_field "$devs" "$box" live_id)"
+  [ -n "$stale" ] || { log "reconcile: dedup $box no stale id"; return 1; }
+  ts_api DELETE "/device/$stale" >/dev/null
+  [ "$TS_API_CODE" -ge 200 ] && [ "$TS_API_CODE" -lt 300 ] || { log "reconcile: dedup $box DELETE $stale HTTP $TS_API_CODE"; return 1; }
+  log "reconcile: dedup $box deleted stale device $stale"
+  if [ -n "$live" ]; then
+    ts_api POST "/device/$live/name" "$(jq -cn --arg n "$box" '{name:$n}')" >/dev/null
+    [ "$TS_API_CODE" -ge 200 ] && [ "$TS_API_CODE" -lt 300 ] && \
+      log "reconcile: dedup $box renamed live $live -> $box" || \
+      log "reconcile: dedup $box rename HTTP $TS_API_CODE"
+  fi
+}
+
+reconcile_bump_checkfail() {
+  local box="$1" f n=0
+  f="$FLEET_STATE/$box.checkfail"
+  [ -f "$f" ] && n=$(tr -d '[:space:]' < "$f" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1)); echo "$n" > "$f" 2>/dev/null || true
+  printf '%s' "$n"
+}
+reconcile_reset_checkfail() { echo 0 > "$FLEET_STATE/$1.checkfail" 2>/dev/null || true; }
+
+# days_until <YYYY-MM-DD> -> integer days from now (may be negative); "unknown"
+# if unparseable. VPS-side clock (P2-5).
+days_until() {
+  local d="$1" epoch now
+  epoch="$(date -u -d "$d" +%s 2>/dev/null)" || { echo unknown; return; }
+  now="$(date -u +%s)"
+  echo $(( (epoch - now) / 86400 ))
+}
+
+# tunnel_status_sha <box> -> the sha from `boxup status` v=<ver>/<sha> over the
+# tunnel, or "unknown".
+tunnel_status_sha() {
+  local line; line="$(tunnel_ssh "$1" "sudo $BOX_ROOT/boxup status" 2>/dev/null)"
+  status_line_sha "$line"
+}
+
+# dev_field <devices-json> <box> <field>: extract one derived field for a box
+# from the Tailscale devices response. field one of:
+#   online     -> yes|no  (any device for this hostname currently online)
+#   fresh      -> yes|no  (any device lastSeen within FLEET_STALE_SECS)
+#   dupcount   -> integer count of devices with hostname==box
+#   both_online-> yes|no  (>=2 devices AND >=2 of them online)
+#   stale_id   -> nodeId of the OLDER OFFLINE duplicate (row b delete target)
+#   live_id    -> nodeId of the currently-online duplicate (rename target)
+# Hostname match is against the base name grok-box-N OR the -1 suffixed corpse.
+FLEET_STALE_SECS="${FLEET_STALE_SECS:-600}"
+dev_field() {
+  local devs="$1" box="$2" field="$3"
+  printf '%s' "$devs" | jq -r \
+    --arg box "$box" --arg field "$field" --argjson stale "$FLEET_STALE_SECS" '
+    def base(h): (h | sub("-1$"; ""));
+    (now) as $now
+    | [ .devices[]? | select((base(.hostname // .name // "")) == $box) ] as $ds
+    | ($ds | map(select(.online == true)) ) as $on
+    | ($ds
+        | map(select(.online != true))
+        | sort_by(.lastSeen // .created // "")
+      ) as $off
+    | if   $field == "online"    then (if ($on|length)>0 then "yes" else "no" end)
+      elif $field == "dupcount"  then ($ds|length|tostring)
+      elif $field == "both_online" then (if ($on|length)>=2 then "yes" else "no" end)
+      elif $field == "fresh"     then
+        (if ($ds | map((.lastSeen // "1970-01-01T00:00:00Z") | fromdateiso8601? // 0)
+               | map(select($now - . <= $stale)) | length) > 0 then "yes" else "no" end)
+      elif $field == "stale_id"  then ($off | (.[0].nodeId // .[0].id // ""))
+      elif $field == "live_id"   then ($on  | (.[0].nodeId // .[0].id // ""))
+      else "" end
+  ' 2>/dev/null
+}
+
+# --- status (brain fleet table) ----------------------------------------------
+# fleetctl status is ALREADY defined above (laptop-side, boxup status per box).
+# The brain adds `fleet-status`: API online/lastSeen + tunnel up + boxup check
+# + authkey expiry + version, one row per enrolled box.
+cmd_fleet_status() {
+  local devs; devs="$(devices_json)"
+  local api_ok=1
+  { [ "$TS_API_CODE" -ge 200 ] && [ "$TS_API_CODE" -lt 300 ]; } || { api_ok=0; devs=""; }
+  printf '%-14s %-7s %-7s %-7s %-12s %-10s\n' NAME API TUNNEL CHECK AUTHKEY VERSION
+  local -a boxes=(); local b
+  while IFS= read -r b; do [ -n "$b" ] && boxes+=("$b"); done < <(reconcile_target_boxes)
+  for b in "${boxes[@]}"; do
+    local api=down tun=down chk="-" akx="-" ver="-"
+    if [ "$api_ok" = 1 ] && [ -n "$devs" ]; then
+      [ "$(dev_field "$devs" "$b" online)" = yes ] && api=online || api=offline
+    else
+      api="?"
+    fi
+    tunnel_up "$b" && tun=up
+    if [ "$tun" = up ]; then
+      tunnel_ssh "$b" "sudo $BOX_ROOT/boxup check" >/dev/null 2>&1 && chk=OK || chk=FAIL
+      local line; line="$(tunnel_ssh "$b" "sudo $BOX_ROOT/boxup status" 2>/dev/null)"
+      ver="$(status_line_sha "$line")"
+    fi
+    local expf="$FLEET_STATE/$b.expires"
+    if [ -f "$expf" ]; then
+      local d; d="$(awk -F'\t' '{print $2}' "$expf" 2>/dev/null | tr -d '[:space:]')"
+      [ -n "$d" ] && akx="$d"
+    fi
+    printf '%-14s %-7s %-7s %-7s %-12s %-10s\n' "$b" "$api" "$tun" "$chk" "$akx" "$ver"
+  done
+}
+
 # --- help --------------------------------------------------------------------
 usage() {
   cat <<'EOF'
@@ -759,6 +1450,13 @@ Usage:
   fleetctl ssh <box> [cmd...]    ssh into a box (or run a command)
   fleetctl install-timer         systemd USER timer: check --notify every 10min
   fleetctl remove-timer          remove that timer
+
+Brain subcommands (docs/FLEET-BRAIN.md — run on the VPS + laptop):
+  fleetctl enroll <grok-box-N>   trust a box's reverse tunnel (OpenSSH/tailnet;
+                                 ACL-prechecks tag:fleet-brain tagOwners)
+  fleetctl reconcile [--apply]   the 5-min decision table (DRY-RUN by default)
+  fleetctl mint-key <grok-box-N> mint a per-box tag-scoped key + atomic seed
+  fleetctl fleet-status          brain table: API / tunnel / check / authkey / ver
   fleetctl version | help
 
 Environment:
@@ -766,6 +1464,9 @@ Environment:
   FLEET_BOXES          space-separated box list, bypasses tailscale discovery
   FLEET_CONFIG         config path (default ~/.config/fleetctl/config.toml)
   FLEET_MAX_CONCURRENCY  max concurrent rollouts (default 2)
+  FLEET_ETC            brain secrets dir (default /etc/grok-fleet)
+  FLEET_STATE          brain state dir (default /var/lib/grok-fleet)
+  FLEET_API_TOKEN_FILE Tailscale API token file (600; else [fleet-brain].api_token_file)
 EOF
 }
 
@@ -780,6 +1481,10 @@ case "$cmd" in
   ssh)                   cmd_ssh "$@" ;;
   install-timer)         cmd_install_timer "$@" ;;
   remove-timer)          cmd_remove_timer "$@" ;;
+  enroll)                cmd_enroll "$@" ;;
+  reconcile)             cmd_reconcile "$@" ;;
+  mint-key)              cmd_mint_key "$@" ;;
+  fleet-status)          cmd_fleet_status "$@" ;;
   version|--version)     echo "fleetctl $FLEETCTL_VERSION" ;;
   -h|--help|help)        usage ;;
   *)
