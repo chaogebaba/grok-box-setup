@@ -92,7 +92,8 @@ config_get() {
 }
 
 # SSH password. Precedence: FLEET_SSH_PASSWORD env > config.toml [ssh].password
-# > default. Never echoed; only ever handed to sshpass -p. Not logged, not
+# > default. Never echoed; only ever passed to sshpass -e via the SSHPASS env
+# var (not on the command line, so never visible in ps). Not logged, not
 # stored in git.
 ssh_password() {
   local p=""

@@ -82,6 +82,10 @@ notification on failure):
 ./fleetctl remove-timer         # tears it down
 ```
 
+Note: the timer's notifications use `notify-send`, which needs a graphical
+session — outside one (e.g. over plain ssh) nothing pops up, but failures are
+still logged to the systemd user journal.
+
 ## House rules
 
 - No systemd, no cron — the platform has neither. tini is PID 1.
