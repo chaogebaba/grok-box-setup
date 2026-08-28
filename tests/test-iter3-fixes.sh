@@ -794,6 +794,57 @@ else
   esac
 fi
 
+# ---------------------------------------------------------------------------
+# P2-2 — `boxup once` (and `up`) exit rc=0 on a CLEAN converge and rc=201 only
+# when the converge lock was busy. Regression guard for the trailing-conditional
+# bug (design-gate-hotfix-final P2-2): the arms USED to end on a bare
+# `[ "$_rc" = 201 ] && exit "$_rc"`, so with set -u (no set -e) a healthy
+# converge (_rc=0) made the arm's last status 1 → `boxup once` exited 1 on
+# EVERY clean run. Fixed in 5.2.0: each arm now `exit 0`s the clean path and
+# only propagates 201. This drives the REAL `once)` / `up)` arm text extracted
+# from boxup, with do_ensure stubbed to return the rc under test and the other
+# side effects (start_daemon/run_tick/print_status) stubbed to no-ops. A
+# mutation that drops the explicit `exit 0`, or that stops propagating 201,
+# fails this.
+# ---------------------------------------------------------------------------
+# extract_arm: print a `case` arm body from LABEL up to and including its `;;`.
+p2_2_arm_test() {
+  local arm_label="$1" ensure_rc="$2" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+# Stub every side effect the arm calls so only the rc plumbing is exercised.
+require_root(){ :; }
+do_ensure(){ return $ensure_rc; }
+start_daemon(){ :; }
+run_tick(){ :; }
+print_status(){ :; }
+# Pull the real arm body out of boxup: from the '  $arm_label|' label line to
+# its ';;'. The arm ends in \`exit …\`, so run it in a subshell and capture that
+# subshell's status.
+arm="\$(awk '/^  $arm_label\\|/{i=1} i{print} i&&/;;/{exit}' "\$BOXUP")"
+( eval "case $arm_label in
+\$arm
+esac" )
+echo \$?
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+# once) — clean converge ⇒ 0, lock busy ⇒ 201
+o_clean="$(p2_2_arm_test once 0)"
+o_busy="$(p2_2_arm_test once 201)"
+[ "$o_clean" = 0 ]   && pass "P2-2 \`boxup once\` clean converge (do_ensure rc=0) exits 0" \
+                     || bad  "P2-2 \`boxup once\` clean converge exited [$o_clean] want 0 (trailing-conditional bug?)"
+[ "$o_busy" = 201 ]  && pass "P2-2 \`boxup once\` converge lock busy (do_ensure rc=201) exits 201" \
+                     || bad  "P2-2 \`boxup once\` lock-busy exited [$o_busy] want 201"
+# up) — same shape
+u_clean="$(p2_2_arm_test up 0)"
+u_busy="$(p2_2_arm_test up 201)"
+[ "$u_clean" = 0 ]   && pass "P2-2 \`boxup up\` clean converge (do_ensure rc=0) exits 0" \
+                     || bad  "P2-2 \`boxup up\` clean converge exited [$u_clean] want 0 (trailing-conditional bug?)"
+[ "$u_busy" = 201 ]  && pass "P2-2 \`boxup up\` converge lock busy (do_ensure rc=201) exits 201" \
+                     || bad  "P2-2 \`boxup up\` lock-busy exited [$u_busy] want 201"
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
 exit "$fail"
