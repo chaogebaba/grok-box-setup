@@ -365,6 +365,270 @@ case "$dedup_seq" in
 esac
 
 # =============================================================================
+# ROTATE (task b) — reconcile_rotate: mint+seed the new key, THEN revoke the OLD
+# key id via DELETE /tailnet/-/keys/<id>. Missing id => skip cleanly. NEVER
+# delete before the new key is verified seeded (cmd_mint_key returns 0).
+# =============================================================================
+# The harness stubs cmd_mint_key (verified-seed success/failure) + key_meta_id
+# (recorded old id / none) + ts_api (records the call sequence), then drives the
+# REAL reconcile_rotate and inspects what it called and in what order.
+rotate_test() {
+  local mint_rc="$1" old_id="$2" del_rc="$3" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+TS_TAILNET="-"
+TS_API_CODE=0
+log(){ :; }
+notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in reconcile_rotate ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+seq="\$(mktemp)"
+# key_meta_id: the recorded OLD id (empty => none recorded).
+key_meta_id(){ [ -n "$old_id" ] && printf '%s' "$old_id"; }
+# cmd_mint_key: records the mint call, returns the seed verdict. If it were
+# ordered AFTER a delete we would see it out of order in \$seq.
+cmd_mint_key(){ echo "MINT \$1" >> "\$seq"; return $mint_rc; }
+# ts_api: record the method+path (the DELETE is what we assert on).
+ts_api(){ echo "\$1 \$2" >> "\$seq"; TS_API_CODE=$del_rc; [ "$del_rc" -ge 200 ] && [ "$del_rc" -lt 300 ]; }
+reconcile_rotate grok-box-8 >/dev/null 2>&1
+echo "rc=\$?"
+tr '\n' '|' < "\$seq"
+echo
+rm -f "\$seq"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+
+# (1) Happy path: verified seed (mint rc 0), a recorded old id, DELETE 200.
+#     Must MINT first, THEN DELETE the OLD id, and succeed.
+rot_ok="$(rotate_test 0 K-OLD-123 200)"
+case "$rot_ok" in
+  *"MINT grok-box-8|DELETE /tailnet/-/keys/K-OLD-123|"*)
+    pass "rotate: mint(verified) THEN DELETE old key id (correct order)" ;;
+  *) bad "rotate happy path wrong: [$rot_ok]" ;;
+esac
+case "$rot_ok" in *"rc=0"*) pass "rotate: happy path returns success" ;; *) bad "rotate happy path rc!=0: [$rot_ok]" ;; esac
+
+# (2) Missing id: no recorded old id => SKIP the revoke cleanly, still succeed.
+rot_noid="$(rotate_test 0 "" 200)"
+case "$rot_noid" in
+  *DELETE*) bad "rotate: DELETE issued with NO recorded old id: [$rot_noid]" ;;
+  "rc=0"*"MINT grok-box-8"*) pass "rotate: missing old id => skip revoke cleanly, rotation still succeeds" ;;
+  *) bad "rotate missing-id wrong: [$rot_noid]" ;;
+esac
+
+# (3) Never delete before verified: mint FAILS (rc 1) => NO DELETE at all, and
+#     the rotation reports failure (old key left intact upstream).
+rot_failseed="$(rotate_test 1 K-OLD-123 200)"
+case "$rot_failseed" in
+  *DELETE*) bad "rotate: DELETED before the new key was verified seeded (FORBIDDEN): [$rot_failseed]" ;;
+  *"MINT grok-box-8"*) pass "rotate: mint/seed FAILURE => NEVER DELETEs the old key" ;;
+  *) bad "rotate fail-seed wrong: [$rot_failseed]" ;;
+esac
+case "$rot_failseed" in *"rc=1"*) pass "rotate: mint/seed failure => rotation reports failure (no revoke)" ;; *) bad "rotate fail-seed rc wrong: [$rot_failseed]" ;; esac
+
+# (4) Revoke miss (DELETE 500) must NOT fail the rotation: the new key is seeded,
+#     the old key will lapse at its own expiry.
+rot_revfail="$(rotate_test 0 K-OLD-123 500)"
+case "$rot_revfail" in
+  "rc=0"*"DELETE /tailnet/-/keys/K-OLD-123|"*) pass "rotate: old-key revoke FAILURE never fails the rotation (new key OK)" ;;
+  *) bad "rotate revoke-miss wrong: [$rot_revfail]" ;;
+esac
+
+# mint records the key id + expires at mint time (task b): cmd_mint_key writes
+# $FLEET_KEYS_DIR/<N>.json with {id,expires} AFTER a verified seed. Drive the
+# REAL cmd_mint_key with stubbed API + seed and assert the meta file.
+mint_records_id_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+TS_TAILNET="-"
+TS_API_CODE=0
+FLEET_STATE="\$(mktemp -d)"
+FLEET_KEYS_DIR="\$FLEET_STATE/keys"
+FLEET_KEY_EXPIRY_SECS=7776000
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in cmd_mint_key record_key_meta key_meta_file key_meta_id box_index mint_payload mint_create ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+BODYF="\$(mktemp)"
+echo '{"key":"tskey-abc","id":"kNEW999","expires":"2099-03-01T00:00:00Z"}' > "\$BODYF"
+ts_api(){ TS_API_CODE=200; return 0; }
+ts_api_body(){ cat "\$BODYF"; }
+seed_key_over_tunnel(){ return 0; }    # pretend the atomic seed verified
+cmd_mint_key grok-box-8 >/dev/null 2>&1
+metaf="\$FLEET_KEYS_DIR/8.json"
+if [ -f "\$metaf" ]; then
+  printf 'id=%s exp=%s\n' "\$(jq -r .id "\$metaf")" "\$(jq -r .expires "\$metaf")"
+else
+  echo "NO-META"
+fi
+# key_meta_id must read it back.
+echo "readback=\$(key_meta_id grok-box-8)"
+rm -rf "\$FLEET_STATE" "\$BODYF"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+mint_meta="$(mint_records_id_test)"
+case "$mint_meta" in
+  *"id=kNEW999 exp=2099-03-01T00:00:00Z"*"readback=kNEW999"*)
+    pass "mint: records key id + expires to keys/<N>.json after verified seed (rotation can revoke it later)" ;;
+  *) bad "mint key-id record wrong: [$mint_meta]" ;;
+esac
+
+# =============================================================================
+# ROLLOUT (task a) — reconcile_rollout: canary-first, abort-on-first-failure,
+# over the tunnel; tunnel_deploy_one/tunnel_scp use the ssh -p 2000N
+# box@127.0.0.1 -i <vps-key> path. Box-free: tunnel_up/tunnel_deploy_one stubbed
+# to record order; the tunnel argv is asserted against real tunnel_ssh/scp.
+# =============================================================================
+# reconcile_rollout order: canary (grok-box-8, default) FIRST, then the rest in
+# enrolled order. tunnel_deploy_one records the box + its verdict.
+rollout_order_test() {
+  local canary_verdict="$1" b3_verdict="$2" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_BOXES="grok-box-3 grok-box-5 grok-box-8"
+log(){ :; }
+notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }           # no canary_box configured => default 8
+tunnel_up(){ return 0; }            # every tunnel up
+seq="\$(mktemp)"
+# tunnel_deploy_one records the box, returns the per-box verdict.
+tunnel_deploy_one(){
+  echo "DEPLOY \$1" >> "\$seq"
+  case "\$1" in
+    grok-box-8) return $canary_verdict ;;
+    grok-box-3) return $b3_verdict ;;
+    *) return 0 ;;
+  esac
+}
+reconcile_rollout grok-box-5 >/dev/null 2>&1
+echo "rc=\$?"
+tr '\n' '|' < "\$seq"; echo
+rm -f "\$seq"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+# Canary first, all pass: deploy 8 THEN the rest (3,5 in enrolled order).
+ro_all="$(rollout_order_test 0 0)"
+case "$ro_all" in
+  "rc=0"*"DEPLOY grok-box-8|DEPLOY grok-box-3|DEPLOY grok-box-5|"*)
+    pass "rollout: canary (grok-box-8) deploys FIRST, then the rest serially" ;;
+  *) bad "rollout order wrong: [$ro_all]" ;;
+esac
+
+# Canary FAILS verification => ABORT: ZERO other boxes touched.
+ro_canfail="$(rollout_order_test 1 0)"
+case "$ro_canfail" in
+  "rc=1"*"DEPLOY grok-box-8|") pass "rollout: canary verified-FAILURE => ABORT, zero other boxes deployed" ;;
+  *"DEPLOY grok-box-3"*|*"DEPLOY grok-box-5"*) bad "rollout: touched other boxes after canary failure (FORBIDDEN): [$ro_canfail]" ;;
+  *) bad "rollout canary-fail wrong: [$ro_canfail]" ;;
+esac
+
+# A mid-list box (grok-box-3) FAILS => ABORT: grok-box-5 (after it) NOT deployed.
+ro_midfail="$(rollout_order_test 0 1)"
+case "$ro_midfail" in
+  *"DEPLOY grok-box-5"*) bad "rollout: deployed grok-box-5 after grok-box-3 failed (abort-on-first-failure violated): [$ro_midfail]" ;;
+  "rc=1"*"DEPLOY grok-box-8|DEPLOY grok-box-3|") pass "rollout: abort-on-first-failure stops NEW deploys after a verified failure" ;;
+  *) bad "rollout mid-fail wrong: [$ro_midfail]" ;;
+esac
+
+# Canary tunnel DOWN => ABORT (cannot verify), zero deployed.
+rollout_canary_down_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_BOXES="grok-box-3 grok-box-8"
+log(){ :; }
+notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }
+tunnel_up(){ [ "\$1" = grok-box-8 ] && return 1 || return 0; }   # canary down
+seq="\$(mktemp)"
+tunnel_deploy_one(){ echo "DEPLOY \$1" >> "\$seq"; return 0; }
+reconcile_rollout grok-box-3 >/dev/null 2>&1
+echo "rc=\$?"; tr '\n' '|' < "\$seq"; echo
+rm -f "\$seq"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+ro_cdown="$(rollout_canary_down_test)"
+case "$ro_cdown" in
+  *DEPLOY*) bad "rollout: deployed despite canary tunnel DOWN (should abort): [$ro_cdown]" ;;
+  "rc=1"*) pass "rollout: canary tunnel DOWN => ABORT before any deploy" ;;
+  *) bad "rollout canary-down wrong: [$ro_cdown]" ;;
+esac
+
+# canary_box config override: [fleet-brain].canary_box = 5 => grok-box-5 first.
+rollout_canary_cfg_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" reconcile_canary_box)"
+config_get(){ [ "\$1 \$2" = "fleet-brain canary_box" ] && echo 5; }
+reconcile_canary_box
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(rollout_canary_cfg_test)" = grok-box-5 ] && pass "rollout: [fleet-brain].canary_box overrides the default (=> grok-box-5)" || bad "canary_box override wrong: [$(rollout_canary_cfg_test)]"
+# Default (unset) => grok-box-8.
+rollout_canary_default_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" reconcile_canary_box)"
+config_get(){ return 1; }
+reconcile_canary_box
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(rollout_canary_default_test)" = grok-box-8 ] && pass "rollout: canary_box default => grok-box-8" || bad "canary_box default wrong: [$(rollout_canary_default_test)]"
+
+# Tunnel argv: tunnel_deploy_one drives the box over ssh -p 2000N box@127.0.0.1
+# -i <vps-key>, and VERIFIES with `boxup check`. Stub ssh (via tunnel_ssh's ssh
+# call) to capture the argv of the LAST call (the boxup check verify).
+rollout_tunnel_argv_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_BOX_KEY="/etc/grok-fleet/box_access_ed25519"
+FLEET_ROLLOUT_TREE=""     # no tarball => converge+verify only (no scp)
+BOX_ROOT="/workspace/box-setup"
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in tunnel_deploy_one tunnel_ssh port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+cap="\$(mktemp)"
+# ssh stub: append the full argv of each invocation (one line per call).
+ssh(){ printf '%s\n' "\$*" >> "\$cap"; return 0; }
+tunnel_deploy_one grok-box-8 >/dev/null 2>&1
+# Emit the LAST ssh argv (the boxup check verify) + whether any call carried the
+# tunnel identity.
+tail -1 "\$cap"
+grep -q -- "-p 20008 box@127.0.0.1" "\$cap" && echo "PORTHOST-OK" || echo "PORTHOST-MISSING"
+grep -q -- "-i /etc/grok-fleet/box_access_ed25519" "\$cap" && echo "KEY-OK" || echo "KEY-MISSING"
+grep -q "boxup check" "\$cap" && echo "VERIFY-OK" || echo "VERIFY-MISSING"
+rm -f "\$cap"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+ro_argv="$(rollout_tunnel_argv_test)"
+case "$ro_argv" in *"PORTHOST-OK"*) pass "rollout tunnel argv: ssh -p 20008 box@127.0.0.1 (port 20000+8)" ;; *) bad "rollout tunnel argv port/host wrong: [$ro_argv]" ;; esac
+case "$ro_argv" in *"KEY-OK"*) pass "rollout tunnel argv: -i <VPS box-access key> (no password fallback, R7)" ;; *) bad "rollout tunnel argv key missing: [$ro_argv]" ;; esac
+case "$ro_argv" in *"VERIFY-OK"*) pass "rollout tunnel: verifies via boxup check over the tunnel (D6 postcondition)" ;; *) bad "rollout tunnel verify missing: [$ro_argv]" ;; esac
+
+# =============================================================================
 # TUNNEL — boxup supervision: unconfigured no-op, respawn argv, status field.
 # =============================================================================
 # tunnel_state: unconfigured (no [fleet].vps) => 'unconfigured'.
