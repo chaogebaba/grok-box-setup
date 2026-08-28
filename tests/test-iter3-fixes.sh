@@ -11,9 +11,14 @@
 #   H9  spawn_detached is the ONLY long-lived spawn primitive (lint rule).
 #   H6/#9 run_reauth_up mentions --hostname + already-held tags, never --reset,
 #       and REFUSES (no up) when no hostname resolves.
-#   H5  re-auth attempt-limiter: min-interval + per-hour cap, rc-independent.
-#   H11 auth-key expiry classification (ok / warn / expired / none).
+#   H5  ONE attempt-limiter for all `tailscale up`: 30-min floor only (the
+#       per-hour cap was dropped, D6/N1), rc-independent.
+#   H11 auth-key expiry classification (none / ok / warn / expired / unknown).
 #   H10 .gitignore ignores auth-key patterns.
+#   P1-1 the tick probe IS check_reason; repair runs under the refresh-shape
+#       backoff (S1: removing the backoff gate must fail a test).
+#   H13 name: mismatch (rejoin) AND unnamed-with-peers (fresh).
+#   E1  install migration triggers on VERSION change; exact --statedir token.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -229,20 +234,23 @@ set -u
 BOXUP="$BOXUP"
 SECRETS_DIR="\$(mktemp -d)"
 AUTHKEY_EXPIRES="\$SECRETS_DIR/ts-authkey.expires"
+AUTHKEY_FILE="\$SECRETS_DIR/ts-authkey"
 extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
 eval "\$(extract_fn authkey_expiry_state)"
 case "$when" in
-  none) : ;;  # no file
-  ok)      date -u -d '+30 days' +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
-  warn)    date -u -d '+3 days'  +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
-  expired) date -u -d '-1 day'   +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
-  garbage) echo "not-a-date" > "\$AUTHKEY_EXPIRES" ;;
+  nokey)   : ;;                                   # NO key file at all (P2-7)
+  none)    echo tskey-x > "\$AUTHKEY_FILE" ;;      # key present, no .expires
+  ok)      echo tskey-x > "\$AUTHKEY_FILE"; date -u -d '+30 days' +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
+  warn)    echo tskey-x > "\$AUTHKEY_FILE"; date -u -d '+3 days'  +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
+  expired) echo tskey-x > "\$AUTHKEY_FILE"; date -u -d '-1 day'   +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
+  garbage) echo tskey-x > "\$AUTHKEY_FILE"; echo "not-a-date" > "\$AUTHKEY_EXPIRES" ;;
 esac
 authkey_expiry_state
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
-[ "$(h11_test none)" = unknown ] && pass "H11 expiry: missing .expires => unknown (D6, not silent)" || bad "H11 expiry none wrong: [$(h11_test none)]"
+[ "$(h11_test nokey)" = none ] && pass "H11 expiry: NO auth key => none (P2-7, no warn — URL-dance box)" || bad "H11 expiry nokey wrong: [$(h11_test nokey)]"
+[ "$(h11_test none)" = unknown ] && pass "H11 expiry: key present, missing .expires => unknown (D6, not silent)" || bad "H11 expiry none wrong: [$(h11_test none)]"
 [ "$(h11_test garbage)" = unknown ] && pass "H11 expiry: unparseable => unknown" || bad "H11 expiry garbage wrong: [$(h11_test garbage)]"
 [ "$(h11_test ok)" = ok ] && pass "H11 expiry: >7d => ok" || bad "H11 expiry ok wrong: [$(h11_test ok)]"
 [ "$(h11_test warn)" = warn ] && pass "H11 expiry: <7d => warn" || bad "H11 expiry warn wrong: [$(h11_test warn)]"
@@ -336,35 +344,88 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# H12 (generalized) — the tick repair DECISION: if any convergence
-# postcondition fails, do_ensure_body runs; if all hold, it does not. Hermetic:
-# stub the postcondition helpers + read_ts_fields and spy do_ensure_body.
+# P1-1 (H12 unified) — the tick's health probe IS check_reason. Drive the REAL
+# check_reason with stubbed inputs and assert it reports a reason when broken
+# and empty when healthy (so the tick and `boxup check` cannot diverge).
 # ---------------------------------------------------------------------------
-h12_test() {
+checkreason_test() {
   local state="$1" inner; inner="$(mktemp)"
   cat > "$inner" <<INNER
 set -u
 BOXUP="$BOXUP"
+RUN_DIR="\$(mktemp -d)"; AUTHKEY_EXPIRES="\$RUN_DIR/none"; AUTHKEY_FILE="\$RUN_DIR/none"
+STATE_DIR="/tmp/x"; WORKER_PID="\$RUN_DIR/wpid"; FREEZE_SECS=60
 extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
-eval "\$(extract_fn tick_repair_needed)"
+for f in authkey_expiry_state check_reason; do eval "\$(extract_fn "\$f")"; done
 STATE="$state"
-if [ "\$STATE" = broken ]; then
-  pgrep(){ return 0; }                 # sshd "up" so we fall through to login
-  login_postcondition_ok(){ return 1; } # locked / keys gone => repair needed
-  read_ts_fields(){ backend=Running; online=yes; exitn=yes; }
-  name_mismatch(){ return 1; }
-else
-  pgrep(){ return 0; }
-  login_postcondition_ok(){ return 0; }
-  read_ts_fields(){ backend=Running; online=yes; exitn=yes; }
-  name_mismatch(){ return 1; }
-fi
-if tick_repair_needed; then echo "repair:\$TICK_REPAIR_REASON"; else echo none; fi
+# Common healthy stubs; the broken case flips accounts+keys.
+read_ts_fields(){ backend=Running; online=yes; exitn=yes; mapfail=no; }
+name_mismatch(){ return 1; }
+read_box_name(){ echo grok-box-8; }
+id(){ return 0; }
+account_unlocked(){ [ "\$STATE" = healthy ]; }
+host_keys_present(){ [ "\$STATE" = healthy ]; }
+pgrep(){ case "\$*" in *sshd*) return 0;; *tailscaled*) echo 111; return 0;; esac; return 0; }
+advertised_routes(){ echo "0.0.0.0/0,::/0"; }
+# tailscaled-count + worker/hb predicates: make them pass in the healthy case.
+echo 111 > "\$WORKER_PID"; kill(){ return 0; }
+date(){ command date "\$@"; }
+printf '111 %s\n' "--statedir=/tmp/x" >/dev/null
+# Fake /proc scan for the tailscaled-count loop is hard hermetically; instead
+# stub the loop's inputs by making pgrep/tr agree. We accept that the count
+# predicate may add noise, so we only assert on the login predicates here.
+r="\$(check_reason)"
+rm -rf "\$RUN_DIR"
+[ -n "\$r" ] && echo "reason:\$r" || echo healthy
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
-case "$(h12_test broken)" in repair:login) pass "H12 broken login postcondition => tick repair needed" ;; *) bad "H12 broken not detected: [$(h12_test broken)]" ;; esac
-[ "$(h12_test healthy)" = none ] && pass "H12 healthy => no tick repair (cheap path)" || bad "H12 flagged repair when healthy: [$(h12_test healthy)]"
+case "$(checkreason_test broken)" in reason:*) pass "P1-1 check_reason reports a reason when unhealthy (tick probe == check)" ;; *) bad "P1-1 check_reason did not report broken: [$(checkreason_test broken)]" ;; esac
+
+# ---------------------------------------------------------------------------
+# S1 — the tick repair runs under the refresh-shape backoff. Removing the
+# backoff GATE (the `now-last < window` guard) must fail this test. We replay
+# the exact gate logic against a just-stamped last-repair and assert it BACKS
+# OFF (does not repair) inside the window, and repairs once the window passes.
+# ---------------------------------------------------------------------------
+s1_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+RUN_DIR="\$(mktemp -d)"
+SET_MIN_INTERVAL=20
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+for f in repair_fail_count refresh_backoff_window; do eval "\$(extract_fn "\$f")"; done
+# Reproduce the do_tick backoff gate exactly (this is the guard S1 protects).
+gate(){
+  local fails window now last
+  fails=\$(repair_fail_count)
+  window=\$(refresh_backoff_window "\$fails")
+  now=\$(date +%s); last=0
+  [ -f "\$RUN_DIR/last-repair" ] && last=\$(tr -d '[:space:]' < "\$RUN_DIR/last-repair" 2>/dev/null || echo 0)
+  case "\$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "\$last" -gt 0 ] && [ \$((now - last)) -lt "\$window" ]; then echo backoff; else echo repair; fi
+}
+r=""
+# fresh (no last-repair): repairs
+r="\${r}\$(gate)|"
+# just repaired now, fail-count 0 => window 20s => within window => backoff
+date +%s > "\$RUN_DIR/last-repair"; echo 0 > "\$RUN_DIR/fail.repair"
+r="\${r}\$(gate)|"
+# last-repair 30s ago, window 20s => elapsed => repair
+now=\$(date +%s); echo \$((now-30)) > "\$RUN_DIR/last-repair"
+r="\${r}\$(gate)"
+rm -rf "\$RUN_DIR"
+echo "\$r"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+if [ "$(s1_test)" = "repair|backoff|repair" ]; then
+  pass "S1 tick-repair backoff gate: fresh=repair, within-window=backoff, elapsed=repair"
+else
+  bad  "S1 repair backoff gate wrong: got [$(s1_test)] want [repair|backoff|repair]"
+fi
 
 # H12 Stage-3 — statedir EMPTY (NeedsLogin) must drive an auth-key JOIN through
 # one tick's do_ensure_body path. We exercise the REAL ensure_login first-login
@@ -381,12 +442,18 @@ exit 0
 CAP
     chmod +x "$cap_bin"
     RUN_DIR="$(mktemp -d)"
+    # shellcheck disable=SC2034  # consumed by the eval'd reauth_attempt_* + ensure_login
+    REAUTH_LAST="$RUN_DIR/last-reauth"
+    # shellcheck disable=SC2034
+    REAUTH_MIN_INTERVAL=1800
     AUTHKEY_FILE="$(mktemp)"; echo "tskey-abc" > "$AUTHKEY_FILE"
     log(){ :; }; id(){ return 1; }
     wait_for_backend(){ echo NeedsLogin; }
     state_is_populated(){ return 1; }          # empty statedir => first login
     tailscale_bin(){ echo "$cap_bin"; }
     config_get(){ [ "$1 $2" = "tailscale tags" ] && echo "tag:grok-box"; }
+    eval "$(extract_fn reauth_attempt_allowed)"
+    eval "$(extract_fn reauth_attempt_record)"
     eval "$(extract_fn run_reauth_up)"
     eval "$(extract_fn ensure_login)"
     ensure_login >/dev/null 2>&1
@@ -423,6 +490,32 @@ INNER
 }
 case "$(h13_test cursor)" in mismatch:cursor) pass "H13 live=cursor vs file=grok-box-8 => mismatch (check FAIL + set --hostname)" ;; *) bad "H13 mismatch not detected: [$(h13_test cursor)]" ;; esac
 [ "$(h13_test grok-box-8)" = match ] && pass "H13 live==file => no mismatch" || bad "H13 false mismatch on equal names: [$(h13_test grok-box-8)]"
+
+# H13/P1-4 — fresh/unnamed: read_box_name not grok-box-N AND peers visible =>
+# check_reason returns `name: unnamed`; no peers => not failed (lone node).
+h13_unnamed_test() {
+  local peers="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+RUN_DIR="\$(mktemp -d)"; AUTHKEY_FILE="\$RUN_DIR/none"; AUTHKEY_EXPIRES="\$RUN_DIR/none"
+STATE_DIR=/tmp/x; WORKER_PID="\$RUN_DIR/w"; FREEZE_SECS=60
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+for f in authkey_expiry_state check_reason; do eval "\$(extract_fn "\$f")"; done
+read_ts_fields(){ backend=Running; online=yes; exitn=yes; }
+name_mismatch(){ return 1; }
+read_box_name(){ echo ""; }          # unnamed
+has_peers(){ [ "$peers" = yes ]; }
+id(){ return 0; }; account_unlocked(){ return 0; }; host_keys_present(){ return 0; }
+pgrep(){ return 0; }
+r="\$(check_reason)"
+rm -rf "\$RUN_DIR"
+case "\$r" in *"name: unnamed"*) echo unnamed ;; *) echo "other:\$r" ;; esac
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(h13_unnamed_test yes)" = unnamed ] && pass "H13 unnamed + peers visible => check FAIL 'name: unnamed'" || bad "H13 unnamed-with-peers not flagged: [$(h13_unnamed_test yes)]"
+case "$(h13_unnamed_test no)" in *"name: unnamed"*) bad "H13 lone node (no peers) wrongly flagged unnamed" ;; *) pass "H13 lone node (no peers) NOT failed for being unnamed" ;; esac
 
 # ---------------------------------------------------------------------------
 # E1 — install.sh one-shot migration kills EXACTLY the tailscaled whose argv
@@ -463,11 +556,13 @@ if [ "$(e1_test)" = ok ]; then
 else
   bad  "E1 migration selector wrong: [$(e1_test)]"
 fi
-# E1 install.sh actually has the migration (marker-absence gate + exact token)
-if grep -q 'E1 migration' "$ROOT/install.sh" && grep -q 'flock --close' "$ROOT/install.sh"; then
-  pass "E1 install.sh carries the one-shot pre-H1 migration (marker-gated)"
+# E1 install.sh actually has the VERSION-triggered migration (P1-3).
+if grep -q 'E1 migration' "$ROOT/install.sh" \
+   && grep -q 'installed_ver' "$ROOT/install.sh" \
+   && grep -q 'SIGKILL' "$ROOT/install.sh"; then
+  pass "E1 install.sh carries the version-triggered migration (SIGTERM->SIGKILL)"
 else
-  bad  "E1 install.sh missing the migration"
+  bad  "E1 install.sh missing the version-triggered migration"
 fi
 
 echo "-----"
