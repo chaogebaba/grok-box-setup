@@ -114,8 +114,13 @@ run_with_converge_lock() {
   fi
   (
     if ! { exec 8>"$CONVERGE_LOCK"; } 2>/dev/null; then
-      # Fail-open: cannot open the lock file — proceed unlocked.
-      exec 8>&- 2>/dev/null || true
+      # Fail-open: cannot open the lock file — log and proceed UNLOCKED (the
+      # lock is an optimization against duplicate work, never a gate on
+      # convergence; the blueprint requires a diagnostic here). Note: do NOT
+      # write `exec 8>&- 2>/dev/null` — an exec with no command makes the
+      # 2>/dev/null PERMANENT for the rest of the subshell and would swallow
+      # the log line below. fd 8 was never opened, so no close is needed.
+      log "converge-lock: cannot open $CONVERGE_LOCK — proceeding unlocked (fail-open)" >&2
       "$fn"
       exit
     fi
@@ -956,13 +961,18 @@ except Exception:
   fi
 
   now=$(date +%s)
-  if [ "$force" = 0 ] && [ -f "$RUN_DIR/last-exitnode-set" ]; then
+  # Window guard keyed on the LAST ATTEMPT time (stamped on BOTH success and
+  # failure below), not merely the last success — otherwise a fresh RUN_DIR
+  # with fail-count > 0 but no stamp would skip the guard entirely and retry a
+  # failing `set` every tick (D4 regression). Missing stamp => last=0 => the
+  # delta is huge, so a genuine first-ever attempt still proceeds immediately.
+  last=0
+  [ -f "$RUN_DIR/last-exitnode-set" ] && \
     last=$(cat "$RUN_DIR/last-exitnode-set" 2>/dev/null || echo 0)
-    case "$last" in ''|*[!0-9]*) last=0 ;; esac
-    if [ $((now - last)) -lt "$window" ]; then
-      log "refresh: need set ($reason) but rate-limited (window=${window}s fails=${fails})"
-      return 0
-    fi
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$force" = 0 ] && [ $((now - last)) -lt "$window" ]; then
+    log "refresh: need set ($reason) but rate-limited (window=${window}s fails=${fails})"
+    return 0
   fi
   log "refresh: tailscale set ($reason) hostname=$name"
   if tailscale_set_full "$name"; then
@@ -972,6 +982,9 @@ except Exception:
   else
     fails=$((fails + 1))
     echo "$fails" > "$RUN_DIR/fail.refresh" 2>/dev/null || true
+    # Stamp the ATTEMPT time on failure too, so the stretched window applies
+    # from the first failure even on a fresh RUN_DIR with no prior stamp.
+    echo "$now" > "$RUN_DIR/last-exitnode-set" 2>/dev/null || true
     window=$(refresh_backoff_window "$fails")
     log "refresh: set failed (consecutive=${fails}, next window=${window}s)" >&2
     return 1
