@@ -29,7 +29,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.1.0
+BOXUP_VERSION=5.2.0
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -48,6 +48,12 @@ SSH_STATE_DIR="$ROOT/state/ssh"
 HOSTNAME_FILE="$ROOT/hostname"
 SECRETS_DIR="$ROOT/secrets"
 AUTHKEY_FILE="$SECRETS_DIR/ts-authkey"
+# H11: optional sidecar recording the auth key's expiry (single ISO date
+# YYYY-MM-DD). Tailscale keys expire (<=90d) and the date is NOT recoverable
+# from the key itself, so it must be recorded next to it. Missing/unparseable
+# WHILE a key exists => status authkey=unknown-expiry + a once/hour check WARN
+# (D6, not silent, not a FAIL); absent ts-authkey entirely => none (no warn).
+AUTHKEY_EXPIRES="$SECRETS_DIR/ts-authkey.expires"
 BIN_DIR="$ROOT/bin"
 CONFIG_FILE="${BOX_SETUP_CONFIG:-$ROOT/config.toml}"
 
@@ -58,29 +64,36 @@ WORKER_LOG="$LOG_DIR/boxup-worker.log"
 TAILSCALED_LOG="$LOG_DIR/tailscaled.log"
 TS_SOCK="/var/run/tailscale/tailscaled.sock"
 
-# Two flock-guarded critical sections, each on its OWN fd (flock keys on the
-# open-file-description, and holding two different fds to two different files
-# in the SAME process never conflict, but reusing one fd across nested
-# subshells does — so keep them distinct and documented together):
-#   * fd 9 -> START_LOCK        the tailscaled fork window (start_tailscaled,
-#                               taken in a subshell so it releases the instant
-#                               the fork returns; the daemon child closes fd 9).
-#   * fd 8 -> CONVERGE_LOCK     converge mutual exclusion (D3): run_tick takes
-#                               it with `flock -n` (skip-on-contention — a
-#                               converge in progress is itself liveness), while
-#                               do_ensure/`boxup once` takes it with `flock -w
-#                               60` (bounded WAIT — `boxup once` is AGENT.md's
-#                               remedy for nearly every symptom and must not be
-#                               silently skipped). BOTH live in a subshell (or
-#                               close the fd explicitly) because `boxup once`
-#                               runs do_ensure then run_tick sequentially in one
-#                               process and a process-held lock would deadlock.
-#                               Fail-open: if the lock file cannot be opened the
-#                               guarded work still runs (the lock is an
-#                               optimization against duplicate work, never a
-#                               gate on convergence).
+# Two flock-guarded critical sections. Since H1 (iter3 hotfix) the converge
+# lock uses flock --close semantics — the body runs with the lock fd CLOSED for
+# it and every descendant — so the historical "which fd, and does the child
+# close it" hazard is gone by construction. The fds:
+#   * fd 9 -> CONVERGE_LOCK     converge mutual exclusion (D3): an OUTER subshell
+#                               holds fd 9 for the body's whole duration; the
+#                               body runs in an INNER subshell with `9<&-` so
+#                               neither it nor any descendant inherits the lock.
+#                               run_tick takes it `flock -n 9` (skip-on-
+#                               contention — a converge in progress is itself
+#                               liveness); do_ensure/`boxup once` takes it
+#                               `flock -w 60 9` (bounded WAIT). H3: we NEVER run
+#                               the body unlocked — a timeout/open-failure is a
+#                               hard skip (tick) or non-zero (once), not an
+#                               unlocked run.
+#   * fd 9 -> START_LOCK        the tailscaled fork window inside start_tailscaled,
+#                               in ITS OWN subshell (the converge body has fd 9
+#                               closed, so this fresh fd 9 does not collide).
+#                               spawn_detached closes fd 8 and fd 9 on the child
+#                               as belt-and-braces defense-in-depth.
+# fd 8 is no longer a converge-lock fd (it was, pre-hotfix); spawn_detached
+# still closes it so a legacy daemon's inherited fd 8 is never propagated
+# further.
 START_LOCK="/run/tailscaled.start.lock"
-CONVERGE_LOCK="$RUN_DIR/converge.lock"
+# F1(b): the converge lock path is VERSIONED (v2). A pre-H1 daemon that inherited
+# the OLD converge.lock fd (the #7 wedge) can NEVER wedge a v2 boxup, because a
+# v2 tick flocks a DIFFERENT file — decoupled by construction, independent of
+# whether the E1 install migration fired. Bump this suffix again if a future
+# change must guarantee non-interference with an older running daemon.
+CONVERGE_LOCK="$RUN_DIR/converge.v2.lock"
 
 DEFAULT_SSH_PASSWORD="12345678"
 DEFAULT_TS_VERSION="1.102.3"
@@ -95,48 +108,90 @@ WORKER_STARTED=$(date +%s)
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# --- converge lock (D3) ------------------------------------------------------
+# --- converge lock (D3, H1) --------------------------------------------------
 # Serialize converge across `boxup once`, the worker tick, and a rollout.
-# run_with_converge_lock <mode> <fn>:
-#   mode = "wait" -> flock -w 60 (do_ensure / `boxup once`: bounded WAIT).
-#   mode = "try"  -> flock -n    (run_tick: skip on contention).
-# The flock lives in a subshell so it is released the instant <fn> returns and
-# never wedges the sequential do_ensure-then-run_tick path of `boxup once`.
-# Fail-open: if the lock file cannot be opened (e.g. RUN_DIR absent on a fresh
-# `boxup tick`), run <fn> UNLOCKED and return 0-from-fn — the lock guards
-# against duplicate work, it is never a gate on convergence.
-# Return code: 0 if the lock was contended in "try" mode (caller decides what
-#   that means), otherwise the exit status of <fn>.
+#
+# H1 (iter3 hotfix): the lock now uses flock --close semantics — the body runs
+# with NO lock descriptor exposed to it OR any descendant. We open the lock on
+# fd 9 in an OUTER subshell that holds the flock for the body's whole duration,
+# then run the body in an INNER subshell with `9<&-` so neither the body nor
+# anything it spawns inherits the fd. This makes the #7 fd-inheritance bug
+# STRUCTURALLY IMPOSSIBLE for any new daemon, regardless of whether a given
+# spawn site remembered to close the fd. It also retires the entire /proc/locks
+# stale-holder detector + 5-skip break that the dual gate proved cannot work:
+# with boxup's real leak shape (a subshell takes `flock -n`, spawns a detached
+# child, then EXITS) /proc/locks records the EXITED helper's pid (e.g. 445980),
+# NOT the inheriting daemon (445981) — so the holder reads "?", the counter
+# resets, and the break never fires. flock --close removes the need for it.
+#
+#   mode = "wait" -> flock -w 60  (do_ensure / `boxup once`: bounded WAIT).
+#   mode = "try"  -> flock -n     (run_tick: skip on contention).
+#
+# H3: mutual exclusion is now GUARANTEED — we NEVER run the body unlocked.
+#   * cannot open the lock file: try -> skip (200); wait -> fail (201).
+#   * wait-mode timeout: fail (201), never proceed unlocked.
+#   * try-mode contention: skip (200), after attempting the transitional
+#     legacy-daemon recovery below.
+# Return code: 200 = try-mode contended (caller stamps hb and skips);
+#   201 = could not take the lock in wait mode (caller surfaces a hard error);
+#   otherwise the exit status of <fn>.
 run_with_converge_lock() {
-  local mode="$1" fn="$2"
+  local mode="$1" fn="$2" rc
   if ! have flock; then
-    "$fn"; return
+    # D2: no flock ⇒ we CANNOT guarantee mutual exclusion, so we REFUSE rather
+    # than run the body unlocked (an unlocked converge/tick defeats D3 and can
+    # race a concurrent one). install.sh asserts util-linux flock exists, so
+    # this is a broken-install guard, not an expected path.
+    log "converge-lock: flock not found (util-linux required) — REFUSING to run unlocked (D2)" >&2
+    case "$mode" in try) return 200 ;; *) return 201 ;; esac
   fi
   (
-    if ! { exec 8>"$CONVERGE_LOCK"; } 2>/dev/null; then
-      # Fail-open: cannot open the lock file — log and proceed UNLOCKED (the
-      # lock is an optimization against duplicate work, never a gate on
-      # convergence; the blueprint requires a diagnostic here). Note: do NOT
-      # write `exec 8>&- 2>/dev/null` — an exec with no command makes the
-      # 2>/dev/null PERMANENT for the rest of the subshell and would swallow
-      # the log line below. fd 8 was never opened, so no close is needed.
-      log "converge-lock: cannot open $CONVERGE_LOCK — proceeding unlocked (fail-open)" >&2
-      "$fn"
-      exit
+    if ! { exec 9>"$CONVERGE_LOCK"; } 2>/dev/null; then
+      # H3: cannot open the lock file. We do NOT run unlocked anymore.
+      # Note: do NOT write `exec 9>&- 2>/dev/null` — an exec with no command
+      # makes the 2>/dev/null permanent and swallows the log below. fd 9 was
+      # never opened, so no close is needed.
+      log "converge-lock: cannot open $CONVERGE_LOCK — refusing to run unlocked (H3)" >&2
+      case "$mode" in try) exit 200 ;; *) exit 201 ;; esac
     fi
     case "$mode" in
       try)
-        if ! flock -n 8; then
-          exit 200   # contended; caller treats this specially
+        if ! flock -n 9; then
+          # Contended. Since H1 (flock --close) a NEW daemon can no longer wedge
+          # the lock, so genuine contention is another live boxup converge —
+          # skip. (Legacy pre-H1 wedges are handled ONCE at upgrade time by the
+          # install.sh migration, not by any runtime detector — see E1: two
+          # rounds of a runtime detector were proven inert, and a one-time
+          # migration is one-shot by nature, not a per-tick job.)
+          exit 200
         fi
         ;;
       *)
-        flock -w 60 8 || true   # bounded wait; proceed even on timeout
+        if ! flock -w 60 9; then
+          # H3: wait-mode timeout. NEVER run the body unlocked (the old code
+          # did, defeating mutual exclusion). Surface a hard failure instead.
+          log "converge-lock: could not acquire within 60s — NOT running unlocked (H3)" >&2
+          exit 201
+        fi
         ;;
     esac
-    "$fn"
+    # H1: run the body with the lock fd CLOSED for it and every descendant.
+    # The outer subshell keeps fd 9 (and thus the flock) until it exits.
+    ( "$fn" ) 9<&-
   )
+  rc=$?
+  return "$rc"
 }
+
+# E1: a runtime legacy-wedge detector was tried for two rounds and DELETED — it
+# was proven inert twice (`stat` without -L stats the /proc/PID/fd symlink not
+# its target; then it re-picked the daemon via `pgrep -n` instead of the found
+# pid; and its $STATE_DIR match was a substring, so `$STATE_DIR-other` counted
+# as ours). A runtime detector for a ONE-TIME migration is the wrong shape.
+# Pre-H1 wedges are cleared ONCE, at upgrade, by the migration in install.sh
+# (stop the old worker; kill only a tailscaled whose argv carries the exact
+# `--statedir=$STATE_DIR` token; the normal `boxup once` then restarts it via
+# the flock --close path). Nothing runs in a tick.
 
 # --- config.toml -------------------------------------------------------------
 # A TOML subset, read with awk so it works before python3 is installed.
@@ -208,6 +263,83 @@ ssh_password() {
   printf '%s' "$p"
 }
 
+# H7 (P0): true (0) iff account <user> exists AND has a USABLE password (not
+# locked, not empty). `passwd -S <user>` prints "<user> <status> ..." where the
+# status field is P (usable), L (locked), or NP (no password). Only P is a
+# working login. Prefer passwd -S; fall back to parsing /etc/shadow field 2
+# (a locked entry starts with ! or *, an empty field means no password). Used
+# by `boxup check` so a box that is sshd=up but has locked accounts (the image
+# ships them locked, /etc/shadow dies on swap) reports UNHEALTHY, not OK.
+account_unlocked() {
+  local user="$1" st hash
+  id "$user" >/dev/null 2>&1 || return 1
+  if have passwd; then
+    st="$(passwd -S "$user" 2>/dev/null | awk '{print $2}')"
+    case "$st" in
+      P) return 0 ;;
+      L|NP) return 1 ;;
+    esac
+    # Unknown/empty status output — fall through to the shadow check.
+  fi
+  if [ -r /etc/shadow ]; then
+    hash="$(awk -F: -v u="$user" '$1==u{print $2}' /etc/shadow 2>/dev/null)"
+    case "$hash" in
+      ''|'!'*|'*'*) return 1 ;;   # empty / locked
+      *) return 0 ;;
+    esac
+  fi
+  return 1   # cannot prove it is unlocked → treat as not-unlocked (fail-safe)
+}
+
+# H12: the LOGIN postcondition, probed CHEAPLY (read-only: passwd -S + one
+# stat, NO chpasswd / keygen). do_tick historically only restarted a DEAD sshd.
+# H12: at least one host key on disk — /etc/ssh/ssh_host_ed25519_key, the SAME
+# file ensure_host_keys treats as the presence marker, so "present" means "sshd
+# can start with OUR persisted identity", not "some file exists". A check_reason
+# predicate (P1-1): the tick and `boxup check` both catch wiped host keys
+# (box-8 Stage 1) and repair via do_ensure_body → ensure_sshd.
+host_keys_present() {
+  [ -s /etc/ssh/ssh_host_ed25519_key ]
+}
+
+# H11: classify the seeded auth key's expiry from $AUTHKEY_EXPIRES (a single
+# ISO date YYYY-MM-DD). Prints exactly one of:
+#   none    — no auth key present at all ($AUTHKEY_FILE absent). A box run via
+#             the AuthURL dance legitimately has no key; do NOT warn about the
+#             expiry of a key that does not exist. (P2-7)
+#   unknown — a key EXISTS but $AUTHKEY_EXPIRES is missing/unreadable/unparseable.
+#             D6: NOT silent — status shows authkey=unknown-expiry and check
+#             WARNs once/hour — but NOT a FAIL (the key may be valid; an
+#             unattended box must not fail for a sidecar the operator hasn't
+#             seeded yet).
+#   ok      — expires in > 7 days
+#   warn    — expires within 7 days (inclusive), not yet past
+#   expired — the date is in the past
+# Warn window = 7 days. Honest rationale: it is one weekly operator pass of
+# margin — nothing authoritative backs a specific number (Tailscale's own
+# KeyExpirationNotice defaults to 24h, which is far too short for an unattended
+# fleet with a weekly human cadence). 14d produced a fortnight of steady-state
+# noise for no added recoverability; 7d is the smallest window a weekly pass
+# reliably catches. Days compared at UTC granularity. One mechanism; both
+# `boxup check` and `boxup status` consume it.
+authkey_expiry_state() {
+  local raw exp_epoch now_epoch days
+  # P2-7: no key => none (no warning; URL-dance boxes are legitimate).
+  [ -s "$AUTHKEY_FILE" ] || { echo none; return 0; }
+  [ -f "$AUTHKEY_EXPIRES" ] || { echo unknown; return 0; }
+  raw="$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null || true)"
+  case "$raw" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+    *) echo unknown; return 0 ;;   # unparseable => unknown (not silent)
+  esac
+  exp_epoch="$(date -u -d "$raw" +%s 2>/dev/null || true)"
+  case "$exp_epoch" in ''|*[!0-9]*) echo unknown; return 0 ;; esac
+  now_epoch="$(date -u +%s)"
+  if [ "$now_epoch" -ge "$exp_epoch" ]; then echo expired; return 0; fi
+  days=$(( (exp_epoch - now_epoch) / 86400 ))
+  if [ "$days" -lt 7 ]; then echo warn; else echo ok; fi
+}
+
 # --- tailscale binaries ------------------------------------------------------
 tailscale_bin() {
   if [ -x "$BIN_DIR/tailscale" ]; then echo "$BIN_DIR/tailscale"; return; fi
@@ -273,7 +405,8 @@ try:
     out["exitn"] = "yes" if s.get("ExitNodeOption") else "no"
     out["mapfail"] = "yes" if ("coordination server" in h
                                or "not-in-map-poll" in h
-                               or "pollnetmap" in h) else "no"
+                               or "pollnetmap" in h
+                               or "out of sync" in h) else "no"
     out["fwdhealth"] = "yes" if "forward" in h else "no"
     out["auth"] = (d.get("AuthURL") or "").replace("\n", " ").strip()
 except Exception:
@@ -310,6 +443,20 @@ except Exception:
 ' 2>/dev/null || true
 }
 
+# H13 (P1-4): true (0) iff the tailnet shows at least one PEER. Naming is
+# computed from peers only (Self is often still `cursor`), so `name: unnamed` is
+# only a health FAILURE once peers are visible — a genuinely lone first node has
+# nothing to pick against and must not be failed forever.
+has_peers() {
+  ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print("yes" if (json.load(sys.stdin).get("Peer") or {}) else "no")
+except Exception:
+    print("no")
+' 2>/dev/null | grep -q yes
+}
+
 prefs_hostname() {
   ts debug prefs 2>/dev/null | python3 -c '
 import json, sys
@@ -318,6 +465,34 @@ try:
 except Exception:
     print("")
 ' 2>/dev/null || true
+}
+
+# F9 (#9): the tags the device ALREADY carries in its current prefs. Source
+# from live prefs (debug prefs AdvertiseTags), falling back to status --json
+# Self.Tags. NEVER from config.toml [tailscale] tags — that is first-login-only
+# (F11). Prints a comma-separated "tag:a,tag:b" or empty. Restating tags the
+# node already has is a MENTION the CLI demands, not INTRODUCING new tags.
+current_advertise_tags() {
+  local tags
+  tags="$(ts debug prefs 2>/dev/null | python3 -c '
+import json, sys
+try:
+    t = json.load(sys.stdin).get("AdvertiseTags") or []
+    print(",".join(str(x) for x in t))
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+  if [ -z "$tags" ]; then
+    tags="$(ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    t = (json.load(sys.stdin).get("Self") or {}).get("Tags") or []
+    print(",".join(str(x) for x in t))
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+  fi
+  echo "$tags"
 }
 
 wait_for_socket() {
@@ -510,10 +685,22 @@ ensure_sshd() {
 
   # Grok images ship box/root with a locked shadow entry (* / !) and /etc/shadow
   # dies on image swap — sshd=up is not a working login. Re-apply every converge.
+  # H7 (P0): do NOT swallow chpasswd failure — a failed unlock means the box can
+  # be sshd=up yet have NO usable login (the exact resurrection-path trap). Log
+  # each non-zero rc loudly; `boxup check` independently verifies the accounts
+  # are actually unlocked (not merely that we tried).
   pw="$(ssh_password)"
   if have chpasswd; then
-    id box >/dev/null 2>&1 && printf 'box:%s\n' "$pw" | chpasswd >/dev/null 2>&1 || true
-    printf 'root:%s\n' "$pw" | chpasswd >/dev/null 2>&1 || true
+    if id box >/dev/null 2>&1; then
+      if ! printf 'box:%s\n' "$pw" | chpasswd 2>/dev/null; then
+        log "sshd: ERROR chpasswd failed to set box password — login may be locked out despite sshd up (H7)" >&2
+      fi
+    fi
+    if ! printf 'root:%s\n' "$pw" | chpasswd 2>/dev/null; then
+      log "sshd: ERROR chpasswd failed to set root password — login may be locked out despite sshd up (H7)" >&2
+    fi
+  else
+    log "sshd: ERROR chpasswd not available — cannot unlock box/root accounts (H7)" >&2
   fi
 
   if [ -x /usr/sbin/sshd ]; then
@@ -521,7 +708,13 @@ ensure_sshd() {
       # Reload only on config change; a HUP every tick churns sshd for nothing.
       [ "$changed" = 1 ] && kill -HUP "$(pgrep -n -x sshd)" 2>/dev/null || true
     else
-      /usr/sbin/sshd 2>/dev/null || true
+      # H9/D4: route sshd's spawn through spawn_detached for CONSISTENCY and
+      # defense-in-depth — every long-lived spawn goes through one helper that
+      # closes the converge-lock fd (fd 9). NB: a self-daemonizing sshd already
+      # drops inherited fds on its own, and since H1 the converge body runs with
+      # the lock fd closed anyway (flock --close), so sshd was never a CONFIRMED
+      # leak — this is belt-and-braces, not a fix for an observed sshd bug.
+      spawn_detached "" /usr/sbin/sshd || true
     fi
   fi
 }
@@ -642,10 +835,46 @@ NFT
   fi
 }
 
+# --- converge: detached long-lived spawns (F7 / #7 + addendum P0-A) ----------
+# THE ONE place that spawns a long-lived, detached child. Every long-lived
+# process boxup starts — tailscaled, sshd (both spawn sites), and the worker —
+# goes through here (H9). Since H1 the converge lock is flock --close, so the
+# body already runs with the lock fd CLOSED — this helper is DEFENSE-IN-DEPTH
+# and consistency (one place any future spawn is guaranteed clean), NOT the
+# load-bearing #7 fix. A lint/test rule fails if setsid/nohup/disown appears
+# outside this function.
+#
+# Closes both fds boxup ever flocks, so a child inherits neither regardless of
+# what the caller held:
+#   * fd 9 -> $CONVERGE_LOCK (H1) and $START_LOCK (start_tailscaled's fork
+#     window) — both use fd 9, at different times/subshells.
+#   * fd 8 -> historical converge-lock fd (pre-H1); closed too so a LEGACY
+#     daemon's inherited fd 8 is never propagated further during the transition.
+# All are write fds, so closes use `>&-`. setsid -f fully detaches (new session,
+# no controlling tty) so the child outlives this shell. NB: a self-daemonizing
+# child (sshd) drops fds on its own anyway — the close here is belt-and-braces.
+#
+# Usage: spawn_detached <logfile|""> <cmd> [args...]
+#   logfile: append target for the child's stdout+stderr; "" -> /dev/null.
+# The caller passes any `env VAR=... cmd ...` as the command words.
+spawn_detached() {
+  local out="$1"; shift
+  if [ -n "$out" ]; then
+    setsid -f "$@" 8>&- 9>&- >>"$out" 2>&1
+  else
+    setsid -f "$@" 8>&- 9>&- >/dev/null 2>&1
+  fi
+}
+
 # --- converge: tailscaled ----------------------------------------------------
 # Exactly one daemon, bound to the workspace statedir. Kill strays (dpkg's
-# default unit uses /var/lib/tailscale) by PID, never pkill -f. The child
-# closes flock fd 8 so a later start is not wedged on the inherited lock.
+# default unit uses /var/lib/tailscale) by PID, never pkill -f.
+# F7 (#7) history: the daemon is spawned via spawn_detached, which closes the
+# lock fds belt-and-braces. Since H1 the converge lock is fd 9 held under
+# flock --close (the body runs with it already closed), so a daemon can no
+# longer inherit it regardless — the pre-H1 failure was tailscaled inheriting
+# the then-fd-8 converge lock and holding it for life (observed 256 skips /
+# 77 min on box-8). The close in spawn_detached is now defense-in-depth.
 start_tailscaled() {
   local daemon pid cmd keep=""
   daemon="$(tailscaled_bin)"
@@ -692,17 +921,20 @@ start_tailscaled() {
 
   # The flock lives in a subshell so it is released the moment the fork window
   # closes — a long-lived worker holding it forever would wedge later starts.
-  # The daemon child closes fd 9 itself so it does not inherit the lock.
+  # F7 (#7): spawn_detached closes BOTH lock fds (fd 8 + fd 9) on the daemon so
+  # it inherits neither — see the helper. The old code closed only fd 9 (as a
+  # sloppy `9<&-`) and never fd 8, so tailscaled held the converge lock for its
+  # whole life and starved every tick.
   (
     exec 9>"$START_LOCK"
     flock -n 9 || exit 3
-    setsid -f env TS_DEBUG_FIREWALL_MODE="${TS_DEBUG_FIREWALL_MODE:-nftables}" \
+    spawn_detached "$TAILSCALED_LOG" \
+      env TS_DEBUG_FIREWALL_MODE="${TS_DEBUG_FIREWALL_MODE:-nftables}" \
       "$daemon" \
         --statedir="$STATE_DIR" \
         --socket="$TS_SOCK" \
         --tun=tailscale0 \
-        --port=41641 \
-        9<&- >>"$TAILSCALED_LOG" 2>&1
+        --port=41641
   )
   if [ "$?" = 3 ]; then
     wait_for_socket || true
@@ -729,51 +961,139 @@ start_tailscaled() {
 # Everything after a successful login goes through `tailscale set` (up resets
 # flags it is not given). NoState right after daemon start is NOT NeedsLogin —
 # it stays in the *) arm below and never mints, per the house rule.
-ensure_login() {
-  local b st
-  st="$(wait_for_backend || true)"
-  case "$st" in Running|Starting) return 0 ;; esac
-  case "$st" in NeedsLogin|Stopped|"") ;; *) return 0 ;; esac
-
+# F9 (#9): invoke `tailscale up --force-reauth` with the MENTIONS current
+# tailscale (1.102.x) demands. It refuses re-auth otherwise:
+#   "changing settings via 'tailscale up' requires mentioning all non-default
+#    flags".
+# We add --hostname=<current> always, and --advertise-tags=<current> ONLY when
+# the device already carries tags (F11 distinction: mentioning tags the node
+# already has is the required MENTION, not INTRODUCING new tags on re-auth —
+# never source these from config.toml). We NEVER use --reset (it would drop
+# prefs we then have to re-set). #9(c): the failure is no longer swallowed with
+# `|| true` — we capture combined output and, on non-zero rc, log the actual
+# tailscale error at ERROR level, calling out the mentioning-flags case
+# explicitly. Non-fatal to the tick (no set -e escape) but always VISIBLE.
+# Args: $1 = human reason for the log; remaining args appended to the up argv
+# (e.g. --auth-key=...). Returns the tailscale rc.
+run_reauth_up() {
+  local reason="$1"; shift
+  local b hostname tags out rc
   b="$(tailscale_bin)"
   [ -x "$b" ] || return 0
   local -a up
   up=("$b" up --ssh=false --advertise-exit-node --accept-dns
-      --snat-subnet-routes=true --timeout=25s)
+      --snat-subnet-routes=true --timeout=25s --force-reauth)
   id box >/dev/null 2>&1 && up+=(--operator=box)
+
+  # H6 (#9): resolve the current hostname from THREE sources in order —
+  # live prefs, the frozen hostname file, then status --json Self.HostName.
+  # If ALL are empty we must NOT attempt: current tailscale refuses an `up`
+  # that omits an already-set --hostname, so a re-auth with no hostname is a
+  # guaranteed-failing command. A doomed `up` is worse than an honest skip
+  # (it still counts as an attempt against the control plane and logs noise).
+  hostname="$(prefs_hostname)"
+  [ -n "$hostname" ] || hostname="$(read_box_name || true)"
+  [ -n "$hostname" ] || hostname="$(ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(((json.load(sys.stdin).get("Self") or {}).get("HostName") or "").strip())
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+  if [ -z "$hostname" ]; then
+    log "login: ERROR cannot resolve current hostname (prefs, $HOSTNAME_FILE, and status Self.HostName all empty) — REFUSING re-auth; a --hostname-less force-reauth is refused by tailscale and would just churn. Fix the hostname source, then retry." >&2
+    return 3
+  fi
+  up+=(--hostname="$hostname")
+
+  tags="$(current_advertise_tags)"
+  if [ -n "$tags" ]; then
+    up+=(--advertise-tags="$tags")
+    log "login: $reason — mentioning current prefs hostname=$hostname tags=$tags (--force-reauth)"
+  else
+    log "login: $reason — mentioning current prefs hostname=$hostname (no tags on device) (--force-reauth)"
+  fi
+
+  out="$("${up[@]}" "$@" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "login: tailscale up --force-reauth FAILED rc=$rc: $out" >&2
+    case "$out" in
+      *"requires mentioning all non-default flags"*)
+        log "login: ERROR tailscale refused re-auth — it wants ALL non-default flags mentioned. Our argv had hostname=$hostname tags=${tags:-<none>}. Tailscale's suggested command is in the error text above; a pref changed underneath us." >&2
+        ;;
+    esac
+  fi
+  return "$rc"
+}
+
+ensure_login() {
+  local st
+  st="$(wait_for_backend || true)"
+  case "$st" in Running|Starting) return 0 ;; esac
+  case "$st" in NeedsLogin|Stopped|"") ;; *) return 0 ;; esac
+
+  local b
+  b="$(tailscale_bin)"
+  [ -x "$b" ] || return 0
+  # P1-1: ONE attempt limiter for ALL `tailscale up` invocations — first-login
+  # AND re-auth. Every `up` (re-register OR fresh join) rewrites registration
+  # against the control plane; a rc=0 `up` that only printed an AuthURL must not
+  # license another attempt next tick. 30-min floor, rc-independent (H5).
+  if ! reauth_attempt_allowed; then
+    log "login: backend=$st but a tailscale up was attempted <${REAUTH_MIN_INTERVAL}s ago — rate-limited, skipping this tick" >&2
+    return 0
+  fi
+  reauth_attempt_record
+  local urc=0
   # A populated statedir at NeedsLogin means an existing identity whose node
   # key expired or was revoked; --force-reauth re-auths it in place (same key).
   # An empty statedir is a first login and must NOT get --force-reauth.
   if state_is_populated; then
-    up+=(--force-reauth)
-    # Tags are auth-time-only and NEVER added on the --force-reauth branch
-    # (F11): an unattended ~180-day key-expiry re-auth must not convert a
-    # user-owned node to tag-owned (ACL semantics change, tagged keys stop
-    # expiring, and an unauthorized tag is REJECTED after --force-reauth
-    # already rotated keys — leaving the box locked out, headscale#3374).
-    # Retagging an existing node is a documented MANUAL operator step.
+    # Tags are auth-time-only and NEVER INTRODUCED on the --force-reauth branch
+    # (F11 / see H8 in docs/AGENT.md for the control-plane scoping): an
+    # unattended re-auth must not convert a user-owned node to tag-owned.
+    # F9 (#9): run_reauth_up still MENTIONS the tags the device ALREADY carries
+    # (from live prefs, never config.toml) because current tailscale refuses an
+    # up that omits an already-set non-default flag. Mentioning is not
+    # introducing. Retagging is still a documented MANUAL operator step.
+    # P0-C (#9): do NOT swallow the re-auth rc with `|| true`. run_reauth_up
+    # already logs the tailscale error text; the CALLER also records the outcome.
     if [ -s "$AUTHKEY_FILE" ]; then
-      log "login: re-auth existing identity with auth-key (--force-reauth)"
-      "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
+      run_reauth_up "re-auth existing identity with auth-key" \
+        --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")"; urc=$?
     else
-      log "login: re-auth existing identity, minting AuthURL (--force-reauth) — see boxup status"
-      "${up[@]}" || true
+      run_reauth_up "re-auth existing identity, minting AuthURL — see boxup status"; urc=$?
+    fi
+    if [ "$urc" -ne 0 ]; then
+      log "login: re-auth (NeedsLogin, populated statedir) FAILED rc=$urc — see the tailscale error above; node stays NeedsLogin, will retry after the attempt-limiter window" >&2
     fi
   else
     # First login (empty statedir). This is the ONLY place --advertise-tags is
-    # added: config [tailscale] tags, when non-empty, tags the node at initial
-    # registration. Default unset => flag omitted => byte-identical to before.
-    local tags
+    # added from config: config [tailscale] tags, when non-empty, tags the node
+    # at initial registration. Default unset => flag omitted => byte-identical
+    # to before. Left intentionally UNCHANGED by #9 (first-login branch only).
+    local -a up
+    up=("$b" up --ssh=false --advertise-exit-node --accept-dns
+        --snat-subnet-routes=true --timeout=25s)
+    id box >/dev/null 2>&1 && up+=(--operator=box)
+    local tags out
     tags="$(config_get tailscale tags || true)"
     [ -n "$tags" ] && up+=(--advertise-tags="$tags")
+    # P1-1: do NOT swallow the first-login `up` rc with `|| true`. Capture the
+    # combined output, log it, and surface a non-zero rc so a failing first
+    # login is visible (a `check` FAIL + a degraded converge), not silent.
     if [ -s "$AUTHKEY_FILE" ]; then
       log "login: auth-key join (statedir empty)${tags:+ tags=$tags}"
-      "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
+      out="$("${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" 2>&1)"; urc=$?
     else
       log "login: minting AuthURL (statedir empty, no key)${tags:+ tags=$tags} — see boxup status"
-      "${up[@]}" || true
+      out="$("${up[@]}" 2>&1)"; urc=$?
+    fi
+    if [ "$urc" -ne 0 ]; then
+      log "login: first-login tailscale up FAILED rc=$urc: $out" >&2
     fi
   fi
+  return "$urc"
 }
 
 # --- converge: name ----------------------------------------------------------
@@ -838,17 +1158,130 @@ print(f"grok-box-{n}")
 PY
 }
 
+# H13: the LIVE hostname the control plane currently has for Self (status JSON
+# Self.HostName). The frozen $HOSTNAME_FILE is the INTENT; this is the observed
+# POSTCONDITION. After an auth-key rejoin the node can register under the OS
+# hostname (`cursor`) even though the file says grok-box-8 — box-8 Stage 3.
+live_hostname() {
+  ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(((json.load(sys.stdin).get("Self") or {}).get("HostName") or "").strip())
+except Exception:
+    print("")
+' 2>/dev/null || true
+}
+
+# F2: the LIVE MagicDNS first label (Self.DNSName, e.g.
+# "grok-box-8-1.tail8ecb39.ts.net." -> "grok-box-8-1"). This is what peers
+# actually resolve/reach. On a state-loss rejoin while the STALE node still
+# holds `grok-box-8`, the new node's DNSName gets a `-1` suffix even though its
+# Self.HostName is already `grok-box-8` — so a HostName-only comparison passes
+# while the box is unreachable under its intended MagicDNS name.
+live_dnsname_label() {
+  ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = ((json.load(sys.stdin).get("Self") or {}).get("DNSName") or "").strip().rstrip(".")
+    print(d.split(".")[0] if d else "")
+except Exception:
+    print("")
+' 2>/dev/null || true
+}
+
+# H13/F2: true (0) iff the frozen file name is a grok-box-N AND the live control-
+# plane identity differs from it, in EITHER of two ways. Sets NAME_MISMATCH_KIND
+# (hostname|dns), NAME_MISMATCH_FILE, NAME_MISMATCH_LIVE for callers.
+#   * kind=hostname: Self.HostName != file (e.g. `cursor`). Self-FIXABLE on-box
+#     via `tailscale set --hostname=<file>`.
+#   * kind=dns: Self.HostName already == file BUT the MagicDNS first label != file
+#     (e.g. `grok-box-8-1` — the split-brain `-1` suffix). NOT self-fixable:
+#     `tailscale set --hostname` is a no-op when the hostname is unchanged; the
+#     stale device must be deleted then the live device renamed via the API
+#     (brain/operator, FLEET-BRAIN row b). ensure_name reports it, does not spin.
+# HostName mismatch is checked first (it's the fixable one). A missing file name
+# or unreadable live values ⇒ NOT a mismatch (we only act on a concrete intent).
+NAME_MISMATCH_FILE=""
+NAME_MISMATCH_LIVE=""
+NAME_MISMATCH_KIND=""
+name_mismatch() {
+  local f l dns
+  NAME_MISMATCH_FILE=""; NAME_MISMATCH_LIVE=""; NAME_MISMATCH_KIND=""
+  f="$(read_box_name || true)"
+  case "$f" in grok-box-[0-9]*) ;; *) return 1 ;; esac
+  l="$(live_hostname)"
+  if [ -n "$l" ] && [ "$f" != "$l" ]; then
+    NAME_MISMATCH_FILE="$f"; NAME_MISMATCH_LIVE="$l"; NAME_MISMATCH_KIND=hostname
+    return 0
+  fi
+  dns="$(live_dnsname_label)"
+  if [ -n "$dns" ] && [ "$f" != "$dns" ]; then
+    NAME_MISMATCH_FILE="$f"; NAME_MISMATCH_LIVE="$dns"; NAME_MISMATCH_KIND=dns
+    return 0
+  fi
+  return 1
+}
+
 ensure_name() {
   local name
   name="$(read_box_name || true)"
-  case "$name" in grok-box-[0-9]*) return 0 ;; esac
-  read_ts_fields
-  [ "$backend" = Running ] || return 0
-  name="$(pick_name 2>/dev/null || true)"
+  # First: pick + freeze a name if we don't have one yet.
   case "$name" in
+    grok-box-[0-9]*) ;;
+    *)
+      read_ts_fields
+      [ "$backend" = Running ] || return 0
+      name="$(pick_name 2>/dev/null || true)"
+      case "$name" in
+        grok-box-[0-9]*)
+          printf '%s\n' "$name" > "$HOSTNAME_FILE"
+          log "name: picked $name"
+          ;;
+        *) return 0 ;;   # couldn't pick yet
+      esac
+      ;;
+  esac
+  # H13/F2: the file is the INTENT; enforce it against the LIVE postcondition.
+  if name_mismatch; then
+    if [ "$NAME_MISMATCH_KIND" = hostname ]; then
+      # Self.HostName differs (e.g. `cursor` after a rejoin) — self-fixable:
+      # push `tailscale set --hostname` (not `up`, so no other pref resets).
+      log "name: live=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE — pushing tailscale set --hostname" >&2
+      local b
+      b="$(tailscale_bin)"
+      if [ -x "$b" ]; then
+        if id box >/dev/null 2>&1 && timeout 25 sudo -n -u box "$b" set --hostname="$NAME_MISMATCH_FILE" 2>/dev/null; then
+          :
+        else
+          timeout 25 "$b" set --hostname="$NAME_MISMATCH_FILE" 2>/dev/null || \
+            log "name: tailscale set --hostname=$NAME_MISMATCH_FILE failed" >&2
+        fi
+      fi
+    else
+      # F2 kind=dns: the MagicDNS name carries a `-1` split-brain suffix while
+      # Self.HostName is already correct. `tailscale set --hostname` is a NO-OP
+      # here (hostname unchanged) so we do NOT spin on it — this is NOT fixable
+      # on-box. It needs the brain/operator to DELETE the stale duplicate device
+      # then POST /api/v2/device/<live-id>/name. Log it; `check` reports it.
+      log "name: dns=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE — split-brain MagicDNS suffix, NOT on-box fixable; brain/operator must delete the stale device + POST /device/name" >&2
+    fi
+  fi
+  # F3 (P2): also set the OS hostname to the frozen grok-box-N. The sand image
+  # ships OS hostname `cursor`; leaving it means prompts, logs, and `hostname`
+  # all say `cursor`, which misleads an operator ssh'd into the box (box-8 test:
+  # the reproducer printed "on cursor"). This is COSMETIC (tailscale identity is
+  # unaffected — that's Self.HostName/prefs, handled above) and BEST-EFFORT
+  # (log, never fail a converge). Re-applied every converge because the overlay
+  # (incl. /etc/hostname) dies on an image swap, same as passwords/nft. Only
+  # when we have a concrete grok-box-N.
+  local want
+  want="$(read_box_name || true)"
+  case "$want" in
     grok-box-[0-9]*)
-      printf '%s\n' "$name" > "$HOSTNAME_FILE"
-      log "name: picked $name"
+      if [ "$(hostname 2>/dev/null || true)" != "$want" ]; then
+        hostname "$want" 2>/dev/null || log "name: could not set OS hostname to $want (need CAP_SYS_ADMIN)" >&2
+        printf '%s\n' "$want" > /etc/hostname 2>/dev/null || true
+      fi
       ;;
   esac
 }
@@ -856,16 +1289,19 @@ ensure_name() {
 # --- converge: exit-node refresh --------------------------------------------
 # Full flag set. Prefer operator=box; fall back to root if that user cannot
 # talk to the daemon yet (first join, operator not written).
+# H3: each `set` is wrapped in `timeout` — an unbounded `tailscale set` is the
+# realistic way the converge body could hold the lock past 60s and starve the
+# next converge; bound it so the lock is always released promptly.
 tailscale_set_full() {
   local name="$1" b
   b="$(tailscale_bin)"
   [ -x "$b" ] || return 1
-  if id box >/dev/null 2>&1 && sudo -n -u box "$b" set --hostname="$name" \
+  if id box >/dev/null 2>&1 && timeout 25 sudo -n -u box "$b" set --hostname="$name" \
       --ssh=false --operator=box --advertise-exit-node \
       --snat-subnet-routes=true --stateful-filtering=false 2>/dev/null; then
     return 0
   fi
-  "$b" set --hostname="$name" --ssh=false --operator=box \
+  timeout 25 "$b" set --hostname="$name" --ssh=false --operator=box \
     --advertise-exit-node --snat-subnet-routes=true \
     --stateful-filtering=false
 }
@@ -893,6 +1329,41 @@ refresh_backoff_window() {
   elif [ "$n" -eq 2 ]; then echo 180
   else                      echo 600
   fi
+}
+
+# --- re-auth ATTEMPT limiter (H5) --------------------------------------------
+# A `tailscale up` ATTEMPT (first-login OR force-reauth) rewrites registration
+# against the control plane; a storm is worse than the bug. The prior design
+# keyed a backoff off rc, but a rc=0 `up` that only PRINTED an AuthURL reset the
+# counter and left a 20s floor (~180 attempts/hour). ONE mechanism now, separate
+# from the D4 refresh backoff: a hard minimum interval between attempts
+# (REAUTH_MIN_INTERVAL, 30 min), rc-independent. (N1/D6: an earlier per-hour cap
+# was removed as redundant — a 30-min floor already caps attempts at 2/hour, so
+# a second knob could never bind first.)
+# Why 30 min: comfortably above tailscale control-plane rate-limit headroom for
+# `up`, and 1800s == the hourly-automation period / 2, so the external hourly
+# `boxup once` and a 15s worker tick can never double-fire a re-auth for one
+# outage (two attempts can't fall inside one 3600s period). Persisted under
+# $RUN_DIR — ephemeral, so a reboot/swap legitimately resets and a fresh box may
+# attempt once immediately.
+REAUTH_LAST="$RUN_DIR/last-reauth"          # unix ts of the last ATTEMPT
+REAUTH_MIN_INTERVAL="${BOXUP_REAUTH_MIN_INTERVAL:-1800}"   # 30 min
+
+# 0 (proceed) iff we are outside the min-interval floor; else 1. Read-only —
+# the caller calls reauth_attempt_record() only when it actually attempts.
+reauth_attempt_allowed() {
+  local now last
+  now=$(date +%s)
+  last=0
+  [ -f "$REAUTH_LAST" ] && last=$(tr -d '[:space:]' < "$REAUTH_LAST" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ "$last" -le 0 ] && return 0
+  [ $((now - last)) -ge "$REAUTH_MIN_INTERVAL" ]
+}
+
+# Record that an attempt happened NOW (regardless of its rc).
+reauth_attempt_record() {
+  date +%s > "$REAUTH_LAST" 2>/dev/null || true
 }
 
 # Push a full `tailscale set` when the coordination server would show "unable
@@ -1057,6 +1528,14 @@ recycle_tailscaled() {
   start_tailscaled || true
   # Hostinfo set is skipped while backend=NoState; wait out the blip.
   wait_for_backend >/dev/null || true
+  # H4 (#8): consume the FRESH BackendState the restart produced. A node that
+  # was deleted server-side stays Running-but-dead across a LocalAPI query, but
+  # a genuine daemon RESTART re-reads state and lands in NeedsLogin (upstream
+  # tailscale/tailscale#20615) — so re-auth is driven by recycle-then-read, not
+  # by log parsing. ensure_login MUST run before refresh_exitnode: a freshly
+  # NeedsLogin daemon otherwise sits idle until the next hourly converge (the
+  # gate flagged this exact ordering bug — old code only called refresh here).
+  ensure_login || true
   refresh_exitnode || true
 }
 
@@ -1085,8 +1564,13 @@ maybe_wake_recycle() {
   recycle_tailscaled "time jump ${age}s (hb) — map poll dies on freeze"
 }
 
-# Process alive + Running + (Online=false or map-poll Health) after freeze.
-# Not NeedsLogin, not a new AuthURL.
+# Process alive + Running + (Online=false OR map-poll/out-of-sync Health) that
+# persists ⇒ recycle. H4 (#8): this is the recycle-then-read driver for a
+# server-deleted node too — a deleted node stays Running-but-dead on a LocalAPI
+# query, but the RESTART inside recycle_tailscaled re-reads state and lands in
+# NeedsLogin, which recycle_tailscaled → ensure_login then re-auths. No Health
+# text matching, no log parsing: persistent Online=false / not-in-map-poll is
+# the trigger, the restart produces the authoritative BackendState.
 recycle_offline_tailscaled() {
   local now last ticks do_recycle=0
   recycled_recently && return 0
@@ -1138,16 +1622,62 @@ do_tick() {
   ensure_forwarding || true
   ensure_nat || true
 
-  if ! pgrep -x sshd >/dev/null 2>&1; then
-    [ -x /usr/sbin/sshd ] && /usr/sbin/sshd 2>/dev/null || true
+  # P1-1 (H12, unified): the tick's health probe IS `check_reason` — the SINGLE
+  # health predicate, so the tick and `boxup check` can never diverge. If any
+  # predicate fails, run the FULL do_ensure_body under this tick's lock (stop
+  # hand-picking which repair a tick may run: the tick's job is "if not
+  # converged, converge"). A persistently UNSATISFIABLE predicate is bounded by
+  # the SAME backoff shape as refresh (20→60→180→600s cap) with `repair=failing:N`
+  # in status and a log line naming the reason — never a blind fixed loop. The
+  # freeze/recycle above stays: it handles sleep/thaw liveness that check can't
+  # express, and it must run every tick regardless of the backoff window.
+  local reason
+  reason="$(check_reason)"
+  if [ -n "$reason" ]; then
+    local fails window now last
+    fails=$(repair_fail_count)
+    window=$(refresh_backoff_window "$fails")
+    now=$(date +%s); last=0
+    [ -f "$RUN_DIR/last-repair" ] && last=$(tr -d '[:space:]' < "$RUN_DIR/last-repair" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$window" ]; then
+      log "tick: unhealthy (reason=$reason) but repair backing off (window=${window}s fails=${fails})" >&2
+    else
+      log "tick: unhealthy (reason=$reason) — running full do_ensure_body under the lock" >&2
+      echo "$now" > "$RUN_DIR/last-repair" 2>/dev/null || true
+      do_ensure_body || true
+      # Re-evaluate: a cleared predicate resets the backoff, a persistent one
+      # stretches it (bounded, visible via repair=failing:N in status).
+      if [ -n "$(check_reason)" ]; then
+        fails=$((fails + 1))
+        echo "$fails" > "$RUN_DIR/fail.repair" 2>/dev/null || true
+        window=$(refresh_backoff_window "$fails")
+        log "tick: still unhealthy after repair (consecutive=${fails}, next window=${window}s)" >&2
+      else
+        echo 0 > "$RUN_DIR/fail.repair" 2>/dev/null || true
+      fi
+    fi
+  else
+    # Healthy: reset the repair backoff and do the cheap idempotent maintenance.
+    echo 0 > "$RUN_DIR/fail.repair" 2>/dev/null || true
+    case "$(read_box_name || true)" in
+      grok-box-[0-9]*)
+        pgrep -x tailscaled >/dev/null 2>&1 && refresh_exitnode || true
+        ;;
+    esac
   fi
-
-  case "$(read_box_name || true)" in
-    grok-box-[0-9]*)
-      pgrep -x tailscaled >/dev/null 2>&1 && refresh_exitnode || true
-      ;;
-  esac
   date +%s > "$RUN_DIR/hb" 2>/dev/null || true
+}
+
+# P1-1: consecutive tick-repair failures (a persistently UNSATISFIABLE check
+# predicate). Reuses refresh_backoff_window (20→60→180→600s). Ephemeral run-dir
+# state (resets free on reboot/recycle), like fail.refresh.
+repair_fail_count() {
+  local n=0
+  [ -f "$RUN_DIR/fail.repair" ] && \
+    n=$(tr -d '[:space:]' < "$RUN_DIR/fail.repair" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
 }
 
 # run_tick: take the converge lock with flock -n (skip on contention). A tick
@@ -1207,11 +1737,19 @@ stop_workers() {
 }
 
 worker_loop() {
+  local trc
   ensure_dirs
   echo $$ > "$WORKER_PID"
   echo "boxup-worker v$BOXUP_VERSION pid=$$ interval=$INTERVAL freeze=${FREEZE_SECS}s" >> "$WORKER_LOG"
   while true; do
-    run_tick >> "$WORKER_LOG" 2>&1 || true
+    # P1: capture and surface the tick rc instead of a blanket `|| true`.
+    # run_tick is designed to return 0 (B1: a skipped tick is liveness), so a
+    # NON-zero here means run_tick itself errored unexpectedly — log it rather
+    # than discard it silently. Never break the loop (the self-heal must keep
+    # ticking past a transient failure — D8 `set -u` not blanket `set -e`).
+    run_tick >> "$WORKER_LOG" 2>&1
+    trc=$?
+    [ "$trc" -ne 0 ] && log "worker: run_tick returned rc=$trc (unexpected; loop continues)" >> "$WORKER_LOG" 2>&1
     if [ "$(wc -c < "$WORKER_LOG" 2>/dev/null || echo 0)" -gt 10485760 ]; then
       : > "$WORKER_LOG"
     fi
@@ -1225,7 +1763,11 @@ start_daemon() {
   # once kept an old version's worker in memory next to a newer install.
   stop_workers
   rm -f "$WORKER_PID"
-  setsid -f env BOX_SETUP_ROOT="$ROOT" bash "$SELF" worker >/dev/null 2>&1
+  # F7/P0-A: route the worker spawn through spawn_detached too. Currently benign
+  # (start_daemon runs at top level, after the lock subshell has exited) but it
+  # is one refactor away from being bug #7 again if start_daemon is ever called
+  # from under the converge lock — one helper, no special cases.
+  spawn_detached "" env BOX_SETUP_ROOT="$ROOT" bash "$SELF" worker
   local i=0
   while [ "$i" -lt 15 ]; do
     if [ -f "$WORKER_PID" ] && kill -0 "$(cat "$WORKER_PID" 2>/dev/null)" 2>/dev/null; then
@@ -1287,7 +1829,22 @@ print_status() {
   local rf
   rf=$(refresh_fail_count)
   [ "$rf" -ge 3 ] && printf ' refresh=failing:%s' "$rf"
+  # P1-1: a persistently unsatisfiable tick-repair predicate is bounded by the
+  # same backoff as refresh; surface it at N>=1 so an unhealthy-but-backing-off
+  # box is visible (unlike refresh, ANY repair failure is worth showing).
+  local rp
+  rp=$(repair_fail_count)
+  [ "$rp" -ge 1 ] && printf ' repair=failing:%s' "$rp"
   [ -n "${auth:-}" ] && printf ' auth=%s' "$auth"
+  # H11: surface auth-key expiry (warn/expired only; ok/none stay silent so a
+  # healthy box's status line is unchanged).
+  local akx
+  akx="$(authkey_expiry_state)"
+  case "$akx" in
+    warn)    printf ' authkey=expiring:%s' "$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)" ;;
+    expired) printf ' authkey=EXPIRED:%s' "$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)" ;;
+    unknown) printf ' authkey=unknown-expiry' ;;
+  esac
   printf '\n'
 }
 
@@ -1303,6 +1860,26 @@ print_status() {
 # downgrade a new fleetctl to the legacy status parse. Every failure here is
 # exit 1; the dispatch arm below runs do_check and translates its rc to 0/1.
 do_check() {
+  local reason
+  reason="$(check_reason)"
+  if [ -n "$reason" ]; then
+    echo "check=FAIL reason=$reason"
+    return 1
+  fi
+  printf 'check=OK '
+  print_status
+  return 0
+}
+
+# check_reason: the SINGLE health predicate, factored out so BOTH `boxup check`
+# and the worker tick (P1-1) use the exact same list — no parallel/forked
+# predicate set can drift. Prints the first-failed-predicate string (empty ⇒
+# healthy). Read-only apart from the once/hour unknown-expiry warn. Cost: one
+# read_ts_fields (ts status --json + python), one advertised_routes (ts debug
+# prefs + python) only on the happy path, passwd -S x1-2, a few pgrep — ~2
+# tailscale calls, well within a 15s tick (measured acceptable; if a future
+# tailscale makes status slow, cache it, do NOT fork the list).
+check_reason() {
   local reason="" v4 v6 hb_secs now last ts_count pid cmd routes
   v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
   v6=$(tr -d '[:space:]' < /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
@@ -1315,8 +1892,46 @@ do_check() {
   if [ -z "$reason" ] && [ "${online:-no}" != yes ]; then
     reason="online=${online:-no} (want yes)"
   fi
+  # H13 (P1-4): the name postcondition has TWO failure modes.
+  #   * rejoin/wrong-name: file says grok-box-N but live Self.HostName differs
+  #     (e.g. `cursor` after an auth-key rejoin) — name_mismatch.
+  #   * fresh/unnamed: no grok-box-N frozen yet while backend=Running with peers
+  #     visible — the box SHOULD have picked a name by now; `name=-` is NOT
+  #     healthy. (We gate on peers so a lone first node isn't failed forever.)
+  if [ -z "$reason" ] && name_mismatch; then
+    if [ "$NAME_MISMATCH_KIND" = dns ]; then
+      reason="name: dns=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE"
+    else
+      reason="name: live=$NAME_MISMATCH_LIVE want=$NAME_MISMATCH_FILE"
+    fi
+  fi
+  if [ -z "$reason" ]; then
+    case "$(read_box_name || true)" in
+      grok-box-[0-9]*) ;;
+      *) has_peers && reason="name: unnamed" ;;
+    esac
+  fi
   if [ -z "$reason" ] && ! pgrep -x sshd >/dev/null 2>&1; then
     reason="sshd=down (want up)"
+  fi
+  # H7 (P0): sshd running is not a working login. Verify the login accounts
+  # actually have a usable password — the resurrection-path invariant.
+  # D8: `box` is THE login account; a MISSING box account is a FAILURE, not a
+  # skip (the old `id box && ...` silently passed a box with no box account).
+  if [ -z "$reason" ] && ! id box >/dev/null 2>&1; then
+    reason="login: box account missing"
+  fi
+  if [ -z "$reason" ] && ! account_unlocked box; then
+    reason="account box=locked (sshd up but no usable login)"
+  fi
+  if [ -z "$reason" ] && id root >/dev/null 2>&1 && ! account_unlocked root; then
+    reason="account root=locked (sshd up but no usable login)"
+  fi
+  # H12: sshd up + accounts unlocked is still not a working login without host
+  # keys on disk (box-8 Stage 1 wiped them). Same file ensure_host_keys treats
+  # as the presence marker, so "present" means sshd can start with OUR identity.
+  if [ -z "$reason" ] && ! host_keys_present; then
+    reason="host keys missing (/etc/ssh/ssh_host_ed25519_key)"
   fi
   if [ -z "$reason" ] && { [ "$v4" != 1 ] || [ "$v6" != 1 ]; }; then
     reason="ipfwd=4:${v4},6:${v6} (want 4:1,6:1)"
@@ -1361,40 +1976,94 @@ do_check() {
       fi
     fi
   fi
-
-  if [ -n "$reason" ]; then
-    echo "check=FAIL reason=$reason"
-    return 1
+  # H11: an EXPIRED auth key means the box's only unattended recovery path is
+  # dead — it is not healthy, it just hasn't needed to recover yet. Fail check.
+  # (A key expiring soon is a WARNING surfaced in status, not a check failure.)
+  # D6: an UNKNOWN expiry (missing/unparseable .expires sidecar) is NOT a FAIL
+  # — the key may be valid, we just can't prove it — but it is NOT silent
+  # either: WARN once per hour so a never-seeded sidecar stays visible.
+  local akx_check
+  akx_check="$(authkey_expiry_state)"
+  if [ -z "$reason" ] && [ "$akx_check" = expired ]; then
+    reason="authkey EXPIRED ($(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)) — unattended recovery path is dead"
   fi
-  printf 'check=OK '
-  print_status
-  return 0
+  if [ "$akx_check" = unknown ]; then
+    local uxlog now_u last_u
+    uxlog="$RUN_DIR/last-authkey-unknown.log"
+    now_u=$(date +%s); last_u=0
+    [ -f "$uxlog" ] && last_u=$(tr -d '[:space:]' < "$uxlog" 2>/dev/null || echo 0)
+    case "$last_u" in ''|*[!0-9]*) last_u=0 ;; esac
+    if [ $((now_u - last_u)) -ge 3600 ]; then
+      echo "$now_u" > "$uxlog" 2>/dev/null || true
+      log "check: WARN authkey expiry unknown ($AUTHKEY_EXPIRES missing or unparseable) — seed it (see docs/AGENT.md §A); key may still be valid, not failing check" >&2
+    fi
+  fi
+  printf '%s' "$reason"
 }
+
 
 # --- converge ----------------------------------------------------------------
 # The converge body. Runs under the converge lock (via do_ensure).
+# P1: previously every member was bare or `|| true`, so a converge reported
+# success even if every step failed — invisibly. We now run each step through
+# _ensure_step, which logs a non-zero rc and records a `degraded` marker under
+# $RUN_DIR. The function's RETURN SEMANTICS ARE UNCHANGED (callers depend on
+# do_ensure_body not failing a tick): it still returns 0 regardless. The marker
+# and per-step logs are the visibility; they do not gate convergence. A clean
+# converge clears the marker.
+DEGRADED_MARKER="$RUN_DIR/degraded"
+
+# _ensure_step <label> <fn>: run <fn>, log its rc if non-zero, set the degraded
+# flag (shell var `_degraded`) so the body can stamp the marker. Never aborts.
+_ensure_step() {
+  local label="$1" fn="$2" rc
+  "$fn"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "converge: step '$label' rc=$rc (converge continues, marking degraded)" >&2
+    _degraded=1
+  fi
+  return 0
+}
+
 do_ensure_body() {
+  local _degraded=0
   ensure_dirs
-  ensure_packages
-  ensure_tailscale_bin || true
-  ensure_sshd
-  ensure_forwarding || true
-  start_tailscaled || true
+  _ensure_step packages       ensure_packages
+  _ensure_step tailscale-bin  ensure_tailscale_bin
+  _ensure_step sshd           ensure_sshd
+  _ensure_step forwarding     ensure_forwarding
+  _ensure_step tailscaled     start_tailscaled
   wait_for_socket || true
-  ensure_login
-  ensure_name
-  ensure_nat || true
-  refresh_exitnode || true
+  _ensure_step login          ensure_login
+  _ensure_step name           ensure_name
+  _ensure_step nat            ensure_nat
+  _ensure_step refresh        refresh_exitnode
+  # Visibility only — does NOT change the return code (callers depend on a tick
+  # not being failed by a degraded converge). A clean pass clears the marker.
+  if [ "$_degraded" = 1 ]; then
+    date +%s > "$DEGRADED_MARKER" 2>/dev/null || true
+  else
+    rm -f "$DEGRADED_MARKER" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # do_ensure: take the converge lock with flock -w 60 (bounded WAIT, never
 # skip — `boxup once` is AGENT.md's remedy for nearly every symptom, so a tick
-# holding the lock must delay converge, not fake it out). ensure_dirs must run
-# BEFORE we open the lock file (CONVERGE_LOCK lives in RUN_DIR); if RUN_DIR is
-# absent run_with_converge_lock fails open and converge still runs unlocked.
+# holding the lock must delay converge, not fake it out). H3: if the lock
+# cannot be taken within the window we do NOT converge unlocked — do_ensure
+# returns non-zero (201) so `boxup once`/`up`/`ensure` surface a hard error
+# rather than silently faking a converge. ensure_dirs runs BEFORE we open the
+# lock file (CONVERGE_LOCK lives in RUN_DIR).
 do_ensure() {
+  local rc
   ensure_dirs
   run_with_converge_lock wait do_ensure_body
+  rc=$?
+  if [ "$rc" = 201 ]; then
+    log "converge: could NOT take the converge lock (busy > 60s) — converge SKIPPED, not faked (H3). Retry, or check for a stuck converge/tailscale_set." >&2
+  fi
+  return "$rc"
 }
 
 do_update() {
@@ -1435,20 +2104,33 @@ cmd="${1:-up}"
 case "$cmd" in
   once|--once)
     require_root once
-    do_ensure
+    # H3: if do_ensure could not take the converge lock (rc=201), surface it as
+    # a non-zero exit so the hourly automation sees a failed converge instead of
+    # a faked-success. Still run the tick + status for visibility.
+    do_ensure; _once_rc=$?
     start_daemon
     run_tick
     print_status
+    # Propagate a busy converge lock (201) so hourly automation sees a failed
+    # converge; a clean run must exit 0 explicitly. Without this, the trailing
+    # `[ … = 201 ]` test would be the arm's last status and a healthy converge
+    # (_once_rc=0) would make `boxup once` exit 1 (no set -e). (P2-2, 5.2.0)
+    if [ "$_once_rc" = 201 ]; then exit "$_once_rc"; fi
+    exit 0
     ;;
   ensure|--ensure)
     require_root ensure
-    do_ensure
+    do_ensure   # propagates rc (201 = lock busy, converge NOT faked — H3)
     ;;
   up|--up|"")
     require_root up
-    do_ensure
+    do_ensure; _up_rc=$?
     start_daemon
     print_status
+    # Same trailing-conditional trap as `once`: exit 0 on the clean path, only
+    # propagate a busy converge lock (201). (P2-2, 5.2.0)
+    if [ "$_up_rc" = 201 ]; then exit "$_up_rc"; fi
+    exit 0
     ;;
   tick|--tick)
     require_root tick
