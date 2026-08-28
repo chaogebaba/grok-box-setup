@@ -48,6 +48,10 @@ SSH_STATE_DIR="$ROOT/state/ssh"
 HOSTNAME_FILE="$ROOT/hostname"
 SECRETS_DIR="$ROOT/secrets"
 AUTHKEY_FILE="$SECRETS_DIR/ts-authkey"
+# H11: optional sidecar recording the auth key's expiry (single ISO date
+# YYYY-MM-DD). Tailscale keys expire (<=90d) and the date is NOT recoverable
+# from the key itself, so it must be recorded next to it. Missing = fail-quiet.
+AUTHKEY_EXPIRES="$SECRETS_DIR/ts-authkey.expires"
 BIN_DIR="$ROOT/bin"
 CONFIG_FILE="${BOX_SETUP_CONFIG:-$ROOT/config.toml}"
 
@@ -58,27 +62,29 @@ WORKER_LOG="$LOG_DIR/boxup-worker.log"
 TAILSCALED_LOG="$LOG_DIR/tailscaled.log"
 TS_SOCK="/var/run/tailscale/tailscaled.sock"
 
-# Two flock-guarded critical sections, each on its OWN fd (flock keys on the
-# open-file-description, and holding two different fds to two different files
-# in the SAME process never conflict, but reusing one fd across nested
-# subshells does — so keep them distinct and documented together):
-#   * fd 9 -> START_LOCK        the tailscaled fork window (start_tailscaled,
-#                               taken in a subshell so it releases the instant
-#                               the fork returns; the daemon child closes fd 9).
-#   * fd 8 -> CONVERGE_LOCK     converge mutual exclusion (D3): run_tick takes
-#                               it with `flock -n` (skip-on-contention — a
-#                               converge in progress is itself liveness), while
-#                               do_ensure/`boxup once` takes it with `flock -w
-#                               60` (bounded WAIT — `boxup once` is AGENT.md's
-#                               remedy for nearly every symptom and must not be
-#                               silently skipped). BOTH live in a subshell (or
-#                               close the fd explicitly) because `boxup once`
-#                               runs do_ensure then run_tick sequentially in one
-#                               process and a process-held lock would deadlock.
-#                               Fail-open: if the lock file cannot be opened the
-#                               guarded work still runs (the lock is an
-#                               optimization against duplicate work, never a
-#                               gate on convergence).
+# Two flock-guarded critical sections. Since H1 (iter3 hotfix) the converge
+# lock uses flock --close semantics — the body runs with the lock fd CLOSED for
+# it and every descendant — so the historical "which fd, and does the child
+# close it" hazard is gone by construction. The fds:
+#   * fd 9 -> CONVERGE_LOCK     converge mutual exclusion (D3): an OUTER subshell
+#                               holds fd 9 for the body's whole duration; the
+#                               body runs in an INNER subshell with `9<&-` so
+#                               neither it nor any descendant inherits the lock.
+#                               run_tick takes it `flock -n 9` (skip-on-
+#                               contention — a converge in progress is itself
+#                               liveness); do_ensure/`boxup once` takes it
+#                               `flock -w 60 9` (bounded WAIT). H3: we NEVER run
+#                               the body unlocked — a timeout/open-failure is a
+#                               hard skip (tick) or non-zero (once), not an
+#                               unlocked run.
+#   * fd 9 -> START_LOCK        the tailscaled fork window inside start_tailscaled,
+#                               in ITS OWN subshell (the converge body has fd 9
+#                               closed, so this fresh fd 9 does not collide).
+#                               spawn_detached closes fd 8 and fd 9 on the child
+#                               as belt-and-braces defense-in-depth.
+# fd 8 is no longer a converge-lock fd (it was, pre-hotfix); spawn_detached
+# still closes it so a legacy daemon's inherited fd 8 is never propagated
+# further.
 START_LOCK="/run/tailscaled.start.lock"
 CONVERGE_LOCK="$RUN_DIR/converge.lock"
 
@@ -95,204 +101,112 @@ WORKER_STARTED=$(date +%s)
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# --- converge lock stale-holder detection (F7 / #7) --------------------------
-# The converge skip counter is ephemeral run-dir bookkeeping (like fail.refresh
-# / offline-ticks), NOT persistent identity — it must reset free on reboot /
-# fresh RUN_DIR, so it lives under $RUN_DIR, never $STATE_DIR. (Brief said
-# "$STATE_DIR"; that dir holds the tailscale identity and survives image swaps
-# — a stale skip counter there would outlive the daemon that caused it. Using
-# $RUN_DIR matches every other counter and DESIGN.md's ephemeral-bookkeeping
-# rule.)
-CONVERGE_SKIP_COUNT="$RUN_DIR/converge-skip.count"
-CONVERGE_STALE_BREAK_AFTER=5   # consecutive non-boxup skips before we break
-
-converge_skip_count_read() {
-  local n=0
-  [ -f "$CONVERGE_SKIP_COUNT" ] && \
-    n=$(tr -d '[:space:]' < "$CONVERGE_SKIP_COUNT" 2>/dev/null || echo 0)
-  case "$n" in ''|*[!0-9]*) n=0 ;; esac
-  echo "$n"
-}
-
-converge_skip_count_reset() { rm -f "$CONVERGE_SKIP_COUNT" 2>/dev/null || true; }
-
-converge_lock_holders() {
-  local target ino line lpid lino comm printed=0
-  target="$(readlink -f "$CONVERGE_LOCK" 2>/dev/null || echo "$CONVERGE_LOCK")"
-  [ -n "$target" ] || return 1
-  [ -r /proc/locks ] || return 1
-  # Inode of the lock file (device:inode in /proc/locks is MAJ:MIN:INO; we
-  # match on the inode component, which is unambiguous for a single file).
-  ino="$(stat -c '%i' "$target" 2>/dev/null || true)"
-  case "$ino" in ''|*[!0-9]*) return 1 ;; esac
-  # /proc/locks columns: "N: FLOCK ADVISORY WRITE <pid> <maj>:<min>:<ino> ..."
-  while IFS= read -r line; do
-    case "$line" in *FLOCK*) ;; *) continue ;; esac
-    # shellcheck disable=SC2086  # deliberate word-split of the columns
-    set -- $line
-    lpid="$5"
-    lino="${6##*:}"
-    [ "$lino" = "$ino" ] || continue
-    case "$lpid" in ''|*[!0-9]*) continue ;; esac
-    [ "$lpid" = "$$" ] && continue        # never count our own boxup process
-    [ "$lpid" = "$BASHPID" ] && continue  # nor our own lock-check subshell
-    if [ -r "/proc/$lpid/comm" ]; then
-      comm="$(tr -d '\0\n' < "/proc/$lpid/comm" 2>/dev/null || echo '?')"
-    else
-      comm='?'   # unreadable (racing/exiting pid) — caller fails SAFE
-    fi
-    [ -n "$comm" ] || comm='?'   # empty comm (racing pid) — also unproven
-    echo "$lpid $comm"
-    printed=1
-  done < /proc/locks
-  [ "$printed" = 1 ] || return 1
-  return 0
-}
-
-# True (0) iff the converge lock is held by a process we must NOT stomp — a
-# GENUINE concurrent boxup/shell, OR a holder whose comm we cannot read (a
-# racing/exiting pid: we cannot PROVE it is non-boxup, so we fail SAFE and keep
-# skipping rather than break). comm values that count as boxup: bash/sh/dash
-# (boxup runs under a shell), "boxup" itself, or "?" (unreadable = unproven).
-converge_lock_held_by_boxup() {
-  local holders line comm
-  holders="$(converge_lock_holders)" || return 1
-  while IFS= read -r line; do
-    comm="${line#* }"
-    case "$comm" in
-      bash|sh|dash|boxup|'?') return 0 ;;
-    esac
-  done <<EOF
-$holders
-EOF
-  return 1
-}
-
-# True (0) iff there IS a holder but EVERY holder's comm is unproven ('?') —
-# i.e. we could not resolve any holder pid to a readable /proc/PID/comm. This
-# is the fail-safe path (treated as boxup, never broken), but it is also the
-# platform-degradation signal the supervisor asked to make loud: verified
-# 2026-08-28 that /proc/locks pids DO resolve inside these containers (shared
-# pid namespace, tini as pid 1). If the platform ever moves the boxes into
-# their own pid namespace, holders stop resolving, this returns true forever,
-# and the stale-break silently no-ops — the exact invisible-regression class
-# that produced #7/#8. So the caller LOGS this (once per window), never silent.
-converge_lock_holder_unresolved() {
-  local holders line comm any=0
-  holders="$(converge_lock_holders)" || return 1   # no holder at all
-  while IFS= read -r line; do
-    comm="${line#* }"
-    any=1
-    case "$comm" in '?') ;; *) return 1 ;; esac   # a resolved holder exists
-  done <<EOF
-$holders
-EOF
-  [ "$any" = 1 ]
-}
-
-# Rate-limited (once per window) diagnostic for the unresolvable-holder
-# degradation. Uses its own stamp so it never spams per-tick.
-CONVERGE_UNRESOLVED_LOG="$RUN_DIR/last-unresolved-holder.log"
-converge_log_unresolved_once() {
-  local now last window=600
-  now=$(date +%s)
-  last=0
-  [ -f "$CONVERGE_UNRESOLVED_LOG" ] && \
-    last=$(tr -d '[:space:]' < "$CONVERGE_UNRESOLVED_LOG" 2>/dev/null || echo 0)
-  case "$last" in ''|*[!0-9]*) last=0 ;; esac
-  [ $((now - last)) -ge "$window" ] || return 0
-  echo "$now" > "$CONVERGE_UNRESOLVED_LOG" 2>/dev/null || true
-  log "tick: converge lock holder pid does not resolve to /proc/PID/comm — treating as unproven and NOT breaking (fail-safe). If this persists, the boxes may have moved into their own pid namespace and this self-heal has degraded to a no-op — investigate (verified working on grok-box-1 2026-08-28)." >&2
-}
-
-# --- converge lock (D3) ------------------------------------------------------
+# --- converge lock (D3, H1) --------------------------------------------------
 # Serialize converge across `boxup once`, the worker tick, and a rollout.
-# run_with_converge_lock <mode> <fn>:
-#   mode = "wait" -> flock -w 60 (do_ensure / `boxup once`: bounded WAIT).
-#   mode = "try"  -> flock -n    (run_tick: skip on contention).
-# The flock lives in a subshell so it is released the instant <fn> returns and
-# never wedges the sequential do_ensure-then-run_tick path of `boxup once`.
-# Fail-open: if the lock file cannot be opened (e.g. RUN_DIR absent on a fresh
-# `boxup tick`), run <fn> UNLOCKED and return 0-from-fn — the lock guards
-# against duplicate work, it is never a gate on convergence.
-# Return code: 0 if the lock was contended in "try" mode (caller decides what
-#   that means), otherwise the exit status of <fn>.
+#
+# H1 (iter3 hotfix): the lock now uses flock --close semantics — the body runs
+# with NO lock descriptor exposed to it OR any descendant. We open the lock on
+# fd 9 in an OUTER subshell that holds the flock for the body's whole duration,
+# then run the body in an INNER subshell with `9<&-` so neither the body nor
+# anything it spawns inherits the fd. This makes the #7 fd-inheritance bug
+# STRUCTURALLY IMPOSSIBLE for any new daemon, regardless of whether a given
+# spawn site remembered to close the fd. It also retires the entire /proc/locks
+# stale-holder detector + 5-skip break that the dual gate proved cannot work:
+# with boxup's real leak shape (a subshell takes `flock -n`, spawns a detached
+# child, then EXITS) /proc/locks records the EXITED helper's pid (e.g. 445980),
+# NOT the inheriting daemon (445981) — so the holder reads "?", the counter
+# resets, and the break never fires. flock --close removes the need for it.
+#
+#   mode = "wait" -> flock -w 60  (do_ensure / `boxup once`: bounded WAIT).
+#   mode = "try"  -> flock -n     (run_tick: skip on contention).
+#
+# H3: mutual exclusion is now GUARANTEED — we NEVER run the body unlocked.
+#   * cannot open the lock file: try -> skip (200); wait -> fail (201).
+#   * wait-mode timeout: fail (201), never proceed unlocked.
+#   * try-mode contention: skip (200), after attempting the transitional
+#     legacy-daemon recovery below.
+# Return code: 200 = try-mode contended (caller stamps hb and skips);
+#   201 = could not take the lock in wait mode (caller surfaces a hard error);
+#   otherwise the exit status of <fn>.
 run_with_converge_lock() {
-  local mode="$1" fn="$2"
+  local mode="$1" fn="$2" rc
   if ! have flock; then
     "$fn"; return
   fi
   (
-    if ! { exec 8>"$CONVERGE_LOCK"; } 2>/dev/null; then
-      # Fail-open: cannot open the lock file — log and proceed UNLOCKED (the
-      # lock is an optimization against duplicate work, never a gate on
-      # convergence; the blueprint requires a diagnostic here). Note: do NOT
-      # write `exec 8>&- 2>/dev/null` — an exec with no command makes the
-      # 2>/dev/null PERMANENT for the rest of the subshell and would swallow
-      # the log line below. fd 8 was never opened, so no close is needed.
-      log "converge-lock: cannot open $CONVERGE_LOCK — proceeding unlocked (fail-open)" >&2
-      "$fn"
-      exit
+    if ! { exec 9>"$CONVERGE_LOCK"; } 2>/dev/null; then
+      # H3: cannot open the lock file. We do NOT run unlocked anymore.
+      # Note: do NOT write `exec 9>&- 2>/dev/null` — an exec with no command
+      # makes the 2>/dev/null permanent and swallows the log below. fd 9 was
+      # never opened, so no close is needed.
+      log "converge-lock: cannot open $CONVERGE_LOCK — refusing to run unlocked (H3)" >&2
+      case "$mode" in try) exit 200 ;; *) exit 201 ;; esac
     fi
     case "$mode" in
       try)
-        if ! flock -n 8; then
-          # Contended. F7 (#7): distinguish a GENUINE concurrent boxup from a
-          # tailscaled that inherited fd 8 and holds the converge lock for its
-          # whole life. If a live boxup/shell holds it, this is real work in
-          # progress — skip as before (reset the skip counter: a genuine holder
-          # means the lock is NOT stale). If the holder is non-boxup
-          # (tailscaled or anything else) for CONVERGE_STALE_BREAK_AFTER
-          # consecutive ticks, the lock is stale — break it and run the tick
-          # anyway. Fail-open: if the /proc walk errors we cannot prove the
-          # holder is non-boxup, so we behave exactly as today (skip).
-          if converge_lock_held_by_boxup; then
-            # Either a genuine boxup/shell holder, OR an unresolvable holder
-            # (fail-safe: never break on an unproven holder). If it is the
-            # unresolvable case, log it once per window — a persistent
-            # unresolvable holder means the platform moved the boxes into their
-            # own pid namespace and this self-heal has silently degraded.
-            converge_lock_holder_unresolved && converge_log_unresolved_once
-            converge_skip_count_reset
-            exit 200
-          fi
-          if converge_lock_holders >/dev/null 2>&1; then
-            # Holder exists and is provably non-boxup. Count consecutive skips;
-            # only break after the threshold so a brief non-boxup overlap never
-            # trips it. If the counter cannot be persisted (missing/unwritable
-            # $RUN_DIR), we CANNOT know this is the Nth consecutive skip, so we
-            # never break — skip as today (supervisor directive: no counter =
-            # no break).
-            local skips holder_line
-            skips=$(( $(converge_skip_count_read) + 1 ))
-            if ! echo "$skips" > "$CONVERGE_SKIP_COUNT" 2>/dev/null; then
-              exit 200   # cannot persist the streak → never break, just skip
-            fi
-            if [ "$skips" -ge "$CONVERGE_STALE_BREAK_AFTER" ]; then
-              holder_line="$(converge_lock_holders 2>/dev/null | head -n1)"
-              log "tick: converge lock held by non-boxup pid=${holder_line% *} comm=${holder_line#* } — stale (${skips} consecutive skips), breaking" >&2
-              converge_skip_count_reset
-              # Run the tick UNLOCKED. We do not hold the flock (the stale
-              # holder still does, on ITS fd), but the holder is not a boxup so
-              # there is no concurrent converge to collide with.
-              "$fn"
-              exit
-            fi
-            exit 200   # under threshold — skip this tick, keep counting
-          fi
-          # /proc walk could not identify any holder (fail-open): behave as
-          # today — skip without counting.
+        if ! flock -n 9; then
+          # Contended. flock --close means a NEW daemon can no longer wedge the
+          # lock, so genuine contention is another live boxup converge — skip.
+          # H2 (TRANSITIONAL): but a box already wedged by the OLD (pre-hotfix)
+          # daemon still has that tailscaled holding fd 8/9; flock --close does
+          # not free an already-leaked fd. Detect that ONE specific case via
+          # /proc/*/fd (which DOES see the inheritor, unlike /proc/locks) and
+          # RECYCLE the daemon — a recycle actually releases the lock. We never
+          # break for an arbitrary opener, and never run a tick unlocked.
+          recover_legacy_wedged_lock || true
           exit 200
         fi
-        # Acquired the lock cleanly: any prior skip streak is over.
-        converge_skip_count_reset
         ;;
       *)
-        flock -w 60 8 || true   # bounded wait; proceed even on timeout
+        if ! flock -w 60 9; then
+          # H3: wait-mode timeout. NEVER run the body unlocked (the old code
+          # did, defeating mutual exclusion). Surface a hard failure instead.
+          log "converge-lock: could not acquire within 60s — NOT running unlocked (H3)" >&2
+          exit 201
+        fi
         ;;
     esac
-    "$fn"
+    # H1: run the body with the lock fd CLOSED for it and every descendant.
+    # The outer subshell keeps fd 9 (and thus the flock) until it exits.
+    ( "$fn" ) 9<&-
   )
+  rc=$?
+  return "$rc"
+}
+
+# H2 (TRANSITIONAL — removable once the whole fleet runs this version): on
+# try-mode lock contention, look for a tailscaled that inherited the converge
+# lock from the OLD daemon and is holding it for life. Act ONLY when the holder
+# is a `tailscaled` process, running on OUR $STATE_DIR, that actually has the
+# lock file open (matched by dev+inode, not path string). Exclude self and our
+# ancestry. When found, RECYCLE it (recycle_tailscaled releases the lock by
+# restarting the daemon through the flock --close path); do NOT run a tick
+# unlocked, and NEVER touch a process that merely has the file open.
+recover_legacy_wedged_lock() {
+  local dev ino st pid comm cmd fd lstat found=""
+  st="$(stat -c '%d %i' "$CONVERGE_LOCK" 2>/dev/null || true)"
+  dev="${st% *}"; ino="${st#* }"
+  case "$dev" in ''|*[!0-9]*) return 1 ;; esac
+  case "$ino" in ''|*[!0-9]*) return 1 ;; esac
+  for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
+    [ "$pid" = "$$" ] && continue
+    [ "$pid" = "$BASHPID" ] && continue
+    comm="$(tr -d '\0\n' < "/proc/$pid/comm" 2>/dev/null || true)"
+    [ "$comm" = tailscaled ] || continue
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    echo "$cmd" | grep -q -- "$STATE_DIR" || continue   # must be OUR daemon
+    for fd in "/proc/$pid/fd/"*; do
+      [ -e "$fd" ] || continue
+      lstat="$(stat -c '%d %i' "$fd" 2>/dev/null || true)"
+      [ "$lstat" = "$dev $ino" ] || continue
+      found="$pid"; break
+    done
+    [ -n "$found" ] && break
+  done
+  [ -n "$found" ] || return 1
+  log "tick: LEGACY wedge — tailscaled pid=$found (our statedir) holds the converge lock from a pre-hotfix daemon; recycling to release it (transitional)" >&2
+  recycle_tailscaled "legacy converge-lock wedge (pid=$found) — recycle to release inherited fd"
+  return 0
 }
 
 # --- config.toml -------------------------------------------------------------
@@ -365,6 +279,58 @@ ssh_password() {
   printf '%s' "$p"
 }
 
+# H7 (P0): true (0) iff account <user> exists AND has a USABLE password (not
+# locked, not empty). `passwd -S <user>` prints "<user> <status> ..." where the
+# status field is P (usable), L (locked), or NP (no password). Only P is a
+# working login. Prefer passwd -S; fall back to parsing /etc/shadow field 2
+# (a locked entry starts with ! or *, an empty field means no password). Used
+# by `boxup check` so a box that is sshd=up but has locked accounts (the image
+# ships them locked, /etc/shadow dies on swap) reports UNHEALTHY, not OK.
+account_unlocked() {
+  local user="$1" st hash
+  id "$user" >/dev/null 2>&1 || return 1
+  if have passwd; then
+    st="$(passwd -S "$user" 2>/dev/null | awk '{print $2}')"
+    case "$st" in
+      P) return 0 ;;
+      L|NP) return 1 ;;
+    esac
+    # Unknown/empty status output — fall through to the shadow check.
+  fi
+  if [ -r /etc/shadow ]; then
+    hash="$(awk -F: -v u="$user" '$1==u{print $2}' /etc/shadow 2>/dev/null)"
+    case "$hash" in
+      ''|'!'*|'*'*) return 1 ;;   # empty / locked
+      *) return 0 ;;
+    esac
+  fi
+  return 1   # cannot prove it is unlocked → treat as not-unlocked (fail-safe)
+}
+
+# H11: classify the seeded auth key's expiry from $AUTHKEY_EXPIRES (a single
+# ISO date YYYY-MM-DD). Prints exactly one of:
+#   none    — no file, unreadable, or unparseable date (FAIL-QUIET: no warning)
+#   ok      — expires in > 14 days
+#   warn    — expires within 14 days (inclusive), not yet past
+#   expired — the date is in the past
+# Days are compared at UTC date granularity. This is the one mechanism; both
+# `boxup check` and `boxup status` consume it.
+authkey_expiry_state() {
+  local raw exp_epoch now_epoch days
+  [ -f "$AUTHKEY_EXPIRES" ] || { echo none; return 0; }
+  raw="$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null || true)"
+  case "$raw" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+    *) echo none; return 0 ;;   # unparseable => fail-quiet
+  esac
+  exp_epoch="$(date -u -d "$raw" +%s 2>/dev/null || true)"
+  case "$exp_epoch" in ''|*[!0-9]*) echo none; return 0 ;; esac
+  now_epoch="$(date -u +%s)"
+  if [ "$now_epoch" -ge "$exp_epoch" ]; then echo expired; return 0; fi
+  days=$(( (exp_epoch - now_epoch) / 86400 ))
+  if [ "$days" -lt 14 ]; then echo warn; else echo ok; fi
+}
+
 # --- tailscale binaries ------------------------------------------------------
 tailscale_bin() {
   if [ -x "$BIN_DIR/tailscale" ]; then echo "$BIN_DIR/tailscale"; return; fi
@@ -419,7 +385,7 @@ ts_fields() {
   ts status --json 2>/dev/null | python3 -c '
 import json, sys
 out = {"backend": "", "online": "no", "exitn": "no", "mapfail": "no",
-       "fwdhealth": "no", "routes": "", "auth": "", "nodegone": "no"}
+       "fwdhealth": "no", "routes": "", "auth": ""}
 try:
     d = json.load(sys.stdin)
     s = d.get("Self") or {}
@@ -430,15 +396,9 @@ try:
     out["exitn"] = "yes" if s.get("ExitNodeOption") else "no"
     out["mapfail"] = "yes" if ("coordination server" in h
                                or "not-in-map-poll" in h
-                               or "pollnetmap" in h) else "no"
+                               or "pollnetmap" in h
+                               or "out of sync" in h) else "no"
     out["fwdhealth"] = "yes" if "forward" in h else "no"
-    # F8 (#8): the control plane deleted the node but LocalAPI keeps reporting
-    # BackendState=Running. The Health strings name it — "node not found" /
-    # "not found (404)". This is one of two nodegone sources (the other is a
-    # bounded tailscaled.log tail in read_ts_fields); either is sufficient.
-    out["nodegone"] = "yes" if ("node not found" in h
-                                or "not found (404)" in h
-                                or "404: node not found" in h) else "no"
     out["auth"] = (d.get("AuthURL") or "").replace("\n", " ").strip()
 except Exception:
     pass
@@ -449,7 +409,6 @@ for k, v in out.items():
 
 read_ts_fields() {
   backend=""; online="no"; exitn="no"; mapfail="no"; fwdhealth="no"; auth=""
-  nodegone="no"
   while IFS= read -r line; do
     case "$line" in
       backend=*)   backend="${line#backend=}" ;;
@@ -458,31 +417,10 @@ read_ts_fields() {
       mapfail=*)   mapfail="${line#mapfail=}" ;;
       fwdhealth=*) fwdhealth="${line#fwdhealth=}" ;;
       auth=*)      auth="${line#auth=}" ;;
-      nodegone=*)  nodegone="${line#nodegone=}" ;;
     esac
   done <<EOF
 $(ts_fields)
 EOF
-  # F8 (#8): second nodegone source — a BOUNDED tail of $TAILSCALED_LOG. The
-  # Health strings above can clear while the map-poll keeps 404ing, so also
-  # scan the log. Bounded two ways so a stale log never re-triggers forever:
-  # only the last ~200 lines, AND (since we cannot cheaply parse per-line
-  # timestamps against the daemon's start) only when Self.Online is false —
-  # a node that is genuinely Online again is not gone regardless of old lines.
-  if [ "$nodegone" != yes ] && [ "$online" != yes ]; then
-    nodegone_from_log && nodegone="yes"
-  fi
-}
-
-# F8 (#8): true (0) iff the last ~200 lines of $TAILSCALED_LOG show a
-# PollNetMap / lite-map "404 node not found". Bounded to the tail only; the
-# caller additionally gates on Self.Online=false so a stale log entry from a
-# since-recovered node cannot re-trigger re-auth. Fail-open: no log / no match
-# returns non-zero (not nodegone).
-nodegone_from_log() {
-  [ -f "$TAILSCALED_LOG" ] || return 1
-  tail -n 200 "$TAILSCALED_LOG" 2>/dev/null \
-    | grep -Eiq 'pollnetmap.*404.*node not found|404: node not found'
 }
 
 advertised_routes() {
@@ -724,10 +662,22 @@ ensure_sshd() {
 
   # Grok images ship box/root with a locked shadow entry (* / !) and /etc/shadow
   # dies on image swap — sshd=up is not a working login. Re-apply every converge.
+  # H7 (P0): do NOT swallow chpasswd failure — a failed unlock means the box can
+  # be sshd=up yet have NO usable login (the exact resurrection-path trap). Log
+  # each non-zero rc loudly; `boxup check` independently verifies the accounts
+  # are actually unlocked (not merely that we tried).
   pw="$(ssh_password)"
   if have chpasswd; then
-    id box >/dev/null 2>&1 && printf 'box:%s\n' "$pw" | chpasswd >/dev/null 2>&1 || true
-    printf 'root:%s\n' "$pw" | chpasswd >/dev/null 2>&1 || true
+    if id box >/dev/null 2>&1; then
+      if ! printf 'box:%s\n' "$pw" | chpasswd 2>/dev/null; then
+        log "sshd: ERROR chpasswd failed to set box password — login may be locked out despite sshd up (H7)" >&2
+      fi
+    fi
+    if ! printf 'root:%s\n' "$pw" | chpasswd 2>/dev/null; then
+      log "sshd: ERROR chpasswd failed to set root password — login may be locked out despite sshd up (H7)" >&2
+    fi
+  else
+    log "sshd: ERROR chpasswd not available — cannot unlock box/root accounts (H7)" >&2
   fi
 
   if [ -x /usr/sbin/sshd ]; then
@@ -1008,16 +958,33 @@ run_reauth_up() {
       --snat-subnet-routes=true --timeout=25s --force-reauth)
   id box >/dev/null 2>&1 && up+=(--operator=box)
 
+  # H6 (#9): resolve the current hostname from THREE sources in order —
+  # live prefs, the frozen hostname file, then status --json Self.HostName.
+  # If ALL are empty we must NOT attempt: current tailscale refuses an `up`
+  # that omits an already-set --hostname, so a re-auth with no hostname is a
+  # guaranteed-failing command. A doomed `up` is worse than an honest skip
+  # (it still counts as an attempt against the control plane and logs noise).
   hostname="$(prefs_hostname)"
   [ -n "$hostname" ] || hostname="$(read_box_name || true)"
-  [ -n "$hostname" ] && up+=(--hostname="$hostname")
+  [ -n "$hostname" ] || hostname="$(ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(((json.load(sys.stdin).get("Self") or {}).get("HostName") or "").strip())
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+  if [ -z "$hostname" ]; then
+    log "login: ERROR cannot resolve current hostname (prefs, $HOSTNAME_FILE, and status Self.HostName all empty) — REFUSING re-auth; a --hostname-less force-reauth is refused by tailscale and would just churn. Fix the hostname source, then retry." >&2
+    return 3
+  fi
+  up+=(--hostname="$hostname")
 
   tags="$(current_advertise_tags)"
   if [ -n "$tags" ]; then
     up+=(--advertise-tags="$tags")
-    log "login: $reason — mentioning current prefs hostname=${hostname:-?} tags=$tags (--force-reauth)"
+    log "login: $reason — mentioning current prefs hostname=$hostname tags=$tags (--force-reauth)"
   else
-    log "login: $reason — mentioning current prefs hostname=${hostname:-?} (no tags on device) (--force-reauth)"
+    log "login: $reason — mentioning current prefs hostname=$hostname (no tags on device) (--force-reauth)"
   fi
 
   out="$("${up[@]}" "$@" 2>&1)"; rc=$?
@@ -1025,7 +992,7 @@ run_reauth_up() {
     log "login: tailscale up --force-reauth FAILED rc=$rc: $out" >&2
     case "$out" in
       *"requires mentioning all non-default flags"*)
-        log "login: ERROR tailscale refused re-auth — it wants ALL non-default flags mentioned. Our argv had hostname=${hostname:-?} tags=${tags:-<none>}. Tailscale's suggested command is in the error text above; a pref changed underneath us." >&2
+        log "login: ERROR tailscale refused re-auth — it wants ALL non-default flags mentioned. Our argv had hostname=$hostname tags=${tags:-<none>}. Tailscale's suggested command is in the error text above; a pref changed underneath us." >&2
         ;;
     esac
   fi
@@ -1034,49 +1001,7 @@ run_reauth_up() {
 
 ensure_login() {
   local st
-  # Read full fields (need backend AND nodegone). wait_for_backend settles the
-  # backend first; then read_ts_fields populates nodegone from Health + a
-  # bounded tailscaled.log tail.
   st="$(wait_for_backend || true)"
-  read_ts_fields
-  # F8 (#8): Running is a legitimate "logged in" ONLY when the node is not
-  # gone. When the control plane has deleted the node, LocalAPI still reports
-  # BackendState=Running while PollNetMap 404s — fall through to the re-auth
-  # path (same path as NeedsLogin with a populated statedir) instead of
-  # returning 0. Gate strictly on Running: NoState/Starting right after daemon
-  # start must NOT trigger re-auth off a stale log tail (house rule: NoState ≠
-  # NeedsLogin, never mint on NoState).
-  if [ "$nodegone" = yes ] && [ "$st" = Running ]; then
-    if ! state_is_populated; then
-      # No identity to re-auth (empty statedir) — nothing --force-reauth can do.
-      return 0
-    fi
-    # F8 (#8) rate limit: at most one re-auth per D4 backoff window; a re-auth
-    # storm against the control plane is worse than the bug.
-    if ! reauth_window_ok; then
-      return 0
-    fi
-    date +%s > "$REAUTH_LAST" 2>/dev/null || true
-    if [ -s "$AUTHKEY_FILE" ]; then
-      if run_reauth_up "node deleted server-side (nodegone), re-auth with auth-key" \
-           --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")"; then
-        echo 0 > "$REAUTH_FAIL" 2>/dev/null || true
-      else
-        echo $(( $(reauth_fail_count) + 1 )) > "$REAUTH_FAIL" 2>/dev/null || true
-      fi
-    else
-      # No key: we can only mint an AuthURL no human may click. Log LOUDLY once
-      # per window (the window guard above ensures once-per-window) — do NOT
-      # spin.
-      log "login: WARNING node gone server-side (nodegone) but NO auth-key — minting AuthURL a human must click; see boxup status. Rate-limited to once per backoff window." >&2
-      if run_reauth_up "node deleted server-side (nodegone), minting AuthURL"; then
-        echo 0 > "$REAUTH_FAIL" 2>/dev/null || true
-      else
-        echo $(( $(reauth_fail_count) + 1 )) > "$REAUTH_FAIL" 2>/dev/null || true
-      fi
-    fi
-    return 0
-  fi
   case "$st" in Running|Starting) return 0 ;; esac
   case "$st" in NeedsLogin|Stopped|"") ;; *) return 0 ;; esac
 
@@ -1088,14 +1013,20 @@ ensure_login() {
   # An empty statedir is a first login and must NOT get --force-reauth.
   if state_is_populated; then
     # Tags are auth-time-only and NEVER INTRODUCED on the --force-reauth branch
-    # (F11): an unattended ~180-day key-expiry re-auth must not convert a
-    # user-owned node to tag-owned (ACL semantics change, tagged keys stop
-    # expiring, and an unauthorized tag is REJECTED after --force-reauth
-    # already rotated keys — leaving the box locked out, headscale#3374).
+    # (F11 / see H8 in docs/AGENT.md for the control-plane scoping): an
+    # unattended re-auth must not convert a user-owned node to tag-owned.
     # F9 (#9): run_reauth_up still MENTIONS the tags the device ALREADY carries
     # (from live prefs, never config.toml) because current tailscale refuses an
     # up that omits an already-set non-default flag. Mentioning is not
     # introducing. Retagging is still a documented MANUAL operator step.
+    # H5: bound force-reauth ATTEMPTS (30-min floor + per-hour cap), regardless
+    # of rc — a rc=0 `up` that only printed an AuthURL must not license another
+    # attempt next tick.
+    if ! reauth_attempt_allowed; then
+      log "login: NeedsLogin but re-auth attempt rate-limited (min ${REAUTH_MIN_INTERVAL}s between attempts, max ${REAUTH_MAX_PER_HOUR}/hour) — skipping this tick" >&2
+      return 0
+    fi
+    reauth_attempt_record
     # P0-C (#9): do NOT swallow the re-auth rc with `|| true`. run_reauth_up
     # already logs the tailscale error text; the CALLER also records the
     # outcome so a persistent NeedsLogin re-auth failure is visible, not silent.
@@ -1107,7 +1038,7 @@ ensure_login() {
       run_reauth_up "re-auth existing identity, minting AuthURL — see boxup status"; rrc=$?
     fi
     if [ "$rrc" -ne 0 ]; then
-      log "login: re-auth (NeedsLogin, populated statedir) FAILED rc=$rrc — see the tailscale error above; node stays NeedsLogin, will retry next converge" >&2
+      log "login: re-auth (NeedsLogin, populated statedir) FAILED rc=$rrc — see the tailscale error above; node stays NeedsLogin, will retry after the attempt-limiter window" >&2
     fi
   else
     # First login (empty statedir). This is the ONLY place --advertise-tags is
@@ -1211,16 +1142,19 @@ ensure_name() {
 # --- converge: exit-node refresh --------------------------------------------
 # Full flag set. Prefer operator=box; fall back to root if that user cannot
 # talk to the daemon yet (first join, operator not written).
+# H3: each `set` is wrapped in `timeout` — an unbounded `tailscale set` is the
+# realistic way the converge body could hold the lock past 60s and starve the
+# next converge; bound it so the lock is always released promptly.
 tailscale_set_full() {
   local name="$1" b
   b="$(tailscale_bin)"
   [ -x "$b" ] || return 1
-  if id box >/dev/null 2>&1 && sudo -n -u box "$b" set --hostname="$name" \
+  if id box >/dev/null 2>&1 && timeout 25 sudo -n -u box "$b" set --hostname="$name" \
       --ssh=false --operator=box --advertise-exit-node \
       --snat-subnet-routes=true --stateful-filtering=false 2>/dev/null; then
     return 0
   fi
-  "$b" set --hostname="$name" --ssh=false --operator=box \
+  timeout 25 "$b" set --hostname="$name" --ssh=false --operator=box \
     --advertise-exit-node --snat-subnet-routes=true \
     --stateful-filtering=false
 }
@@ -1250,34 +1184,65 @@ refresh_backoff_window() {
   fi
 }
 
-# --- re-auth backoff (F8 / #8, D4-shaped) ------------------------------------
-# nodegone-triggered re-auth must NOT storm the control plane. It reuses the D4
-# backoff WINDOW function above (20->60->180->600s) but with its OWN counter
-# and attempt-stamp so it never conflates with refresh_exitnode's failures. A
-# re-auth fires at most once per window; when there is no auth key (only an
-# AuthURL a human must click) we log loudly ONCE per window instead of spinning.
-REAUTH_FAIL="$RUN_DIR/fail.reauth"
-REAUTH_LAST="$RUN_DIR/last-reauth"
+# --- re-auth ATTEMPT limiter (H5) --------------------------------------------
+# A force-reauth ATTEMPT rewrites the node's registration against the control
+# plane; a storm of them is worse than the bug. The prior design keyed a
+# backoff off rc, but a rc=0 `up` (which returns success while merely PRINTING
+# an AuthURL that no human clicks) reset the counter and left a 20s floor —
+# ~180 attempts/hour. This is a SEPARATE limiter from the D4 failure backoff:
+# it bounds ATTEMPTS regardless of rc.
+#   * hard minimum 30 min between attempts (REAUTH_MIN_INTERVAL)
+#   * absolute cap per rolling hour (REAUTH_MAX_PER_HOUR)
+# Both persisted under $RUN_DIR (ephemeral: a reboot/swap legitimately resets,
+# which is fine — a fresh box may attempt once immediately).
+REAUTH_LAST="$RUN_DIR/last-reauth"          # unix ts of the last ATTEMPT
+REAUTH_HOUR="$RUN_DIR/reauth-hour"          # "<hour_start_ts> <count>"
+REAUTH_MIN_INTERVAL="${BOXUP_REAUTH_MIN_INTERVAL:-1800}"   # 30 min
+REAUTH_MAX_PER_HOUR="${BOXUP_REAUTH_MAX_PER_HOUR:-3}"
 
-reauth_fail_count() {
-  local n=0
-  [ -f "$REAUTH_FAIL" ] && \
-    n=$(tr -d '[:space:]' < "$REAUTH_FAIL" 2>/dev/null || echo 0)
-  case "$n" in ''|*[!0-9]*) n=0 ;; esac
-  echo "$n"
-}
-
-# 0 (proceed) iff we are outside the current re-auth backoff window; else 1.
-# Stamps nothing — the caller stamps the attempt time on both outcomes.
-reauth_window_ok() {
-  local fails window now last
-  fails=$(reauth_fail_count)
-  window=$(refresh_backoff_window "$fails")
+# 0 (proceed) iff BOTH limiters allow an attempt now; else 1. Read-only — the
+# caller calls reauth_attempt_record() only when it actually attempts.
+reauth_attempt_allowed() {
+  local now last hstart hcount
   now=$(date +%s)
   last=0
   [ -f "$REAUTH_LAST" ] && last=$(tr -d '[:space:]' < "$REAUTH_LAST" 2>/dev/null || echo 0)
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
-  [ $((now - last)) -ge "$window" ]
+  if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$REAUTH_MIN_INTERVAL" ]; then
+    return 1   # inside the 30-min floor
+  fi
+  hstart=0; hcount=0
+  if [ -f "$REAUTH_HOUR" ]; then
+    read -r hstart hcount < "$REAUTH_HOUR" 2>/dev/null || { hstart=0; hcount=0; }
+  fi
+  case "$hstart" in ''|*[!0-9]*) hstart=0 ;; esac
+  case "$hcount" in ''|*[!0-9]*) hcount=0 ;; esac
+  # Same rolling hour AND already at the cap ⇒ deny.
+  if [ "$hstart" -gt 0 ] && [ $((now - hstart)) -lt 3600 ] \
+     && [ "$hcount" -ge "$REAUTH_MAX_PER_HOUR" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# Record that an attempt happened NOW (regardless of its rc). Advances both the
+# min-interval stamp and the per-hour counter (rolling the window when >1h old).
+reauth_attempt_record() {
+  local now hstart hcount
+  now=$(date +%s)
+  echo "$now" > "$REAUTH_LAST" 2>/dev/null || true
+  hstart=0; hcount=0
+  if [ -f "$REAUTH_HOUR" ]; then
+    read -r hstart hcount < "$REAUTH_HOUR" 2>/dev/null || { hstart=0; hcount=0; }
+  fi
+  case "$hstart" in ''|*[!0-9]*) hstart=0 ;; esac
+  case "$hcount" in ''|*[!0-9]*) hcount=0 ;; esac
+  if [ "$hstart" -le 0 ] || [ $((now - hstart)) -ge 3600 ]; then
+    hstart="$now"; hcount=1          # new rolling hour
+  else
+    hcount=$((hcount + 1))
+  fi
+  echo "$hstart $hcount" > "$REAUTH_HOUR" 2>/dev/null || true
 }
 
 # Push a full `tailscale set` when the coordination server would show "unable
@@ -1287,16 +1252,6 @@ refresh_exitnode() {
   local name need=0 reason="" chk warn v4 v6 routes now last
   read_ts_fields
   case "$backend" in Running) ;; *) return 0 ;; esac
-  # P0-B (#8 sibling): a node deleted server-side stays backend=Running while
-  # PollNetMap 404s (nodegone). A `tailscale set` cannot fix a gone node — the
-  # fix is re-auth (ensure_login owns it). Pushing prefs here would be a no-op
-  # against a dead identity and can cancel the in-flight map poll. Skip so the
-  # re-auth path is the only thing acting on a gone node. Same guard the
-  # ensure_login Running-branch now applies.
-  if [ "$nodegone" = yes ]; then
-    log "refresh: node gone server-side (nodegone) — deferring to re-auth, skipping set" >&2
-    return 0
-  fi
 
   name="$(read_box_name || true)"
   case "$name" in
@@ -1452,6 +1407,14 @@ recycle_tailscaled() {
   start_tailscaled || true
   # Hostinfo set is skipped while backend=NoState; wait out the blip.
   wait_for_backend >/dev/null || true
+  # H4 (#8): consume the FRESH BackendState the restart produced. A node that
+  # was deleted server-side stays Running-but-dead across a LocalAPI query, but
+  # a genuine daemon RESTART re-reads state and lands in NeedsLogin (upstream
+  # tailscale/tailscale#20615) — so re-auth is driven by recycle-then-read, not
+  # by log parsing. ensure_login MUST run before refresh_exitnode: a freshly
+  # NeedsLogin daemon otherwise sits idle until the next hourly converge (the
+  # gate flagged this exact ordering bug — old code only called refresh here).
+  ensure_login || true
   refresh_exitnode || true
 }
 
@@ -1480,8 +1443,13 @@ maybe_wake_recycle() {
   recycle_tailscaled "time jump ${age}s (hb) — map poll dies on freeze"
 }
 
-# Process alive + Running + (Online=false or map-poll Health) after freeze.
-# Not NeedsLogin, not a new AuthURL.
+# Process alive + Running + (Online=false OR map-poll/out-of-sync Health) that
+# persists ⇒ recycle. H4 (#8): this is the recycle-then-read driver for a
+# server-deleted node too — a deleted node stays Running-but-dead on a LocalAPI
+# query, but the RESTART inside recycle_tailscaled re-reads state and lands in
+# NeedsLogin, which recycle_tailscaled → ensure_login then re-auths. No Health
+# text matching, no log parsing: persistent Online=false / not-in-map-poll is
+# the trigger, the restart produces the authoritative BackendState.
 recycle_offline_tailscaled() {
   local now last ticks do_recycle=0
   recycled_recently && return 0
@@ -1698,6 +1666,14 @@ print_status() {
   rf=$(refresh_fail_count)
   [ "$rf" -ge 3 ] && printf ' refresh=failing:%s' "$rf"
   [ -n "${auth:-}" ] && printf ' auth=%s' "$auth"
+  # H11: surface auth-key expiry (warn/expired only; ok/none stay silent so a
+  # healthy box's status line is unchanged).
+  local akx
+  akx="$(authkey_expiry_state)"
+  case "$akx" in
+    warn)    printf ' authkey=expiring:%s' "$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)" ;;
+    expired) printf ' authkey=EXPIRED:%s' "$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)" ;;
+  esac
   printf '\n'
 }
 
@@ -1727,6 +1703,14 @@ do_check() {
   fi
   if [ -z "$reason" ] && ! pgrep -x sshd >/dev/null 2>&1; then
     reason="sshd=down (want up)"
+  fi
+  # H7 (P0): sshd running is not a working login. Verify box (and root, when it
+  # exists) actually have a usable password — the resurrection-path invariant.
+  if [ -z "$reason" ] && id box >/dev/null 2>&1 && ! account_unlocked box; then
+    reason="account box=locked (sshd up but no usable login)"
+  fi
+  if [ -z "$reason" ] && id root >/dev/null 2>&1 && ! account_unlocked root; then
+    reason="account root=locked (sshd up but no usable login)"
   fi
   if [ -z "$reason" ] && { [ "$v4" != 1 ] || [ "$v6" != 1 ]; }; then
     reason="ipfwd=4:${v4},6:${v6} (want 4:1,6:1)"
@@ -1770,6 +1754,12 @@ do_check() {
         reason="exit-node routes missing 0.0.0.0/0 or ::/0"
       fi
     fi
+  fi
+  # H11: an EXPIRED auth key means the box's only unattended recovery path is
+  # dead — it is not healthy, it just hasn't needed to recover yet. Fail check.
+  # (A key expiring soon is a WARNING, surfaced below, not a check failure.)
+  if [ -z "$reason" ] && [ "$(authkey_expiry_state)" = expired ]; then
+    reason="authkey EXPIRED ($(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)) — unattended recovery path is dead"
   fi
 
   if [ -n "$reason" ]; then
@@ -1829,12 +1819,20 @@ do_ensure_body() {
 
 # do_ensure: take the converge lock with flock -w 60 (bounded WAIT, never
 # skip — `boxup once` is AGENT.md's remedy for nearly every symptom, so a tick
-# holding the lock must delay converge, not fake it out). ensure_dirs must run
-# BEFORE we open the lock file (CONVERGE_LOCK lives in RUN_DIR); if RUN_DIR is
-# absent run_with_converge_lock fails open and converge still runs unlocked.
+# holding the lock must delay converge, not fake it out). H3: if the lock
+# cannot be taken within the window we do NOT converge unlocked — do_ensure
+# returns non-zero (201) so `boxup once`/`up`/`ensure` surface a hard error
+# rather than silently faking a converge. ensure_dirs runs BEFORE we open the
+# lock file (CONVERGE_LOCK lives in RUN_DIR).
 do_ensure() {
+  local rc
   ensure_dirs
   run_with_converge_lock wait do_ensure_body
+  rc=$?
+  if [ "$rc" = 201 ]; then
+    log "converge: could NOT take the converge lock (busy > 60s) — converge SKIPPED, not faked (H3). Retry, or check for a stuck converge/tailscale_set." >&2
+  fi
+  return "$rc"
 }
 
 do_update() {
@@ -1875,20 +1873,25 @@ cmd="${1:-up}"
 case "$cmd" in
   once|--once)
     require_root once
-    do_ensure
+    # H3: if do_ensure could not take the converge lock (rc=201), surface it as
+    # a non-zero exit so the hourly automation sees a failed converge instead of
+    # a faked-success. Still run the tick + status for visibility.
+    do_ensure; _once_rc=$?
     start_daemon
     run_tick
     print_status
+    [ "$_once_rc" = 201 ] && exit "$_once_rc"
     ;;
   ensure|--ensure)
     require_root ensure
-    do_ensure
+    do_ensure   # propagates rc (201 = lock busy, converge NOT faked — H3)
     ;;
   up|--up|"")
     require_root up
-    do_ensure
+    do_ensure; _up_rc=$?
     start_daemon
     print_status
+    [ "$_up_rc" = 201 ] && exit "$_up_rc"
     ;;
   tick|--tick)
     require_root tick
