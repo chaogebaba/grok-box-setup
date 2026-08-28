@@ -45,9 +45,26 @@ fi
 
 mkdir -p "$DEST"/{bin,docs,etc,secrets,state/tailscale,state/ssh}
 
-install -m 0755 "$REPO_ROOT/boxup" "$DEST/boxup"
-install -m 0755 "$REPO_ROOT/box-bootstrap.sh" "$DEST/box-bootstrap.sh"
-install -m 0755 "$REPO_ROOT/install.sh" "$DEST/install.sh"
+# Atomic executable install (D3/M2): write to a UNIQUE mktemp file INSIDE $DEST
+# then rename onto the destination. Same directory ⇒ rename(2) ⇒ atomic swap;
+# a running bash keeps its fd on the old inode and finishes reading the old
+# file uninterrupted (precedent: rustup / dpkg self-replace). A fixed dotfile
+# name would let two concurrent installs (D5's hourly self-heal makes that
+# plausible) truncate each other's partial write and then atomically install a
+# corrupt file — mktemp gives each install its own scratch inode.
+install_atomic() {
+  local mode="$1" src="$2" dst="$3" tmp
+  tmp="$(mktemp "$(dirname "$dst")/.install.XXXXXX")" || return 1
+  if ! install -m "$mode" "$src" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$dst"
+}
+
+install_atomic 0755 "$REPO_ROOT/boxup" "$DEST/boxup"
+install_atomic 0755 "$REPO_ROOT/box-bootstrap.sh" "$DEST/box-bootstrap.sh"
+install_atomic 0755 "$REPO_ROOT/install.sh" "$DEST/install.sh"
 install -m 0644 "$REPO_ROOT/etc/config.example.toml" "$DEST/etc/config.example.toml"
 install -m 0644 "$REPO_ROOT/docs/"*.md "$DEST/docs/" 2>/dev/null || true
 install -m 0644 "$REPO_ROOT/README.md" "$DEST/README.md" 2>/dev/null || true
