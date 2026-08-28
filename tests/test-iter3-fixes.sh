@@ -173,8 +173,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# H5 — re-auth attempt-limiter: min-interval blocks a second attempt; a fresh
-# state allows one; the per-hour cap blocks beyond the cap. rc-independent.
+# H5 — re-auth attempt-limiter (D6: min-interval ONLY, per-hour cap dropped).
+# fresh => allowed; immediately after a record => blocked; after the interval
+# has passed => allowed again. rc-independent (record is called regardless).
 # ---------------------------------------------------------------------------
 h5_test() {
   local inner; inner="$(mktemp)"
@@ -183,37 +184,25 @@ set -u
 BOXUP="$BOXUP"
 RUN_DIR="\$(mktemp -d)"
 REAUTH_LAST="\$RUN_DIR/last-reauth"
-REAUTH_HOUR="\$RUN_DIR/reauth-hour"
 REAUTH_MIN_INTERVAL=1800
-REAUTH_MAX_PER_HOUR=3
 extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
 for f in reauth_attempt_allowed reauth_attempt_record; do eval "\$(extract_fn "\$f")"; done
 r=""
-# fresh: allowed
-reauth_attempt_allowed && r="\${r}A" || r="\${r}."
+reauth_attempt_allowed && r="\${r}A" || r="\${r}."   # fresh: allowed
 reauth_attempt_record
-# immediately after: min-interval blocks
-reauth_attempt_allowed && r="\${r}A" || r="\${r}."
-# simulate 31 min ago but hour cap: force last old, count at cap in this hour
-now=\$(date +%s)
-echo \$((now-2000)) > "\$REAUTH_LAST"
-echo "\$now 3" > "\$REAUTH_HOUR"
-reauth_attempt_allowed && r="\${r}A" || r="\${r}."   # capped => blocked
-# old interval + under cap => allowed
-echo \$((now-2000)) > "\$REAUTH_LAST"
-echo "\$now 1" > "\$REAUTH_HOUR"
-reauth_attempt_allowed && r="\${r}A" || r="\${r}."
+reauth_attempt_allowed && r="\${r}A" || r="\${r}."   # just recorded: blocked
+now=\$(date +%s); echo \$((now-2000)) > "\$REAUTH_LAST"  # >30min ago
+reauth_attempt_allowed && r="\${r}A" || r="\${r}."   # interval elapsed: allowed
 rm -rf "\$RUN_DIR"
 echo "\$r"
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
 h5="$(h5_test)"
-# expected: A . . A  (fresh allowed; min-interval block; hour-cap block; under-cap allowed)
-if [ "$h5" = "A..A" ]; then
-  pass "H5 attempt-limiter: min-interval + per-hour cap gate attempts (pattern A..A)"
+if [ "$h5" = "A.A" ]; then
+  pass "H5 attempt-limiter: 30-min floor gates attempts (A.A), no per-hour cap"
 else
-  bad  "H5 attempt-limiter pattern wrong: got [$h5] want [A..A]"
+  bad  "H5 attempt-limiter pattern wrong: got [$h5] want [A.A]"
 fi
 
 # ---------------------------------------------------------------------------
@@ -231,17 +220,19 @@ extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^
 eval "\$(extract_fn authkey_expiry_state)"
 case "$when" in
   none) : ;;  # no file
-  ok)      date -u -d '+60 days' +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
-  warn)    date -u -d '+5 days'  +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
+  ok)      date -u -d '+30 days' +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
+  warn)    date -u -d '+3 days'  +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
   expired) date -u -d '-1 day'   +%Y-%m-%d > "\$AUTHKEY_EXPIRES" ;;
+  garbage) echo "not-a-date" > "\$AUTHKEY_EXPIRES" ;;
 esac
 authkey_expiry_state
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
-[ "$(h11_test none)" = none ] && pass "H11 expiry: missing .expires => none (fail-quiet)" || bad "H11 expiry none wrong: [$(h11_test none)]"
-[ "$(h11_test ok)" = ok ] && pass "H11 expiry: >14d => ok" || bad "H11 expiry ok wrong: [$(h11_test ok)]"
-[ "$(h11_test warn)" = warn ] && pass "H11 expiry: <14d => warn" || bad "H11 expiry warn wrong: [$(h11_test warn)]"
+[ "$(h11_test none)" = unknown ] && pass "H11 expiry: missing .expires => unknown (D6, not silent)" || bad "H11 expiry none wrong: [$(h11_test none)]"
+[ "$(h11_test garbage)" = unknown ] && pass "H11 expiry: unparseable => unknown" || bad "H11 expiry garbage wrong: [$(h11_test garbage)]"
+[ "$(h11_test ok)" = ok ] && pass "H11 expiry: >7d => ok" || bad "H11 expiry ok wrong: [$(h11_test ok)]"
+[ "$(h11_test warn)" = warn ] && pass "H11 expiry: <7d => warn" || bad "H11 expiry warn wrong: [$(h11_test warn)]"
 [ "$(h11_test expired)" = expired ] && pass "H11 expiry: past date => expired" || bad "H11 expiry expired wrong: [$(h11_test expired)]"
 
 # ---------------------------------------------------------------------------
@@ -256,6 +247,116 @@ if [ "$h10_ok" = 1 ]; then
 else
   bad  "H10 .gitignore misses an auth-key pattern (see above)"
 fi
+
+# ---------------------------------------------------------------------------
+# D2 — no `flock` ⇒ REFUSE, never run the body unlocked. Stub `have` so
+# `have flock` is false and assert the body function never ran (marker absent)
+# and the return code is the refuse code (200 try / 201 wait).
+# ---------------------------------------------------------------------------
+d2_test() {
+  local mode="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+RUN_DIR="\$(mktemp -d)"
+CONVERGE_LOCK="\$RUN_DIR/converge.lock"
+log(){ :; }
+have(){ return 1; }   # flock (and everything) reported absent
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn run_with_converge_lock)"
+marker="\$RUN_DIR/ran"
+body(){ echo ran > "\$marker"; }
+run_with_converge_lock "$mode" body; rc=\$?
+ran=no; [ -f "\$marker" ] && ran=yes
+rm -rf "\$RUN_DIR"
+echo "\$rc \$ran"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+d2_try="$(d2_test try)"; d2_wait="$(d2_test wait)"
+[ "$d2_try" = "200 no" ] && pass "D2 no-flock try-mode: REFUSE (rc 200) and body never ran" || bad "D2 no-flock try wrong: [$d2_try] want [200 no]"
+[ "$d2_wait" = "201 no" ] && pass "D2 no-flock wait-mode: REFUSE (rc 201) and body never ran" || bad "D2 no-flock wait wrong: [$d2_wait] want [201 no]"
+# install.sh asserts flock exists
+if grep -q "command -v flock" "$ROOT/install.sh"; then
+  pass "D2 install.sh asserts flock (util-linux) exists"
+else
+  bad  "D2 install.sh does not assert flock exists"
+fi
+
+# ---------------------------------------------------------------------------
+# H1 raw-setsid — a RAW `setsid sleep` (NOT via spawn_detached) inside the body
+# must STILL end up without the lock held after the body returns, because the
+# body runs under `( fn ) 9<&-`. This catches removal of the inner `9<&-`:
+# without it, a raw detached child would inherit fd 9 and hold the lock.
+# ---------------------------------------------------------------------------
+h1_raw_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+have(){ command -v "\$1" >/dev/null 2>&1; }
+log(){ :; }
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn run_with_converge_lock)"
+RUN_DIR="\$(mktemp -d)"
+CONVERGE_LOCK="\$RUN_DIR/converge.lock"
+marker="\$(mktemp)"
+# Body spawns a RAW detached child, bypassing spawn_detached entirely.
+body(){ setsid sh -c "echo \\\$\\\$ > '\$marker'; exec sleep 5" & }
+run_with_converge_lock wait body
+sleep 0.4
+# After the body returned, is the lock free? Try to take it non-blocking.
+if flock -n "\$CONVERGE_LOCK" -c true; then held=no; else held=yes; fi
+child="\$(cat "\$marker" 2>/dev/null)"
+[ -n "\$child" ] && kill "\$child" 2>/dev/null
+pkill -x sleep 2>/dev/null
+rm -rf "\$RUN_DIR" "\$marker"
+echo "\$held"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+h1raw="$(h1_raw_test)"
+if [ "$h1raw" = no ]; then
+  pass "H1 inner 9<&-: a RAW setsid child in the body does NOT hold the lock (released)"
+else
+  bad  "H1 inner 9<&- missing? raw child held the lock after body returned ([$h1raw])"
+fi
+
+# ---------------------------------------------------------------------------
+# H12 — box-8 reproducer, hermetic: lock box+root and remove host keys in a
+# FAKE root (temp /etc/shadow + /etc/ssh via stubs), run ONE do_tick-equivalent
+# repair decision, assert ensure_sshd would be invoked. We can't run real
+# passwd/chpasswd without root, so we stub account_unlocked/host_keys_present
+# to read temp fixtures and spy that ensure_sshd is called when the
+# postcondition fails, then "repaired" and NOT called when it holds.
+# ---------------------------------------------------------------------------
+h12_test() {
+  local state="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn login_postcondition_ok)"
+# Fixtures drive the stubs.
+STATE="$state"
+id(){ return 0; }                      # box + root both "exist"
+if [ "\$STATE" = broken ]; then
+  account_unlocked(){ return 1; }      # locked
+  host_keys_present(){ return 1; }     # keys gone
+else
+  account_unlocked(){ return 0; }
+  host_keys_present(){ return 0; }
+fi
+called=no
+ensure_sshd(){ called=yes; }
+# The exact do_tick decision (mirrors the wired block):
+if ! login_postcondition_ok; then ensure_sshd; fi
+echo "\$called"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(h12_test broken)" = yes ] && pass "H12 login postcondition FAILED (locked + no keys) => ensure_sshd invoked" || bad "H12 did not repair on broken postcondition"
+[ "$(h12_test healthy)" = no ] && pass "H12 healthy postcondition => ensure_sshd NOT invoked (~0 cost)" || bad "H12 ran ensure_sshd when healthy"
 
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
