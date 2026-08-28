@@ -95,6 +95,116 @@ WORKER_STARTED=$(date +%s)
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# --- converge lock stale-holder detection (F7 / #7) --------------------------
+# The converge skip counter is ephemeral run-dir bookkeeping (like fail.refresh
+# / offline-ticks), NOT persistent identity — it must reset free on reboot /
+# fresh RUN_DIR, so it lives under $RUN_DIR, never $STATE_DIR. (Brief said
+# "$STATE_DIR"; that dir holds the tailscale identity and survives image swaps
+# — a stale skip counter there would outlive the daemon that caused it. Using
+# $RUN_DIR matches every other counter and DESIGN.md's ephemeral-bookkeeping
+# rule.)
+CONVERGE_SKIP_COUNT="$RUN_DIR/converge-skip.count"
+CONVERGE_STALE_BREAK_AFTER=5   # consecutive non-boxup skips before we break
+
+converge_skip_count_read() {
+  local n=0
+  [ -f "$CONVERGE_SKIP_COUNT" ] && \
+    n=$(tr -d '[:space:]' < "$CONVERGE_SKIP_COUNT" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
+
+converge_skip_count_reset() { rm -f "$CONVERGE_SKIP_COUNT" 2>/dev/null || true; }
+
+converge_lock_holders() {
+  local target ino line lpid lino comm printed=0
+  target="$(readlink -f "$CONVERGE_LOCK" 2>/dev/null || echo "$CONVERGE_LOCK")"
+  [ -n "$target" ] || return 1
+  [ -r /proc/locks ] || return 1
+  # Inode of the lock file (device:inode in /proc/locks is MAJ:MIN:INO; we
+  # match on the inode component, which is unambiguous for a single file).
+  ino="$(stat -c '%i' "$target" 2>/dev/null || true)"
+  case "$ino" in ''|*[!0-9]*) return 1 ;; esac
+  # /proc/locks columns: "N: FLOCK ADVISORY WRITE <pid> <maj>:<min>:<ino> ..."
+  while IFS= read -r line; do
+    case "$line" in *FLOCK*) ;; *) continue ;; esac
+    # shellcheck disable=SC2086  # deliberate word-split of the columns
+    set -- $line
+    lpid="$5"
+    lino="${6##*:}"
+    [ "$lino" = "$ino" ] || continue
+    case "$lpid" in ''|*[!0-9]*) continue ;; esac
+    [ "$lpid" = "$$" ] && continue        # never count our own boxup process
+    [ "$lpid" = "$BASHPID" ] && continue  # nor our own lock-check subshell
+    if [ -r "/proc/$lpid/comm" ]; then
+      comm="$(tr -d '\0\n' < "/proc/$lpid/comm" 2>/dev/null || echo '?')"
+    else
+      comm='?'   # unreadable (racing/exiting pid) — caller fails SAFE
+    fi
+    [ -n "$comm" ] || comm='?'   # empty comm (racing pid) — also unproven
+    echo "$lpid $comm"
+    printed=1
+  done < /proc/locks
+  [ "$printed" = 1 ] || return 1
+  return 0
+}
+
+# True (0) iff the converge lock is held by a process we must NOT stomp — a
+# GENUINE concurrent boxup/shell, OR a holder whose comm we cannot read (a
+# racing/exiting pid: we cannot PROVE it is non-boxup, so we fail SAFE and keep
+# skipping rather than break). comm values that count as boxup: bash/sh/dash
+# (boxup runs under a shell), "boxup" itself, or "?" (unreadable = unproven).
+converge_lock_held_by_boxup() {
+  local holders line comm
+  holders="$(converge_lock_holders)" || return 1
+  while IFS= read -r line; do
+    comm="${line#* }"
+    case "$comm" in
+      bash|sh|dash|boxup|'?') return 0 ;;
+    esac
+  done <<EOF
+$holders
+EOF
+  return 1
+}
+
+# True (0) iff there IS a holder but EVERY holder's comm is unproven ('?') —
+# i.e. we could not resolve any holder pid to a readable /proc/PID/comm. This
+# is the fail-safe path (treated as boxup, never broken), but it is also the
+# platform-degradation signal the supervisor asked to make loud: verified
+# 2026-08-28 that /proc/locks pids DO resolve inside these containers (shared
+# pid namespace, tini as pid 1). If the platform ever moves the boxes into
+# their own pid namespace, holders stop resolving, this returns true forever,
+# and the stale-break silently no-ops — the exact invisible-regression class
+# that produced #7/#8. So the caller LOGS this (once per window), never silent.
+converge_lock_holder_unresolved() {
+  local holders line comm any=0
+  holders="$(converge_lock_holders)" || return 1   # no holder at all
+  while IFS= read -r line; do
+    comm="${line#* }"
+    any=1
+    case "$comm" in '?') ;; *) return 1 ;; esac   # a resolved holder exists
+  done <<EOF
+$holders
+EOF
+  [ "$any" = 1 ]
+}
+
+# Rate-limited (once per window) diagnostic for the unresolvable-holder
+# degradation. Uses its own stamp so it never spams per-tick.
+CONVERGE_UNRESOLVED_LOG="$RUN_DIR/last-unresolved-holder.log"
+converge_log_unresolved_once() {
+  local now last window=600
+  now=$(date +%s)
+  last=0
+  [ -f "$CONVERGE_UNRESOLVED_LOG" ] && \
+    last=$(tr -d '[:space:]' < "$CONVERGE_UNRESOLVED_LOG" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $((now - last)) -ge "$window" ] || return 0
+  echo "$now" > "$CONVERGE_UNRESOLVED_LOG" 2>/dev/null || true
+  log "tick: converge lock holder pid does not resolve to /proc/PID/comm — treating as unproven and NOT breaking (fail-safe). If this persists, the boxes may have moved into their own pid namespace and this self-heal has degraded to a no-op — investigate (verified working on grok-box-1 2026-08-28)." >&2
+}
+
 # --- converge lock (D3) ------------------------------------------------------
 # Serialize converge across `boxup once`, the worker tick, and a rollout.
 # run_with_converge_lock <mode> <fn>:
@@ -127,8 +237,55 @@ run_with_converge_lock() {
     case "$mode" in
       try)
         if ! flock -n 8; then
-          exit 200   # contended; caller treats this specially
+          # Contended. F7 (#7): distinguish a GENUINE concurrent boxup from a
+          # tailscaled that inherited fd 8 and holds the converge lock for its
+          # whole life. If a live boxup/shell holds it, this is real work in
+          # progress — skip as before (reset the skip counter: a genuine holder
+          # means the lock is NOT stale). If the holder is non-boxup
+          # (tailscaled or anything else) for CONVERGE_STALE_BREAK_AFTER
+          # consecutive ticks, the lock is stale — break it and run the tick
+          # anyway. Fail-open: if the /proc walk errors we cannot prove the
+          # holder is non-boxup, so we behave exactly as today (skip).
+          if converge_lock_held_by_boxup; then
+            # Either a genuine boxup/shell holder, OR an unresolvable holder
+            # (fail-safe: never break on an unproven holder). If it is the
+            # unresolvable case, log it once per window — a persistent
+            # unresolvable holder means the platform moved the boxes into their
+            # own pid namespace and this self-heal has silently degraded.
+            converge_lock_holder_unresolved && converge_log_unresolved_once
+            converge_skip_count_reset
+            exit 200
+          fi
+          if converge_lock_holders >/dev/null 2>&1; then
+            # Holder exists and is provably non-boxup. Count consecutive skips;
+            # only break after the threshold so a brief non-boxup overlap never
+            # trips it. If the counter cannot be persisted (missing/unwritable
+            # $RUN_DIR), we CANNOT know this is the Nth consecutive skip, so we
+            # never break — skip as today (supervisor directive: no counter =
+            # no break).
+            local skips holder_line
+            skips=$(( $(converge_skip_count_read) + 1 ))
+            if ! echo "$skips" > "$CONVERGE_SKIP_COUNT" 2>/dev/null; then
+              exit 200   # cannot persist the streak → never break, just skip
+            fi
+            if [ "$skips" -ge "$CONVERGE_STALE_BREAK_AFTER" ]; then
+              holder_line="$(converge_lock_holders 2>/dev/null | head -n1)"
+              log "tick: converge lock held by non-boxup pid=${holder_line% *} comm=${holder_line#* } — stale (${skips} consecutive skips), breaking" >&2
+              converge_skip_count_reset
+              # Run the tick UNLOCKED. We do not hold the flock (the stale
+              # holder still does, on ITS fd), but the holder is not a boxup so
+              # there is no concurrent converge to collide with.
+              "$fn"
+              exit
+            fi
+            exit 200   # under threshold — skip this tick, keep counting
+          fi
+          # /proc walk could not identify any holder (fail-open): behave as
+          # today — skip without counting.
+          exit 200
         fi
+        # Acquired the lock cleanly: any prior skip streak is over.
+        converge_skip_count_reset
         ;;
       *)
         flock -w 60 8 || true   # bounded wait; proceed even on timeout
@@ -262,7 +419,7 @@ ts_fields() {
   ts status --json 2>/dev/null | python3 -c '
 import json, sys
 out = {"backend": "", "online": "no", "exitn": "no", "mapfail": "no",
-       "fwdhealth": "no", "routes": "", "auth": ""}
+       "fwdhealth": "no", "routes": "", "auth": "", "nodegone": "no"}
 try:
     d = json.load(sys.stdin)
     s = d.get("Self") or {}
@@ -275,6 +432,13 @@ try:
                                or "not-in-map-poll" in h
                                or "pollnetmap" in h) else "no"
     out["fwdhealth"] = "yes" if "forward" in h else "no"
+    # F8 (#8): the control plane deleted the node but LocalAPI keeps reporting
+    # BackendState=Running. The Health strings name it — "node not found" /
+    # "not found (404)". This is one of two nodegone sources (the other is a
+    # bounded tailscaled.log tail in read_ts_fields); either is sufficient.
+    out["nodegone"] = "yes" if ("node not found" in h
+                                or "not found (404)" in h
+                                or "404: node not found" in h) else "no"
     out["auth"] = (d.get("AuthURL") or "").replace("\n", " ").strip()
 except Exception:
     pass
@@ -285,6 +449,7 @@ for k, v in out.items():
 
 read_ts_fields() {
   backend=""; online="no"; exitn="no"; mapfail="no"; fwdhealth="no"; auth=""
+  nodegone="no"
   while IFS= read -r line; do
     case "$line" in
       backend=*)   backend="${line#backend=}" ;;
@@ -293,10 +458,31 @@ read_ts_fields() {
       mapfail=*)   mapfail="${line#mapfail=}" ;;
       fwdhealth=*) fwdhealth="${line#fwdhealth=}" ;;
       auth=*)      auth="${line#auth=}" ;;
+      nodegone=*)  nodegone="${line#nodegone=}" ;;
     esac
   done <<EOF
 $(ts_fields)
 EOF
+  # F8 (#8): second nodegone source — a BOUNDED tail of $TAILSCALED_LOG. The
+  # Health strings above can clear while the map-poll keeps 404ing, so also
+  # scan the log. Bounded two ways so a stale log never re-triggers forever:
+  # only the last ~200 lines, AND (since we cannot cheaply parse per-line
+  # timestamps against the daemon's start) only when Self.Online is false —
+  # a node that is genuinely Online again is not gone regardless of old lines.
+  if [ "$nodegone" != yes ] && [ "$online" != yes ]; then
+    nodegone_from_log && nodegone="yes"
+  fi
+}
+
+# F8 (#8): true (0) iff the last ~200 lines of $TAILSCALED_LOG show a
+# PollNetMap / lite-map "404 node not found". Bounded to the tail only; the
+# caller additionally gates on Self.Online=false so a stale log entry from a
+# since-recovered node cannot re-trigger re-auth. Fail-open: no log / no match
+# returns non-zero (not nodegone).
+nodegone_from_log() {
+  [ -f "$TAILSCALED_LOG" ] || return 1
+  tail -n 200 "$TAILSCALED_LOG" 2>/dev/null \
+    | grep -Eiq 'pollnetmap.*404.*node not found|404: node not found'
 }
 
 advertised_routes() {
@@ -318,6 +504,34 @@ try:
 except Exception:
     print("")
 ' 2>/dev/null || true
+}
+
+# F9 (#9): the tags the device ALREADY carries in its current prefs. Source
+# from live prefs (debug prefs AdvertiseTags), falling back to status --json
+# Self.Tags. NEVER from config.toml [tailscale] tags — that is first-login-only
+# (F11). Prints a comma-separated "tag:a,tag:b" or empty. Restating tags the
+# node already has is a MENTION the CLI demands, not INTRODUCING new tags.
+current_advertise_tags() {
+  local tags
+  tags="$(ts debug prefs 2>/dev/null | python3 -c '
+import json, sys
+try:
+    t = json.load(sys.stdin).get("AdvertiseTags") or []
+    print(",".join(str(x) for x in t))
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+  if [ -z "$tags" ]; then
+    tags="$(ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    t = (json.load(sys.stdin).get("Self") or {}).get("Tags") or []
+    print(",".join(str(x) for x in t))
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+  fi
+  echo "$tags"
 }
 
 wait_for_socket() {
@@ -521,7 +735,11 @@ ensure_sshd() {
       # Reload only on config change; a HUP every tick churns sshd for nothing.
       [ "$changed" = 1 ] && kill -HUP "$(pgrep -n -x sshd)" 2>/dev/null || true
     else
-      /usr/sbin/sshd 2>/dev/null || true
+      # F7/P0-A: sshd self-daemonizes and would keep an inherited converge-lock
+      # fd open for life (ensure_sshd runs inside the fd-8 lock subshell via
+      # do_ensure_body). Spawn through spawn_detached so it inherits neither
+      # lock fd — same failure class as the tailscaled leak.
+      spawn_detached "" /usr/sbin/sshd || true
     fi
   fi
 }
@@ -642,10 +860,44 @@ NFT
   fi
 }
 
+# --- converge: detached long-lived spawns (F7 / #7 + addendum P0-A) ----------
+# THE ONE place that spawns a long-lived, detached child. Every long-lived
+# process boxup starts — tailscaled, sshd (both spawn sites), and the worker —
+# MUST go through here so it inherits NEITHER converge-lock fd. #7 happened
+# because the fd-close was an unenforced per-site convention (the old comment
+# even claimed a close that the code did not do); a hand-appended `8>&- 9>&-`
+# at each call site is exactly how it survived review. One helper = one place
+# to be right, one place to review.
+#
+# Closes BOTH lock fds on the child:
+#   * fd 8 -> $CONVERGE_LOCK — held by run_with_converge_lock while do_ensure_body
+#     / do_tick run; a child that keeps it holds the converge flock for life and
+#     starves every later tick (the #7 failure, byte-for-byte).
+#   * fd 9 -> $START_LOCK — the tailscaled fork window.
+# Both are write fds, so both closes use `>&-`. setsid -f fully detaches
+# (new session, no controlling tty) so the child outlives this shell.
+#
+# Usage: spawn_detached <logfile|""> <cmd> [args...]
+#   logfile: append target for the child's stdout+stderr; "" -> /dev/null.
+# The caller passes any `env VAR=... cmd ...` as the command words.
+spawn_detached() {
+  local out="$1"; shift
+  if [ -n "$out" ]; then
+    setsid -f "$@" 8>&- 9>&- >>"$out" 2>&1
+  else
+    setsid -f "$@" 8>&- 9>&- >/dev/null 2>&1
+  fi
+}
+
 # --- converge: tailscaled ----------------------------------------------------
 # Exactly one daemon, bound to the workspace statedir. Kill strays (dpkg's
-# default unit uses /var/lib/tailscale) by PID, never pkill -f. The child
-# closes flock fd 8 so a later start is not wedged on the inherited lock.
+# default unit uses /var/lib/tailscale) by PID, never pkill -f.
+# F7 (#7): the daemon is spawned via spawn_detached, which closes BOTH lock fds
+# (fd 8 $CONVERGE_LOCK + fd 9 $START_LOCK). start_tailscaled is reachable from
+# under the converge lock (do_tick/do_ensure_body run it while holding fd 8),
+# so a daemon inheriting fd 8 would hold the converge flock for its ENTIRE life
+# — every later `run_tick` then loses `flock -n 8` and logs "converge already
+# running — skipping" forever (observed 256 skips / 77 min on box-8).
 start_tailscaled() {
   local daemon pid cmd keep=""
   daemon="$(tailscaled_bin)"
@@ -692,17 +944,20 @@ start_tailscaled() {
 
   # The flock lives in a subshell so it is released the moment the fork window
   # closes — a long-lived worker holding it forever would wedge later starts.
-  # The daemon child closes fd 9 itself so it does not inherit the lock.
+  # F7 (#7): spawn_detached closes BOTH lock fds (fd 8 + fd 9) on the daemon so
+  # it inherits neither — see the helper. The old code closed only fd 9 (as a
+  # sloppy `9<&-`) and never fd 8, so tailscaled held the converge lock for its
+  # whole life and starved every tick.
   (
     exec 9>"$START_LOCK"
     flock -n 9 || exit 3
-    setsid -f env TS_DEBUG_FIREWALL_MODE="${TS_DEBUG_FIREWALL_MODE:-nftables}" \
+    spawn_detached "$TAILSCALED_LOG" \
+      env TS_DEBUG_FIREWALL_MODE="${TS_DEBUG_FIREWALL_MODE:-nftables}" \
       "$daemon" \
         --statedir="$STATE_DIR" \
         --socket="$TS_SOCK" \
         --tun=tailscale0 \
-        --port=41641 \
-        9<&- >>"$TAILSCALED_LOG" 2>&1
+        --port=41641
   )
   if [ "$?" = 3 ]; then
     wait_for_socket || true
@@ -729,40 +984,140 @@ start_tailscaled() {
 # Everything after a successful login goes through `tailscale set` (up resets
 # flags it is not given). NoState right after daemon start is NOT NeedsLogin —
 # it stays in the *) arm below and never mints, per the house rule.
-ensure_login() {
-  local b st
-  st="$(wait_for_backend || true)"
-  case "$st" in Running|Starting) return 0 ;; esac
-  case "$st" in NeedsLogin|Stopped|"") ;; *) return 0 ;; esac
-
+# F9 (#9): invoke `tailscale up --force-reauth` with the MENTIONS current
+# tailscale (1.102.x) demands. It refuses re-auth otherwise:
+#   "changing settings via 'tailscale up' requires mentioning all non-default
+#    flags".
+# We add --hostname=<current> always, and --advertise-tags=<current> ONLY when
+# the device already carries tags (F11 distinction: mentioning tags the node
+# already has is the required MENTION, not INTRODUCING new tags on re-auth —
+# never source these from config.toml). We NEVER use --reset (it would drop
+# prefs we then have to re-set). #9(c): the failure is no longer swallowed with
+# `|| true` — we capture combined output and, on non-zero rc, log the actual
+# tailscale error at ERROR level, calling out the mentioning-flags case
+# explicitly. Non-fatal to the tick (no set -e escape) but always VISIBLE.
+# Args: $1 = human reason for the log; remaining args appended to the up argv
+# (e.g. --auth-key=...). Returns the tailscale rc.
+run_reauth_up() {
+  local reason="$1"; shift
+  local b hostname tags out rc
   b="$(tailscale_bin)"
   [ -x "$b" ] || return 0
   local -a up
   up=("$b" up --ssh=false --advertise-exit-node --accept-dns
-      --snat-subnet-routes=true --timeout=25s)
+      --snat-subnet-routes=true --timeout=25s --force-reauth)
   id box >/dev/null 2>&1 && up+=(--operator=box)
+
+  hostname="$(prefs_hostname)"
+  [ -n "$hostname" ] || hostname="$(read_box_name || true)"
+  [ -n "$hostname" ] && up+=(--hostname="$hostname")
+
+  tags="$(current_advertise_tags)"
+  if [ -n "$tags" ]; then
+    up+=(--advertise-tags="$tags")
+    log "login: $reason — mentioning current prefs hostname=${hostname:-?} tags=$tags (--force-reauth)"
+  else
+    log "login: $reason — mentioning current prefs hostname=${hostname:-?} (no tags on device) (--force-reauth)"
+  fi
+
+  out="$("${up[@]}" "$@" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "login: tailscale up --force-reauth FAILED rc=$rc: $out" >&2
+    case "$out" in
+      *"requires mentioning all non-default flags"*)
+        log "login: ERROR tailscale refused re-auth — it wants ALL non-default flags mentioned. Our argv had hostname=${hostname:-?} tags=${tags:-<none>}. Tailscale's suggested command is in the error text above; a pref changed underneath us." >&2
+        ;;
+    esac
+  fi
+  return "$rc"
+}
+
+ensure_login() {
+  local st
+  # Read full fields (need backend AND nodegone). wait_for_backend settles the
+  # backend first; then read_ts_fields populates nodegone from Health + a
+  # bounded tailscaled.log tail.
+  st="$(wait_for_backend || true)"
+  read_ts_fields
+  # F8 (#8): Running is a legitimate "logged in" ONLY when the node is not
+  # gone. When the control plane has deleted the node, LocalAPI still reports
+  # BackendState=Running while PollNetMap 404s — fall through to the re-auth
+  # path (same path as NeedsLogin with a populated statedir) instead of
+  # returning 0. Gate strictly on Running: NoState/Starting right after daemon
+  # start must NOT trigger re-auth off a stale log tail (house rule: NoState ≠
+  # NeedsLogin, never mint on NoState).
+  if [ "$nodegone" = yes ] && [ "$st" = Running ]; then
+    if ! state_is_populated; then
+      # No identity to re-auth (empty statedir) — nothing --force-reauth can do.
+      return 0
+    fi
+    # F8 (#8) rate limit: at most one re-auth per D4 backoff window; a re-auth
+    # storm against the control plane is worse than the bug.
+    if ! reauth_window_ok; then
+      return 0
+    fi
+    date +%s > "$REAUTH_LAST" 2>/dev/null || true
+    if [ -s "$AUTHKEY_FILE" ]; then
+      if run_reauth_up "node deleted server-side (nodegone), re-auth with auth-key" \
+           --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")"; then
+        echo 0 > "$REAUTH_FAIL" 2>/dev/null || true
+      else
+        echo $(( $(reauth_fail_count) + 1 )) > "$REAUTH_FAIL" 2>/dev/null || true
+      fi
+    else
+      # No key: we can only mint an AuthURL no human may click. Log LOUDLY once
+      # per window (the window guard above ensures once-per-window) — do NOT
+      # spin.
+      log "login: WARNING node gone server-side (nodegone) but NO auth-key — minting AuthURL a human must click; see boxup status. Rate-limited to once per backoff window." >&2
+      if run_reauth_up "node deleted server-side (nodegone), minting AuthURL"; then
+        echo 0 > "$REAUTH_FAIL" 2>/dev/null || true
+      else
+        echo $(( $(reauth_fail_count) + 1 )) > "$REAUTH_FAIL" 2>/dev/null || true
+      fi
+    fi
+    return 0
+  fi
+  case "$st" in Running|Starting) return 0 ;; esac
+  case "$st" in NeedsLogin|Stopped|"") ;; *) return 0 ;; esac
+
+  local b
+  b="$(tailscale_bin)"
+  [ -x "$b" ] || return 0
   # A populated statedir at NeedsLogin means an existing identity whose node
   # key expired or was revoked; --force-reauth re-auths it in place (same key).
   # An empty statedir is a first login and must NOT get --force-reauth.
   if state_is_populated; then
-    up+=(--force-reauth)
-    # Tags are auth-time-only and NEVER added on the --force-reauth branch
+    # Tags are auth-time-only and NEVER INTRODUCED on the --force-reauth branch
     # (F11): an unattended ~180-day key-expiry re-auth must not convert a
     # user-owned node to tag-owned (ACL semantics change, tagged keys stop
     # expiring, and an unauthorized tag is REJECTED after --force-reauth
     # already rotated keys — leaving the box locked out, headscale#3374).
-    # Retagging an existing node is a documented MANUAL operator step.
+    # F9 (#9): run_reauth_up still MENTIONS the tags the device ALREADY carries
+    # (from live prefs, never config.toml) because current tailscale refuses an
+    # up that omits an already-set non-default flag. Mentioning is not
+    # introducing. Retagging is still a documented MANUAL operator step.
+    # P0-C (#9): do NOT swallow the re-auth rc with `|| true`. run_reauth_up
+    # already logs the tailscale error text; the CALLER also records the
+    # outcome so a persistent NeedsLogin re-auth failure is visible, not silent.
+    local rrc
     if [ -s "$AUTHKEY_FILE" ]; then
-      log "login: re-auth existing identity with auth-key (--force-reauth)"
-      "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
+      run_reauth_up "re-auth existing identity with auth-key" \
+        --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")"; rrc=$?
     else
-      log "login: re-auth existing identity, minting AuthURL (--force-reauth) — see boxup status"
-      "${up[@]}" || true
+      run_reauth_up "re-auth existing identity, minting AuthURL — see boxup status"; rrc=$?
+    fi
+    if [ "$rrc" -ne 0 ]; then
+      log "login: re-auth (NeedsLogin, populated statedir) FAILED rc=$rrc — see the tailscale error above; node stays NeedsLogin, will retry next converge" >&2
     fi
   else
     # First login (empty statedir). This is the ONLY place --advertise-tags is
-    # added: config [tailscale] tags, when non-empty, tags the node at initial
-    # registration. Default unset => flag omitted => byte-identical to before.
+    # added from config: config [tailscale] tags, when non-empty, tags the node
+    # at initial registration. Default unset => flag omitted => byte-identical
+    # to before. Left intentionally UNCHANGED by #9 (first-login branch only).
+    local -a up
+    up=("$b" up --ssh=false --advertise-exit-node --accept-dns
+        --snat-subnet-routes=true --timeout=25s)
+    id box >/dev/null 2>&1 && up+=(--operator=box)
     local tags
     tags="$(config_get tailscale tags || true)"
     [ -n "$tags" ] && up+=(--advertise-tags="$tags")
@@ -895,6 +1250,36 @@ refresh_backoff_window() {
   fi
 }
 
+# --- re-auth backoff (F8 / #8, D4-shaped) ------------------------------------
+# nodegone-triggered re-auth must NOT storm the control plane. It reuses the D4
+# backoff WINDOW function above (20->60->180->600s) but with its OWN counter
+# and attempt-stamp so it never conflates with refresh_exitnode's failures. A
+# re-auth fires at most once per window; when there is no auth key (only an
+# AuthURL a human must click) we log loudly ONCE per window instead of spinning.
+REAUTH_FAIL="$RUN_DIR/fail.reauth"
+REAUTH_LAST="$RUN_DIR/last-reauth"
+
+reauth_fail_count() {
+  local n=0
+  [ -f "$REAUTH_FAIL" ] && \
+    n=$(tr -d '[:space:]' < "$REAUTH_FAIL" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
+
+# 0 (proceed) iff we are outside the current re-auth backoff window; else 1.
+# Stamps nothing — the caller stamps the attempt time on both outcomes.
+reauth_window_ok() {
+  local fails window now last
+  fails=$(reauth_fail_count)
+  window=$(refresh_backoff_window "$fails")
+  now=$(date +%s)
+  last=0
+  [ -f "$REAUTH_LAST" ] && last=$(tr -d '[:space:]' < "$REAUTH_LAST" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $((now - last)) -ge "$window" ]
+}
+
 # Push a full `tailscale set` when the coordination server would show "unable
 # to relay traffic". Never `up`. Rate-limited: an unneeded set every tick
 # cancels PollNetMap and marks the node offline.
@@ -902,6 +1287,16 @@ refresh_exitnode() {
   local name need=0 reason="" chk warn v4 v6 routes now last
   read_ts_fields
   case "$backend" in Running) ;; *) return 0 ;; esac
+  # P0-B (#8 sibling): a node deleted server-side stays backend=Running while
+  # PollNetMap 404s (nodegone). A `tailscale set` cannot fix a gone node — the
+  # fix is re-auth (ensure_login owns it). Pushing prefs here would be a no-op
+  # against a dead identity and can cancel the in-flight map poll. Skip so the
+  # re-auth path is the only thing acting on a gone node. Same guard the
+  # ensure_login Running-branch now applies.
+  if [ "$nodegone" = yes ]; then
+    log "refresh: node gone server-side (nodegone) — deferring to re-auth, skipping set" >&2
+    return 0
+  fi
 
   name="$(read_box_name || true)"
   case "$name" in
@@ -1139,7 +1534,10 @@ do_tick() {
   ensure_nat || true
 
   if ! pgrep -x sshd >/dev/null 2>&1; then
-    [ -x /usr/sbin/sshd ] && /usr/sbin/sshd 2>/dev/null || true
+    # F7/P0-A: do_tick runs under `run_with_converge_lock try`, so this spawn is
+    # inside the fd-8 lock subshell too — route through spawn_detached so sshd
+    # inherits neither lock fd (see ensure_sshd for the same reason).
+    [ -x /usr/sbin/sshd ] && { spawn_detached "" /usr/sbin/sshd || true; }
   fi
 
   case "$(read_box_name || true)" in
@@ -1207,11 +1605,19 @@ stop_workers() {
 }
 
 worker_loop() {
+  local trc
   ensure_dirs
   echo $$ > "$WORKER_PID"
   echo "boxup-worker v$BOXUP_VERSION pid=$$ interval=$INTERVAL freeze=${FREEZE_SECS}s" >> "$WORKER_LOG"
   while true; do
-    run_tick >> "$WORKER_LOG" 2>&1 || true
+    # P1: capture and surface the tick rc instead of a blanket `|| true`.
+    # run_tick is designed to return 0 (B1: a skipped tick is liveness), so a
+    # NON-zero here means run_tick itself errored unexpectedly — log it rather
+    # than discard it silently. Never break the loop (the self-heal must keep
+    # ticking past a transient failure — D8 `set -u` not blanket `set -e`).
+    run_tick >> "$WORKER_LOG" 2>&1
+    trc=$?
+    [ "$trc" -ne 0 ] && log "worker: run_tick returned rc=$trc (unexpected; loop continues)" >> "$WORKER_LOG" 2>&1
     if [ "$(wc -c < "$WORKER_LOG" 2>/dev/null || echo 0)" -gt 10485760 ]; then
       : > "$WORKER_LOG"
     fi
@@ -1225,7 +1631,11 @@ start_daemon() {
   # once kept an old version's worker in memory next to a newer install.
   stop_workers
   rm -f "$WORKER_PID"
-  setsid -f env BOX_SETUP_ROOT="$ROOT" bash "$SELF" worker >/dev/null 2>&1
+  # F7/P0-A: route the worker spawn through spawn_detached too. Currently benign
+  # (start_daemon runs at top level, after the lock subshell has exited) but it
+  # is one refactor away from being bug #7 again if start_daemon is ever called
+  # from under the converge lock — one helper, no special cases.
+  spawn_detached "" env BOX_SETUP_ROOT="$ROOT" bash "$SELF" worker
   local i=0
   while [ "$i" -lt 15 ]; do
     if [ -f "$WORKER_PID" ] && kill -0 "$(cat "$WORKER_PID" 2>/dev/null)" 2>/dev/null; then
@@ -1373,18 +1783,48 @@ do_check() {
 
 # --- converge ----------------------------------------------------------------
 # The converge body. Runs under the converge lock (via do_ensure).
+# P1: previously every member was bare or `|| true`, so a converge reported
+# success even if every step failed — invisibly. We now run each step through
+# _ensure_step, which logs a non-zero rc and records a `degraded` marker under
+# $RUN_DIR. The function's RETURN SEMANTICS ARE UNCHANGED (callers depend on
+# do_ensure_body not failing a tick): it still returns 0 regardless. The marker
+# and per-step logs are the visibility; they do not gate convergence. A clean
+# converge clears the marker.
+DEGRADED_MARKER="$RUN_DIR/degraded"
+
+# _ensure_step <label> <fn>: run <fn>, log its rc if non-zero, set the degraded
+# flag (shell var `_degraded`) so the body can stamp the marker. Never aborts.
+_ensure_step() {
+  local label="$1" fn="$2" rc
+  "$fn"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "converge: step '$label' rc=$rc (converge continues, marking degraded)" >&2
+    _degraded=1
+  fi
+  return 0
+}
+
 do_ensure_body() {
+  local _degraded=0
   ensure_dirs
-  ensure_packages
-  ensure_tailscale_bin || true
-  ensure_sshd
-  ensure_forwarding || true
-  start_tailscaled || true
+  _ensure_step packages       ensure_packages
+  _ensure_step tailscale-bin  ensure_tailscale_bin
+  _ensure_step sshd           ensure_sshd
+  _ensure_step forwarding     ensure_forwarding
+  _ensure_step tailscaled     start_tailscaled
   wait_for_socket || true
-  ensure_login
-  ensure_name
-  ensure_nat || true
-  refresh_exitnode || true
+  _ensure_step login          ensure_login
+  _ensure_step name           ensure_name
+  _ensure_step nat            ensure_nat
+  _ensure_step refresh        refresh_exitnode
+  # Visibility only — does NOT change the return code (callers depend on a tick
+  # not being failed by a degraded converge). A clean pass clears the marker.
+  if [ "$_degraded" = 1 ]; then
+    date +%s > "$DEGRADED_MARKER" 2>/dev/null || true
+  else
+    rm -f "$DEGRADED_MARKER" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # do_ensure: take the converge lock with flock -w 60 (bounded WAIT, never
