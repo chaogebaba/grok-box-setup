@@ -650,15 +650,22 @@ start_tailscaled() {
   log "start: tailscaled pid=${pid:-?} statedir=$STATE_DIR"
 }
 
-# --- converge: first login ---------------------------------------------------
-# `tailscale up` is allowed here and ONLY here: when the backend needs a login
-# AND the statedir has no identity. Everything after first login goes through
-# `tailscale set` (up resets flags it is not given).
+# --- converge: first login / re-auth -----------------------------------------
+# `tailscale up` is allowed here and ONLY here: when the backend needs a login.
+# Two cases share this one `up`, distinguished by the statedir:
+#   * statedir empty  -> first login (auth-key join, or mint an AuthURL)
+#   * statedir populated but backend=NeedsLogin -> the node key expired (~180d)
+#     or the node was deleted in the admin console. `tailscale up` on an expired
+#     node exits silently, so re-auth needs --force-reauth (tailscale#6786,
+#     tailscale#4854). Re-auth reuses the existing machine key: same identity,
+#     no fork. The minted AuthURL surfaces in `boxup status` via auth=.
+# Everything after a successful login goes through `tailscale set` (up resets
+# flags it is not given). NoState right after daemon start is NOT NeedsLogin —
+# it stays in the *) arm below and never mints, per the house rule.
 ensure_login() {
   local b st
   st="$(wait_for_backend || true)"
   case "$st" in Running|Starting) return 0 ;; esac
-  state_is_populated && return 0
   case "$st" in NeedsLogin|Stopped|"") ;; *) return 0 ;; esac
 
   b="$(tailscale_bin)"
@@ -667,12 +674,26 @@ ensure_login() {
   up=("$b" up --ssh=false --advertise-exit-node --accept-dns
       --snat-subnet-routes=true --timeout=25s)
   id box >/dev/null 2>&1 && up+=(--operator=box)
-  if [ -s "$AUTHKEY_FILE" ]; then
-    log "login: auth-key join (statedir empty)"
-    "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
+  # A populated statedir at NeedsLogin means an existing identity whose node
+  # key expired or was revoked; --force-reauth re-auths it in place (same key).
+  # An empty statedir is a first login and must NOT get --force-reauth.
+  if state_is_populated; then
+    up+=(--force-reauth)
+    if [ -s "$AUTHKEY_FILE" ]; then
+      log "login: re-auth existing identity with auth-key (--force-reauth)"
+      "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
+    else
+      log "login: re-auth existing identity, minting AuthURL (--force-reauth) — see boxup status"
+      "${up[@]}" || true
+    fi
   else
-    log "login: minting AuthURL (statedir empty, no key) — see boxup status"
-    "${up[@]}" || true
+    if [ -s "$AUTHKEY_FILE" ]; then
+      log "login: auth-key join (statedir empty)"
+      "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
+    else
+      log "login: minting AuthURL (statedir empty, no key) — see boxup status"
+      "${up[@]}" || true
+    fi
   fi
 }
 

@@ -58,6 +58,12 @@ last-exitnode-set) is deliberately ephemeral bookkeeping.
    empty statedir → auth-key join, else mint an AuthURL and surface it in
    `status`. This mints a NEW node; the old one must be deleted in the admin
    console.
+5. **Node key expired / node deleted in console**: backend=NeedsLogin with a
+   *populated* statedir — the node key hit its ~180-day expiry, or the node
+   was removed in the admin console. `tailscale up` on an expired node exits
+   silently, so `boxup once` re-auths with `--force-reauth`; the AuthURL
+   appears in `status` as `auth=`. Re-auth reuses the existing machine key, so
+   it is the same identity — no new node is forked.
 
 ## Convergence rules that encode past incidents
 
