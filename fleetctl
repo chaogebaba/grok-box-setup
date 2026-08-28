@@ -1,0 +1,528 @@
+#!/bin/bash
+# fleetctl — laptop-side fleet CLI for the grok boxes.
+#
+# One file, run from the operator's laptop (Fedora: tailscale + ssh + sshpass).
+# It is the replacement for ad-hoc `for box in ...; do ssh ...; done` loops:
+# discover the grok-box-N nodes on the tailnet and drive boxup on each over ssh.
+#
+#   fleetctl list            discover boxes (name, tailscale IP, online)
+#   fleetctl status [box..]  one boxup status line per box (read-only)
+#   fleetctl check           quiet health gate; exit 1 if any box unhealthy
+#   fleetctl rollout [box..] deploy current git HEAD to boxes (git archive)
+#   fleetctl ssh <box> [cmd] convenience ssh wrapper
+#   fleetctl install-timer   systemd USER timer running `check --notify` /10min
+#   fleetctl remove-timer    tear that timer down
+#   fleetctl version | help
+#
+# The boxes are managed by boxup (/workspace/box-setup/boxup); fleetctl never
+# duplicates boxup's logic — for `status` it prints boxup's own status line
+# verbatim, and `rollout` runs boxup on the box. Only `rollout` mutates a box.
+# Never touches a non-grok machine: it acts only on names matching
+# ^grok-box-[0-9]+$ (from `tailscale status`, or a FLEET_BOXES override).
+#
+# Style follows boxup: bash, `set -u` (not -e), a log() helper, no deps beyond
+# tailscale / ssh / sshpass / python3 / git.
+set -u
+
+FLEETCTL_VERSION=1.0.0
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+BOXUP_REMOTE="/workspace/box-setup/boxup"
+BOX_USER="box"
+
+# Laptop-side config, distinct from the box's config.toml.
+CONFIG_FILE="${FLEET_CONFIG:-$HOME/.config/fleetctl/config.toml}"
+DEFAULT_SSH_PASSWORD="12345678"
+
+# Concurrency cap for the fan-out commands.
+MAX_CONCURRENCY="${FLEET_MAX_CONCURRENCY:-2}"
+
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- config.toml -------------------------------------------------------------
+# A TOML subset read with awk — copied verbatim from boxup so fleetctl has no
+# runtime dependency on the box's copy. Handles [table] headers, "basic" and
+# 'literal' strings, bare values and # comments. See boxup for the rationale.
+read -r -d '' _FLEET_TOML_AWK <<'AWK' || true
+function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+{
+  line = trim($0)
+  if (line == "" || line ~ /^#/) next
+  if (line ~ /^\[.*\]$/) { sec = trim(substr(line, 2, length(line) - 2)); next }
+  eq = index(line, "=")
+  if (eq == 0) next
+  if (sec != want_t || trim(substr(line, 1, eq - 1)) != want_k) next
+  v = trim(substr(line, eq + 1))
+  if (substr(v, 1, 1) == "\"") {
+    out = ""; i = 2; n = length(v)
+    while (i <= n) {
+      c = substr(v, i, 1)
+      if (c == "\\" && i < n) {
+        d = substr(v, i + 1, 1)
+        if (d == "n") out = out "\n"
+        else if (d == "t") out = out "\t"
+        else out = out d
+        i += 2; continue
+      }
+      if (c == "\"") break
+      out = out c; i++
+    }
+    print out; found = 1; exit
+  }
+  if (substr(v, 1, 1) == "'") {
+    rest = substr(v, 2)
+    q = index(rest, "'")
+    if (q > 0) rest = substr(rest, 1, q - 1)
+    print rest; found = 1; exit
+  }
+  h = index(v, "#")
+  if (h > 0) v = trim(substr(v, 1, h - 1))
+  print v; found = 1; exit
+}
+END { exit(found ? 0 : 1) }
+AWK
+
+# config_get <table> <key> -> prints value, non-zero when unset.
+config_get() {
+  [ -f "$CONFIG_FILE" ] || return 1
+  awk -v want_t="$1" -v want_k="$2" "$_FLEET_TOML_AWK" "$CONFIG_FILE" 2>/dev/null
+}
+
+# SSH password. Precedence: FLEET_SSH_PASSWORD env > config.toml [ssh].password
+# > default. Never echoed; only ever passed to sshpass -e via the SSHPASS env
+# var (not on the command line, so never visible in ps). Not logged, not
+# stored in git.
+ssh_password() {
+  local p=""
+  if [ -n "${FLEET_SSH_PASSWORD:-}" ]; then
+    p="$FLEET_SSH_PASSWORD"
+  else
+    p="$(config_get ssh password || true)"
+  fi
+  [ -n "$p" ] || p="$DEFAULT_SSH_PASSWORD"
+  printf '%s' "$p"
+}
+
+# --- discovery ---------------------------------------------------------------
+# Print "name<TAB>ip<TAB>online" for every grok-box-N peer, sorted by N. Reads
+# tailscale status --json once. Self is excluded (a laptop is never a box).
+fleet_discover() {
+  tailscale status --json 2>/dev/null | python3 -c '
+import json, re, sys
+pat = re.compile(r"^grok-box-([0-9]+)$")
+rows = []
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+for peer in (d.get("Peer") or {}).values():
+    name = str(peer.get("HostName") or "").strip()
+    m = pat.match(name)
+    if not m:
+        continue
+    ips = peer.get("TailscaleIPs") or []
+    ip = ""
+    for cand in ips:
+        if ":" not in str(cand):
+            ip = str(cand); break
+    if not ip and ips:
+        ip = str(ips[0])
+    online = "yes" if peer.get("Online") else "no"
+    rows.append((int(m.group(1)), name, ip or "-", online))
+for _, name, ip, online in sorted(rows):
+    print(f"{name}\t{ip}\t{online}")
+' 2>/dev/null || true
+}
+
+# One field of a discovery row for a given box name. field: ip|online.
+fleet_field() {
+  local want="$1" field="$2"
+  fleet_discover | while IFS=$'\t' read -r name ip online; do
+    [ "$name" = "$want" ] || continue
+    case "$field" in
+      ip) printf '%s' "$ip" ;;
+      online) printf '%s' "$online" ;;
+    esac
+    break
+  done
+}
+
+# Resolve the target box list. FLEET_BOXES (space-separated) bypasses discovery
+# entirely — used for testing unreachable handling with fake names. Otherwise
+# use the caller's explicit args, else all discovered boxes.
+#   resolve_targets [--online-only] [box...]
+resolve_targets() {
+  local online_only=0
+  if [ "${1:-}" = "--online-only" ]; then online_only=1; shift; fi
+
+  if [ -n "${FLEET_BOXES:-}" ]; then
+    printf '%s\n' $FLEET_BOXES
+    return 0
+  fi
+  if [ "$#" -gt 0 ]; then
+    printf '%s\n' "$@"
+    return 0
+  fi
+  if [ "$online_only" = 1 ]; then
+    fleet_discover | awk -F'\t' '$3 == "yes" { print $1 }'
+  else
+    fleet_discover | awk -F'\t' '{ print $1 }'
+  fi
+}
+
+# --- reachability + ssh ------------------------------------------------------
+# Reachable if a 1-packet tailscale ping succeeds OR the peer is Online=true.
+# Bounded so a dead box never hangs the fan-out. FLEET_BOXES names that are not
+# real peers fail here (ping fails, no Online row) → reported unreachable.
+box_reachable() {
+  local box="$1"
+  if [ "$(fleet_field "$box" online)" = "yes" ]; then
+    return 0
+  fi
+  if have tailscale && \
+     timeout 5 tailscale ping -c1 --timeout 3s "$box" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# Run a command on a box over ssh. Password from ssh_password, never echoed.
+# args after box are passed as a single remote command string.
+box_ssh() {
+  local box="$1"; shift
+  local pw
+  pw="$(ssh_password)"
+  SSHPASS="$pw" sshpass -e ssh \
+    -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=6 \
+    -o BatchMode=no \
+    "$BOX_USER@$box" "$@"
+}
+
+# --- list --------------------------------------------------------------------
+cmd_list() {
+  local any=0
+  printf '%-14s %-16s %-6s\n' "NAME" "TAILSCALE IP" "ONLINE"
+  while IFS=$'\t' read -r name ip online; do
+    [ -n "$name" ] || continue
+    any=1
+    printf '%-14s %-16s %-6s\n' "$name" "$ip" "$online"
+  done <<EOF
+$(fleet_discover)
+EOF
+  [ "$any" = 1 ] || echo "(no grok-box-N peers found on the tailnet)"
+}
+
+# --- status ------------------------------------------------------------------
+# Print boxup's own status line per box, prefixed by the box name. Offline /
+# unreachable boxes are reported but never fail the command (exit 0 always).
+status_one() {
+  local box="$1" line
+  if ! box_reachable "$box"; then
+    printf '%-14s UNREACHABLE\n' "$box"
+    return 0
+  fi
+  line="$(box_ssh "$box" "sudo $BOXUP_REMOTE status" 2>/dev/null)"
+  if [ -z "$line" ]; then
+    printf '%-14s UNREACHABLE (ssh/boxup failed)\n' "$box"
+    return 0
+  fi
+  printf '%-14s %s\n' "$box" "$line"
+}
+
+cmd_status() {
+  local -a targets=()
+  while IFS= read -r b; do [ -n "$b" ] && targets+=("$b"); done < <(resolve_targets --online-only "$@")
+  if [ "${#targets[@]}" -eq 0 ]; then
+    echo "(no target boxes)"
+    return 0
+  fi
+  local b
+  for b in "${targets[@]}"; do
+    status_one "$b"
+  done
+  return 0
+}
+
+# --- check -------------------------------------------------------------------
+# Quiet health gate. A box is UNHEALTHY if any of: unreachable, backend not
+# Running, online != yes, exit-node not advertised, sshd not up, or worker
+# (selfheal) count != 1. Prints only problems. Exit 0 if all healthy, else 1.
+# --notify additionally fires notify-send -u critical per problem.
+check_one() {
+  # echoes "OK" or "<box>: <problem>" lines to stdout; returns 0 healthy.
+  local box="$1" line
+  if ! box_reachable "$box"; then
+    echo "$box: unreachable"
+    return 1
+  fi
+  line="$(box_ssh "$box" "sudo $BOXUP_REMOTE status" 2>/dev/null)"
+  if [ -z "$line" ]; then
+    echo "$box: unreachable (ssh/boxup failed)"
+    return 1
+  fi
+
+  # Parse the space-separated key=value status line into fields.
+  local backend="" online="" exitn="" sshd="" worker="" tok k v
+  for tok in $line; do
+    k="${tok%%=*}"; v="${tok#*=}"
+    case "$k" in
+      backend)   backend="$v" ;;
+      online)    online="$v" ;;
+      exit-node) exitn="$v" ;;
+      sshd)      sshd="$v" ;;
+      worker)    worker="$v" ;;
+    esac
+  done
+
+  local -a problems=()
+  [ "$backend" = "Running" ] || problems+=("backend=$backend (want Running)")
+  [ "$online" = "yes" ]      || problems+=("online=$online (want yes)")
+  [ "$exitn" = "yes" ]       || problems+=("exit-node=$exitn (want yes)")
+  [ "$sshd" = "up" ]         || problems+=("sshd=$sshd (want up)")
+  # worker field is a pid or '-'; exactly one worker means a numeric pid.
+  case "$worker" in
+    ''|-|*[!0-9]*) problems+=("worker=${worker:--} (want exactly 1)") ;;
+  esac
+
+  if [ "${#problems[@]}" -eq 0 ]; then
+    return 0
+  fi
+  local p
+  for p in "${problems[@]}"; do
+    echo "$box: $p"
+  done
+  return 1
+}
+
+cmd_check() {
+  local notify=0
+  if [ "${1:-}" = "--notify" ]; then notify=1; shift; fi
+
+  local -a targets=()
+  while IFS= read -r b; do [ -n "$b" ] && targets+=("$b"); done < <(resolve_targets "$@")
+
+  local rc=0 b out
+  for b in "${targets[@]}"; do
+    if ! out="$(check_one "$b")"; then
+      rc=1
+      printf '%s\n' "$out"
+      if [ "$notify" = 1 ] && have notify-send; then
+        while IFS= read -r pl; do
+          [ -n "$pl" ] && notify-send -u critical "fleetctl: box unhealthy" "$pl"
+        done <<EOF
+$out
+EOF
+      fi
+    fi
+  done
+  return "$rc"
+}
+
+# --- rollout -----------------------------------------------------------------
+# Deploy the current git HEAD to boxes: git archive HEAD -> tarball -> scp ->
+# extract on the box -> install.sh -> boxup once -> print the status line.
+# Refuses a dirty tree unless --dirty. Sequential with max 2 concurrent.
+# Unreachable boxes are skipped and listed. The box /tmp staging dir is cleaned.
+box_scp() {
+  local src="$1" box="$2" dst="$3" pw
+  pw="$(ssh_password)"
+  SSHPASS="$pw" sshpass -e scp \
+    -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=6 \
+    -o BatchMode=no \
+    "$src" "$BOX_USER@$box:$dst"
+}
+
+rollout_one() {
+  local box="$1" tarball="$2" remote_tar="/tmp/grok-box-setup-fleet.tar" \
+        remote_dir="/tmp/grok-box-setup-fleet" line
+  if ! box_reachable "$box"; then
+    printf '%-14s SKIPPED (unreachable)\n' "$box"
+    return 2
+  fi
+  if ! box_scp "$tarball" "$box" "$remote_tar" >/dev/null 2>&1; then
+    printf '%-14s FAILED (scp)\n' "$box"
+    return 1
+  fi
+  # Extract, install, converge, print status; then clean the staging dir.
+  if ! box_ssh "$box" "
+    set -e
+    rm -rf '$remote_dir'
+    mkdir -p '$remote_dir'
+    tar -xf '$remote_tar' -C '$remote_dir'
+    sudo bash '$remote_dir/install.sh'
+    sudo $BOXUP_REMOTE once >/dev/null 2>&1 || sudo $BOXUP_REMOTE once
+  " >/dev/null 2>&1; then
+    box_ssh "$box" "rm -rf '$remote_dir' '$remote_tar'" >/dev/null 2>&1 || true
+    printf '%-14s FAILED (install/once)\n' "$box"
+    return 1
+  fi
+  line="$(box_ssh "$box" "sudo $BOXUP_REMOTE status" 2>/dev/null)"
+  box_ssh "$box" "rm -rf '$remote_dir' '$remote_tar'" >/dev/null 2>&1 || true
+  printf '%-14s %s\n' "$box" "${line:-(status unavailable)}"
+  return 0
+}
+
+cmd_rollout() {
+  local allow_dirty=0
+  if [ "${1:-}" = "--dirty" ]; then allow_dirty=1; shift; fi
+
+  have git || { log "rollout: git not found"; return 1; }
+  if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    log "rollout: not inside a git repository"
+    return 1
+  fi
+  if [ "$allow_dirty" = 0 ] && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    log "rollout: working tree is dirty; commit/stash or pass --dirty"
+    return 1
+  fi
+
+  local tarball
+  tarball="$(mktemp --suffix=.tar 2>/dev/null || mktemp)" || {
+    log "rollout: mktemp failed"; return 1; }
+  if ! git archive --format=tar -o "$tarball" HEAD 2>/dev/null; then
+    rm -f "$tarball"
+    log "rollout: git archive HEAD failed"
+    return 1
+  fi
+  log "rollout: packaged HEAD $(git rev-parse --short HEAD 2>/dev/null || echo '?') -> $(basename "$tarball")"
+
+  local -a targets=()
+  while IFS= read -r b; do [ -n "$b" ] && targets+=("$b"); done < <(resolve_targets "$@")
+
+  local -a skipped=()
+  local running=0 b rc
+  for b in "${targets[@]}"; do
+    # Bounded concurrency: at most MAX_CONCURRENCY rollouts in flight.
+    while [ "$(jobs -rp | wc -l)" -ge "$MAX_CONCURRENCY" ]; do
+      wait -n 2>/dev/null || wait
+    done
+    rollout_one "$b" "$tarball" &
+    running=$((running + 1))
+  done
+  wait
+
+  rm -f "$tarball"
+
+  # Re-list which boxes were skipped as unreachable (rollout_one printed inline;
+  # this is a compact summary for the operator).
+  for b in "${targets[@]}"; do
+    box_reachable "$b" || skipped+=("$b")
+  done
+  if [ "${#skipped[@]}" -gt 0 ]; then
+    log "rollout: skipped unreachable: ${skipped[*]}"
+  fi
+  return 0
+}
+
+# --- ssh ---------------------------------------------------------------------
+cmd_ssh() {
+  local box="${1:-}"
+  if [ -z "$box" ]; then
+    log "usage: fleetctl ssh <box> [cmd...]"
+    return 2
+  fi
+  shift
+  if [ "$#" -gt 0 ]; then
+    box_ssh "$box" "$*"
+  else
+    # Interactive session.
+    local pw; pw="$(ssh_password)"
+    SSHPASS="$pw" sshpass -e ssh \
+      -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=6 \
+      -o BatchMode=no \
+      "$BOX_USER@$box"
+  fi
+}
+
+# --- systemd user timer ------------------------------------------------------
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT_SERVICE="$UNIT_DIR/fleetctl-check.service"
+UNIT_TIMER="$UNIT_DIR/fleetctl-check.timer"
+
+cmd_install_timer() {
+  have systemctl || { log "install-timer: systemctl not found"; return 1; }
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_SERVICE" <<EOF
+[Unit]
+Description=fleetctl health check (grok box fleet)
+
+[Service]
+Type=oneshot
+ExecStart=$SELF check --notify
+EOF
+  cat > "$UNIT_TIMER" <<EOF
+[Unit]
+Description=Run fleetctl check every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now fleetctl-check.timer
+  log "install-timer: enabled fleetctl-check.timer (every 10min, check --notify)"
+  log "install-timer: units at $UNIT_TIMER"
+}
+
+cmd_remove_timer() {
+  have systemctl || { log "remove-timer: systemctl not found"; return 1; }
+  systemctl --user disable --now fleetctl-check.timer >/dev/null 2>&1 || true
+  rm -f "$UNIT_TIMER" "$UNIT_SERVICE"
+  systemctl --user daemon-reload
+  log "remove-timer: removed fleetctl-check timer + service"
+}
+
+# --- help --------------------------------------------------------------------
+usage() {
+  cat <<'EOF'
+fleetctl — laptop-side fleet CLI for the grok boxes
+
+Usage:
+  fleetctl list                  discover grok-box-N peers (name, ts IP, online)
+  fleetctl status [box...]       one boxup status line per box (default: online)
+  fleetctl check [--notify]      health gate; exit 1 if any box unhealthy
+  fleetctl rollout [--dirty] [box...]
+                                 deploy current git HEAD to boxes
+  fleetctl ssh <box> [cmd...]    ssh into a box (or run a command)
+  fleetctl install-timer         systemd USER timer: check --notify every 10min
+  fleetctl remove-timer          remove that timer
+  fleetctl version | help
+
+Environment:
+  FLEET_SSH_PASSWORD   ssh password (else config.toml [ssh].password, else 12345678)
+  FLEET_BOXES          space-separated box list, bypasses tailscale discovery
+  FLEET_CONFIG         config path (default ~/.config/fleetctl/config.toml)
+  FLEET_MAX_CONCURRENCY  max concurrent rollouts (default 2)
+EOF
+}
+
+# --- dispatch ----------------------------------------------------------------
+cmd="${1:-help}"
+[ "$#" -gt 0 ] && shift
+case "$cmd" in
+  list)                  cmd_list "$@" ;;
+  status)                cmd_status "$@" ;;
+  check)                 cmd_check "$@" ;;
+  rollout)               cmd_rollout "$@" ;;
+  ssh)                   cmd_ssh "$@" ;;
+  install-timer)         cmd_install_timer "$@" ;;
+  remove-timer)          cmd_remove_timer "$@" ;;
+  version|--version)     echo "fleetctl $FLEETCTL_VERSION" ;;
+  -h|--help|help)        usage ;;
+  *)
+    echo "fleetctl: unknown command: $cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
