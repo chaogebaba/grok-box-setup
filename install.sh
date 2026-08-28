@@ -28,6 +28,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo env BOX_SETUP_ROOT="$DEST" \
       BOX_SETUP_ONCE="${BOX_SETUP_ONCE:-}" \
       BOX_SETUP_AUTHKEY="${BOX_SETUP_AUTHKEY:-}" \
+      BOX_SETUP_GIT_SHA="${BOX_SETUP_GIT_SHA:-}" \
       BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" \
       bash "$0" "$@"
   fi
@@ -45,13 +46,55 @@ fi
 
 mkdir -p "$DEST"/{bin,docs,etc,secrets,state/tailscale,state/ssh}
 
-install -m 0755 "$REPO_ROOT/boxup" "$DEST/boxup"
-install -m 0755 "$REPO_ROOT/box-bootstrap.sh" "$DEST/box-bootstrap.sh"
-install -m 0755 "$REPO_ROOT/install.sh" "$DEST/install.sh"
+# Atomic executable install (D3/M2): write to a UNIQUE mktemp file INSIDE $DEST
+# then rename onto the destination. Same directory ⇒ rename(2) ⇒ atomic swap;
+# a running bash keeps its fd on the old inode and finishes reading the old
+# file uninterrupted (precedent: rustup / dpkg self-replace). A fixed dotfile
+# name would let two concurrent installs (D5's hourly self-heal makes that
+# plausible) truncate each other's partial write and then atomically install a
+# corrupt file — mktemp gives each install its own scratch inode.
+install_atomic() {
+  local mode="$1" src="$2" dst="$3" tmp
+  tmp="$(mktemp "$(dirname "$dst")/.install.XXXXXX")" || return 1
+  if ! install -m "$mode" "$src" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$dst"
+}
+
+# Refuse to install a boxup that lost its tail sentinel (D5): the shim's
+# corruption predicate keys on `# boxup-eof` being the literal last line, and a
+# truncated boxup still parses (bash -n stops at a statement boundary) and
+# execs silently. Refuse LOUDLY and leave the existing installed boxup
+# untouched — we check BEFORE writing, and install_atomic's rename ordering
+# means a refusal never half-replaces the live file.
+if [ "$(tail -n1 "$REPO_ROOT/boxup")" != "# boxup-eof" ]; then
+  echo "install: FATAL — $REPO_ROOT/boxup is missing its '# boxup-eof' tail sentinel;" >&2
+  echo "install: refusing to install a possibly-truncated boxup. Existing install left untouched." >&2
+  exit 1
+fi
+
+install_atomic 0755 "$REPO_ROOT/boxup" "$DEST/boxup"
+install_atomic 0755 "$REPO_ROOT/box-bootstrap.sh" "$DEST/box-bootstrap.sh"
+install_atomic 0755 "$REPO_ROOT/install.sh" "$DEST/install.sh"
 install -m 0644 "$REPO_ROOT/etc/config.example.toml" "$DEST/etc/config.example.toml"
 install -m 0644 "$REPO_ROOT/docs/"*.md "$DEST/docs/" 2>/dev/null || true
 install -m 0644 "$REPO_ROOT/README.md" "$DEST/README.md" 2>/dev/null || true
 install -m 0644 "$REPO_ROOT/VERSION" "$DEST/VERSION" 2>/dev/null || true
+
+# Stamp the installed git sha (D10). Sources, in order: $BOX_SETUP_GIT_SHA
+# (set by fleetctl rollout, whose git archive carries no .git); a rev-parse of
+# the source tree ($REPO_ROOT — `boxup update`'s clone has .git); else
+# "unknown". Boxup surfaces it in status as v=<version>/<sha>.
+box_git_sha="${BOX_SETUP_GIT_SHA:-}"
+if [ -z "$box_git_sha" ]; then
+  box_git_sha="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+fi
+[ -n "$box_git_sha" ] || box_git_sha="unknown"
+printf '%s\n' "$box_git_sha" > "$DEST/GIT_SHA"
+chmod 0644 "$DEST/GIT_SHA" 2>/dev/null || true
+log "stamped GIT_SHA=$box_git_sha"
 
 # config.toml is the user's, not ours. Seed it once, never overwrite it, so a
 # custom ssh password survives every later install.

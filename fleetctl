@@ -8,7 +8,7 @@
 #   fleetctl list            discover boxes (name, tailscale IP, online)
 #   fleetctl status [box..]  one boxup status line per box (read-only)
 #   fleetctl check           quiet health gate; exit 1 if any box unhealthy
-#   fleetctl rollout [box..] deploy current git HEAD to boxes (git archive)
+#   fleetctl rollout <box..> deploy git HEAD to boxes; --all for the fleet
 #   fleetctl ssh <box> [cmd] convenience ssh wrapper
 #   fleetctl install-timer   systemd USER timer running `check --notify` /10min
 #   fleetctl remove-timer    tear that timer down
@@ -219,18 +219,53 @@ EOF
 # --- status ------------------------------------------------------------------
 # Print boxup's own status line per box, prefixed by the box name. Offline /
 # unreachable boxes are reported but never fail the command (exit 0 always).
+#
+# Drift detection (D10): parse the v=<version>/<sha> token, compare <sha> to the
+# laptop's git HEAD, and append `sha=<sha> drift=yes|no`. A box with no sha (old
+# boxup, v=<version> with no /sha) renders `sha=unknown drift=unknown` —
+# informational, never a failure. status_one echoes the box's sha as its LAST
+# stdout word via a side channel file so cmd_status can build the fleet summary.
+
+# Extract the sha from a boxup status line's v= token: v=5.1.0/abc123 -> abc123;
+# v=5.1.0 (old) -> unknown.
+status_line_sha() {
+  local line="$1" tok v
+  for tok in $line; do
+    case "$tok" in
+      v=*) v="${tok#v=}"
+           case "$v" in
+             */*) printf '%s' "${v#*/}" ;;
+             *)   printf 'unknown' ;;
+           esac
+           return 0 ;;
+    esac
+  done
+  printf 'unknown'
+}
+
 status_one() {
-  local box="$1" line
+  local box="$1" line sha drift head_sha="$2" shafile="${3:-}"
   if ! box_reachable "$box"; then
     printf '%-14s UNREACHABLE\n' "$box"
+    [ -n "$shafile" ] && printf '%s\t%s\n' "$box" "unreachable" >> "$shafile"
     return 0
   fi
   line="$(box_ssh "$box" "sudo $BOXUP_REMOTE status" 2>/dev/null)"
   if [ -z "$line" ]; then
     printf '%-14s UNREACHABLE (ssh/boxup failed)\n' "$box"
+    [ -n "$shafile" ] && printf '%s\t%s\n' "$box" "unreachable" >> "$shafile"
     return 0
   fi
-  printf '%-14s %s\n' "$box" "$line"
+  sha="$(status_line_sha "$line")"
+  if [ "$sha" = "unknown" ] || [ "$head_sha" = "unknown" ]; then
+    drift="unknown"
+  elif [ "$sha" = "$head_sha" ]; then
+    drift="no"
+  else
+    drift="yes"
+  fi
+  printf '%-14s %s sha=%s drift=%s\n' "$box" "$line" "$sha" "$drift"
+  [ -n "$shafile" ] && printf '%s\t%s\n' "$box" "$sha" >> "$shafile"
 }
 
 cmd_status() {
@@ -240,25 +275,45 @@ cmd_status() {
     echo "(no target boxes)"
     return 0
   fi
+  local head_sha shafile
+  head_sha="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  shafile="$(mktemp 2>/dev/null || echo '')"
   local b
   for b in "${targets[@]}"; do
-    status_one "$b"
+    status_one "$b" "$head_sha" "$shafile"
   done
+  # Fleet drift summary: mixed shas across reachable boxes, or any box behind
+  # laptop HEAD, is worth one summary line. Never a failure (exit 0).
+  if [ -n "$shafile" ] && [ -f "$shafile" ]; then
+    local uniq_shas
+    uniq_shas="$(awk -F'\t' '$2 != "unreachable" && $2 != "unknown" { print $2 }' "$shafile" | sort -u | wc -l)"
+    if [ "$uniq_shas" -gt 1 ]; then
+      log "status: fleet is MIXED-version ($uniq_shas distinct shas); laptop HEAD=$head_sha"
+    elif [ "$head_sha" != "unknown" ] && \
+         awk -F'\t' -v h="$head_sha" '$2 != "unreachable" && $2 != "unknown" && $2 != h { c=1 } END { exit(c?0:1) }' "$shafile"; then
+      log "status: some boxes drift from laptop HEAD=$head_sha"
+    fi
+    rm -f "$shafile"
+  fi
   return 0
 }
 
 # --- check -------------------------------------------------------------------
-# Quiet health gate. A box is UNHEALTHY if any of: unreachable, backend not
-# Running, online != yes, exit-node not advertised, sshd not up, or worker
-# (selfheal) count != 1. Prints only problems. Exit 0 if all healthy, else 1.
-# --notify additionally fires notify-send -u critical per problem.
-check_one() {
-  # echoes "OK" or "<box>: <problem>" lines to stdout; returns 0 healthy.
+# Quiet health gate. The single health definition lives in `boxup check` on the
+# box (D6); fleetctl delegates to it and trusts its exit code (0 healthy,
+# 1 unhealthy). fleetctl keeps only reachability (ssh failure) as its own layer.
+#
+# Version-skew fallback (B2): an OLD boxup has no `check` subcommand, so its
+# dispatch exits 2 on the unknown command. fleetctl MUST treat exit 2 (or
+# unknown-command output) as "old boxup" and fall back to the legacy laptop-side
+# parse of `boxup status` — never report a healthy old box as failing (the
+# README:77-81 timer fires notify-send -u critical every 10 min, and D7's
+# canary-first flow guarantees a mixed-version window).
+
+# Legacy laptop-side parse of `boxup status` — the pre-D6 health definition,
+# kept ONLY as the skew fallback for boxes running an old boxup.
+check_one_legacy() {
   local box="$1" line
-  if ! box_reachable "$box"; then
-    echo "$box: unreachable"
-    return 1
-  fi
   line="$(box_ssh "$box" "sudo $BOXUP_REMOTE status" 2>/dev/null)"
   if [ -z "$line" ]; then
     echo "$box: unreachable (ssh/boxup failed)"
@@ -295,6 +350,47 @@ check_one() {
   for p in "${problems[@]}"; do
     echo "$box: $p"
   done
+  return 1
+}
+
+check_one() {
+  # echoes nothing when healthy; "<box>: <problem>" lines otherwise.
+  # returns 0 healthy, 1 unhealthy/unreachable.
+  local box="$1" out rc
+  if ! box_reachable "$box"; then
+    echo "$box: unreachable"
+    return 1
+  fi
+
+  # Delegate to `boxup check`. Capture stdout + exit code together.
+  out="$(box_ssh "$box" "sudo $BOXUP_REMOTE check" 2>/dev/null)"
+  rc=$?
+
+  # ssh connection failure (255): unreachable, not unhealthy.
+  if [ "$rc" = 255 ]; then
+    echo "$box: unreachable (ssh failed)"
+    return 1
+  fi
+
+  # B2 skew fallback: an old boxup exits 2 (unknown subcommand) and/or prints
+  # an "unknown command" usage line. Fall back to the legacy status parse so a
+  # healthy old box is never reported as failing.
+  if [ "$rc" = 2 ] || printf '%s' "$out" | grep -qi 'unknown command'; then
+    check_one_legacy "$box"
+    return $?
+  fi
+
+  if [ "$rc" = 0 ]; then
+    return 0
+  fi
+
+  # rc == 1 (or any other non-2/255): boxup check said unhealthy. Surface its
+  # reason line prefixed by the box name.
+  if [ -n "$out" ]; then
+    printf '%s: %s\n' "$box" "$out"
+  else
+    printf '%s: check=FAIL (no output, rc=%s)\n' "$box" "$rc"
+  fi
   return 1
 }
 
@@ -337,86 +433,249 @@ box_scp() {
     "$src" "$BOX_USER@$box:$dst"
 }
 
+# Post-install verification via `boxup check` (D6 = the one health predicate).
+# rollout_one has already run `boxup once` synchronously, so hb/sshd/ipfwd are
+# fresh and fail FAST. But online=yes / backend=Running / exit-node advertised
+# can lag a fresh login/recycle by up to ~2 min (map-poll + need-driven set), so
+# those three predicates are RETRYABLE: retry every 15s (worker INTERVAL) up to
+# 8 tries (~120s). Any other failing predicate fails fast. We distinguish the
+# two by the reason `boxup check` prints (S3/F9).
+ROLLOUT_VERIFY_TRIES="${FLEET_VERIFY_TRIES:-8}"
+ROLLOUT_VERIFY_INTERVAL="${FLEET_VERIFY_INTERVAL:-15}"
+
+# Returns 0 healthy, 1 unhealthy (after retries). Echoes the final reason.
+rollout_verify() {
+  local box="$1" i=1 out rc reason
+  while :; do
+    out="$(box_ssh "$box" "sudo $BOXUP_REMOTE check" 2>/dev/null)"
+    rc=$?
+    # B2 skew: an old boxup has no `check`. Fall back to the laptop parse once.
+    if [ "$rc" = 2 ] || printf '%s' "$out" | grep -qi 'unknown command'; then
+      if check_one_legacy "$box" >/dev/null; then echo "OK (legacy)"; return 0; fi
+      echo "unhealthy (legacy parse)"; return 1
+    fi
+    [ "$rc" = 0 ] && { echo "OK"; return 0; }
+    reason="${out#check=FAIL reason=}"
+    # Retryable only if the FIRST-failed predicate is online/backend/exit-node.
+    case "$reason" in
+      online=*|backend=*|exit-node*)
+        if [ "$i" -ge "$ROLLOUT_VERIFY_TRIES" ]; then
+          echo "$reason (still pending after ${i} tries)"; return 1
+        fi
+        log "verify $box: $reason — retry $i/$ROLLOUT_VERIFY_TRIES in ${ROLLOUT_VERIFY_INTERVAL}s"
+        sleep "$ROLLOUT_VERIFY_INTERVAL"
+        i=$((i + 1))
+        ;;
+      *)
+        echo "$reason"; return 1   # fail fast
+        ;;
+    esac
+  done
+}
+
+# rollout_one <box> <tarball> <statusdir>. Writes its outcome to a PER-BOX file
+# <statusdir>/<box> as "<result>\t<detail>" (result = ok|failed|skipped). This
+# is the result CHANNEL (F8) — a per-box file, so concurrent rollouts never
+# interleave; `wait` alone is not a result channel. Returns 0 ok / 1 failed /
+# 2 skipped(unreachable).
 rollout_one() {
-  local box="$1" tarball="$2" remote_tar="/tmp/grok-box-setup-fleet.tar" \
-        remote_dir="/tmp/grok-box-setup-fleet" line
+  local box="$1" tarball="$2" statusdir="$3" \
+        remote_tar="/tmp/grok-box-setup-fleet.tar" \
+        remote_dir="/tmp/grok-box-setup-fleet" line verify sf
+  sf="$statusdir/$box"
   if ! box_reachable "$box"; then
+    printf '%s\t%s\n' "skipped" "unreachable" > "$sf"
     printf '%-14s SKIPPED (unreachable)\n' "$box"
     return 2
   fi
   if ! box_scp "$tarball" "$box" "$remote_tar" >/dev/null 2>&1; then
+    printf '%s\t%s\n' "failed" "scp" > "$sf"
     printf '%-14s FAILED (scp)\n' "$box"
     return 1
   fi
-  # Extract, install, converge, print status; then clean the staging dir.
+  # Extract, install, converge. BOX_SETUP_GIT_SHA via `sudo env` (D10/B3).
   if ! box_ssh "$box" "
     set -e
     rm -rf '$remote_dir'
     mkdir -p '$remote_dir'
     tar -xf '$remote_tar' -C '$remote_dir'
-    sudo bash '$remote_dir/install.sh'
+    sudo env BOX_SETUP_GIT_SHA='${ROLLOUT_GIT_SHA:-unknown}' bash '$remote_dir/install.sh'
     sudo $BOXUP_REMOTE once >/dev/null 2>&1 || sudo $BOXUP_REMOTE once
   " >/dev/null 2>&1; then
     box_ssh "$box" "rm -rf '$remote_dir' '$remote_tar'" >/dev/null 2>&1 || true
+    printf '%s\t%s\n' "failed" "install/once" > "$sf"
     printf '%-14s FAILED (install/once)\n' "$box"
     return 1
   fi
-  line="$(box_ssh "$box" "sudo $BOXUP_REMOTE status" 2>/dev/null)"
   box_ssh "$box" "rm -rf '$remote_dir' '$remote_tar'" >/dev/null 2>&1 || true
-  printf '%-14s %s\n' "$box" "${line:-(status unavailable)}"
-  return 0
+
+  # Post-install verification (retry online/backend/exit-node lag).
+  verify="$(rollout_verify "$box")"
+  line="$(box_ssh "$box" "sudo $BOXUP_REMOTE status" 2>/dev/null)"
+  case "$verify" in
+    OK|"OK (legacy)"|"")
+      printf '%s\t%s\n' "ok" "${line:-status?}" > "$sf"
+      printf '%-14s %s\n' "$box" "${line:-(status unavailable)}"
+      return 0 ;;
+  esac
+  printf '%s\t%s\n' "failed" "verify: $verify" > "$sf"
+  printf '%-14s FAILED (verify: %s)\n' "$box" "$verify"
+  return 1
 }
 
-cmd_rollout() {
-  local allow_dirty=0
-  if [ "${1:-}" = "--dirty" ]; then allow_dirty=1; shift; fi
-
+# Preflight shared by all rollout forms: git present, in a repo, clean tree
+# (unless --dirty), package HEAD into a tarball, stamp ROLLOUT_GIT_SHA. Echoes
+# the sha and tarball path (TAB-separated) on stdout; returns nonzero on any
+# failure. NOTE: the caller runs this in a command substitution, so any
+# variable it sets (e.g. ROLLOUT_GIT_SHA) would be LOST in the subshell — that
+# is why the sha is RETURNED on stdout for the parent to assign, not exported
+# from here (B3: otherwise the remote install got BOX_SETUP_GIT_SHA='unknown').
+rollout_package() {
+  local allow_dirty="$1" tarball sha
   have git || { log "rollout: git not found"; return 1; }
   if ! git rev-parse --git-dir >/dev/null 2>&1; then
-    log "rollout: not inside a git repository"
-    return 1
+    log "rollout: not inside a git repository"; return 1
   fi
   if [ "$allow_dirty" = 0 ] && [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-    log "rollout: working tree is dirty; commit/stash or pass --dirty"
-    return 1
+    log "rollout: working tree is dirty; commit/stash or pass --dirty"; return 1
   fi
-
-  local tarball
   tarball="$(mktemp --suffix=.tar 2>/dev/null || mktemp)" || {
     log "rollout: mktemp failed"; return 1; }
   if ! git archive --format=tar -o "$tarball" HEAD 2>/dev/null; then
-    rm -f "$tarball"
-    log "rollout: git archive HEAD failed"
-    return 1
+    rm -f "$tarball"; log "rollout: git archive HEAD failed"; return 1
   fi
-  log "rollout: packaged HEAD $(git rev-parse --short HEAD 2>/dev/null || echo '?') -> $(basename "$tarball")"
+  sha="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  log "rollout: packaged HEAD $sha -> $(basename "$tarball")"
+  printf '%s\t%s' "$sha" "$tarball"
+}
 
-  local -a targets=()
-  while IFS= read -r b; do [ -n "$b" ] && targets+=("$b"); done < <(resolve_targets "$@")
-
-  local -a skipped=()
-  local running=0 b rc
-  for b in "${targets[@]}"; do
-    # Bounded concurrency: at most MAX_CONCURRENCY rollouts in flight.
+# Roll a list of boxes with bounded concurrency + an abort brake. The abort
+# flag is a file; it is checked BEFORE each new dispatch (F8), so a verified
+# failure stops NEW dispatches while in-flight boxes finish and report.
+# Args: <tarball> <statusdir> <abortfile> <box...>
+rollout_batch() {
+  local tarball="$1" statusdir="$2" abortfile="$3"; shift 3
+  local b rc1
+  for b in "$@"; do
+    if [ -f "$abortfile" ]; then
+      printf '%s\t%s\n' "skipped" "aborted" > "$statusdir/$b"
+      printf '%-14s SKIPPED (rollout aborted)\n' "$b"
+      continue
+    fi
     while [ "$(jobs -rp | wc -l)" -ge "$MAX_CONCURRENCY" ]; do
       wait -n 2>/dev/null || wait
     done
-    rollout_one "$b" "$tarball" &
-    running=$((running + 1))
+    # Re-check the abort flag AFTER the capacity wait and immediately before
+    # dispatch: an in-flight box can trip the brake while we were blocked in
+    # `wait -n`, and dispatching now would violate "no NEW dispatches after a
+    # verified failure" (repro: concurrency=1, b1 fails then b2 starts).
+    if [ -f "$abortfile" ]; then
+      printf '%s\t%s\n' "skipped" "aborted" > "$statusdir/$b"
+      printf '%-14s SKIPPED (rollout aborted)\n' "$b"
+      continue
+    fi
+    (
+      # A verified failure (rc 1) trips the abort brake for subsequent
+      # dispatches; an unreachable skip (rc 2) does not.
+      rollout_one "$b" "$tarball" "$statusdir"; rc1=$?
+      [ "$rc1" = 1 ] && : > "$abortfile"
+    ) &
   done
   wait
+}
 
-  rm -f "$tarball"
-
-  # Re-list which boxes were skipped as unreachable (rollout_one printed inline;
-  # this is a compact summary for the operator).
-  for b in "${targets[@]}"; do
-    box_reachable "$b" || skipped+=("$b")
+# Print the deployed/skipped/failed summary from the per-box status files +
+# each box's version+sha (D10). Returns 0 iff no box failed.
+rollout_summary() {
+  local statusdir="$1" rc=0 sf box result detail v
+  echo "---- rollout summary ----"
+  for sf in "$statusdir"/*; do
+    [ -f "$sf" ] || continue
+    box="$(basename "$sf")"
+    IFS=$'\t' read -r result detail < "$sf"
+    case "$result" in
+      ok)
+        v="$(printf '%s' "$detail" | grep -o 'v=[^ ]*' || echo v=?)"
+        printf '  %-14s OK       %s\n' "$box" "$v" ;;
+      skipped) printf '  %-14s SKIPPED  (%s)\n' "$box" "$detail" ;;
+      failed)  printf '  %-14s FAILED   (%s)\n' "$box" "$detail"; rc=1 ;;
+    esac
   done
-  if [ "${#skipped[@]}" -gt 0 ]; then
-    log "rollout: skipped unreachable: ${skipped[*]}"
+  return "$rc"
+}
+
+cmd_rollout() {
+  local allow_dirty=0 all=0 canary="grok-box-5"
+  # Flag parse: --dirty, --all, --canary <box>. Remaining args are explicit
+  # targets. Order-independent for the flags.
+  local -a rest=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dirty)  allow_dirty=1; shift ;;
+      --all)    all=1; shift ;;
+      --canary) canary="${2:-}"; shift 2 || { log "rollout: --canary needs a box"; return 2; } ;;
+      *)        rest+=("$1"); shift ;;
+    esac
+  done
+
+  # CLI contract (D7): explicit targets OR --all. A bare `rollout` is a usage
+  # error naming the two valid forms — full-fleet must be opt-in via --all.
+  if [ "$all" = 0 ] && [ "${#rest[@]}" -eq 0 ] && [ -z "${FLEET_BOXES:-}" ]; then
+    log "rollout: refusing to guess targets. Use:"
+    log "  fleetctl rollout <box...>      deploy to explicit boxes"
+    log "  fleetctl rollout --all         deploy to the whole fleet (canary first)"
+    return 2
   fi
-  return 0
+
+  local tarball statusdir abortfile rc=0 b crc pkg
+  # rollout_package returns "<sha>\t<tarball>" on stdout so the sha assignment
+  # survives into THIS shell (a subshell assignment inside $(...) would be lost,
+  # and the remote install would run BOX_SETUP_GIT_SHA='unknown' — B3).
+  pkg="$(rollout_package "$allow_dirty")" || return 1
+  ROLLOUT_GIT_SHA="${pkg%%$'\t'*}"
+  tarball="${pkg#*$'\t'}"
+  statusdir="$(mktemp -d)"; abortfile="$(mktemp)"; rm -f "$abortfile"
+
+  if [ "$all" = 1 ]; then
+    # Canary-first. An UNREACHABLE canary ABORTS (S2): rolling the whole fleet
+    # unverified is worse than stopping and letting the operator pick another.
+    log "rollout --all: canary=$canary (override with --canary <box>)"
+    if ! box_reachable "$canary"; then
+      log "rollout: canary $canary is UNREACHABLE — aborting. Pick a reachable"
+      log "         canary with: fleetctl rollout --all --canary <other-box>"
+      rm -rf "$tarball" "$statusdir" "$abortfile"
+      return 1
+    fi
+    rollout_one "$canary" "$tarball" "$statusdir"; crc=$?
+    if [ "$crc" != 0 ]; then
+      log "rollout: canary $canary FAILED verification — aborting, ZERO other boxes touched"
+      log "         last-good redeploy after fixing: fleetctl rollout $canary"
+      rollout_summary "$statusdir"
+      rm -rf "$tarball" "$statusdir" "$abortfile"
+      return 1
+    fi
+    log "rollout: canary $canary verified — rolling the rest"
+    # The rest = all discovered boxes minus the canary.
+    local -a therest=()
+    while IFS= read -r b; do
+      [ -n "$b" ] && [ "$b" != "$canary" ] && therest+=("$b")
+    done < <(resolve_targets)
+    rollout_batch "$tarball" "$statusdir" "$abortfile" "${therest[@]}"
+  else
+    # Explicit targets (or FLEET_BOXES). No canary gate; still abort-on-failure.
+    local -a targets=()
+    while IFS= read -r b; do [ -n "$b" ] && targets+=("$b"); done < <(resolve_targets "${rest[@]}")
+    rollout_batch "$tarball" "$statusdir" "$abortfile" "${targets[@]}"
+  fi
+
+  rollout_summary "$statusdir"; rc=$?
+  if [ -f "$abortfile" ]; then
+    log "rollout: ABORTED on a verified failure — no new dispatches after it"
+    log "         redeploy the last-good sha after fixing: fleetctl rollout --all"
+    rc=1
+  fi
+  rm -rf "$tarball" "$statusdir" "$abortfile"
+  return "$rc"
 }
 
 # --- ssh ---------------------------------------------------------------------
@@ -492,8 +751,11 @@ Usage:
   fleetctl list                  discover grok-box-N peers (name, ts IP, online)
   fleetctl status [box...]       one boxup status line per box (default: online)
   fleetctl check [--notify]      health gate; exit 1 if any box unhealthy
-  fleetctl rollout [--dirty] [box...]
-                                 deploy current git HEAD to boxes
+  fleetctl rollout <box...>      deploy current git HEAD to explicit boxes
+  fleetctl rollout --all [--canary <box>]
+                                 deploy to the whole fleet (canary first,
+                                 verify, abort on first verified failure)
+  fleetctl rollout [--dirty] ... allow a dirty working tree
   fleetctl ssh <box> [cmd...]    ssh into a box (or run a command)
   fleetctl install-timer         systemd USER timer: check --notify every 10min
   fleetctl remove-timer          remove that timer

@@ -33,6 +33,19 @@
 # next converge. Leave commented to keep whatever bin/ already has (the
 # built-in default is only used when bin/ is empty).
 #version = "1.102.3"
+#
+# Tags advertised at FIRST login only (empty statedir). When set, boxup adds
+# --advertise-tags=<value> to the initial `tailscale up`. It is NEVER added on
+# the ~180-day key-expiry re-auth (--force-reauth) path, and never appears in
+# `tailscale set`. Retagging an already-registered node is a MANUAL operator
+# step — see docs/AGENT.md §F.
+#
+# ORDERING (do not skip): the tailnet ACL tagOwners/autoApprovers for this tag
+# MUST exist BEFORE you seed this key into any box's config.toml — the
+# empty-statedir branch is also the state-lost recovery path, and a box
+# rebuilding its identity with an unauthorized tag cannot rejoin at all. If the
+# seeded auth key itself carries tags, they must match this value.
+#tags = "tag:grok-box"
 
 [update]
 # Repo cloned by `boxup update`. Always a fresh clone to a temp dir + this

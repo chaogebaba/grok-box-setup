@@ -28,6 +28,7 @@ boxup ensure    full converge only
 boxup up        converge + start the selfheal worker   (default)
 boxup tick      one health tick
 boxup status    one-line health string
+boxup check     health gate: exit 0 healthy / 1 unhealthy (never 2)
 boxup stop      stop the selfheal worker (tailscaled stays up)
 boxup update    fresh clone from GitHub + reinstall (never git pull)
 ```
@@ -50,7 +51,9 @@ Design, environment facts, and the reasoning behind every special case:
 
 `/workspace/box-setup/config.toml` (seeded once, never overwritten):
 SSH password (`[ssh] password`, default `12345678`), pinned tailscale version
-(`[tailscale] version`), update repo (`[update] repo`). See
+(`[tailscale] version`), first-login tags (`[tailscale] tags`, e.g.
+`tag:grok-box` — added to `tailscale up` at first registration only, never on
+re-auth; see AGENT.md §F before enabling), update repo (`[update] repo`). See
 [etc/config.example.toml](etc/config.example.toml).
 
 ## Fleet operations (laptop)
@@ -62,14 +65,33 @@ discovers every `grok-box-N` peer; it never touches other machines.
 
 ```bash
 ./fleetctl list                 # name, tailscale IP, online — all grok-box-N peers
-./fleetctl status               # boxup's status line per online box (read-only)
+./fleetctl status               # boxup status line per online box + sha/drift (read-only)
 ./fleetctl check                # quiet health gate; exit 1 + prints only problems
-./fleetctl rollout              # deploy current git HEAD to every box (git archive)
+./fleetctl rollout grok-box-3   # deploy current git HEAD to explicit boxes
+./fleetctl rollout --all        # deploy to the whole fleet (canary first, then batch)
 ./fleetctl ssh grok-box-3 [cmd] # ssh wrapper
 ```
 
-A box is unhealthy for `check` if it is unreachable or its `boxup status` is not
-`backend=Running online=yes exit-node=yes sshd=up` with exactly one worker.
+`rollout` requires a target: one or more explicit `grok-box-N`, or `--all` for
+the whole fleet. A bare `fleetctl rollout` is a usage error (it will not guess).
+`--all` deploys to a canary first (default `grok-box-5`, override with
+`--canary <box>`), verifies it with `boxup check`, and only then rolls the rest
+at 2-concurrency. The first box that fails verification trips an **abort**: no
+new boxes are dispatched (in-flight ones finish and report), the command exits
+nonzero, and a summary lists each box's result and `v=<version>/<sha>`. There is
+no auto-rollback — on abort the exact redeploy command is printed. An
+unreachable canary aborts (pick another with `--canary`); unreachable
+non-canary boxes are skipped, never failures. `--dirty` allows a dirty tree.
+
+`fleetctl status` appends `sha=<sha> drift=yes|no` per box (comparing the box's
+installed git sha to the laptop's HEAD) and logs a summary when the fleet is
+mixed-version; a box running an older boxup renders `sha=unknown drift=unknown`
+(informational, never a failure).
+
+`fleetctl check` delegates to `boxup check` on each box and trusts its exit
+code; a box running an older boxup (no `check` subcommand) falls back to the
+laptop-side `boxup status` parse so it is never wrongly reported as failing.
+
 Password precedence: `FLEET_SSH_PASSWORD` > `~/.config/fleetctl/config.toml`
 `[ssh].password` > `12345678` (never stored in git). `FLEET_BOXES="grok-box-1
 grok-box-2"` bypasses discovery for a fixed list.

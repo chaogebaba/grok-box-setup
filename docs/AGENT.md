@@ -43,12 +43,22 @@ sudo /workspace/box-setup/boxup once
 
 ```bash
 sudo /workspace/box-setup/boxup status
+sudo /workspace/box-setup/boxup check   # exit 0 healthy / 1 unhealthy (never 2)
 ```
 
+`status` prints one line; `check` is the single health predicate (same one
+`fleetctl` and rollout verification use): exit 0 and `check=OK ...` when
+healthy, else exit 1 and `check=FAIL reason=<first-failed-predicate>`.
+
 Healthy: `backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1`
-with numeric pids and a small `hb=` age (≤ ~30s). Cross-check from another
-machine on the tailnet: `tailscale ping grok-box-N` and
-`ssh box@grok-box-N` (password from config.toml, default `12345678`).
+with numeric pids and a small `hb=` age (≤ ~30s), and `v=5.1.0/<sha>`.
+Cross-check from another machine on the tailnet: `tailscale ping grok-box-N`
+and `ssh box@grok-box-N` (password from config.toml, default `12345678`).
+
+If a persistently failing exit-node refresh has escalated, `status` shows
+`refresh=failing:N` (N = consecutive failures; the retry window backs off
+20s→60s→180s→600s). Force one immediate retry, bypassing the backoff, with the
+env form in section D.
 
 ## D. Something is wrong
 
@@ -60,6 +70,8 @@ machine on the tailnet: `tailscale ping grok-box-N` and
 | `exit-node=no` | prefs lost after swap | `boxup once` (refresh pushes full `tailscale set`) |
 | `sshd=down` or login refused | swap wiped shadow/config | `boxup once` re-applies password + drop-in |
 | `ipfwd` not `4:1,6:1` | sysctl wiped | `boxup tick` |
+| `check=FAIL reason=...` | that predicate is unhealthy | act on the named predicate (its own row here); most are fixed by `boxup once` |
+| `refresh=failing:N` in status | exit-node `tailscale set` has failed N times in a row (backoff 20→60→180→600s) | check `/var/log/boxup-worker.log`; force one immediate retry with `sudo env BOXUP_FORCE_REFRESH=1 /workspace/box-setup/boxup once` |
 | `hb=-` or huge | worker dead | `boxup once` (restarts it) |
 | tailnet shows two nodes for one box | stale identity got recreated | delete the OLD node in the admin console; never copy `state/` between boxes |
 
@@ -84,3 +96,37 @@ sudo /workspace/box-setup/box-bootstrap.sh --once
 
 That shim calls `boxup once`. It is the resurrection path after an image
 swap — do not rename or remove either file.
+
+**Self-heal (since v5.1):** the shim now also repairs a missing or corrupt
+`boxup`. If `/workspace/box-setup/boxup` is absent, fails `bash -n`, or has
+lost its `# boxup-eof` tail sentinel, the shim clones the repo fresh from
+GitHub (https only, `--depth 1`), sanity-checks the clone, reinstalls, runs
+`boxup once`, then satisfies the original request. It logs `[shim] SELF-HEAL:`
+to stderr and runs as root on the hourly schedule — so a `[shim] SELF-HEAL:`
+line in the logs means the on-box boxup was corrupt and was re-fetched from
+GitHub. The clone URL is `[update] repo` in config.toml (must be `https://`),
+else the built-in default.
+
+## G. Tags (`[tailscale] tags`) and manual retag
+
+`[tailscale] tags` (e.g. `tags = "tag:grok-box"`) is added to `tailscale up`
+**only at first login** (empty statedir). It is deliberately NEVER applied on
+the ~180-day key-expiry re-auth path, because converting a live user-owned node
+to tag-owned during an unattended re-auth can lock it out of the tailnet.
+
+Ordering (do this before enabling tags): the tailnet ACL `tagOwners`
+(and `autoApprovers` for the exit routes) for the tag MUST exist BEFORE you seed
+`[tailscale] tags` into any box's config.toml — the first-login branch is also
+the state-lost recovery path, and a box rebuilding its identity with an
+unauthorized tag cannot rejoin at all. If the seeded auth key itself carries
+tags, they must match the config value.
+
+To retag an ALREADY-registered node, it is a **manual** operator step (never
+automatic): once the ACL authorizes the tag, run on the box
+
+```bash
+sudo /workspace/box-setup/bin/tailscale up --advertise-tags=tag:grok-box --force-reauth \
+  --ssh=false --advertise-exit-node --accept-dns --snat-subnet-routes=true --operator=box
+```
+
+then `sudo /workspace/box-setup/boxup once` to re-push prefs.

@@ -9,6 +9,7 @@
 #   boxup up        converge + start the selfheal worker   (default)
 #   boxup tick      one health tick (sysctl / nft / refresh / procs)
 #   boxup status    one-line health string
+#   boxup check     health gate: exit 0 healthy / 1 unhealthy (never 2)
 #   boxup stop      stop the selfheal worker (tailscaled stays up)
 #   boxup update    fresh clone from GitHub + reinstall (never git pull)
 #   boxup worker    internal: the selfheal loop
@@ -28,7 +29,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.0.0
+BOXUP_VERSION=5.1.0
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -55,8 +56,31 @@ LOG_DIR="${BOX_SETUP_LOG:-/var/log}"
 WORKER_PID="/run/tailscale-selfheal.pid"
 WORKER_LOG="$LOG_DIR/boxup-worker.log"
 TAILSCALED_LOG="$LOG_DIR/tailscaled.log"
-START_LOCK="/run/tailscaled.start.lock"
 TS_SOCK="/var/run/tailscale/tailscaled.sock"
+
+# Two flock-guarded critical sections, each on its OWN fd (flock keys on the
+# open-file-description, and holding two different fds to two different files
+# in the SAME process never conflict, but reusing one fd across nested
+# subshells does — so keep them distinct and documented together):
+#   * fd 9 -> START_LOCK        the tailscaled fork window (start_tailscaled,
+#                               taken in a subshell so it releases the instant
+#                               the fork returns; the daemon child closes fd 9).
+#   * fd 8 -> CONVERGE_LOCK     converge mutual exclusion (D3): run_tick takes
+#                               it with `flock -n` (skip-on-contention — a
+#                               converge in progress is itself liveness), while
+#                               do_ensure/`boxup once` takes it with `flock -w
+#                               60` (bounded WAIT — `boxup once` is AGENT.md's
+#                               remedy for nearly every symptom and must not be
+#                               silently skipped). BOTH live in a subshell (or
+#                               close the fd explicitly) because `boxup once`
+#                               runs do_ensure then run_tick sequentially in one
+#                               process and a process-held lock would deadlock.
+#                               Fail-open: if the lock file cannot be opened the
+#                               guarded work still runs (the lock is an
+#                               optimization against duplicate work, never a
+#                               gate on convergence).
+START_LOCK="/run/tailscaled.start.lock"
+CONVERGE_LOCK="$RUN_DIR/converge.lock"
 
 DEFAULT_SSH_PASSWORD="12345678"
 DEFAULT_TS_VERSION="1.102.3"
@@ -70,6 +94,49 @@ WORKER_STARTED=$(date +%s)
 
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- converge lock (D3) ------------------------------------------------------
+# Serialize converge across `boxup once`, the worker tick, and a rollout.
+# run_with_converge_lock <mode> <fn>:
+#   mode = "wait" -> flock -w 60 (do_ensure / `boxup once`: bounded WAIT).
+#   mode = "try"  -> flock -n    (run_tick: skip on contention).
+# The flock lives in a subshell so it is released the instant <fn> returns and
+# never wedges the sequential do_ensure-then-run_tick path of `boxup once`.
+# Fail-open: if the lock file cannot be opened (e.g. RUN_DIR absent on a fresh
+# `boxup tick`), run <fn> UNLOCKED and return 0-from-fn — the lock guards
+# against duplicate work, it is never a gate on convergence.
+# Return code: 0 if the lock was contended in "try" mode (caller decides what
+#   that means), otherwise the exit status of <fn>.
+run_with_converge_lock() {
+  local mode="$1" fn="$2"
+  if ! have flock; then
+    "$fn"; return
+  fi
+  (
+    if ! { exec 8>"$CONVERGE_LOCK"; } 2>/dev/null; then
+      # Fail-open: cannot open the lock file — log and proceed UNLOCKED (the
+      # lock is an optimization against duplicate work, never a gate on
+      # convergence; the blueprint requires a diagnostic here). Note: do NOT
+      # write `exec 8>&- 2>/dev/null` — an exec with no command makes the
+      # 2>/dev/null PERMANENT for the rest of the subshell and would swallow
+      # the log line below. fd 8 was never opened, so no close is needed.
+      log "converge-lock: cannot open $CONVERGE_LOCK — proceeding unlocked (fail-open)" >&2
+      "$fn"
+      exit
+    fi
+    case "$mode" in
+      try)
+        if ! flock -n 8; then
+          exit 200   # contended; caller treats this specially
+        fi
+        ;;
+      *)
+        flock -w 60 8 || true   # bounded wait; proceed even on timeout
+        ;;
+    esac
+    "$fn"
+  )
+}
 
 # --- config.toml -------------------------------------------------------------
 # A TOML subset, read with awk so it works before python3 is installed.
@@ -679,6 +746,12 @@ ensure_login() {
   # An empty statedir is a first login and must NOT get --force-reauth.
   if state_is_populated; then
     up+=(--force-reauth)
+    # Tags are auth-time-only and NEVER added on the --force-reauth branch
+    # (F11): an unattended ~180-day key-expiry re-auth must not convert a
+    # user-owned node to tag-owned (ACL semantics change, tagged keys stop
+    # expiring, and an unauthorized tag is REJECTED after --force-reauth
+    # already rotated keys — leaving the box locked out, headscale#3374).
+    # Retagging an existing node is a documented MANUAL operator step.
     if [ -s "$AUTHKEY_FILE" ]; then
       log "login: re-auth existing identity with auth-key (--force-reauth)"
       "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
@@ -687,11 +760,17 @@ ensure_login() {
       "${up[@]}" || true
     fi
   else
+    # First login (empty statedir). This is the ONLY place --advertise-tags is
+    # added: config [tailscale] tags, when non-empty, tags the node at initial
+    # registration. Default unset => flag omitted => byte-identical to before.
+    local tags
+    tags="$(config_get tailscale tags || true)"
+    [ -n "$tags" ] && up+=(--advertise-tags="$tags")
     if [ -s "$AUTHKEY_FILE" ]; then
-      log "login: auth-key join (statedir empty)"
+      log "login: auth-key join (statedir empty)${tags:+ tags=$tags}"
       "${up[@]}" --auth-key="$(tr -d '[:space:]' < "$AUTHKEY_FILE")" || true
     else
-      log "login: minting AuthURL (statedir empty, no key) — see boxup status"
+      log "login: minting AuthURL (statedir empty, no key)${tags:+ tags=$tags} — see boxup status"
       "${up[@]}" || true
     fi
   fi
@@ -791,6 +870,31 @@ tailscale_set_full() {
     --stateful-filtering=false
 }
 
+# Refresh-failure backoff (D4). A persistently failing `tailscale set` used to
+# retry on EVERY 15s tick forever (last-set is stamped only on success), with
+# no escalation and no status visibility. Now consecutive failures stretch the
+# effective rate-limit window 20s -> 60s -> 180s -> cap 600s; a success resets
+# both the counter and the window. There is NO permanent give-up.
+#
+# fail.refresh holds the consecutive-failure count (run dir; reset free on
+# recycle/boot). The window is a pure function of that count:
+refresh_fail_count() {
+  local n=0
+  [ -f "$RUN_DIR/fail.refresh" ] && \
+    n=$(tr -d '[:space:]' < "$RUN_DIR/fail.refresh" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
+
+refresh_backoff_window() {
+  local n="$1"
+  if   [ "$n" -le 0 ]; then echo "$SET_MIN_INTERVAL"
+  elif [ "$n" -eq 1 ]; then echo 60
+  elif [ "$n" -eq 2 ]; then echo 180
+  else                      echo 600
+  fi
+}
+
 # Push a full `tailscale set` when the coordination server would show "unable
 # to relay traffic". Never `up`. Rate-limited: an unneeded set every tick
 # cancels PollNetMap and marks the node offline.
@@ -842,20 +946,47 @@ except Exception:
 
   [ "$need" = 1 ] || return 0
 
+  local fails window force=0
+  fails=$(refresh_fail_count)
+  window=$(refresh_backoff_window "$fails")
+
+  # BOXUP_FORCE_REFRESH=1 bypasses the backoff window exactly once (an operator
+  # escape hatch). It is NOT tied to `cmd == once` — the hourly automation runs
+  # `boxup once`, so a cmd-based bypass would reset backoff unattended (F6).
+  # sudo strips the var, so require_root whitelists it and D12 documents the
+  # working form: sudo env BOXUP_FORCE_REFRESH=1 /workspace/box-setup/boxup once
+  if [ "${BOXUP_FORCE_REFRESH:-}" = 1 ]; then
+    force=1
+    log "refresh: BOXUP_FORCE_REFRESH=1 — bypassing backoff window (${window}s, fails=${fails})"
+  fi
+
   now=$(date +%s)
-  if [ -f "$RUN_DIR/last-exitnode-set" ]; then
+  # Window guard keyed on the LAST ATTEMPT time (stamped on BOTH success and
+  # failure below), not merely the last success — otherwise a fresh RUN_DIR
+  # with fail-count > 0 but no stamp would skip the guard entirely and retry a
+  # failing `set` every tick (D4 regression). Missing stamp => last=0 => the
+  # delta is huge, so a genuine first-ever attempt still proceeds immediately.
+  last=0
+  [ -f "$RUN_DIR/last-exitnode-set" ] && \
     last=$(cat "$RUN_DIR/last-exitnode-set" 2>/dev/null || echo 0)
-    case "$last" in ''|*[!0-9]*) last=0 ;; esac
-    if [ $((now - last)) -lt "$SET_MIN_INTERVAL" ]; then
-      log "refresh: need set ($reason) but rate-limited"
-      return 0
-    fi
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$force" = 0 ] && [ $((now - last)) -lt "$window" ]; then
+    log "refresh: need set ($reason) but rate-limited (window=${window}s fails=${fails})"
+    return 0
   fi
   log "refresh: tailscale set ($reason) hostname=$name"
   if tailscale_set_full "$name"; then
     echo "$now" > "$RUN_DIR/last-exitnode-set" 2>/dev/null || true
+    # Success resets the failure counter and window.
+    echo 0 > "$RUN_DIR/fail.refresh" 2>/dev/null || true
   else
-    log "refresh: set failed" >&2
+    fails=$((fails + 1))
+    echo "$fails" > "$RUN_DIR/fail.refresh" 2>/dev/null || true
+    # Stamp the ATTEMPT time on failure too, so the stretched window applies
+    # from the first failure even on a fresh RUN_DIR with no prior stamp.
+    echo "$now" > "$RUN_DIR/last-exitnode-set" 2>/dev/null || true
+    window=$(refresh_backoff_window "$fails")
+    log "refresh: set failed (consecutive=${fails}, next window=${window}s)" >&2
     return 1
   fi
 }
@@ -991,7 +1122,8 @@ recycle_offline_tailscaled() {
 }
 
 # --- selfheal: worker --------------------------------------------------------
-run_tick() {
+# The actual tick body. Runs under the converge lock (via run_tick).
+do_tick() {
   # Freeze checks first — they need the OLD heartbeat.
   if pgrep -x tailscaled >/dev/null 2>&1; then
     maybe_wake_recycle || true
@@ -1016,6 +1148,21 @@ run_tick() {
       ;;
   esac
   date +%s > "$RUN_DIR/hb" 2>/dev/null || true
+}
+
+# run_tick: take the converge lock with flock -n (skip on contention). A tick
+# that loses the lock to an in-progress converge MUST still stamp hb before
+# returning 0 (B1 — a converge in progress IS liveness; otherwise a long
+# `boxup once` starves hb and the next tick spuriously recycles tailscaled).
+run_tick() {
+  local rc
+  run_with_converge_lock try do_tick
+  rc=$?
+  if [ "$rc" = 200 ]; then
+    log "tick: converge already running — skipping (stamping hb for liveness)"
+    date +%s > "$RUN_DIR/hb" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # True iff argv is `bash <path>/boxup worker` (or a legacy v4 selfheal worker).
@@ -1101,6 +1248,16 @@ stop_daemon() {
 }
 
 # --- status ------------------------------------------------------------------
+# The installed git sha, stamped by install.sh into $ROOT/GIT_SHA. "unknown"
+# when absent (an old-format box, or a source tree with no .git at install
+# time). Never fails.
+boxup_git_sha() {
+  local s=""
+  [ -f "$ROOT/GIT_SHA" ] && s=$(tr -d '[:space:]' < "$ROOT/GIT_SHA" 2>/dev/null || true)
+  [ -n "$s" ] || s="unknown"
+  printf '%s' "$s"
+}
+
 print_status() {
   local sshd=down ts_pid sh_pid="" hb=- v4 v6 name now last
   v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
@@ -1120,15 +1277,103 @@ print_status() {
   read_ts_fields
   name="$(read_box_name || true)"
 
+  local vstr
+  vstr="$BOXUP_VERSION/$(boxup_git_sha)"
   printf 'backend=%s online=%s exit-node=%s sshd=%s ipfwd=4:%s,6:%s tailscaled=%s selfheal=%s worker=%s hb=%s name=%s v=%s' \
     "${backend:-unknown}" "${online:-no}" "${exitn:-no}" "$sshd" "$v4" "$v6" \
-    "${ts_pid:--}" "${sh_pid:--}" "${sh_pid:--}" "$hb" "${name:--}" "$BOXUP_VERSION"
+    "${ts_pid:--}" "${sh_pid:--}" "${sh_pid:--}" "$hb" "${name:--}" "$vstr"
+  # refresh backoff visibility (D4): surface a persistently failing refresh only
+  # at N>=3 consecutive failures, so a healthy box's status line is unchanged.
+  local rf
+  rf=$(refresh_fail_count)
+  [ "$rf" -ge 3 ] && printf ' refresh=failing:%s' "$rf"
   [ -n "${auth:-}" ] && printf ' auth=%s' "$auth"
   printf '\n'
 }
 
+# --- check: the single health predicate (D6) ---------------------------------
+# `boxup check`: exit 0 iff the box is healthy, else exit 1 printing
+# `check=FAIL reason=<first-failed-predicate>`. On success prints
+# `check=OK ` + the normal status line. This is THE definition of "healthy";
+# fleetctl and D7 rollout verification delegate to it instead of reimplementing
+# health parsing laptop-side.
+#
+# check MUST NEVER exit 2 — exit 2 is the unknown-subcommand dispatch arm and
+# is fleetctl's "old boxup" signal (B2). A check bug emitting 2 would silently
+# downgrade a new fleetctl to the legacy status parse. Every failure here is
+# exit 1; the dispatch arm below runs do_check and translates its rc to 0/1.
+do_check() {
+  local reason="" v4 v6 hb_secs now last ts_count pid cmd routes
+  v4=$(tr -d '[:space:]' < /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
+  v6=$(tr -d '[:space:]' < /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
+  read_ts_fields
+
+  # Predicates in order; first failure wins.
+  if [ -z "$reason" ] && [ "${backend:-}" != Running ]; then
+    reason="backend=${backend:-unknown} (want Running)"
+  fi
+  if [ -z "$reason" ] && [ "${online:-no}" != yes ]; then
+    reason="online=${online:-no} (want yes)"
+  fi
+  if [ -z "$reason" ] && ! pgrep -x sshd >/dev/null 2>&1; then
+    reason="sshd=down (want up)"
+  fi
+  if [ -z "$reason" ] && { [ "$v4" != 1 ] || [ "$v6" != 1 ]; }; then
+    reason="ipfwd=4:${v4},6:${v6} (want 4:1,6:1)"
+  fi
+  if [ -z "$reason" ]; then
+    # Exactly one tailscaled bound to the workspace statedir.
+    ts_count=0
+    for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
+      cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+      echo "$cmd" | grep -q -- "$STATE_DIR" && ts_count=$((ts_count + 1))
+    done
+    if [ "$ts_count" != 1 ]; then
+      reason="tailscaled=${ts_count} on statedir (want exactly 1)"
+    fi
+  fi
+  if [ -z "$reason" ]; then
+    # Worker alive with a fresh heartbeat (< FREEZE_SECS).
+    if [ ! -f "$WORKER_PID" ] || \
+       ! kill -0 "$(tr -d '[:space:]' < "$WORKER_PID" 2>/dev/null)" 2>/dev/null; then
+      reason="worker=dead (want alive)"
+    else
+      hb_secs=-1
+      if [ -f "$RUN_DIR/hb" ]; then
+        now=$(date +%s)
+        last=$(tr -d '[:space:]' < "$RUN_DIR/hb" 2>/dev/null || echo 0)
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        [ "$last" -gt 0 ] && hb_secs=$((now - last))
+      fi
+      if [ "$hb_secs" -lt 0 ] || [ "$hb_secs" -ge "$FREEZE_SECS" ]; then
+        reason="hb=${hb_secs}s (want < ${FREEZE_SECS}s)"
+      fi
+    fi
+  fi
+  if [ -z "$reason" ]; then
+    # Exit-node advertised (ExitNodeOption + both default routes present).
+    if [ "${exitn:-no}" != yes ]; then
+      reason="exit-node=${exitn:-no} (want yes)"
+    else
+      routes="$(advertised_routes)"
+      if ! echo "$routes" | grep -q '0.0.0.0/0' || ! echo "$routes" | grep -q '::/0'; then
+        reason="exit-node routes missing 0.0.0.0/0 or ::/0"
+      fi
+    fi
+  fi
+
+  if [ -n "$reason" ]; then
+    echo "check=FAIL reason=$reason"
+    return 1
+  fi
+  printf 'check=OK '
+  print_status
+  return 0
+}
+
 # --- converge ----------------------------------------------------------------
-do_ensure() {
+# The converge body. Runs under the converge lock (via do_ensure).
+do_ensure_body() {
   ensure_dirs
   ensure_packages
   ensure_tailscale_bin || true
@@ -1140,6 +1385,16 @@ do_ensure() {
   ensure_name
   ensure_nat || true
   refresh_exitnode || true
+}
+
+# do_ensure: take the converge lock with flock -w 60 (bounded WAIT, never
+# skip — `boxup once` is AGENT.md's remedy for nearly every symptom, so a tick
+# holding the lock must delay converge, not fake it out). ensure_dirs must run
+# BEFORE we open the lock file (CONVERGE_LOCK lives in RUN_DIR); if RUN_DIR is
+# absent run_with_converge_lock fails open and converge still runs unlocked.
+do_ensure() {
+  ensure_dirs
+  run_with_converge_lock wait do_ensure_body
 }
 
 do_update() {
@@ -1166,7 +1421,8 @@ require_root() {
         BOX_SETUP_CONFIG="${BOX_SETUP_CONFIG:-}" \
         BOX_SETUP_RUN="${BOX_SETUP_RUN:-}" \
         BOX_SETUP_LOG="${BOX_SETUP_LOG:-}" \
-        BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" bash "$SELF" "$@"
+        BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" \
+        BOXUP_FORCE_REFRESH="${BOXUP_FORCE_REFRESH:-}" bash "$SELF" "$@"
     fi
     log "boxup: need root" >&2
     exit 1
@@ -1201,6 +1457,11 @@ case "$cmd" in
   status|--status)
     print_status
     ;;
+  check|--check)
+    # Read-only health gate. Delegate to do_check; force the exit code into
+    # {0,1} so a bug can never surface as 2 (B2: 2 = "old boxup" to fleetctl).
+    if do_check; then exit 0; else exit 1; fi
+    ;;
   stop|--stop)
     require_root stop
     stop_daemon
@@ -1224,3 +1485,6 @@ case "$cmd" in
     exit 2
     ;;
 esac
+
+
+# boxup-eof
