@@ -57,12 +57,26 @@ AUTHKEY_EXPIRES="$SECRETS_DIR/ts-authkey.expires"
 BIN_DIR="$ROOT/bin"
 CONFIG_FILE="${BOX_SETUP_CONFIG:-$ROOT/config.toml}"
 
+# FLEET-BRAIN (docs/FLEET-BRAIN.md §1): the out-of-band reverse-SSH tunnel key
+# + supervision state. The per-box ed25519 key lives under /workspace so it
+# survives an image swap; it authenticates THIS box's tunnel to the VPS. The
+# box generates it on first converge if absent (enroll reads the .pub over the
+# tailnet). Tunnel supervision is a NO-OP unless [fleet].vps is configured, so
+# an un-enrolled box is completely unaffected. (TUNNEL_PID/TUNNEL_LOG depend on
+# RUN_DIR/LOG_DIR, set below.)
+TUNNEL_KEY="$SECRETS_DIR/tunnel_ed25519"
+TUNNEL_PUB="$SECRETS_DIR/tunnel_ed25519.pub"
+
 RUN_DIR="${BOX_SETUP_RUN:-/run/box-setup}"
 LOG_DIR="${BOX_SETUP_LOG:-/var/log}"
 WORKER_PID="/run/tailscale-selfheal.pid"
 WORKER_LOG="$LOG_DIR/boxup-worker.log"
 TAILSCALED_LOG="$LOG_DIR/tailscaled.log"
 TS_SOCK="/var/run/tailscale/tailscaled.sock"
+
+# FLEET-BRAIN reverse-tunnel supervision state (see TUNNEL_KEY above).
+TUNNEL_PID="$RUN_DIR/tunnel.pid"
+TUNNEL_LOG="$LOG_DIR/boxup-tunnel.log"
 
 # Two flock-guarded critical sections. Since H1 (iter3 hotfix) the converge
 # lock uses flock --close semantics — the body runs with the lock fd CLOSED for
@@ -866,6 +880,144 @@ spawn_detached() {
   fi
 }
 
+# --- converge: FLEET-BRAIN reverse tunnel (docs/FLEET-BRAIN.md §1) ------------
+# The boxup tick supervises a plain `ssh -N` reverse tunnel in a loop, exactly
+# like it supervises tailscaled/sshd — NOT autossh (no extra binary survives an
+# image swap), NOT a systemd unit (no systemd in the sand container). Each tick:
+# if no live tunnel process, (re)spawn it detached via spawn_detached and let
+# the tick own the lifecycle. Liveness is CLIENT-driven (ServerAliveInterval/
+# CountMax) because the VPS runs ClientAliveInterval 0 and never reaps a dead
+# tunnel. Backoff bounds respawn storms when the VPS is unreachable.
+#
+# UNCONFIGURED ⇒ SILENT NO-OP: with no [fleet].vps set, an un-enrolled box does
+# nothing here and is completely unaffected.
+
+# fleet_configured: 0 iff [fleet].vps is set (a VPS host to tunnel to).
+fleet_configured() {
+  local vps; vps="$(config_get fleet vps || true)"
+  [ -n "$vps" ]
+}
+
+# fleet_port: the box's reverse loopback port 20000+box_index. box_index comes
+# from [fleet].box_index, else parsed from the frozen grok-box-N hostname.
+fleet_port() {
+  local n; n="$(config_get fleet box_index || true)"
+  if [ -z "$n" ]; then
+    local name; name="$(read_box_name || true)"
+    n="${name#grok-box-}"
+  fi
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$((20000 + n))"
+}
+
+# ensure_tunnel_key: generate the per-box ed25519 tunnel key on first converge
+# if absent. Lives under /workspace (survives image swap). Private key 600.
+ensure_tunnel_key() {
+  [ -f "$TUNNEL_KEY" ] && return 0
+  have ssh-keygen || { log "tunnel: ssh-keygen missing — cannot generate tunnel key" >&2; return 1; }
+  mkdir -p "$SECRETS_DIR" 2>/dev/null || true
+  chmod 700 "$SECRETS_DIR" 2>/dev/null || true
+  local umask_old; umask_old="$(umask)"
+  umask 077
+  if ssh-keygen -t ed25519 -N "" -C "grok-tunnel-$(read_box_name 2>/dev/null || echo box)" \
+       -f "$TUNNEL_KEY" >/dev/null 2>&1; then
+    log "tunnel: generated per-box tunnel key at $TUNNEL_KEY"
+  else
+    log "tunnel: ssh-keygen failed for $TUNNEL_KEY" >&2
+    umask "$umask_old"; return 1
+  fi
+  umask "$umask_old"
+  chmod 600 "$TUNNEL_KEY" 2>/dev/null || true
+  chmod 644 "$TUNNEL_PUB" 2>/dev/null || true
+}
+
+# tunnel_pid: the supervised ssh -N pid if alive AND still a tunnel process,
+# else empty. Never match a bare `ssh` an operator ran — verify the argv.
+tunnel_pid() {
+  [ -f "$TUNNEL_PID" ] || return 1
+  local pid; pid="$(tr -d '[:space:]' < "$TUNNEL_PID" 2>/dev/null)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  # Confirm it is our reverse tunnel (argv carries -R 127.0.0.1:2000N).
+  local cmd; cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$cmd" in *"-R 127.0.0.1:"*|*"-R"*"127.0.0.1:"*) printf '%s' "$pid"; return 0 ;; esac
+  return 1
+}
+
+# tunnel_backoff_window <fails> -> 15,30,60,120,300 cap (respawn storm brake).
+tunnel_backoff_window() {
+  local f="${1:-0}"
+  case "$f" in 0|1) echo 0 ;; 2) echo 15 ;; 3) echo 30 ;; 4) echo 60 ;; 5) echo 120 ;; *) echo 300 ;; esac
+}
+tunnel_fail_count() {
+  local n=0
+  [ -f "$RUN_DIR/fail.tunnel" ] && n=$(tr -d '[:space:]' < "$RUN_DIR/fail.tunnel" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
+
+# supervise_tunnel: the per-tick supervisor. Unconfigured => silent no-op. If a
+# live tunnel exists, nothing to do. Otherwise (re)spawn under a backoff window.
+supervise_tunnel() {
+  fleet_configured || return 0        # unconfigured: silent no-op
+  local vps port sshport
+  vps="$(config_get fleet vps || true)"
+  [ -n "$vps" ] || return 0
+  port="$(fleet_port)" || { log "tunnel: no box_index/hostname — cannot derive port" >&2; return 0; }
+  sshport="$(config_get fleet port || true)"; [ -n "$sshport" ] || sshport=22
+
+  if tunnel_pid >/dev/null 2>&1; then
+    echo 0 > "$RUN_DIR/fail.tunnel" 2>/dev/null || true
+    return 0
+  fi
+
+  # No live tunnel. Respect the backoff window since the last spawn attempt.
+  local fails window now last
+  fails="$(tunnel_fail_count)"
+  window="$(tunnel_backoff_window "$fails")"
+  now="$(date +%s)"; last=0
+  [ -f "$RUN_DIR/last-tunnel" ] && last=$(tr -d '[:space:]' < "$RUN_DIR/last-tunnel" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$last" -gt 0 ] && [ "$window" -gt 0 ] && [ $((now - last)) -lt "$window" ]; then
+    log "tunnel: down but backing off (window=${window}s fails=${fails})" >&2
+    return 0
+  fi
+
+  ensure_tunnel_key || return 0
+  [ -f "$TUNNEL_KEY" ] || { log "tunnel: no key at $TUNNEL_KEY — skipping" >&2; return 0; }
+
+  echo "$now" > "$RUN_DIR/last-tunnel" 2>/dev/null || true
+  echo $((fails + 1)) > "$RUN_DIR/fail.tunnel" 2>/dev/null || true
+
+  touch "$TUNNEL_LOG" 2>/dev/null || true
+  if [ "$(wc -c < "$TUNNEL_LOG" 2>/dev/null || echo 0)" -gt 10485760 ]; then : > "$TUNNEL_LOG"; fi
+
+  # Spawn detached (the ONLY long-lived spawn primitive, H9). ExitOnForwardFailure
+  # + ServerAlive* make a dead tunnel exit promptly so the next tick respawns it.
+  log "tunnel: (re)spawning reverse tunnel -R 127.0.0.1:$port:localhost:22 -> fleet@$vps:$sshport"
+  spawn_detached "$TUNNEL_LOG" \
+    ssh -N -T \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -o BatchMode=yes \
+      -o StrictHostKeyChecking=accept-new \
+      -i "$TUNNEL_KEY" \
+      -R "127.0.0.1:$port:localhost:22" \
+      -p "$sshport" "fleet@$vps"
+  # Record the newest ssh pid we can attribute to this tunnel.
+  sleep 0.3
+  local pid
+  pid="$(pgrep -n -f -- "-R 127.0.0.1:$port:localhost:22" 2>/dev/null || true)"
+  [ -n "$pid" ] && printf '%s\n' "$pid" > "$TUNNEL_PID" 2>/dev/null || true
+}
+
+# tunnel_state: for `boxup status`. unconfigured | up | down.
+tunnel_state() {
+  fleet_configured || { printf 'unconfigured'; return 0; }
+  if tunnel_pid >/dev/null 2>&1; then printf 'up'; else printf 'down'; fi
+}
+
 # --- converge: tailscaled ----------------------------------------------------
 # Exactly one daemon, bound to the workspace statedir. Kill strays (dpkg's
 # default unit uses /var/lib/tailscale) by PID, never pkill -f.
@@ -1622,6 +1774,12 @@ do_tick() {
   ensure_forwarding || true
   ensure_nat || true
 
+  # FLEET-BRAIN §1: supervise the out-of-band reverse tunnel every tick, like
+  # tailscaled/sshd. Unconfigured ([fleet].vps unset) is a silent no-op, so an
+  # un-enrolled box is unaffected. Runs regardless of the check-repair backoff
+  # (the tunnel is liveness the brain needs even while a box is unhealthy).
+  supervise_tunnel || true
+
   # P1-1 (H12, unified): the tick's health probe IS `check_reason` — the SINGLE
   # health predicate, so the tick and `boxup check` can never diverge. If any
   # predicate fails, run the FULL do_ensure_body under this tick's lock (stop
@@ -1845,6 +2003,9 @@ print_status() {
     expired) printf ' authkey=EXPIRED:%s' "$(tr -d '[:space:]' < "$AUTHKEY_EXPIRES" 2>/dev/null)" ;;
     unknown) printf ' authkey=unknown-expiry' ;;
   esac
+  # FLEET-BRAIN §1: the reverse-tunnel state. unconfigured (silent for legacy
+  # readers is fine, but the brain reads this field) | up | down.
+  printf ' tunnel=%s' "$(tunnel_state)"
   printf '\n'
 }
 
@@ -2038,6 +2199,12 @@ do_ensure_body() {
   _ensure_step name           ensure_name
   _ensure_step nat            ensure_nat
   _ensure_step refresh        refresh_exitnode
+  # FLEET-BRAIN §1: generate the per-box tunnel key on first converge (so
+  # enroll can read the .pub over the tailnet) and supervise the reverse tunnel.
+  # Both are no-ops when already keyed / unconfigured — an un-enrolled box is
+  # unaffected.
+  _ensure_step tunnel-key     ensure_tunnel_key
+  _ensure_step tunnel         supervise_tunnel
   # Visibility only — does NOT change the return code (callers depend on a tick
   # not being failed by a degraded converge). A clean pass clears the marker.
   if [ "$_degraded" = 1 ]; then

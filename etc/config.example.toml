@@ -51,3 +51,25 @@
 # Repo cloned by `boxup update`. Always a fresh clone to a temp dir + this
 # install.sh — never `git pull` in place.
 #repo = "https://github.com/chaogebaba/grok-box-setup.git"
+
+[fleet]
+# FLEET-BRAIN out-of-band reverse-SSH tunnel (docs/FLEET-BRAIN.md §1).
+#
+# UNCONFIGURED BY DEFAULT: with `vps` unset, boxup does NOTHING here — no
+# tunnel, no key use beyond generation — so an un-enrolled box is completely
+# unaffected. Set these ONLY after `fleetctl enroll grok-box-N` has trusted
+# this box's tunnel key on the VPS.
+#
+# vps        the always-on brain host the box dials out to. The box opens a
+#            reverse tunnel  ssh -R 127.0.0.1:2000N:localhost:22 fleet@<vps>
+#            supervised by the boxup tick (respawn with backoff, like
+#            tailscaled). Liveness is client-driven (ServerAlive*), because the
+#            VPS runs ClientAliveInterval 0 and never reaps a dead tunnel.
+#vps = "107.172.132.211"
+#
+# port       the VPS sshd port (default 22).
+#port = 22
+#
+# box_index  N in grok-box-N; the reverse loopback port is 20000+N (range
+#            20001–20008). Leave unset to derive N from the frozen hostname.
+#box_index = 8
