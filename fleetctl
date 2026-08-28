@@ -525,9 +525,13 @@ rollout_one() {
 
 # Preflight shared by all rollout forms: git present, in a repo, clean tree
 # (unless --dirty), package HEAD into a tarball, stamp ROLLOUT_GIT_SHA. Echoes
-# the tarball path on stdout; returns nonzero on any failure.
+# the sha and tarball path (TAB-separated) on stdout; returns nonzero on any
+# failure. NOTE: the caller runs this in a command substitution, so any
+# variable it sets (e.g. ROLLOUT_GIT_SHA) would be LOST in the subshell — that
+# is why the sha is RETURNED on stdout for the parent to assign, not exported
+# from here (B3: otherwise the remote install got BOX_SETUP_GIT_SHA='unknown').
 rollout_package() {
-  local allow_dirty="$1" tarball
+  local allow_dirty="$1" tarball sha
   have git || { log "rollout: git not found"; return 1; }
   if ! git rev-parse --git-dir >/dev/null 2>&1; then
     log "rollout: not inside a git repository"; return 1
@@ -540,9 +544,9 @@ rollout_package() {
   if ! git archive --format=tar -o "$tarball" HEAD 2>/dev/null; then
     rm -f "$tarball"; log "rollout: git archive HEAD failed"; return 1
   fi
-  ROLLOUT_GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  log "rollout: packaged HEAD $ROLLOUT_GIT_SHA -> $(basename "$tarball")"
-  printf '%s' "$tarball"
+  sha="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  log "rollout: packaged HEAD $sha -> $(basename "$tarball")"
+  printf '%s\t%s' "$sha" "$tarball"
 }
 
 # Roll a list of boxes with bounded concurrency + an abort brake. The abort
@@ -561,6 +565,15 @@ rollout_batch() {
     while [ "$(jobs -rp | wc -l)" -ge "$MAX_CONCURRENCY" ]; do
       wait -n 2>/dev/null || wait
     done
+    # Re-check the abort flag AFTER the capacity wait and immediately before
+    # dispatch: an in-flight box can trip the brake while we were blocked in
+    # `wait -n`, and dispatching now would violate "no NEW dispatches after a
+    # verified failure" (repro: concurrency=1, b1 fails then b2 starts).
+    if [ -f "$abortfile" ]; then
+      printf '%s\t%s\n' "skipped" "aborted" > "$statusdir/$b"
+      printf '%-14s SKIPPED (rollout aborted)\n' "$b"
+      continue
+    fi
     (
       # A verified failure (rc 1) trips the abort brake for subsequent
       # dispatches; an unreachable skip (rc 2) does not.
@@ -614,8 +627,13 @@ cmd_rollout() {
     return 2
   fi
 
-  local tarball statusdir abortfile rc=0 b crc
-  tarball="$(rollout_package "$allow_dirty")" || return 1
+  local tarball statusdir abortfile rc=0 b crc pkg
+  # rollout_package returns "<sha>\t<tarball>" on stdout so the sha assignment
+  # survives into THIS shell (a subshell assignment inside $(...) would be lost,
+  # and the remote install would run BOX_SETUP_GIT_SHA='unknown' — B3).
+  pkg="$(rollout_package "$allow_dirty")" || return 1
+  ROLLOUT_GIT_SHA="${pkg%%$'\t'*}"
+  tarball="${pkg#*$'\t'}"
   statusdir="$(mktemp -d)"; abortfile="$(mktemp)"; rm -f "$abortfile"
 
   if [ "$all" = 1 ]; then
