@@ -169,8 +169,10 @@ To retag an ALREADY-registered node, it is a **manual** operator step (never
 automatic): once the ACL authorizes the tag, run on the box
 
 ```bash
+h="$(cat /workspace/box-setup/hostname 2>/dev/null)"
+[ -n "$h" ] || { echo "unnamed box: run 'sudo /workspace/box-setup/boxup once' first"; exit 1; }
 sudo /workspace/box-setup/bin/tailscale up --advertise-tags=tag:grok-box --force-reauth \
-  --hostname="$(cat /workspace/box-setup/hostname)" \
+  --hostname="$h" \
   --ssh=false --advertise-exit-node --accept-dns --snat-subnet-routes=true --operator=box
 ```
 
