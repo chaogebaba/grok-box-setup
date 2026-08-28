@@ -55,30 +55,53 @@ if [ -x "$DEST/box-bootstrap.sh" ] && [ ! -f "$DEST/boxup" ]; then
   bash "$DEST/box-bootstrap.sh" --stop >/dev/null 2>&1 || true
 fi
 
-# E1 — one-shot pre-H1 wedge migration. Before H1, tailscaled could inherit the
-# converge-lock fd and hold it for life, wedging every tick. flock --close
-# prevents that for NEW daemons but cannot free an ALREADY-leaked fd, and the
-# two runtime detectors we tried were proven inert. So clear it ONCE, here, on
-# upgrade from a pre-H1 boxup: detect by the ABSENCE of the H1 marker in the
-# currently-installed boxup, stop the old worker, then kill ONLY a tailscaled
-# whose argv carries the EXACT token `--statedir=$STATE_DIR` (word-split match,
-# never a substring — so `--statedir=$STATE_DIR-other` is NOT killed). The
-# normal `boxup once` below restarts the daemon via the flock --close path.
-# Runs once per upgrade, never in a tick.
+# E1 — one-shot version-change tailscaled recycle. Before H1, tailscaled could
+# inherit the converge-lock fd and hold it for life, wedging every tick. flock
+# --close prevents that for NEW daemons but cannot free an ALREADY-leaked fd,
+# and the two runtime detectors we tried were proven inert. P1-3: trigger on ANY
+# VERSION change (installed VERSION != the version being installed), NOT a
+# comment-marker heuristic — the marker keys on disk contents while the LIVE
+# daemon is a separate generation; the two diverge (a box can already have the
+# H1 file on disk from a partial/earlier step while the wedged pre-H1 daemon is
+# still the running process). A version bump is the unambiguous "a new boxup is
+# taking over" signal. On a bump we recycle tailscaled unconditionally: exact-
+# token select, SIGTERM, poll up to 10s, SIGKILL, verify gone; the normal
+# `boxup once` below restarts it via the flock --close path. ~5s connectivity
+# blip per upgrade is acceptable and bounded. Runs once per upgrade, never in a
+# tick; no sentinel file (disk vs live-generation divergence is the whole
+# reason a sentinel/marker cannot be trusted here).
 STATE_DIR_MIG="$DEST/state/tailscale"
-if [ -f "$DEST/boxup" ] && ! grep -q 'flock --close' "$DEST/boxup" 2>/dev/null; then
-  log "E1 migration: upgrading from a pre-H1 boxup — clearing any inherited converge-lock wedge"
+installed_ver=""; [ -f "$DEST/VERSION" ] && installed_ver="$(tr -d '[:space:]' < "$DEST/VERSION" 2>/dev/null || true)"
+new_ver=""; [ -f "$REPO_ROOT/VERSION" ] && new_ver="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION" 2>/dev/null || true)"
+if [ -f "$DEST/boxup" ] && [ -n "$new_ver" ] && [ "$installed_ver" != "$new_ver" ]; then
+  log "E1 migration: version change ${installed_ver:-none} -> $new_ver — recycling tailscaled to clear any inherited converge-lock wedge"
   bash "$DEST/boxup" stop >/dev/null 2>&1 || true
   for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
-    # Exact-token match: split argv on NULs, require a literal
-    # `--statedir=$STATE_DIR_MIG` argument (not a prefix of a longer path).
+    # Exact-token match: split argv on NULs, require a LITERAL
+    # `--statedir=$STATE_DIR_MIG` argument (not a prefix of a longer path, so
+    # `--statedir=$STATE_DIR_MIG-other` is NOT selected).
     match=0
     while IFS= read -r -d '' arg; do
       [ "$arg" = "--statedir=$STATE_DIR_MIG" ] && match=1
     done < "/proc/$pid/cmdline" 2>/dev/null || true
-    if [ "$match" = 1 ]; then
-      log "E1 migration: killing pre-H1 tailscaled pid=$pid (exact --statedir=$STATE_DIR_MIG)"
-      kill "$pid" 2>/dev/null || true
+    [ "$match" = 1 ] || continue
+    log "E1 migration: SIGTERM tailscaled pid=$pid (exact --statedir=$STATE_DIR_MIG)"
+    kill "$pid" 2>/dev/null || true
+    # Poll up to 10s for graceful exit, then SIGKILL.
+    i=0
+    while [ "$i" -lt 50 ]; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2; i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      log "E1 migration: pid=$pid still alive after 10s — SIGKILL"
+      kill -9 "$pid" 2>/dev/null || true
+      sleep 0.3
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+      log "E1 migration: WARNING pid=$pid STILL alive after SIGKILL — the new daemon may not bind cleanly" >&2
+    else
+      log "E1 migration: pid=$pid gone"
     fi
   done
 fi
