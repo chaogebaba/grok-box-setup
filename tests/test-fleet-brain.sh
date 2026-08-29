@@ -321,50 +321,68 @@ chk_json '.capabilities.devices.create.tags == ["tag:grok-box"]' && pass "mint p
 chk_json '.expirySeconds == 7776000'                          && pass "mint payload: expirySeconds=90d cap"            || bad "mint payload expirySeconds wrong: [$payload]"
 chk_json '.expirySeconds <= 7776000'                          && pass "mint payload: expirySeconds <= 90d"             || bad "mint payload expirySeconds over cap: [$payload]"
 
-# Atomic seed: a sha MISMATCH on the remote write must FAIL and leave the OLD
-# key intact (the .tmp is removed, ts-authkey unchanged). We drive the REAL
-# seed_key_over_tunnel with a tunnel_ssh stub that runs the remote script
-# LOCALLY against a fake box tree, but corrupts the write so the sha differs.
-seed_fail_test() {
-  local inner; inner="$(mktemp)"
-  cat > "$inner" <<'INNER'
+# Atomic seed (F1/F2/S4): the REAL seed_key_over_tunnel installs the key AS ROOT.
+# Harness pattern (wrap_test, tests below): a fake `sudo` on PATH (`exec "$@"`)
+# and `tunnel_ssh(){ shift; printf '%s\n' "$*" >>"$T/cmds"; sh -c "$*"; }` so the
+# real `sudo env … sh -c '<script>'` boundary is parsed by a REAL shell and the
+# env vars arrive through real `env`. The fake tree paths are injected by
+# overriding BOX_AUTHKEY* before calling the real seed_key_over_tunnel. S4: the
+# stub records every remote command string to $T/cmds so we can assert the write
+# starts with `sudo env `, carries no key value, and the read-back is `sudo cat`.
+# mode: ok => everything matches; shamismatch => corrupt the streamed key so the
+# remote sha != want_sha (the remote script rm's the .tmp and exits 3).
+seed_harness() {
+  local mode="$1" inner d
+  inner="$(mktemp)"; d="$(mktemp -d)"
+  mkdir -p "$d/secrets" "$d/bin" "$d/box"
+  echo "OLD-KEY" > "$d/secrets/ts-authkey"       # the pre-existing key
+  # Fake sudo: `sudo <cmd...>` => exec <cmd...> (drop argv[1]).
+  printf '#!/bin/sh\nexec "$@"\n' > "$d/bin/sudo"; chmod +x "$d/bin/sudo"
+  # Fake boxup: prints a converged status line (no authkey= token => fresh).
+  printf '#!/bin/sh\ncase "$1" in status) echo "backend=Running name=grok-box-8 tunnel=up";; esac\n' > "$d/box/boxup"; chmod +x "$d/box/boxup"
+  cat > "$inner" <<INNER
 set -u
-FLEETCTL="__FLEETCTL__"
-BOXROOT="$(mktemp -d)"
-mkdir -p "$BOXROOT/secrets"
-echo "OLD-KEY" > "$BOXROOT/secrets/ts-authkey"       # the pre-existing key
-BOX_ROOT="$BOXROOT"
-BOX_AUTHKEY="$BOXROOT/secrets/ts-authkey"
-BOX_AUTHKEY_TMP="$BOXROOT/secrets/.ts-authkey.tmp"
-BOX_AUTHKEY_EXPIRES="$BOXROOT/secrets/ts-authkey.expires"
+FLEETCTL="$FLEETCTL"
+T="$d"
+PATH="$d/bin:\$PATH"; export PATH
+BOX_ROOT="$d/box"
+BOX_AUTHKEY="$d/secrets/ts-authkey"
+BOX_AUTHKEY_TMP="$d/secrets/.ts-authkey.tmp"
+BOX_AUTHKEY_EXPIRES="$d/secrets/ts-authkey.expires"
 log(){ :; }
-extract_from(){ awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$1"; }
-eval "$(extract_from "$FLEETCTL" seed_key_over_tunnel)"
-eval "$(extract_from "$FLEETCTL" seed_status_converged)"
-# tunnel_ssh stub: for the seed heredoc, CORRUPT the stdin so the remote sha
-# never matches want_sha (the remote script rm's the .tmp and exits 3). For a
-# `boxup status` call, print a benign line.
-# tunnel_ssh stub: the remote script arrives as the LAST arg ("$*" after the
-# box), and the key arrives on STDIN. Run the script via `bash -c` with stdin
-# forwarded. The CORRUPT case tweaks the piped key so the remote sha never
-# matches want_sha (the remote script rm's the .tmp and exits 3).
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in seed_remote_script seed_key_over_tunnel seed_status_converged; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# REAL wrapping (S4): record the remote command, then run it through a real
+# shell so the outer single-quote boundary of \`sudo env … sh -c '<script>'\`
+# is parsed by the shell (not manually stripped). The key arrives on STDIN.
+# For the shamismatch mode, corrupt the piped key ONLY on the write command so
+# the remote sha never matches want_sha; boxup status / sudo cat pass through.
+MODE="$mode"
 tunnel_ssh(){
-  shift    # drop the box arg
-  local script="$*"
-  case "$script" in
-    *"boxup status"*) echo "backend=Running name=grok-box-8 v=5.2.0/deadbee tunnel=up"; return 0 ;;
-    *) sed 's/$/-CORRUPT/' | bash -c "$script" ;;
+  shift
+  printf '%s\n' "\$*" >> "$d/cmds"
+  case "\$*" in
+    *"boxup status"*|*"sudo cat"*) sh -c "\$*" ;;
+    *) if [ "\$MODE" = shamismatch ]; then sed 's/\$/-CORRUPT/' | sh -c "\$*"; else sh -c "\$*"; fi ;;
   esac
 }
 if seed_key_over_tunnel grok-box-8 "FRESH-KEY" "2099-01-01"; then echo "seed=OK"; else echo "seed=FAIL"; fi
-echo "onbox=$(cat "$BOX_AUTHKEY")"
-[ -e "$BOX_AUTHKEY_TMP" ] && echo "tmp=present" || echo "tmp=gone"
-rm -rf "$BOXROOT"
+echo "onbox=\$(cat "$d/secrets/ts-authkey")"
+[ -e "$d/secrets/.ts-authkey.tmp" ] && echo "tmp=present" || echo "tmp=gone"
+echo "exp=\$(cat "$d/secrets/ts-authkey.expires" 2>/dev/null || true)"
+# The write command (first non-status, non-cat line) must start with 'sudo env '
+# and must NOT contain the key value; the read-back must start with 'sudo cat '.
+writecmd="\$(grep -v 'boxup status' "$d/cmds" | grep -v 'sudo cat' | head -n1)"
+case "\$writecmd" in "sudo env "*) echo "writepfx=ok" ;; *) echo "writepfx=BAD:\$writecmd" ;; esac
+case "\$writecmd" in *FRESH-KEY*) echo "keyleak=LEAK" ;; *) echo "keyleak=none" ;; esac
+if grep -q '^sudo cat ' "$d/cmds"; then echo "readback=sudocat"; else echo "readback=BAD"; fi
 INNER
-  sed -i "s#__FLEETCTL__#$FLEETCTL#" "$inner"
-  timeout 20 bash "$inner"; rm -f "$inner"
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
-seedout="$(seed_fail_test)"
+
+# FAIL path: a sha MISMATCH on the remote write must FAIL and leave the OLD key
+# intact (the .tmp is removed, ts-authkey unchanged).
+seedout="$(seed_harness shamismatch)"
 case "$seedout" in
   *"seed=FAIL"*) pass "mint atomic seed: sha mismatch => seed FAILS (old key not advanced)" ;;
   *) bad "mint atomic seed did not fail on sha mismatch: [$seedout]" ;;
@@ -377,36 +395,90 @@ case "$seedout" in
   *"tmp=gone"*) pass "mint atomic seed: the .tmp scratch is removed on mismatch" ;;
   *) bad "mint atomic seed left a .tmp behind: [$seedout]" ;;
 esac
+# The write command is root-privileged (sudo env) even on the failing path.
+case "$seedout" in
+  *"writepfx=ok"*) pass "mint atomic seed: the write command runs as 'sudo env …' (root-privileged seed)" ;;
+  *) bad "mint atomic seed write not sudo env: [$seedout]" ;;
+esac
+case "$seedout" in
+  *"keyleak=none"*) pass "mint atomic seed: the key value never appears in the remote command string (stdin only)" ;;
+  *) bad "mint atomic seed leaked the key onto the command line: [$seedout]" ;;
+esac
 
-# Atomic seed SUCCESS: matching sha => mv into place + .expires written.
-seed_ok_test() {
-  local inner; inner="$(mktemp)"
-  cat > "$inner" <<'INNER'
-set -u
-FLEETCTL="__FLEETCTL__"
-BOXROOT="$(mktemp -d)"; mkdir -p "$BOXROOT/secrets"; echo OLD > "$BOXROOT/secrets/ts-authkey"
-BOX_ROOT="$BOXROOT"
-BOX_AUTHKEY="$BOXROOT/secrets/ts-authkey"
-BOX_AUTHKEY_TMP="$BOXROOT/secrets/.ts-authkey.tmp"
-BOX_AUTHKEY_EXPIRES="$BOXROOT/secrets/ts-authkey.expires"
-log(){ :; }
-extract_from(){ awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$1"; }
-eval "$(extract_from "$FLEETCTL" seed_key_over_tunnel)"
-eval "$(extract_from "$FLEETCTL" seed_status_converged)"
-tunnel_ssh(){ shift; local s="$*"; case "$s" in *"boxup status"*) echo "backend=Running tunnel=up"; return 0 ;; *) bash -c "$s" ;; esac; }
-if seed_key_over_tunnel grok-box-8 "FRESH-KEY" "2099-01-01"; then echo "seed=OK"; else echo "seed=FAIL"; fi
-echo "onbox=$(cat "$BOX_AUTHKEY")"
-echo "exp=$(cat "$BOX_AUTHKEY_EXPIRES" 2>/dev/null)"
-rm -rf "$BOXROOT"
-INNER
-  sed -i "s#__FLEETCTL__#$FLEETCTL#" "$inner"
-  timeout 20 bash "$inner"; rm -f "$inner"
-}
-seedok="$(seed_ok_test)"
+# OK path: matching sha => mv into place + .expires written; verified via the
+# sudo boxup status + sudo cat read-back through the REAL wrapping.
+seedok="$(seed_harness ok)"
 case "$seedok" in
-  *"seed=OK"*"onbox=FRESH-KEY"*"exp=2099-01-01"*) pass "mint atomic seed: matching sha => key installed + .expires written" ;;
+  *"seed=OK"*"onbox=FRESH-KEY"*"exp=2099-01-01"*) pass "mint atomic seed: matching sha => key installed + .expires written (root seed, real wrapping)" ;;
   *) bad "mint atomic seed success path wrong: [$seedok]" ;;
 esac
+case "$seedok" in
+  *"writepfx=ok"*) pass "mint atomic seed: success-path write runs as 'sudo env …'" ;;
+  *) bad "mint atomic seed success write not sudo env: [$seedok]" ;;
+esac
+case "$seedok" in
+  *"readback=sudocat"*) pass "mint atomic seed: the .expires read-back goes through 'sudo cat' (D2 — secrets/ is root:700)" ;;
+  *) bad "mint atomic seed read-back not sudo cat: [$seedok]" ;;
+esac
+
+# --- F3/D5b (m1 kill): no-sudo guard. secrets/ is root:700, so ANY secrets-
+# touching remote command that is not `sudo …` is EACCES on a real box.
+# Simulate that: tunnel_ssh returns 1 (EACCES) for any command NOT beginning
+# with `sudo `. On CORRECT code every seed command (write, status, read-back) is
+# `sudo …`, so the guard never fires and the seed SUCCEEDS. If the sudo were
+# dropped (mutant m1), the write is rejected and the seed FAILS with the OLD key
+# intact — this case is the empirical trip-wire for that mutant.
+seed_no_sudo_guard() {
+  local inner d; inner="$(mktemp)"; d="$(mktemp -d)"
+  mkdir -p "$d/secrets" "$d/bin" "$d/box"
+  echo "OLD-KEY" > "$d/secrets/ts-authkey"
+  printf '#!/bin/sh\nexec "$@"\n' > "$d/bin/sudo"; chmod +x "$d/bin/sudo"
+  printf '#!/bin/sh\ncase "$1" in status) echo "backend=Running tunnel=up";; esac\n' > "$d/box/boxup"; chmod +x "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+PATH="$d/bin:\$PATH"; export PATH
+BOX_ROOT="$d/box"
+BOX_AUTHKEY="$d/secrets/ts-authkey"
+BOX_AUTHKEY_TMP="$d/secrets/.ts-authkey.tmp"
+BOX_AUTHKEY_EXPIRES="$d/secrets/ts-authkey.expires"
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in seed_remote_script seed_key_over_tunnel seed_status_converged; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# EACCES simulation: reject (rc 1) any remote command lacking a leading 'sudo '.
+tunnel_ssh(){ shift; case "\$*" in "sudo "*) sh -c "\$*" ;; *) return 1 ;; esac; }
+if seed_key_over_tunnel grok-box-8 "FRESH-KEY" "2099-01-01"; then echo "seed=OK"; else echo "seed=FAIL"; fi
+echo "onbox=\$(cat "$d/secrets/ts-authkey")"
+rm -rf "$d"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+guardout="$(seed_no_sudo_guard)"
+case "$guardout" in
+  *"seed=OK"*"onbox=FRESH-KEY"*) pass "F3/D5b (m1 kill): every seed command is 'sudo …', so the EACCES-on-non-sudo guard passes and the seed converges" ;;
+  *) bad "F3/D5b: a seed command was NOT sudo (EACCES guard tripped): [$guardout]" ;;
+esac
+
+# --- E1 char-scan (F1/F8-m7): the REAL seed_remote_script output must carry NO
+# apostrophe (the sole char that terminates the outer `sh -c '<script>'`), NO
+# backtick, and NO `#` comment line — any of them would break the wrapped remote
+# command on a real box. Cheap tripwire; the authoritative guard is the real-
+# wrapping seed_harness above.
+srs_scan_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" seed_remote_script)"
+seed_remote_script
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+srs_scan="$(srs_scan_test)"
+case "$srs_scan" in *"'"*) bad "E1: seed_remote_script emits an apostrophe — breaks sudo env … sh -c '<script>': [$srs_scan]" ;; *) pass "E1: seed_remote_script output carries NO apostrophe (secondary char scan)" ;; esac
+case "$srs_scan" in *'`'*) bad "E1: seed_remote_script emits a backtick: [$srs_scan]" ;; *) pass "E1: seed_remote_script output carries NO backtick (secondary char scan)" ;; esac
+case "$(printf '%s\n' "$srs_scan" | grep -c '^[[:space:]]*#')" in 0) pass "E1: seed_remote_script emits NO # comment line" ;; *) bad "E1: seed_remote_script emits a # comment line: [$srs_scan]" ;; esac
 
 # =============================================================================
 # RECONCILE — the PURE decision table (reconcile_decide), each row.
@@ -652,6 +724,112 @@ case "$mint_meta" in
     pass "mint: records key id + expires to keys/<N>.json after verified seed (rotation can revoke it later)" ;;
   *) bad "mint key-id record wrong: [$mint_meta]" ;;
 esac
+
+# =============================================================================
+# REVOKE-ON-FAILURE (#13 D3/F4/F7/S3) — a minted key that cannot be BOTH seeded
+# AND recorded is an unrecorded live key on the tailnet; cmd_mint_key MUST revoke
+# it. Drive the REAL cmd_mint_key + revoke_minted_key with mint_create/ts_api/
+# ts_api_body stubbed (as rotate_test/mint_records_id_test stub them) and
+# seed_key_over_tunnel / record_key_meta stubbed to force each failure arm.
+# Assert: exactly ONE `DELETE /tailnet/<tailnet>/keys/<id>`, log carries
+# `REVOKING the just-minted key id=`, rc 1, no keys/<N>.json written, and a
+# non-2xx/non-404 DELETE latches RECONCILE_READONLY=1.
+#   args: seed_rc  del_code  persist(ok|fail)  seed_writes_dst(yes|no)
+mint_fail_test() {
+  local seed_rc="$1" del_code="$2" persist="$3" writes="$4" inner
+  inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+TS_TAILNET="-"
+TS_API_CODE=0
+RECONCILE_READONLY=0
+FLEET_STATE="\$(mktemp -d)"
+FLEET_KEYS_DIR="\$FLEET_STATE/keys"
+FLEET_KEY_EXPIRY_SECS=7776000
+BOX_AUTHKEY="\$FLEET_STATE/ts-authkey"     # fake dst for the m8 post-mv variant
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name box_name_from_index cmd_mint_key revoke_minted_key key_meta_file key_meta_id box_index ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+seq="\$(mktemp)"
+BODYF="\$(mktemp)"
+echo '{"key":"tskey-SENTINEL","id":"kNEW999","expires":"2099-03-01T00:00:00Z"}' > "\$BODYF"
+# mint_create: the key-create succeeds (2xx), body read from file (no ts_api).
+mint_create(){ TS_API_CODE=200; }
+ts_api_body(){ cat "\$BODYF"; }
+# ts_api: ONLY the revoke DELETE reaches here — record it + set the DELETE code.
+ts_api(){ echo "\$1 \$2" >> "\$seq"; TS_API_CODE=$del_code; }
+# seed_key_over_tunnel: force the seed verdict. For the m8 post-mv variant, WRITE
+# the fake dst BEFORE failing, proving the revoke fires regardless of how far the
+# seed got.
+seed_key_over_tunnel(){ [ "$writes" = yes ] && echo NEW > "\$BOX_AUTHKEY"; return $seed_rc; }
+INNER
+  # record_key_meta stub only for the persist-failure arm; otherwise use the real one.
+  if [ "$persist" = fail ]; then
+    printf 'record_key_meta(){ return 1; }\n' >> "$inner"
+  fi
+  cat >> "$inner" <<INNER
+cmd_mint_key grok-box-8
+echo "rc=\$?"
+echo "readonly=\$RECONCILE_READONLY"
+[ -f "\$FLEET_KEYS_DIR/8.json" ] && echo "meta=present" || echo "meta=none"
+echo "DELCOUNT=\$(grep -c '^DELETE ' "\$seq")"
+tr '\n' '|' < "\$seq"; echo
+rm -rf "\$FLEET_STATE" "\$seq" "\$BODYF"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+
+# D5c: seed fails at rc 1 => revoke fires exactly once, rc 1, no meta written.
+msf1="$(mint_fail_test 1 200 ok no)"
+case "$msf1" in
+  *"REVOKING the just-minted key id="*) pass "D5c: seed failure (rc 1) logs REVOKING the just-minted key id=" ;;
+  *) bad "D5c rc1: no REVOKING log: [$msf1]" ;;
+esac
+case "$msf1" in
+  *"DELCOUNT=1"*"DELETE /tailnet/-/keys/kNEW999|"*) pass "D5c: seed failure (rc 1) => exactly one DELETE of the just-minted key id" ;;
+  *) bad "D5c rc1: DELETE not issued exactly once: [$msf1]" ;;
+esac
+case "$msf1" in *"rc=1"*"meta=none"*) pass "D5c: seed failure (rc 1) => rc 1 and NO keys/<N>.json persisted" ;; *) bad "D5c rc1: rc/meta wrong: [$msf1]" ;; esac
+
+# S3: seed fails at rc 3 (the SEED_SHA_MISMATCH exit) => revoke STILL fires.
+msf3="$(mint_fail_test 3 200 ok no)"
+case "$msf3" in
+  *"rc=1"*"DELCOUNT=1"*"DELETE /tailnet/-/keys/kNEW999|"*) pass "S3: seed failure (rc 3) also revokes exactly once, rc 1 (revoke fires for EVERY non-zero seed rc)" ;;
+  *) bad "S3 rc3: DELETE/rc wrong: [$msf3]" ;;
+esac
+
+# m8 (S3): the seed fails AFTER writing the fake dst (post-mv failure) => the
+# revoke MUST still fire (the API key exists regardless of how far the seed got).
+msf_postmv="$(mint_fail_test 1 200 ok yes)"
+case "$msf_postmv" in
+  *"rc=1"*"DELCOUNT=1"*"DELETE /tailnet/-/keys/kNEW999|"*) pass "m8 kill: a post-mv seed failure still revokes the just-minted key (revoke is unconditional on seed failure)" ;;
+  *) bad "m8: post-mv seed failure did not revoke: [$msf_postmv]" ;;
+esac
+
+# D5c 500-DELETE variant: seed fails, DELETE returns 500 => RECONCILE_READONLY=1,
+# rc 1, and a `could NOT revoke` log (m4 kill: a 500 is NOT treated as success).
+msf500="$(mint_fail_test 1 500 ok no)"
+case "$msf500" in
+  *"could NOT revoke key id=kNEW999 (HTTP 500)"*"rc=1"*"readonly=1"*) pass "D5c/m4 kill: a 500 DELETE => could-NOT-revoke log + RECONCILE_READONLY=1 + rc 1 (500 never counts as revoked)" ;;
+  *) bad "D5c 500: readonly/log/rc wrong: [$msf500]" ;;
+esac
+# A 404 DELETE is idempotent-OK (key already gone) — still rc 1, NOT read-only.
+msf404="$(mint_fail_test 1 404 ok no)"
+case "$msf404" in
+  *"revoked the just-minted key id=kNEW999 (HTTP 404)"*"rc=1"*"readonly=0"*) pass "D5c: a 404 DELETE is idempotent-OK (already gone), rc 1, NOT read-only" ;;
+  *) bad "D5c 404: wrong: [$msf404]" ;;
+esac
+
+# F7: record_key_meta FAILS (verified seed, but persist fails) => exactly one
+# DELETE, rc 1 — the SAME revoke_minted_key helper both arms share.
+mpf="$(mint_fail_test 0 200 fail no)"
+case "$mpf" in
+  *"REVOKING the just-minted key id="*"rc=1"*"DELCOUNT=1"*"DELETE /tailnet/-/keys/kNEW999|"*) pass "F7: persist failure => exactly one DELETE of the just-minted key + rc 1 (shared revoke helper)" ;;
+  *) bad "F7 persist-fail revoke wrong: [$mpf]" ;;
+esac
+case "$mpf" in *"meta=none"*) pass "F7: persist failure => no keys/<N>.json left behind" ;; *) bad "F7: stray meta after persist failure: [$mpf]" ;; esac
+
 
 # =============================================================================
 # ROLLOUT (task a) — reconcile_rollout: canary-first, abort-on-first-failure,
@@ -1097,61 +1275,57 @@ INNER
 # the key material is absent from it. If the key were appended to argv (M11),
 # the capture would contain it.
 m11_test() {
-  local inner; inner="$(mktemp)"
-  cat > "$inner" <<'INNER'
+  local inner d; inner="$(mktemp)"; d="$(mktemp -d)"
+  mkdir -p "$d/secrets" "$d/bin" "$d/box"
+  printf '#!/bin/sh\nexec "$@"\n' > "$d/bin/sudo"; chmod +x "$d/bin/sudo"
+  printf '#!/bin/sh\ncase "$1" in status) echo "backend=Running tunnel=up";; esac\n' > "$d/box/boxup"; chmod +x "$d/box/boxup"
+  cat > "$inner" <<INNER
 set -u
-FLEETCTL="__FLEETCTL__"
-BOXROOT="$(mktemp -d)"; mkdir -p "$BOXROOT/secrets"
-BOX_ROOT="$BOXROOT"
-BOX_AUTHKEY="$BOXROOT/secrets/ts-authkey"
-BOX_AUTHKEY_TMP="$BOXROOT/secrets/.ts-authkey.tmp"
-BOX_AUTHKEY_EXPIRES="$BOXROOT/secrets/ts-authkey.expires"
+FLEETCTL="$FLEETCTL"
+PATH="$d/bin:\$PATH"; export PATH
+BOX_ROOT="$d/box"
+BOX_AUTHKEY="$d/secrets/ts-authkey"
+BOX_AUTHKEY_TMP="$d/secrets/.ts-authkey.tmp"
+BOX_AUTHKEY_EXPIRES="$d/secrets/ts-authkey.expires"
 log(){ :; }
-extract_from(){ awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$1"; }
-eval "$(extract_from "$FLEETCTL" seed_key_over_tunnel)"
-eval "$(extract_from "$FLEETCTL" seed_status_converged)"
-cap="$(mktemp)"
-# tunnel_ssh stub: record the remote command ARGV, and for the seed run consume
-# stdin so the write still succeeds (so we exercise the real code path).
-tunnel_ssh(){
-  shift
-  printf 'ARGV:%s\n' "$*" >> "$cap"
-  case "$*" in
-    *"boxup status"*) echo "backend=Running tunnel=up"; return 0 ;;
-    *) bash -c "$*" ;;   # runs the seed heredoc; key arrives on stdin
-  esac
-}
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in seed_remote_script seed_key_over_tunnel seed_status_converged; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+cap="$d/cap"
+# tunnel_ssh stub: record the remote command ARGV, then run it through a REAL
+# shell (fake sudo on PATH) so the key — which arrives on stdin — never lands in
+# the recorded ARGV unless the code wrongly put it there (M11).
+tunnel_ssh(){ shift; printf 'ARGV:%s\n' "\$*" >> "$d/cap"; sh -c "\$*"; }
 seed_key_over_tunnel grok-box-8 "SENTINEL_SECRET_KEY_MATERIAL" "2099-01-01" >/dev/null 2>&1
-if grep -q "SENTINEL_SECRET_KEY_MATERIAL" "$cap"; then echo "KEY-IN-ARGV"; else echo "KEY-ABSENT"; fi
-rm -rf "$BOXROOT" "$cap"
+if grep -q "SENTINEL_SECRET_KEY_MATERIAL" "$d/cap"; then echo "KEY-IN-ARGV"; else echo "KEY-ABSENT"; fi
+rm -rf "$d"
 INNER
-  sed -i "s#__FLEETCTL__#$FLEETCTL#" "$inner"
   timeout 20 bash "$inner"; rm -f "$inner"
 }
 [ "$(m11_test)" = "KEY-ABSENT" ] && pass "M11: the auth key never appears in the remote SSH argv (stdin-only)" || bad "M11: key leaked into the SSH command argv: [$(m11_test)]"
 
 # --- M13: the seeded auth key file must be chmod 600, not 644. Drive the REAL
-# seed against a fake box tree and stat the resulting file mode.
+# seed against a fake box tree (fake sudo + boxup on PATH) and stat the mode.
 m13_test() {
-  local inner; inner="$(mktemp)"
-  cat > "$inner" <<'INNER'
+  local inner d; inner="$(mktemp)"; d="$(mktemp -d)"
+  mkdir -p "$d/secrets" "$d/bin" "$d/box"
+  printf '#!/bin/sh\nexec "$@"\n' > "$d/bin/sudo"; chmod +x "$d/bin/sudo"
+  printf '#!/bin/sh\ncase "$1" in status) echo "backend=Running tunnel=up";; esac\n' > "$d/box/boxup"; chmod +x "$d/box/boxup"
+  cat > "$inner" <<INNER
 set -u
-FLEETCTL="__FLEETCTL__"
-BOXROOT="$(mktemp -d)"; mkdir -p "$BOXROOT/secrets"
-BOX_ROOT="$BOXROOT"
-BOX_AUTHKEY="$BOXROOT/secrets/ts-authkey"
-BOX_AUTHKEY_TMP="$BOXROOT/secrets/.ts-authkey.tmp"
-BOX_AUTHKEY_EXPIRES="$BOXROOT/secrets/ts-authkey.expires"
+FLEETCTL="$FLEETCTL"
+PATH="$d/bin:\$PATH"; export PATH
+BOX_ROOT="$d/box"
+BOX_AUTHKEY="$d/secrets/ts-authkey"
+BOX_AUTHKEY_TMP="$d/secrets/.ts-authkey.tmp"
+BOX_AUTHKEY_EXPIRES="$d/secrets/ts-authkey.expires"
 log(){ :; }
-extract_from(){ awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$1"; }
-eval "$(extract_from "$FLEETCTL" seed_key_over_tunnel)"
-eval "$(extract_from "$FLEETCTL" seed_status_converged)"
-tunnel_ssh(){ shift; case "$*" in *"boxup status"*) echo "backend=Running tunnel=up"; return 0 ;; *) bash -c "$*" ;; esac; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in seed_remote_script seed_key_over_tunnel seed_status_converged; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+tunnel_ssh(){ shift; sh -c "\$*"; }
 seed_key_over_tunnel grok-box-8 "FRESH" "2099-01-01" >/dev/null 2>&1
-stat -c '%a' "$BOX_AUTHKEY" 2>/dev/null
-rm -rf "$BOXROOT"
+stat -c '%a' "$d/secrets/ts-authkey" 2>/dev/null || true
+rm -rf "$d"
 INNER
-  sed -i "s#__FLEETCTL__#$FLEETCTL#" "$inner"
   timeout 20 bash "$inner"; rm -f "$inner"
 }
 [ "$(m13_test)" = 600 ] && pass "M13: the seeded auth key is chmod 600 (not 644)" || bad "M13: auth key mode wrong: [$(m13_test)]"
