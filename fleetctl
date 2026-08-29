@@ -762,12 +762,14 @@ cmd_remove_timer() {
 # =============================================================================
 # BRAIN subcommands (docs/FLEET-BRAIN.md) — the VPS-side always-on reconciler.
 #
-# These run from the VPS (/opt/grok-fleet/fleetctl under a systemd timer) and
-# ALSO from the laptop for manual enroll/mint. They are a DISTINCT concern from
-# the laptop-side list/status/check/rollout above: they use the Tailscale API
-# (write-scoped PAT from a 600 file, NEVER argv/log) + per-box reverse-SSH
-# tunnels + OpenSSH-over-the-tailnet enrollment. Deps: curl + jq + ssh only
-# (VPS budget: bash+curl+jq+ssh, no python service).
+# enroll is VPS-ONLY (#12/F4): it writes ~$FLEET_VPS_USER/.ssh locally and its
+# post-checks inspect the VPS daemon, so it refuses (rc 6) when the fleet user is
+# absent. mint-key/status and the rest run from the VPS (under the systemd timer)
+# OR from the laptop. They are a DISTINCT concern from the laptop-side
+# list/status/check/rollout above: they use the Tailscale API (write-scoped PAT
+# from a 600 file, NEVER argv/log) + per-box reverse-SSH tunnels +
+# OpenSSH-over-the-tailnet enrollment. Deps: curl + jq + ssh only (VPS budget:
+# bash+curl+jq+ssh, no python service).
 #
 # The brain reaches an enrolled box ONLY as `box@127.0.0.1 -p 2000N` over that
 # box's reverse tunnel, using the VPS's own ed25519 key (Resolved decision 7);
@@ -1014,12 +1016,19 @@ ts_api_body() { [ -n "$TS_API_LAST_BODY" ] && cat "$TS_API_LAST_BODY" 2>/dev/nul
 ts_ok() { [ "$TS_API_CODE" -ge 200 ] 2>/dev/null && [ "$TS_API_CODE" -lt 300 ] 2>/dev/null; }
 
 # --- enroll ------------------------------------------------------------------
-# fleetctl enroll <box>: brain-initiated, tailnet-gated, one-time.
+# fleetctl enroll <box>: brain-initiated, tailnet-gated, one-time. VPS-ONLY (#12).
+#   0. LOCALITY guard: refuse (rc 6) unless the fleet user exists here.
+#   0b.POLICY precheck (rc 5): the VPS sshd effective permitlisten must permit
+#      127.0.0.1:2000N (else the tunnel can never listen — the exact #12 bug).
 #   1. PRECHECK tag:fleet-brain in tagOwners via GET /acl; refuse if absent.
 #   2. read the box's tunnel PUBKEY over OpenSSH on the tailnet
 #      (`ssh box@grok-box-N sudo cat .../tunnel_ed25519.pub`).
 #   3. install a locked-down authorized_keys line for fleet@vps on the VPS.
 #   4. install the VPS's box-access PUBKEY into the box user's authorized_keys.
+#   5. wait (ENROLL_TUNNEL_WAIT, default 90s) for the reverse listener to come
+#      up; rc 4 if it does not (the enrolled.tsv row is still written).
+# rc map: 0 ok, 1 generic/precondition, 2 usage/bad-name, 4 tunnel not up after
+# wait, 5 sshd policy denies the port, 6 not on the VPS.
 #
 # The authorized_keys line shape (the security control, §2):
 #   restrict,port-forwarding,permitlisten="127.0.0.1:2000N" ssh-ed25519 AAAA... comment
@@ -1058,6 +1067,29 @@ cmd_enroll() {
   case "$box" in grok-box-[0-9]*) : ;; *) log "enroll: refusing non-grok box '$box'"; return 2 ;; esac
   local n port; n="$(box_index "$box")" || { log "enroll: bad box name '$box'"; return 2; }
   port="$(port_for "$box")"
+
+  # (F4 #12) LOCALITY GUARD: enroll is VPS-ONLY. It writes ~$FLEET_VPS_USER/.ssh
+  # locally and the D3/D4 checks inspect the VPS daemon, so a laptop run is
+  # meaningless. Refuse BEFORE any side effect if the fleet user is not present.
+  if ! id -u "$FLEET_VPS_USER" >/dev/null 2>&1; then
+    log "enroll: must run on the VPS (user $FLEET_VPS_USER not present here) — see docs/FLEET-BRAIN.md"
+    return 6
+  fi
+
+  # (D4/F2/F6 #12) POLICY PRECHECK: catch the exact #12 failure — the VPS sshd
+  # effective permitlisten does not permit 127.0.0.1:$port — BEFORE writing any
+  # key. PATH-gated on `have sshd` (F6); a query failure proceeds with a warning
+  # (fail-open on introspection), a genuine denial aborts with rc 5.
+  if have sshd; then
+    local pl_rc
+    enroll_permitlisten_verdict "$port"; pl_rc=$?
+    if [ "$pl_rc" = 2 ]; then
+      log "enroll: sshd effective permitlisten for $FLEET_VPS_USER does not include 127.0.0.1:$port — re-run vps/install-vps.sh (#12)"
+      return 5
+    elif [ "$pl_rc" = 1 ]; then
+      log "enroll: cannot evaluate sshd permitlisten policy (sshd -T failed) — continuing"
+    fi
+  fi
 
   # (0) PRECHECK (D1): resolve the VPS address the box will dial out to BEFORE
   # any side effect. FLEET_VPS_ADDR env > config [fleet-brain].vps > REFUSE.
@@ -1099,6 +1131,13 @@ cmd_enroll() {
     return 1
   }
   case "$pubkey" in ssh-ed25519\ *) : ;; *) log "enroll: unexpected pubkey shape from $box: [${pubkey%% *} ...]"; return 1 ;; esac
+
+  # (F7 #12) If 127.0.0.1:$port ALREADY has a listener before we install the
+  # key, the post-enrol tunnel-up proof (D3) may be a false positive (some other
+  # loopback listener, not this box's tunnel). Log-only; continue.
+  if tunnel_up "$box"; then
+    log "enroll: WARNING 127.0.0.1:$port already has a listener before enrol — tunnel-up proof may be a false positive"
+  fi
 
   # (3) install the locked-down authorized_keys line for fleet@vps on the VPS.
   local line; line="$(authorized_keys_line "$port" "$pubkey")"
@@ -1160,7 +1199,19 @@ cmd_enroll() {
   # write succeeded (D8), so enrolled.tsv only ever names fully-enrolled boxes.
   enroll_record_enrolled "$box" "$port"
   notify info "enrolled $box (reverse port 127.0.0.1:$port)"
-  log "enroll: $box DONE — the reverse tunnel comes up on the box's next boxup tick"
+
+  # (D3/F1/F5/F7 #12) Prove the reverse listener actually came up. --no-box-config
+  # did NOT write the box's [fleet] block, so the box will not dial out on its
+  # next tick — skip the wait (it would only ever time out). The enrolled.tsv row
+  # is already written above: on a timeout the enrol itself succeeded (rc 4 only
+  # reports the liveness proof failed), resumable by `boxup once` on the box.
+  if [ "$write_box_config" = 0 ]; then
+    log "enroll: $box DONE — box-side [fleet] not written (--no-box-config); tunnel comes up after you set it and run 'boxup once'"
+    return 0
+  fi
+  local tun_rc
+  enroll_wait_tunnel "$box"; tun_rc=$?
+  [ "$tun_rc" = 0 ] || return "$tun_rc"
 }
 
 # The three side-effecting enroll steps are separate functions so tests can
@@ -1686,6 +1737,68 @@ tunnel_up() {
   local port; port="$(port_for "$1")" || return 1
   have ss || return 1
   ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "127\.0\.0\.1:$port\$"
+}
+
+# enroll_permitlisten_verdict <port> (#12 D4/F2/F6): inspect the VPS's EFFECTIVE
+# sshd permitlisten policy for the fleet user and decide whether a reverse
+# listener on 127.0.0.1:<port> is server-config-allowed. Three outcomes:
+#   rc 0  ALLOWED  — some token is `any` or exactly `127.0.0.1:<port>`.
+#   rc 1  UNKNOWN  — sshd -T failed OR emitted no permitlisten token; caller
+#                    proceeds with a warning (fail-open on introspection).
+#   rc 2  DENIED   — tokens present, none permits <port>; caller aborts (rc 5).
+# Uses $FLEET_VPS_USER (never $FLEET_USER — unset under set -u; F2/NIT3). Parses
+# EVERY token on the line, not just field 2 (F2). Caller PATH-gates on `have
+# sshd` (F6); this helper assumes sshd is present. Limitation (F6): `-C user=`
+# does not evaluate address/host-conditioned Match blocks — the fleet drop-in is
+# user-conditioned only, so this is sufficient for #12.
+enroll_permitlisten_verdict() {
+  local port="$1" out toks tok
+  out="$(sshd -T -C user="$FLEET_VPS_USER" 2>/dev/null)" || return 1
+  toks="$(printf '%s\n' "$out" | awk '$1=="permitlisten"{for(i=2;i<=NF;i++)print $i}')"
+  [ -n "$toks" ] || return 1
+  while IFS= read -r tok; do
+    [ -n "$tok" ] || continue
+    { [ "$tok" = any ] || [ "$tok" = "127.0.0.1:$port" ]; } && return 0
+  done <<EOF
+$toks
+EOF
+  return 2
+}
+
+# enroll_wait_tunnel <box> (#12 D3/F1/F5): after enrol, prove the reverse tunnel
+# actually came up. Contract mirrors rollout_verify's immediate probe + rename's
+# timeout-BEFORE-sleep loop shape so a small ENROLL_TUNNEL_WAIT never oversleeps.
+#   - probe tunnel_up "$box" (a BOX name; the helper derives the port — F1) once
+#     IMMEDIATELY; success => rc 0.
+#   - ENROLL_TUNNEL_WAIT (default 90): total seconds to wait. 0 => skip entirely
+#     (rc 0, no probe — offline/test enrol). Non-numeric or negative => warn and
+#     use 90 (F5).
+#   - loop: on a miss, if elapsed >= budget => timeout (rc 4) BEFORE sleeping;
+#     else sleep 5, add 5 to elapsed, re-probe.
+# rc 0 up (or skipped) / 4 timed out. Tests stub `sleep` to record calls.
+ENROLL_TUNNEL_WAIT="${ENROLL_TUNNEL_WAIT:-90}"
+enroll_wait_tunnel() {
+  local box="$1" port; port="$(port_for "$box")" || port="?"
+  local budget="$ENROLL_TUNNEL_WAIT"
+  case "$budget" in
+    0) return 0 ;;                                  # skip: no proof requested
+    *[!0-9]*|'') log "enroll: ENROLL_TUNNEL_WAIT='$budget' is not a non-negative integer — using 90"; budget=90 ;;
+  esac
+  local elapsed=0
+  while :; do
+    if tunnel_up "$box"; then
+      log "enroll: $box tunnel up on 127.0.0.1:$port"
+      return 0
+    fi
+    # rename's timeout-BEFORE-sleep shape: account for the next 5s sleep FIRST,
+    # so a budget < 5 (e.g. ENROLL_TUNNEL_WAIT=1) times out without ever sleeping.
+    elapsed=$((elapsed + 5))
+    if [ "$elapsed" -ge "$budget" ]; then
+      log "enroll: $box DONE but tunnel NOT up after ${budget}s — inspect: sshd -T -C user=$FLEET_VPS_USER | grep -i permitlisten ; and the box's boxup log"
+      return 4
+    fi
+    sleep 5
+  done
 }
 
 # tunnel_ssh <box> <cmd...>: reach the box over its reverse tunnel as
@@ -3260,11 +3373,12 @@ Usage:
   fleetctl install-timer         systemd USER timer: check --notify every 10min
   fleetctl remove-timer          remove that timer
 
-Brain subcommands (docs/FLEET-BRAIN.md — run on the VPS + laptop):
+Brain subcommands (docs/FLEET-BRAIN.md — enroll: VPS only; mint/status: VPS or laptop):
   fleetctl enroll <grok-box-N>   trust a box's reverse tunnel (OpenSSH/tailnet;
-                                 ACL-prechecks tag:fleet-brain tagOwners) and
-                                 write the box's [fleet] vps/box_index so its
-                                 tunnel dials on the next 'boxup once'
+                                 ACL-prechecks tag:fleet-brain tagOwners), write
+                                 the box's [fleet] vps/box_index, then wait for
+                                 the reverse listener to come up (ENROLL_TUNNEL_WAIT).
+                                 VPS-ONLY (refuses rc 6 if the fleet user is absent)
   fleetctl enroll --no-box-config <grok-box-N>
                                  as above but SKIP the box-side [fleet] write
   fleetctl reconcile [--apply]   the 5-min decision table (DRY-RUN by default)
@@ -3290,6 +3404,8 @@ Environment:
   FLEET_VPS_ADDR       VPS address boxes dial for the tunnel; enroll writes it
                        to the box's [fleet].vps (else config [fleet].vps)
   FLEET_API_TOKEN_FILE Tailscale API token file (600; else [fleet-brain].api_token_file)
+  ENROLL_TUNNEL_WAIT   seconds enroll waits for the reverse tunnel to come up
+                       (default 90; 0 = skip the wait, for offline/test enrol)
 EOF
 }
 

@@ -1985,8 +1985,14 @@ set -u
 FLEETCTL="$FLEETCTL"
 BOXUP_REMOTE="/workspace/box-setup/boxup"
 BOX_CONFIG="/workspace/box-setup/config.toml"
+FLEET_VPS_USER=fleet
+ENROLL_TUNNEL_WAIT=0
 log(){ :; }
 notify(){ :; }
+id(){ return 0; }
+have(){ [ "\$1" = sshd ] && return 1; command -v "\$1" >/dev/null 2>&1; }
+tunnel_up(){ return 1; }
+enroll_wait_tunnel(){ return 0; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
 for fn in box_index_from_name box_name_from_index cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 RECORDED="\$(mktemp)"; : > "\$RECORDED"
@@ -2031,8 +2037,13 @@ set -u
 FLEETCTL="$FLEETCTL"
 BOXUP_REMOTE="/workspace/box-setup/boxup"
 BOX_CONFIG="/workspace/box-setup/config.toml"
+FLEET_VPS_USER=fleet
+ENROLL_TUNNEL_WAIT=0
 log(){ :; }
 notify(){ :; }
+id(){ return 0; }
+have(){ [ "\$1" = sshd ] && return 1; command -v "\$1" >/dev/null 2>&1; }
+tunnel_up(){ return 1; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
 for fn in box_index_from_name box_name_from_index cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 SIDE="\$(mktemp)"; : > "\$SIDE"
@@ -2064,8 +2075,14 @@ set -u
 FLEETCTL="$FLEETCTL"
 BOXUP_REMOTE="/workspace/box-setup/boxup"
 BOX_CONFIG="/workspace/box-setup/config.toml"
+FLEET_VPS_USER=fleet
+ENROLL_TUNNEL_WAIT=0
 log(){ :; }
 notify(){ :; }
+id(){ return 0; }
+have(){ [ "\$1" = sshd ] && return 1; command -v "\$1" >/dev/null 2>&1; }
+tunnel_up(){ return 1; }
+enroll_wait_tunnel(){ return 0; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
 for fn in box_index_from_name box_name_from_index cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 CALLED="\$(mktemp)"; : > "\$CALLED"
@@ -3402,6 +3419,298 @@ case "$r_vf" in
   *) bad "rename S2/F3: old enrolled row deleted despite a FAILED verify: [$r_vf]" ;;
 esac
 
+echo "-----"
+# =============================================================================
+# #12 PermitListen cap — installer drop-in (D6a/D6b, F10) + enroll D3/D4/F4/F7.
+# =============================================================================
+
+# --- D6(a): the rendered sshd drop-in has NO literal PermitListen port list,
+# carries an explicit `PermitListen any`, and still has PermitOpen none + the
+# Match block. Reuses the installer PREFIX harness.
+dropin_render() {
+  local pfx; pfx="$(mktemp -d)"
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  cat "$pfx/etc/ssh/sshd_config.d/50-grok-fleet.conf"
+  rm -rf "$pfx"
+}
+di="$(dropin_render)"
+case "$di" in
+  *'PermitListen 127.0.0.1:20001'*) bad "#12 D6a: drop-in STILL has the literal 8-port PermitListen list" ;;
+  *) pass "#12 D6a: drop-in has NO literal 8-port PermitListen list" ;;
+esac
+printf '%s\n' "$di" | grep -qxE ' *PermitListen any' && pass "#12 D6a: drop-in sets PermitListen any (per-key permitlisten is the cap)" || bad "#12 D6a: drop-in missing 'PermitListen any': [$di]"
+printf '%s\n' "$di" | grep -qxE ' *PermitOpen none' && pass "#12 D6a: drop-in keeps PermitOpen none (no local -L forwarding)" || bad "#12 D6a: drop-in lost 'PermitOpen none'"
+case "$di" in *'Match User fleet'*) pass "#12 D6a: drop-in keeps Match User fleet" ;; *) bad "#12 D6a: drop-in lost Match User block" ;; esac
+
+# --- D6(b): UPGRADE — pre-seed PREFIX with the OLD hand-widened 8..20-port file,
+# run the installer, and assert it is REPLACED with the uncapped `any` content.
+dropin_upgrade() {
+  local pfx; pfx="$(mktemp -d)"
+  mkdir -p "$pfx/etc/ssh/sshd_config.d"
+  cat > "$pfx/etc/ssh/sshd_config.d/50-grok-fleet.conf" <<'OLD'
+Match User fleet
+    AllowTcpForwarding remote
+    PermitOpen none
+    PermitListen 127.0.0.1:20001 127.0.0.1:20002 127.0.0.1:20003 127.0.0.1:20004 127.0.0.1:20005 127.0.0.1:20006 127.0.0.1:20007 127.0.0.1:20008 127.0.0.1:20009 127.0.0.1:20010 127.0.0.1:20011
+OLD
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  cat "$pfx/etc/ssh/sshd_config.d/50-grok-fleet.conf"
+  rm -rf "$pfx"
+}
+up="$(dropin_upgrade)"
+case "$up" in
+  *'PermitListen 127.0.0.1:2001'*|*'PermitListen 127.0.0.1:20001'*) bad "#12 D6b upgrade: old widened PermitListen list survived the installer re-run" ;;
+  *) pass "#12 D6b upgrade: installer replaced the hand-widened 8..N-port file" ;;
+esac
+printf '%s\n' "$up" | grep -qxE ' *PermitListen any' && pass "#12 D6b upgrade: replacement file sets PermitListen any" || bad "#12 D6b upgrade: replacement missing 'PermitListen any'"
+
+# --- F10: a pre-existing DATED .bak.* sidecar (the hand-edit's backup — NOT the
+# installer's) SURVIVES an installer re-run (the installer only manages the exact
+# target, never the operator's .bak).
+dropin_bak_survives() {
+  local pfx; pfx="$(mktemp -d)"; local d="$pfx/etc/ssh/sshd_config.d"
+  mkdir -p "$d"
+  : > "$d/50-grok-fleet.conf.bak.20260829T153543Z"
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  if [ -e "$d/50-grok-fleet.conf.bak.20260829T153543Z" ]; then echo SURVIVED; else echo GONE; fi
+  rm -rf "$pfx"
+}
+[ "$(dropin_bak_survives)" = SURVIVED ] && pass "#12 F10: a dated .bak.* sidecar survives an installer re-run" || bad "#12 F10: installer clobbered the operator's .bak.* sidecar"
+
+# --- F10 (D2 real-path): drive install_sshd_dropin down its REAL (non-PREFIX)
+# validate/rollback path with a `sshd` shim. sshd -t OK => the drop-in lands with
+# PermitListen any; sshd -t REJECT => the drop-in is rolled back (old content
+# restored) and rc 1. This shim never touches a real daemon.
+dropin_realpath() {
+  local mode="$1" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"
+  # A fake sshd on PATH: `-t` honours FAKE_SSHD_T; anything else is a no-op.
+  cat > "$d/sshd" <<'SSHD'
+#!/usr/bin/env bash
+if [ "$1" = -t ]; then exit "${FAKE_SSHD_T:-0}"; fi
+exit 0
+SSHD
+  chmod +x "$d/sshd"
+  # A fake systemctl so a "reload" always succeeds under the shim.
+  cat > "$d/systemctl" <<'SC'
+#!/usr/bin/env bash
+exit 0
+SC
+  chmod +x "$d/systemctl"
+  cat > "$inner" <<INNER
+set -u
+VPS_INSTALL="$VPS_INSTALL"
+PATH="$d:\$PATH"
+PREFIX=""                      # force the REAL validate/reload path
+SSHD_DROPIN_DIR="$d/dropin"; mkdir -p "\$SSHD_DROPIN_DIR"
+SSHD_DROPIN="\$SSHD_DROPIN_DIR/50-grok-fleet.conf"
+FLEET_USER=fleet
+printf 'OLDCONTENT\n' > "\$SSHD_DROPIN"     # a pre-existing file to roll back to
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$VPS_INSTALL" install_sshd_dropin)"
+FAKE_SSHD_T=$mode install_sshd_dropin; rc=\$?
+printf 'RC=%s|' "\$rc"; cat "\$SSHD_DROPIN"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+ok_out="$(dropin_realpath 0)"
+case "$ok_out" in
+  RC=0\|*'PermitListen any'*) pass "#12 F10: real-path install_sshd_dropin — sshd -t OK => lands PermitListen any, rc 0" ;;
+  *) bad "#12 F10: real-path OK case wrong: [$ok_out]" ;;
+esac
+rej_out="$(dropin_realpath 1)"
+case "$rej_out" in
+  RC=1\|OLDCONTENT) pass "#12 F10: real-path install_sshd_dropin — sshd -t REJECT => rollback to old content, rc 1" ;;
+  *) bad "#12 F10: real-path reject/rollback wrong: [$rej_out]" ;;
+esac
+
+# --- D3 (F1/F5): enroll_wait_tunnel. tunnel_up is a BOX-name helper (F1). sleep
+# is stubbed (records a marker, never really waits). Cases: skip on WAIT=0;
+# immediate up (no sleep); up-on-3rd-poll (rc 0); never-up with WAIT=1 times out
+# rc 4 WITHOUT sleeping (timeout-before-oversleep); non-numeric => warn + 90.
+wait_tunnel_test() {
+  local wait="$1" upmode="$2" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_VPS_USER=fleet
+ENROLL_TUNNEL_WAIT="$wait"
+SLEEPS=0
+log(){ echo "LOG:\$*"; }
+sleep(){ SLEEPS=\$((SLEEPS+1)); }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name port_for enroll_wait_tunnel; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# tunnel_up stub keyed by \$upmode:  never | now | third
+CALLS=0
+case "$upmode" in
+  never) tunnel_up(){ return 1; } ;;
+  now)   tunnel_up(){ return 0; } ;;
+  third) tunnel_up(){ CALLS=\$((CALLS+1)); [ "\$CALLS" -ge 3 ]; } ;;
+esac
+enroll_wait_tunnel grok-box-8; rc=\$?
+echo "RC=\$rc SLEEPS=\$SLEEPS"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+case "$(wait_tunnel_test 0 never)" in
+  *"RC=0 SLEEPS=0"*) pass "#12 D3: ENROLL_TUNNEL_WAIT=0 skips the wait (rc 0, no probe/sleep)" ;;
+  *) bad "#12 D3: WAIT=0 skip wrong: [$(wait_tunnel_test 0 never)]" ;;
+esac
+case "$(wait_tunnel_test 90 now)" in
+  *"tunnel up on 127.0.0.1:20008"*"RC=0 SLEEPS=0"*) pass "#12 D3: immediate tunnel-up => rc 0, logs the up line, no sleep" ;;
+  *) bad "#12 D3: immediate-up wrong: [$(wait_tunnel_test 90 now)]" ;;
+esac
+case "$(wait_tunnel_test 90 third)" in
+  *"RC=0 SLEEPS=2"*) pass "#12 D3: tunnel up on the 3rd poll => rc 0 after 2 sleeps" ;;
+  *) bad "#12 D3: up-on-3rd wrong: [$(wait_tunnel_test 90 third)]" ;;
+esac
+case "$(wait_tunnel_test 1 never)" in
+  *"tunnel NOT up after 1s"*"RC=4 SLEEPS=0"*) pass "#12 D3/F5: never-up with WAIT=1 times out rc 4 WITHOUT sleeping (timeout-before-oversleep)" ;;
+  *) bad "#12 D3/F5: WAIT=1 timeout-before-sleep wrong: [$(wait_tunnel_test 1 never)]" ;;
+esac
+case "$(wait_tunnel_test abc now)" in
+  *"is not a non-negative integer — using 90"*"RC=0"*) pass "#12 D3/F5: non-numeric ENROLL_TUNNEL_WAIT warns and falls back to 90" ;;
+  *) bad "#12 D3/F5: non-numeric fallback wrong: [$(wait_tunnel_test abc now)]" ;;
+esac
+
+# --- D4 (F2/F6): enroll_permitlisten_verdict. Parses EVERY token (F2), uses
+# $FLEET_VPS_USER (F2/NIT3). rc 0 allow / 1 unknown(proceed) / 2 deny.
+verdict_test() {
+  local port="$1" sshd_out="$2" sshd_rc="$3" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_VPS_USER=fleet
+log(){ :; }
+sshd(){ [ "$sshd_rc" = 0 ] || return $sshd_rc; printf '%s\n' "$sshd_out"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" enroll_permitlisten_verdict)"
+enroll_permitlisten_verdict "$port"; echo "rc=\$?"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(verdict_test 20011 'permitlisten any' 0)" = "rc=0" ] && pass "#12 D4: 'permitlisten any' => ALLOW (rc 0)" || bad "#12 D4: any wrong: [$(verdict_test 20011 'permitlisten any' 0)]"
+[ "$(verdict_test 20011 'permitlisten 127.0.0.1:20001 127.0.0.1:20011' 0)" = "rc=0" ] && pass "#12 D4/F2: a LATER-token match (field 3) => ALLOW (parses every token, not just field 2)" || bad "#12 D4/F2: later-token wrong: [$(verdict_test 20011 'permitlisten 127.0.0.1:20001 127.0.0.1:20011' 0)]"
+[ "$(verdict_test 20011 'permitlisten 127.0.0.1:20001 127.0.0.1:20002' 0)" = "rc=2" ] && pass "#12 D4: a list WITHOUT the target port => DENY (rc 2, the exact #12 failure caught early)" || bad "#12 D4: deny wrong: [$(verdict_test 20011 'permitlisten 127.0.0.1:20001 127.0.0.1:20002' 0)]"
+[ "$(verdict_test 20011 '' 1)" = "rc=1" ] && pass "#12 D4/F6: sshd -T failed => UNKNOWN (rc 1, caller proceeds with a warning)" || bad "#12 D4/F6: query-fail wrong: [$(verdict_test 20011 '' 1)]"
+[ "$(verdict_test 20011 'port 22' 0)" = "rc=1" ] && pass "#12 D4/F6: no permitlisten token => UNKNOWN (rc 1, not a false deny)" || bad "#12 D4/F6: no-token wrong: [$(verdict_test 20011 'port 22' 0)]"
+
+# --- cmd_enroll integration (F4 rc6 locality; D3 rc4 with the enrolled.tsv row
+# still written; D4 rc5 with NOTHING written). Drive the REAL cmd_enroll with all
+# transport/side-effect functions stubbed (like m01_test does for cmd_reconcile).
+enroll_run() {
+  # $1 = extra shell to inject before the call (stubs/env); $2 = args
+  local setup="$1" args="$2" inner; inner="$(mktemp)"
+  local st; st="$(mktemp -d)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$st"
+FLEET_VPS_USER=fleet
+FLEET_ETC="$st/etc"; mkdir -p "\$FLEET_ETC"
+BOX_CONFIG="/workspace/box-setup/config.toml"
+BOX_TUNNEL_PUB="/workspace/box-setup/secrets/tunnel_ed25519.pub"
+FLEET_BOX_KEY="$st/box_access_ed25519"
+BOXUP_REMOTE="/workspace/box-setup/boxup"
+log(){ echo "LOG:\$*"; }
+notify(){ :; }
+sleep(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name box_name_from_index box_index port_for have tunnel_up authorized_keys_line enroll_permitlisten_verdict enroll_wait_tunnel enroll_record_enrolled cmd_enroll; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# Default stubs (a happy VPS-side); individual cases override via \$setup.
+id(){ return 0; }                                  # fleet user present (on the VPS)
+have(){ [ "\$1" = sshd ] && return 1; command -v "\$1" >/dev/null 2>&1; }  # no sshd => D4 skipped by default
+fleet_vps_addr(){ echo "1.2.3.4"; }
+fleet_vps_port(){ echo 22; }
+acl_has_fleet_brain_tagowner(){ return 0; }
+enroll_read_box_pubkey(){ echo "ssh-ed25519 AAAAC3xyz grok-tunnel"; }
+enroll_install_vps_authorized_key(){ return 0; }
+enroll_record_etc_mapping(){ return 0; }
+enroll_vps_box_access_pubkey(){ echo "ssh-ed25519 AAAAvpskey vps"; }
+enroll_install_box_authorized_key(){ return 0; }
+enroll_write_box_config(){ return 0; }
+tunnel_up(){ return 1; }                            # not up (so D3 will time out unless WAIT=0)
+ENROLL_TUNNEL_WAIT=0
+$setup
+cmd_enroll $args; rc=\$?
+echo "RC=\$rc"
+echo "--- enrolled ---"
+[ -f "$st/enrolled.tsv" ] && cat "$st/enrolled.tsv" || echo "(none)"
+INNER
+  timeout 25 bash "$inner"; rm -f "$inner"; rm -rf "$st"
+}
+
+# F4: fleet user absent => rc 6, refuse BEFORE any write (no enrolled row).
+e_f4="$(enroll_run 'id(){ return 1; }' 'grok-box-8')"
+case "$e_f4" in
+  *"must run on the VPS"*"RC=6"*"(none)"*) pass "#12 F4: enroll off the VPS (fleet user absent) => rc 6, nothing written" ;;
+  *) bad "#12 F4: locality guard wrong: [$e_f4]" ;;
+esac
+
+# D4: sshd present + policy DENIES the port => rc 5, refuse BEFORE any write.
+e_d4="$(enroll_run 'have(){ [ "$1" = sshd ] && return 0; command -v "$1" >/dev/null 2>&1; }; sshd(){ printf "permitlisten 127.0.0.1:20001\n"; }' 'grok-box-8')"
+case "$e_d4" in
+  *"does not include 127.0.0.1:20008"*"RC=5"*"(none)"*) pass "#12 D4: sshd policy denies the port => rc 5, nothing written" ;;
+  *) bad "#12 D4: rc5 precheck wrong: [$e_d4]" ;;
+esac
+
+# D3: tunnel never comes up (WAIT=1) => rc 4, but the enrolled.tsv row IS written
+# (the enrol succeeded; only the liveness proof failed — resumable).
+e_d3="$(enroll_run 'ENROLL_TUNNEL_WAIT=1' 'grok-box-8')"
+case "$e_d3" in
+  *"tunnel NOT up after 1s"*"RC=4"*"grok-box-8"$'\t'"20008"*) pass "#12 D3: tunnel never up => rc 4, enrolled.tsv row STILL written (resumable)" ;;
+  *) bad "#12 D3: rc4-but-recorded wrong: [$e_d3]" ;;
+esac
+
+# Happy path: WAIT=0 (skip proof) => rc 0, row written.
+e_ok="$(enroll_run 'ENROLL_TUNNEL_WAIT=0' 'grok-box-8')"
+case "$e_ok" in
+  *"RC=0"*"grok-box-8"$'\t'"20008"*) pass "#12 enroll happy path (WAIT=0): rc 0, enrolled.tsv row written" ;;
+  *) bad "#12 enroll happy path wrong: [$e_ok]" ;;
+esac
+
+# F7: a listener ALREADY up before enrol logs a false-positive WARNING (log-only).
+e_f7="$(enroll_run 'ENROLL_TUNNEL_WAIT=0; tunnel_up(){ return 0; }' 'grok-box-8')"
+case "$e_f7" in
+  *"already has a listener before enrol"*"RC=0"*) pass "#12 F7: a pre-existing listener before enrol logs a WARNING (log-only, still rc 0)" ;;
+  *) bad "#12 F7: pre-enrol warning wrong: [$e_f7]" ;;
+esac
+
+# --- F8: install_sshd_dropin treats a FAILED sshd reload as FATAL (rc 1), not a
+# swallowed note. sshd -t passes but BOTH systemctl reload arms fail.
+dropin_reload_fatal() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"
+  cat > "$d/sshd" <<'SSHD'
+#!/usr/bin/env bash
+[ "$1" = -t ] && exit 0
+exit 0
+SSHD
+  chmod +x "$d/sshd"
+  cat > "$d/systemctl" <<'SC'
+#!/usr/bin/env bash
+exit 1
+SC
+  chmod +x "$d/systemctl"
+  cat > "$inner" <<INNER
+set -u
+VPS_INSTALL="$VPS_INSTALL"
+PATH="$d:\$PATH"
+PREFIX=""
+SSHD_DROPIN_DIR="$d/dropin"; mkdir -p "\$SSHD_DROPIN_DIR"
+SSHD_DROPIN="\$SSHD_DROPIN_DIR/50-grok-fleet.conf"
+FLEET_USER=fleet
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$VPS_INSTALL" install_sshd_dropin)"
+install_sshd_dropin; echo "RC=\$?"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+case "$(dropin_reload_fatal)" in
+  *"sshd reload FAILED"*"RC=1"*) pass "#12 F8: a failed sshd reload is FATAL (rc 1), never swallowed" ;;
+  *) bad "#12 F8: reload-failure not fatal: [$(dropin_reload_fatal)]" ;;
+esac
 
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi
