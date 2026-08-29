@@ -1562,6 +1562,425 @@ case "$enroll_idem" in
   *) bad "BUG-F: enroll dedup clobbered a neighbouring box or row count wrong: [$enroll_idem]" ;;
 esac
 
+# =============================================================================
+# ENROLL BOX-CONFIG (feat/enroll-one-step) — enroll writes the box's OWN
+# config.toml [fleet] block (vps + box_index) over the SAME box_ssh channel it
+# used to READ the tunnel pubkey, so the reverse tunnel dials without a manual
+# hand-edit. Drives the REAL enroll_write_box_config + fleet_vps_addr via the
+# extract_from+eval harness with a FAKE box_ssh recorder that runs the remote
+# `sh -s` script LOCALLY against a fake box config tree (stdin = the script,
+# positional args = vps/idx/cfg — exactly the real transport shape).
+# Assertions: fresh config gets the block; same-values existing block untouched
+# (byte-compare); differing block replaced without duplication; mode preserved;
+# --no-box-config skips the write.
+# =============================================================================
+
+# fleet_vps_addr precedence (D1): FLEET_VPS_ADDR env > config [fleet-brain].vps
+# > REFUSE (return non-zero, empty output — there is NO baked default). The
+# section is [fleet-brain] (brain-side config), NOT [fleet] (the box-side block
+# enroll writes).
+vpsaddr_test() {
+  local mode="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" fleet_vps_addr)"
+if [ "$mode" = env ]; then
+  export FLEET_VPS_ADDR="9.9.9.9"
+  config_get(){ echo "2.2.2.2"; }            # env must WIN over config
+elif [ "$mode" = config ]; then
+  unset FLEET_VPS_ADDR 2>/dev/null || true
+  # Must read [fleet-brain].vps — NOT [fleet].vps (which is the box-side block).
+  config_get(){ [ "\$1" = fleet-brain ] && [ "\$2" = vps ] && { echo "2.2.2.2"; return 0; }; return 1; }
+else
+  unset FLEET_VPS_ADDR 2>/dev/null || true
+  config_get(){ return 1; }                  # nothing set => REFUSE
+fi
+if fleet_vps_addr; then :; else echo "REFUSE(rc=\$?)"; fi
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(vpsaddr_test env)" = "9.9.9.9" ] && pass "enroll-cfg(D1): fleet_vps_addr FLEET_VPS_ADDR env WINS over config" || bad "fleet_vps_addr env wrong: [$(vpsaddr_test env)]"
+[ "$(vpsaddr_test config)" = "2.2.2.2" ] && pass "enroll-cfg(D1): fleet_vps_addr falls back to config [fleet-brain].vps (NOT [fleet])" || bad "fleet_vps_addr config wrong: [$(vpsaddr_test config)]"
+case "$(vpsaddr_test default)" in
+  "REFUSE("*) pass "enroll-cfg(D1): fleet_vps_addr with nothing set => REFUSE (no baked default)" ;;
+  *)  bad "fleet_vps_addr should refuse when unresolved, got: [$(vpsaddr_test default)]" ;;
+esac
+# Static: the baked default global must be GONE (D1 — no third fallback).
+if grep -q 'FLEET_VPS_ADDR_DEFAULT' "$FLEETCTL"; then
+  bad "enroll-cfg(D1): FLEET_VPS_ADDR_DEFAULT still present in fleetctl (must be deleted)"
+else
+  pass "enroll-cfg(D1): baked FLEET_VPS_ADDR_DEFAULT is DELETED (env/config-only, then refuse)"
+fi
+
+# fleet_vps_port precedence (D3b): FLEET_VPS_PORT env > config [fleet-brain].vps_port
+# > 22. Always resolves (22 is the default).
+vpsport_test() {
+  local mode="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" fleet_vps_port)"
+if [ "$mode" = env ]; then
+  export FLEET_VPS_PORT="2222"
+  config_get(){ echo "3333"; }               # env WINS
+elif [ "$mode" = config ]; then
+  unset FLEET_VPS_PORT 2>/dev/null || true
+  config_get(){ [ "\$1" = fleet-brain ] && [ "\$2" = vps_port ] && { echo "3333"; return 0; }; return 1; }
+else
+  unset FLEET_VPS_PORT 2>/dev/null || true
+  config_get(){ return 1; }                  # default 22
+fi
+fleet_vps_port
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(vpsport_test env)" = "2222" ] && pass "enroll-cfg(D3b): fleet_vps_port FLEET_VPS_PORT env WINS over config" || bad "fleet_vps_port env wrong: [$(vpsport_test env)]"
+[ "$(vpsport_test config)" = "3333" ] && pass "enroll-cfg(D3b): fleet_vps_port falls back to config [fleet-brain].vps_port" || bad "fleet_vps_port config wrong: [$(vpsport_test config)]"
+[ "$(vpsport_test default)" = "22" ] && pass "enroll-cfg(D3b): fleet_vps_port default is 22" || bad "fleet_vps_port default wrong: [$(vpsport_test default)]"
+
+# The box-config harness. Runs the REAL enroll_write_box_config with a fake
+# box_ssh that executes the remote `sudo sh -s -- ...` (the WRITE) and the
+# `sudo sh -c "awk..."` D10 read-backs LOCALLY (sudo stripped, stdin forwarded)
+# against a fake config file. Args:
+#   $1 = seed config.toml file, $2 = vps, $3 = box_index, $4 = port,
+#   $5 = extra mode ('' or 'noop')
+# Prints a series of KEY=VALUE lines the assertions match on.
+boxcfg_test() {
+  local seedfile="$1" vps="$2" idx="$3" port="$4" mode="${5:-}" inner; inner="$(mktemp)"
+  cat > "$inner" <<'INNER'
+set -u
+FLEETCTL="__FLEETCTL__"
+SEEDFILE="__SEEDFILE__"
+WANT_VPS="__VPS__"
+WANT_IDX="__IDX__"
+WANT_PORT="__PORT__"
+MODE="__MODE__"
+log(){ :; }
+BOXROOT="$(mktemp -d)"
+BOX_CONFIG="$BOXROOT/config.toml"
+cp "$SEEDFILE" "$BOX_CONFIG"
+chmod 600 "$BOX_CONFIG"
+extract_from(){ awk -v fn="$2" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$1"; }
+eval "$(extract_from "$FLEETCTL" enroll_write_box_config)"
+# FAKE box_ssh: drop the box arg, strip a leading 'sudo ', run the remaining
+# command via sh with the piped remote script/awk as stdin. The real transport
+# runs both `sudo sh -s -- 'vps' 'idx' 'cfg' 'port'` (WRITE, script on stdin)
+# and `sudo sh -c "awk ..."` (D10 read-back) — both are handled the same way.
+box_ssh(){ shift; local cmd="$*"; cmd="${cmd#sudo }"; sh -c "$cmd"; }
+
+if enroll_write_box_config grok-box-3 "$WANT_VPS" "$WANT_IDX" "$WANT_PORT"; then echo "rc=0"; else echo "rc=$?"; fi
+echo "mode=$(stat -c '%a' "$BOX_CONFIG" 2>/dev/null || stat -f '%Lp' "$BOX_CONFIG")"
+echo "vps_active=$(grep -c '^vps = ' "$BOX_CONFIG")"
+echo "idx_active=$(grep -c '^box_index = ' "$BOX_CONFIG")"
+echo "port_active=$(grep -c '^port = ' "$BOX_CONFIG")"
+echo "fleet_hdr=$(grep -c '^\[fleet\]' "$BOX_CONFIG")"
+echo "vps_val=$(awk -F'"' '/^vps = /{print $2}' "$BOX_CONFIG")"
+echo "idx_val=$(awk '/^box_index = /{print $3}' "$BOX_CONFIG")"
+echo "port_val=$(awk '/^port = /{print $3}' "$BOX_CONFIG")"
+
+if [ "$MODE" = noop ]; then
+  # Second identical call MUST be a byte-for-byte no-op (and keep mode 600).
+  cp "$BOX_CONFIG" "$BOXROOT/before"
+  enroll_write_box_config grok-box-3 "$WANT_VPS" "$WANT_IDX" "$WANT_PORT" || true
+  if cmp -s "$BOXROOT/before" "$BOX_CONFIG"; then echo "noop=IDENTICAL"; else echo "noop=CHANGED"; fi
+  echo "mode2=$(stat -c '%a' "$BOX_CONFIG" 2>/dev/null || stat -f '%Lp' "$BOX_CONFIG")"
+fi
+rm -rf "$BOXROOT"
+INNER
+  sed -i \
+    -e "s#__FLEETCTL__#$FLEETCTL#" \
+    -e "s#__SEEDFILE__#$seedfile#" \
+    -e "s#__VPS__#$vps#" \
+    -e "s#__IDX__#$idx#" \
+    -e "s#__PORT__#$port#" \
+    -e "s#__MODE__#$mode#" \
+    "$inner"
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+
+# Seed A: the shipped template — an EXISTING [fleet] block with only COMMENTED
+# vps/box_index (the real seeded config.toml). A fresh enroll must ADD active
+# keys inside this block (not touch the commented template lines, not duplicate
+# the block).
+seedA="$(mktemp)"
+cat > "$seedA" <<'CFG'
+[ssh]
+#password = "12345678"
+
+[fleet]
+# FLEET-BRAIN reverse tunnel.
+#vps = "107.172.132.211"
+#port = 22
+#box_index = 8
+
+[update]
+#repo = "https://example/x.git"
+CFG
+
+fresh="$(boxcfg_test "$seedA" "1.2.3.4" 3 22 noop)"
+case "$fresh" in *"rc=0"*) pass "enroll-cfg: fresh config write returns success" ;; *) bad "enroll-cfg fresh rc!=0: [$fresh]" ;; esac
+case "$fresh" in *"vps_active=1"*) pass "enroll-cfg(D3a/b): fresh config gets exactly ONE active vps line" ;; *) bad "enroll-cfg fresh vps_active wrong: [$fresh]" ;; esac
+case "$fresh" in *"idx_active=1"*) pass "enroll-cfg(D3b): fresh config gets exactly ONE active box_index line (insert after comment)" ;; *) bad "enroll-cfg fresh idx_active wrong: [$fresh]" ;; esac
+case "$fresh" in *"fleet_hdr=1"*) pass "enroll-cfg: the [fleet] block is NEVER duplicated (one header)" ;; *) bad "enroll-cfg fleet_hdr wrong: [$fresh]" ;; esac
+case "$fresh" in *"vps_val=1.2.3.4"*) pass "enroll-cfg: fresh config wrote the requested vps value" ;; *) bad "enroll-cfg vps_val wrong: [$fresh]" ;; esac
+case "$fresh" in *"idx_val=3"*) pass "enroll-cfg: fresh config wrote box_index = N parsed from the box name" ;; *) bad "enroll-cfg idx_val wrong: [$fresh]" ;; esac
+# D3b: port 22 => the port key is OMITTED (the commented template #port stays,
+# no active port line added).
+case "$fresh" in *"port_active=0"*) pass "enroll-cfg(D3b): port 22 => NO active port line written (box default stands)" ;; *) bad "enroll-cfg port22 wrote a port line: [$fresh]" ;; esac
+case "$fresh" in *"mode=600"*) pass "enroll-cfg: config.toml stays mode 600 after the write" ;; *) bad "enroll-cfg mode wrong: [$fresh]" ;; esac
+# Idempotency: a second identical call is a byte-for-byte no-op, mode preserved.
+case "$fresh" in *"noop=IDENTICAL"*) pass "enroll-cfg(D3): re-enroll with SAME values => byte-for-byte no-op (file untouched)" ;; *) bad "enroll-cfg same-values NOT a no-op: [$fresh]" ;; esac
+case "$fresh" in *"mode2=600"*) pass "enroll-cfg: no-op path leaves mode 600 (never widens the ssh-password file)" ;; *) bad "enroll-cfg no-op mode wrong: [$fresh]" ;; esac
+
+# D3b: a NON-default port (2222) against the commented template => an active
+# port line IS written (inserted after the commented #port), and idempotent.
+freshport="$(boxcfg_test "$seedA" "1.2.3.4" 3 2222 noop)"
+case "$freshport" in *"port_active=1"*"port_val=2222"*) pass "enroll-cfg(D3b): non-default port 2222 => exactly ONE active port line = 2222" ;; *) bad "enroll-cfg port2222 wrong: [$freshport]" ;; esac
+case "$freshport" in *"noop=IDENTICAL"*) pass "enroll-cfg(D3b): port write is idempotent (same non-default port => no-op)" ;; *) bad "enroll-cfg port2222 not idempotent: [$freshport]" ;; esac
+
+# Seed B: an ALREADY-ENROLLED config (active vps/box_index present). Re-writing
+# with DIFFERING values must REPLACE them in place — no duplicate keys, no
+# duplicate block, and the rest of the file preserved.
+seedB="$(mktemp)"
+cat > "$seedB" <<'CFG'
+[ssh]
+#password = "12345678"
+
+[fleet]
+vps = "10.0.0.1"
+port = 22
+box_index = 8
+
+[update]
+#repo = "x"
+CFG
+differ="$(boxcfg_test "$seedB" "9.9.9.9" 5 22)"
+case "$differ" in *"vps_active=1"*"idx_active=1"*) pass "enroll-cfg(D3a): differing values REPLACE in place — still exactly one vps + one box_index" ;; *) bad "enroll-cfg differ dup keys: [$differ]" ;; esac
+case "$differ" in *"fleet_hdr=1"*) pass "enroll-cfg: differing values never duplicate the [fleet] block" ;; *) bad "enroll-cfg differ dup block: [$differ]" ;; esac
+case "$differ" in *"vps_val=9.9.9.9"*"idx_val=5"*) pass "enroll-cfg: differing values updated to the NEW vps + box_index" ;; *) bad "enroll-cfg differ values wrong: [$differ]" ;; esac
+# D3b: an ACTIVE port=22 line + requested port 22 => the active port line is
+# DROPPED (22 is the box default; the key is omitted, not written as 22).
+case "$differ" in *"port_active=0"*) pass "enroll-cfg(D3b): an active port=22 with requested port 22 is DROPPED (default omitted)" ;; *) bad "enroll-cfg port22 not dropped: [$differ]" ;; esac
+
+# Seed B differ-then-noop: after a replace, a repeat with the SAME new values is
+# a no-op (proves idempotency holds on the replace path too).
+differ_noop="$(boxcfg_test "$seedB" "9.9.9.9" 5 22 noop)"
+case "$differ_noop" in *"noop=IDENTICAL"*) pass "enroll-cfg: after a replace, a repeat with same values is a no-op" ;; *) bad "enroll-cfg replace-then-noop not idempotent: [$differ_noop]" ;; esac
+
+# Seed B with a NON-default port => the active port=22 line is REPLACED with the
+# requested port (not dropped, not duplicated).
+differ_port="$(boxcfg_test "$seedB" "9.9.9.9" 5 2222)"
+case "$differ_port" in *"port_active=1"*"port_val=2222"*) pass "enroll-cfg(D3b): active port line REPLACED with the requested non-default port" ;; *) bad "enroll-cfg differ port wrong: [$differ_port]" ;; esac
+
+# Seed C: NO [fleet] block at all => enroll APPENDS one (single header).
+seedC="$(mktemp)"
+printf '[ssh]\n#password = "12345678"\n' > "$seedC"
+noblk="$(boxcfg_test "$seedC" "3.3.3.3" 7 22)"
+case "$noblk" in *"vps_active=1"*"idx_active=1"*"fleet_hdr=1"*) pass "enroll-cfg(D3c): config with NO [fleet] block gets the block appended (one header, active keys)" ;; *) bad "enroll-cfg no-block append wrong: [$noblk]" ;; esac
+case "$noblk" in *"vps_val=3.3.3.3"*"idx_val=7"*) pass "enroll-cfg: appended block carries the requested vps + box_index" ;; *) bad "enroll-cfg appended values wrong: [$noblk]" ;; esac
+case "$noblk" in *"port_active=0"*) pass "enroll-cfg(D3b/c): appended block omits port at default 22" ;; *) bad "enroll-cfg appended port22 wrong: [$noblk]" ;; esac
+# D3c + non-default port: the appended block carries the port line too.
+noblk_port="$(boxcfg_test "$seedC" "3.3.3.3" 7 2222)"
+case "$noblk_port" in *"port_active=1"*"port_val=2222"*) pass "enroll-cfg(D3b/c): appended block carries a non-default port line" ;; *) bad "enroll-cfg appended port wrong: [$noblk_port]" ;; esac
+
+# D9: remote exit-4 (config ABSENT) vs a transport/ssh failure. enroll_write_box_config
+# must return 4 ONLY for the remote "config not found" exit; a transport failure
+# (box_ssh itself fails, no remote code) must NOT be 4 (it is the generic write
+# failure, return 1). The file is never created.
+d9_test() {
+  local kind="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" enroll_write_box_config)"
+BOXROOT="\$(mktemp -d)"
+BOX_CONFIG="\$BOXROOT/config.toml"
+if [ "$kind" = absent ]; then
+  # Config is ABSENT: run the REAL remote script (which exits 4). box_ssh runs
+  # sudo sh -s locally; the read-backs never run because write returns 4 first.
+  box_ssh(){ shift; local cmd="\$*"; cmd="\${cmd#sudo }"; sh -c "\$cmd"; }
+else
+  # Transport failure: box_ssh always fails (like an ssh 255), no remote code.
+  box_ssh(){ return 255; }
+fi
+enroll_write_box_config grok-box-3 "1.2.3.4" 3 22; echo "rc=\$?"
+[ -e "\$BOX_CONFIG" ] && echo "file=created" || echo "file=absent"
+rm -rf "\$BOXROOT"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+case "$(d9_test absent)" in
+  *"rc=4"*"file=absent"*) pass "enroll-cfg(D9): remote config ABSENT => write returns 4 (distinct), file NOT created" ;;
+  *) bad "enroll-cfg D9 exit-4 wrong: [$(d9_test absent)]" ;;
+esac
+case "$(d9_test transport)" in
+  *"rc=1"*"file=absent"*) pass "enroll-cfg(D9): transport/ssh failure => generic write failure (rc 1, NOT 4), file NOT created" ;;
+  *) bad "enroll-cfg D9 transport wrong: [$(d9_test transport)]" ;;
+esac
+
+# D10: a post-write read-back MISMATCH is treated as a write failure (rc 1).
+# Drive the REAL enroll_write_box_config with a box_ssh that performs the WRITE
+# honestly but LIES on the read-back (returns a wrong vps), and assert rc=1.
+d10_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" enroll_write_box_config)"
+BOXROOT="\$(mktemp -d)"
+BOX_CONFIG="\$BOXROOT/config.toml"
+printf '[fleet]\n#vps = "x"\n#box_index = 8\n' > "\$BOX_CONFIG"; chmod 600 "\$BOX_CONFIG"
+# box_ssh: the WRITE (sh -s, script on stdin) runs honestly; the D10 read-back
+# (sh -c "awk ...") is intercepted to return a WRONG value so the assert fails.
+box_ssh(){
+  shift; local cmd="\$*"; cmd="\${cmd#sudo }"
+  case "\$cmd" in
+    *"sh -c"*"awk"*) printf 'WRONG-VALUE\n' ;;   # lie on every read-back
+    *) sh -c "\$cmd" ;;
+  esac
+}
+enroll_write_box_config grok-box-3 "1.2.3.4" 3 22; echo "rc=\$?"
+rm -rf "\$BOXROOT"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+case "$(d10_test)" in
+  *"rc=1"*) pass "enroll-cfg(D10): a post-write read-back mismatch is treated as a write failure (rc 1)" ;;
+  *) bad "enroll-cfg D10 mismatch wrong: [$(d10_test)]" ;;
+esac
+
+# D8: partial-enroll contract at cmd_enroll level — when enroll_write_box_config
+# FAILS, cmd_enroll must NOT record the enrollment and must return 1. Drive the
+# REAL cmd_enroll with every OTHER step stubbed to success and the writer stubbed
+# to fail; assert enroll_record_enrolled is NEVER called and rc=1.
+d8_test() {
+  local wrc="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+BOXUP_REMOTE="/workspace/box-setup/boxup"
+BOX_CONFIG="/workspace/box-setup/config.toml"
+log(){ :; }
+notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+RECORDED="\$(mktemp)"; : > "\$RECORDED"
+acl_has_fleet_brain_tagowner(){ return 0; }
+enroll_read_box_pubkey(){ echo "ssh-ed25519 AAAAC3fake grok-tunnel-grok-box-3"; }
+authorized_keys_line(){ echo "restrict,... \$2"; }
+enroll_install_vps_authorized_key(){ return 0; }
+enroll_record_etc_mapping(){ return 0; }
+enroll_vps_box_access_pubkey(){ echo "ssh-ed25519 AAAAvpskey vps"; }
+enroll_install_box_authorized_key(){ return 0; }
+enroll_record_enrolled(){ echo "RECORDED \$1" >> "\$RECORDED"; return 0; }
+# vps resolves (env), port default; the writer returns the injected code.
+export FLEET_VPS_ADDR="1.2.3.4"
+config_get(){ return 1; }
+enroll_write_box_config(){ return $wrc; }
+cmd_enroll grok-box-3 >/dev/null 2>&1; echo "rc=\$?"
+if [ -s "\$RECORDED" ]; then echo "recorded=yes"; else echo "recorded=no"; fi
+rm -f "\$RECORDED"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+case "$(d8_test 1)" in
+  *"rc=1"*"recorded=no"*) pass "enroll-cfg(D8): box-config write FAILURE => NOT recorded, cmd_enroll returns 1" ;;
+  *) bad "enroll-cfg D8 failure contract wrong: [$(d8_test 1)]" ;;
+esac
+case "$(d8_test 4)" in
+  *"rc=1"*"recorded=no"*) pass "enroll-cfg(D8/D9): exit-4 (config absent) => still NOT recorded, cmd_enroll returns 1" ;;
+  *) bad "enroll-cfg D8 exit-4 contract wrong: [$(d8_test 4)]" ;;
+esac
+case "$(d8_test 0)" in
+  *"rc=0"*"recorded=yes"*) pass "enroll-cfg(D8): box-config write SUCCESS => enrollment IS recorded (write is the last side effect before record)" ;;
+  *) bad "enroll-cfg D8 success contract wrong: [$(d8_test 0)]" ;;
+esac
+
+# D1 precheck: cmd_enroll must REFUSE before any side effect when the VPS address
+# is unresolved (no env, no config) — the ACL check and both authorized_keys
+# installs must NOT run. Stub them to record if they fire; assert none did.
+d1_precheck_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+BOXUP_REMOTE="/workspace/box-setup/boxup"
+BOX_CONFIG="/workspace/box-setup/config.toml"
+log(){ :; }
+notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+SIDE="\$(mktemp)"; : > "\$SIDE"
+unset FLEET_VPS_ADDR 2>/dev/null || true
+config_get(){ return 1; }                       # nothing resolves => refuse
+acl_has_fleet_brain_tagowner(){ echo "ACL" >> "\$SIDE"; return 0; }
+enroll_read_box_pubkey(){ echo "PUBKEY" >> "\$SIDE"; echo "ssh-ed25519 A x"; }
+enroll_install_vps_authorized_key(){ echo "VPSKEY" >> "\$SIDE"; return 0; }
+enroll_install_box_authorized_key(){ echo "BOXKEY" >> "\$SIDE"; return 0; }
+enroll_record_enrolled(){ echo "RECORD" >> "\$SIDE"; return 0; }
+cmd_enroll grok-box-3 >/dev/null 2>&1; echo "rc=\$?"
+if [ -s "\$SIDE" ]; then echo "sideeffects=\$(tr '\n' ',' < "\$SIDE")"; else echo "sideeffects=none"; fi
+rm -f "\$SIDE"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+case "$(d1_precheck_test)" in
+  *"rc=1"*"sideeffects=none"*) pass "enroll-cfg(D1): unresolved VPS addr => REFUSE as a precheck, ZERO side effects (no ACL/key installs)" ;;
+  *) bad "enroll-cfg D1 precheck wrong: [$(d1_precheck_test)]" ;;
+esac
+
+
+# REAL cmd_enroll with every OTHER step stubbed to success and assert the
+# box-config writer is NEVER called (it would touch the recorder file if it ran).
+noboxcfg_test() {
+  local flagpos="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+BOXUP_REMOTE="/workspace/box-setup/boxup"
+BOX_CONFIG="/workspace/box-setup/config.toml"
+log(){ :; }
+notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+CALLED="\$(mktemp)"; : > "\$CALLED"
+# Stub every side-effecting step to success; record if the box-config writer runs.
+acl_has_fleet_brain_tagowner(){ return 0; }
+enroll_read_box_pubkey(){ echo "ssh-ed25519 AAAAC3fake grok-tunnel-grok-box-3"; }
+authorized_keys_line(){ echo "restrict,... \$2"; }
+enroll_install_vps_authorized_key(){ return 0; }
+enroll_record_etc_mapping(){ return 0; }
+enroll_vps_box_access_pubkey(){ echo "ssh-ed25519 AAAAvpskey vps"; }
+enroll_install_box_authorized_key(){ return 0; }
+enroll_record_enrolled(){ return 0; }
+enroll_write_box_config(){ echo "WROTE \$1" >> "\$CALLED"; return 0; }
+config_get(){ return 1; }
+export FLEET_VPS_ADDR="1.2.3.4"
+if [ "$flagpos" = before ]; then
+  cmd_enroll --no-box-config grok-box-3 >/dev/null 2>&1
+elif [ "$flagpos" = after ]; then
+  cmd_enroll grok-box-3 --no-box-config >/dev/null 2>&1
+else
+  cmd_enroll grok-box-3 >/dev/null 2>&1
+fi
+if [ -s "\$CALLED" ]; then echo "WRITER=called"; else echo "WRITER=skipped"; fi
+rm -f "\$CALLED"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(noboxcfg_test before)" = "WRITER=skipped" ] && pass "enroll-cfg: --no-box-config (before name) SKIPS the box-side [fleet] write" || bad "enroll-cfg --no-box-config(before) did not skip: [$(noboxcfg_test before)]"
+[ "$(noboxcfg_test after)" = "WRITER=skipped" ] && pass "enroll-cfg: --no-box-config (after name) SKIPS the box-side write (order-independent)" || bad "enroll-cfg --no-box-config(after) did not skip: [$(noboxcfg_test after)]"
+[ "$(noboxcfg_test none)" = "WRITER=called" ] && pass "enroll-cfg: default (no flag) DOES write the box-side [fleet] block" || bad "enroll-cfg default did not write: [$(noboxcfg_test none)]"
+
+rm -f "$seedA" "$seedB" "$seedC"
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi
 exit "$fail"

@@ -167,6 +167,17 @@ install_config_template() {
 # never passed on argv or logged.
 api_token_file = "/etc/grok-fleet/api-token"
 
+# The VPS address the BOXES dial out to for the reverse-SSH tunnel. This is
+# what \`fleetctl enroll grok-box-N\` writes into each box's own config.toml
+# [fleet].vps (docs/FLEET-BRAIN.md §ops). REQUIRED for enroll: it resolves
+# FLEET_VPS_ADDR env > [fleet-brain].vps > REFUSE (no baked default). Set it to
+# THIS brain's reachable address (the one the boxes can open a tunnel to).
+#vps = "203.0.113.10"
+#
+# The VPS sshd port the boxes dial (default 22). enroll writes [fleet].port on
+# a box ONLY when this is non-default; at 22 the box default stands.
+#vps_port = 22
+
 # Set to true to let the timer MUTATE the tailnet (mint/delete/rename). Until
 # then every reconcile is a dry-run — a fresh install changes nothing.
 apply = false
