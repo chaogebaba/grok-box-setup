@@ -454,6 +454,7 @@ CAP
     config_get(){ [ "$1 $2" = "tailscale tags" ] && echo "tag:grok-box"; }
     eval "$(extract_fn reauth_attempt_allowed)"
     eval "$(extract_fn reauth_attempt_record)"
+    eval "$(extract_fn resolved_config_tags)"
     eval "$(extract_fn run_reauth_up)"
     eval "$(extract_fn ensure_login)"
     ensure_login >/dev/null 2>&1
@@ -1172,6 +1173,304 @@ m5_l="$(m5_account_test L)"
 [ "$m5_l" = locked ] \
   && pass "M5 REAL account_unlocked: passwd -S 'L' => LOCKED (return 1) — neutering to 'return 0' flips this" \
   || bad  "M5 REAL account_unlocked wrong on L: [$m5_l] want locked (the predicate is unguarded/neutered)"
+
+# ===========================================================================
+# #10 tag-expiry-guard (D1–D4, r1.1 fold F1/F2/F5/F6). All box-free, via stubs.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# #10 D3/F1/F2 — ts_fields/read_ts_fields parse Self.Tags + Self.KeyExpiry from
+# a fixture `tailscale status --json`. F1: an ABSENT KeyExpiry field => expiry
+# DISABLED (ts_keyexpiry empty); a present RFC3339 timestamp => enabled. One
+# parser (no second status call).
+# ---------------------------------------------------------------------------
+tsfields_test() {
+  local fixture="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+for f in ts_fields read_ts_fields; do eval "\$(extract_fn "\$f")"; done
+# Stub \`ts status --json\` to print the chosen fixture; ts_fields pipes it to python3.
+ts(){ cat <<'JSON'
+$fixture
+JSON
+}
+read_ts_fields
+printf 'tags=[%s] keyexpiry=[%s]\n' "\${ts_tags}" "\${ts_keyexpiry}"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+# tagged + expiry DISABLED (no KeyExpiry field) => tags set, keyexpiry empty.
+r="$(tsfields_test '{"Self":{"Tags":["tag:grok-box"],"Online":true}}')"
+case "$r" in
+  'tags=[tag:grok-box] keyexpiry=[]') pass "#10 D3/F1 read_ts_fields: tagged + KeyExpiry ABSENT => tags set, keyexpiry EMPTY (disabled)" ;;
+  *) bad "#10 D3/F1 read_ts_fields tagged+disabled wrong: [$r]" ;;
+esac
+# tagged + expiry ENABLED (KeyExpiry present) => keyexpiry carries the timestamp.
+r="$(tsfields_test '{"Self":{"Tags":["tag:grok-box"],"KeyExpiry":"2027-02-25T13:47:46Z","Online":true}}')"
+case "$r" in
+  'tags=[tag:grok-box] keyexpiry=[2027-02-25T13:47:46Z]') pass "#10 D3/F1 read_ts_fields: KeyExpiry PRESENT => keyexpiry carries RFC3339 (enabled)" ;;
+  *) bad "#10 D3/F1 read_ts_fields tagged+expiry wrong: [$r]" ;;
+esac
+# untagged (no Tags field) => tags empty.
+r="$(tsfields_test '{"Self":{"KeyExpiry":"2027-02-25T12:55:08Z","Online":true}}')"
+case "$r" in
+  'tags=[] keyexpiry=[2027-02-25T12:55:08Z]') pass "#10 D3 read_ts_fields: Tags ABSENT => tags empty" ;;
+  *) bad "#10 D3 read_ts_fields untagged wrong: [$r]" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# #10 D3/F1/F2 — verify_node_identity predicate. MUTATION-SENSITIVE: F1 mutant
+# "treat an ABSENT KeyExpiry as enabled" must be caught (a tagged+disabled node
+# must return EMPTY, not key-expiry-enabled).
+# ---------------------------------------------------------------------------
+verifyid_test() {
+  local want="$1" tags="$2" kx="$3" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn verify_node_identity)"
+ts_tags="$tags"; ts_keyexpiry="$kx"
+r="\$(verify_node_identity "$want")"
+[ -n "\$r" ] && echo "\$r" || echo OK
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+# tagged + disabled (kx empty) => OK. (F1 mutant: absent-as-enabled would fail this.)
+[ "$(verifyid_test tag:grok-box tag:grok-box '')" = OK ] \
+  && pass "#10 D3/F1 verify_node_identity: tagged + expiry DISABLED (kx empty) => OK (absent-key mutant caught)" \
+  || bad  "#10 D3/F1 verify_node_identity tagged+disabled NOT OK: [$(verifyid_test tag:grok-box tag:grok-box '')]"
+# untagged (want a tag, have none) => tags-missing:<want>.
+[ "$(verifyid_test tag:grok-box '' '')" = "tags-missing:tag:grok-box" ] \
+  && pass "#10 D3 verify_node_identity: want tag, have none => tags-missing:<want>" \
+  || bad  "#10 D3 verify_node_identity untagged wrong: [$(verifyid_test tag:grok-box '' '')]"
+# tagged but expiry enabled => key-expiry-enabled:<date> (date only, no time).
+[ "$(verifyid_test tag:grok-box tag:grok-box 2027-02-25T13:47:46Z)" = "key-expiry-enabled:2027-02-25" ] \
+  && pass "#10 D3/F1 verify_node_identity: tagged + KeyExpiry present => key-expiry-enabled:<YYYY-MM-DD>" \
+  || bad  "#10 D3/F1 verify_node_identity expiry wrong: [$(verifyid_test tag:grok-box tag:grok-box 2027-02-25T13:47:46Z)]"
+# untagged BY CHOICE (want empty): both predicates SKIP even with expiry set => OK.
+[ "$(verifyid_test '' '' 2027-02-25T12:55:08Z)" = OK ] \
+  && pass "#10 D3 verify_node_identity: want empty (untagged-by-choice) => OK even with expiry set (not flagged)" \
+  || bad  "#10 D3 verify_node_identity untagged-by-choice wrong: [$(verifyid_test '' '' 2027-02-25T12:55:08Z)]"
+
+# ---------------------------------------------------------------------------
+# #10 D1/D2 — resolved_config_tags applies the code default. ABSENT key
+# (config_get exit 1) => tag:grok-box (D7 mutant: default flipped to empty must
+# be caught). PRESENT-empty => empty (untagged opt-out). PRESENT-value => value.
+# ---------------------------------------------------------------------------
+resolvedtags_test() {
+  local mode="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+DEFAULT_TS_TAGS="tag:grok-box"
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn resolved_config_tags)"
+case "$mode" in
+  absent)  config_get(){ return 1; } ;;                 # key not present
+  empty)   config_get(){ printf '%s' ""; return 0; } ;; # tags = ""
+  value)   config_get(){ printf '%s' "tag:custom"; return 0; } ;;
+esac
+printf '[%s]\n' "\$(resolved_config_tags)"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(resolvedtags_test absent)" = "[tag:grok-box]" ] \
+  && pass "#10 D1 resolved_config_tags: ABSENT key => default tag:grok-box (mutant 'default flipped to empty' caught)" \
+  || bad  "#10 D1 resolved_config_tags absent wrong: [$(resolvedtags_test absent)]"
+[ "$(resolvedtags_test empty)" = "[]" ] \
+  && pass "#10 D2 resolved_config_tags: PRESENT-empty (tags=\"\") => empty (untagged opt-out)" \
+  || bad  "#10 D2 resolved_config_tags empty wrong: [$(resolvedtags_test empty)]"
+[ "$(resolvedtags_test value)" = "[tag:custom]" ] \
+  && pass "#10 D1 resolved_config_tags: PRESENT value => verbatim" \
+  || bad  "#10 D1 resolved_config_tags value wrong: [$(resolvedtags_test value)]"
+# D1 mutant guard — the SOURCE default constant itself. The resolvedtags_test
+# above stubs DEFAULT_TS_TAGS in its subshell, so it cannot see a mutation of
+# the source assignment; assert the real value in boxup directly. Mutant
+# "default flipped back to empty" (DEFAULT_TS_TAGS="") is caught HERE.
+src_default="$(sed -n 's/^DEFAULT_TS_TAGS="\(.*\)"$/\1/p' "$BOXUP" | head -1)"
+[ "$src_default" = "tag:grok-box" ] \
+  && pass "#10 D1 source default DEFAULT_TS_TAGS=tag:grok-box (mutant 'flipped to empty' caught at source)" \
+  || bad  "#10 D1 source default wrong: DEFAULT_TS_TAGS=[$src_default] want tag:grok-box"
+
+# ---------------------------------------------------------------------------
+# #10 D1/D2 — first-login argv. ABSENT config key => --advertise-tags=tag:grok-box
+# applied at first login (default). tags="" => NO --advertise-tags flag + the
+# UNTAGGED log line. Drives the REAL ensure_login first-login branch.
+# ---------------------------------------------------------------------------
+firstlogin_argv_test() {
+  # $1: config mode absent|empty ; captures argv on stdout, log on fd 3->stderr merged
+  local mode="$1" capture logcap; capture="$(mktemp)"; logcap="$(mktemp)"
+  (
+    set -u
+    cap_bin="$(mktemp)"
+    cat > "$cap_bin" <<CAP
+#!/bin/sh
+for a in "\$@"; do printf '%s\n' "\$a"; done > "$capture"
+exit 0
+CAP
+    chmod +x "$cap_bin"
+    RUN_DIR="$(mktemp -d)"
+    # shellcheck disable=SC2034
+    REAUTH_LAST="$RUN_DIR/last-reauth"
+    # shellcheck disable=SC2034
+    REAUTH_MIN_INTERVAL=1800
+    # shellcheck disable=SC2034  # consumed by the eval'd resolved_config_tags
+    DEFAULT_TS_TAGS="tag:grok-box"
+    AUTHKEY_FILE="$(mktemp)"; echo "tskey-abc" > "$AUTHKEY_FILE"
+    log(){ printf '%s\n' "$*" >> "$logcap"; }
+    id(){ return 1; }
+    wait_for_backend(){ echo NeedsLogin; }
+    state_is_populated(){ return 1; }          # empty statedir => first login
+    tailscale_bin(){ echo "$cap_bin"; }
+    if [ "$mode" = absent ]; then
+      config_get(){ return 1; }                # key ABSENT => default applies
+    else
+      config_get(){ [ "$1 $2" = "tailscale tags" ] && { printf '%s' ""; return 0; }; return 1; }
+    fi
+    extract_fn(){ awk -v fn="$1" '$0 ~ "^"fn"\\(\\) \\{"{i=1} i{print} i&&/^\}$/{exit}' "$BOXUP"; }
+    for f in reauth_attempt_allowed reauth_attempt_record resolved_config_tags run_reauth_up ensure_login; do eval "$(extract_fn "$f")"; done
+    ensure_login >/dev/null 2>&1
+    rm -f "$cap_bin" "$AUTHKEY_FILE"; rm -rf "$RUN_DIR"
+  )
+  printf 'ARGV:'; tr '\n' ' ' < "$capture"; printf '\nLOG:'; tr '\n' ' ' < "$logcap"
+  rm -f "$capture" "$logcap"
+}
+fl_absent="$(firstlogin_argv_test absent)"
+fl_empty="$(firstlogin_argv_test empty)"
+case "$fl_absent" in
+  *--advertise-tags=tag:grok-box*) pass "#10 D1 first-login: ABSENT config key => --advertise-tags=tag:grok-box (default applied)" ;;
+  *) bad "#10 D1 first-login default tag NOT applied on absent key: [$fl_absent]" ;;
+esac
+case "$fl_empty" in
+  *--advertise-tags*) bad "#10 D2 first-login: tags=\"\" wrongly added --advertise-tags: [$fl_empty]" ;;
+  *) pass "#10 D2 first-login: tags=\"\" => NO --advertise-tags flag (untagged opt-out)" ;;
+esac
+case "$fl_empty" in
+  *"registering UNTAGGED by explicit config"*) pass "#10 D2 first-login: tags=\"\" logs the UNTAGGED-by-explicit-config line" ;;
+  *) bad "#10 D2 first-login UNTAGGED log line missing: [$fl_empty]" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# #10 D4/F5/F6 — `boxup retag` exit codes and argv. F6: no key=>3, tags empty=>4,
+# tailscaled down=>5, post-verify fail=>6, success=>0 (NEVER 2). F5: reuses
+# run_reauth_up (argv carries --force-reauth + --advertise-tags=<resolved>),
+# NOT a hand-rolled up. MUTATION-SENSITIVE: dropping --force-reauth is caught.
+# ---------------------------------------------------------------------------
+retag_test() {
+  # $1: scenario nokey|notags|tsdown|verifyfail|ok  -> prints "rc=<n> ARGV:<argv>"
+  local scen="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+RUN_DIR="\$(mktemp -d)"
+STATE_DIR="/tmp/retag-state"
+DEFAULT_TS_TAGS="tag:grok-box"
+HOSTNAME_FILE="\$RUN_DIR/hostname"; echo grok-box-8 > "\$HOSTNAME_FILE"
+AUTHKEY_FILE="\$RUN_DIR/ts-authkey"
+capture="\$RUN_DIR/argv"
+log(){ :; }
+id(){ return 1; }
+prefs_hostname(){ echo grok-box-8; }
+read_box_name(){ echo grok-box-8; }
+current_advertise_tags(){ echo ""; }
+ts(){ :; }
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+# A capturing tailscale bin for the run_reauth_up path.
+cap_bin="\$RUN_DIR/ts"; cat > "\$cap_bin" <<'CAP'
+#!/bin/sh
+for a in "\$@"; do printf '%s\n' "\$a"; done > "REPLACE_CAPTURE"
+exit 0
+CAP
+sed -i "s#REPLACE_CAPTURE#\$capture#" "\$cap_bin"; chmod +x "\$cap_bin"
+tailscale_bin(){ echo "\$cap_bin"; }
+# config_get tags: default (absent) unless the notags scenario forces empty.
+case "$scen" in
+  notags) config_get(){ [ "\$1 \$2" = "tailscale tags" ] && { printf ''; return 0; }; return 1; } ;;
+  *)      config_get(){ return 1; } ;;   # absent => default tag:grok-box
+esac
+# Seed the auth key unless the nokey scenario.
+case "$scen" in nokey) : ;; *) echo tskey-abc > "\$AUTHKEY_FILE" ;; esac
+# tailscaled-on-statedir precondition: down only for the tsdown scenario.
+case "$scen" in
+  tsdown) tailscaled_on_statedir(){ return 1; } ;;
+  *)      tailscaled_on_statedir(){ return 0; } ;;
+esac
+# read_ts_fields: after the up, report tagged+disabled for ok; untagged for
+# verifyfail. Before-snapshot uses the same stub (harmless).
+case "$scen" in
+  verifyfail) read_ts_fields(){ ts_tags=""; ts_keyexpiry=""; } ;;
+  *)          read_ts_fields(){ ts_tags="tag:grok-box"; ts_keyexpiry=""; } ;;
+esac
+for f in resolved_config_tags verify_node_identity run_reauth_up cmd_retag; do eval "\$(extract_fn "\$f")"; done
+cmd_retag >/dev/null 2>&1; rc=\$?
+printf 'rc=%s ARGV:' "\$rc"; [ -f "\$capture" ] && command tr '\n' ' ' < "\$capture" || true
+rm -rf "\$RUN_DIR"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"
+}
+case "$(retag_test nokey)"   in rc=3*) pass "#10 D4/F6 retag: no seeded auth key => exit 3" ;; *) bad "#10 D4 retag nokey wrong: [$(retag_test nokey)]" ;; esac
+case "$(retag_test notags)"  in rc=4*) pass "#10 D4/F6 retag: resolved tags empty => exit 4" ;; *) bad "#10 D4 retag notags wrong: [$(retag_test notags)]" ;; esac
+case "$(retag_test tsdown)"  in rc=5*) pass "#10 D4/F6 retag: tailscaled not running => exit 5" ;; *) bad "#10 D4 retag tsdown wrong: [$(retag_test tsdown)]" ;; esac
+case "$(retag_test verifyfail)" in rc=6*) pass "#10 D4/F6 retag: post-verify still failing => exit 6" ;; *) bad "#10 D4 retag verifyfail wrong: [$(retag_test verifyfail)]" ;; esac
+retag_ok="$(retag_test ok)"
+case "$retag_ok" in rc=0*) pass "#10 D4/F6 retag: success => exit 0" ;; *) bad "#10 D4 retag ok NOT exit 0: [$retag_ok]" ;; esac
+# F6: NEVER exit 2.
+case "$retag_ok" in rc=2*) bad "#10 D4/F6 retag used exit 2 (reserved for 'old boxup')" ;; *) pass "#10 D4/F6 retag never uses exit 2" ;; esac
+# F5: argv reuses run_reauth_up => carries --force-reauth (mutant: dropped => caught).
+case "$retag_ok" in *--force-reauth*) pass "#10 D4/F5 retag argv carries --force-reauth (reuses run_reauth_up; drop-mutant caught)" ;; *) bad "#10 D4/F5 retag argv MISSING --force-reauth: [$retag_ok]" ;; esac
+case "$retag_ok" in *--advertise-tags=tag:grok-box*) pass "#10 D4/F5 retag argv introduces the resolved tag (--advertise-tags=tag:grok-box)" ;; *) bad "#10 D4/F5 retag argv MISSING --advertise-tags: [$retag_ok]" ;; esac
+
+# ---------------------------------------------------------------------------
+# #10 D3 — check_reason predicate ORDERING: an identity failure (tags-missing)
+# must surface BEFORE sshd. MUTATION-SENSITIVE: if sshd were checked first (or
+# the identity predicate removed), a tags-missing box with sshd down would
+# report sshd, masking the identity problem. Here sshd is UP and identity is
+# broken => reason must be the identity one.
+# ---------------------------------------------------------------------------
+checkreason_identity_test() {
+  local tags="$1" kx="$2" sshd="${3:-up}" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+RUN_DIR="\$(mktemp -d)"; AUTHKEY_FILE="\$RUN_DIR/none"; AUTHKEY_EXPIRES="\$RUN_DIR/none"
+STATE_DIR=/tmp/x; WORKER_PID="\$RUN_DIR/w"; FREEZE_SECS=60
+DEFAULT_TS_TAGS="tag:grok-box"
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+for f in authkey_expiry_state resolved_config_tags verify_node_identity check_reason; do eval "\$(extract_fn "\$f")"; done
+config_get(){ return 1; }   # tags key absent => want=tag:grok-box
+read_ts_fields(){ backend=Running; online=yes; exitn=yes; ts_tags="$tags"; ts_keyexpiry="$kx"; }
+name_mismatch(){ return 1; }
+read_box_name(){ echo grok-box-8; }
+id(){ return 0; }; account_unlocked(){ return 0; }; host_keys_present(){ return 0; }
+# sshd controllable; tailscaled always "present" so its predicate passes.
+pgrep(){ case "\$*" in *sshd*) [ "$sshd" = up ] && return 0 || return 1 ;; *) return 0 ;; esac; }
+r="\$(check_reason)"
+rm -rf "\$RUN_DIR"
+echo "\$r"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+# untagged (want tag:grok-box) + sshd DOWN => identity is checked BEFORE sshd,
+# so the FIRST reason must be tags-missing, NOT sshd=down. MUTATION-SENSITIVE:
+# swapping the order so sshd is checked first makes this report sshd=down.
+case "$(checkreason_identity_test '' '' down)" in
+  "tags-missing:tag:grok-box"*) pass "#10 D3 check_reason: identity (tags-missing) surfaces BEFORE sshd even with sshd DOWN (ordering mutant caught)" ;;
+  *) bad "#10 D3 check_reason ordering wrong (sshd masks identity): [$(checkreason_identity_test '' '' down)]" ;;
+esac
+# tagged + disabled => identity clears => the reason (if any) is a LATER
+# predicate (ipfwd etc.), NEVER an identity one. Assert no identity token.
+case "$(checkreason_identity_test tag:grok-box '')" in
+  *tags-missing*|*key-expiry-enabled*) bad "#10 D3 check_reason false-positive on healthy identity: [$(checkreason_identity_test tag:grok-box '')]" ;;
+  *) pass "#10 D3 check_reason: tagged + expiry disabled => identity clean (no identity reason)" ;;
+esac
+# tagged + expiry enabled => key-expiry-enabled reason.
+case "$(checkreason_identity_test tag:grok-box 2027-02-25T13:47:46Z)" in
+  "key-expiry-enabled:2027-02-25"*) pass "#10 D3 check_reason: tagged + expiry enabled => key-expiry-enabled reason" ;;
+  *) bad "#10 D3 check_reason key-expiry-enabled wrong: [$(checkreason_identity_test tag:grok-box 2027-02-25T13:47:46Z)]" ;;
+esac
 
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi
