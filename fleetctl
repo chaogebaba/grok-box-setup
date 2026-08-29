@@ -1507,7 +1507,10 @@ chmod 600 "$cf"
 # --- mint-key ----------------------------------------------------------------
 # fleetctl mint-key <box>: mint a per-box tag-scoped key and seed it ATOMICALLY
 # over the tunnel (S1). Verify via `boxup status` over the tunnel BEFORE
-# recording success; a failure leaves the OLD key intact.
+# recording success. On any seed/verify failure the just-minted key is revoked
+# and the mint-window guard is NOT advanced; the on-box state is not guaranteed —
+# a pre-`mv` failure leaves the OLD key, but a post-`mv` failure may leave the
+# revoked NEW key, so recovery is the next rejoin/expiry trigger (F4b/S2).
 mint_payload() {
   # The EXACT capabilities shape the frozen wall (H11) mandates.
   # P1-6: expirySeconds is HARD-CLAMPED to the 90-day Tailscale maximum. Neither
