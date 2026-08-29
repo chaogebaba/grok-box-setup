@@ -1485,7 +1485,7 @@ for line in status_txt.splitlines():
 n = 1
 while n in taken:
     n += 1
-print(f"grok-box-{n}")
+print(f"grok-box-{n:03d}")
 PY
 }
 
