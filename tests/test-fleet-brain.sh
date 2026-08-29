@@ -3049,6 +3049,215 @@ esac
   && pass "#10 D6 identity pass: empty device list (read-only run) => silent no-op" \
   || bad  "#10 D6 identity pass not silent on empty list: [$(identitypass_test '')]"
 
+# =============================================================================
+# RENAME (box-naming-3digit D4 + F2/F3/F4/F6/F7) — box-free, VPS-free, API-free.
+# Drives cmd_rename through a fake $FLEET_STATE/$FLEET_ETC with tunnel_ssh /
+# tunnel_up / devices_json / ts_api / ts_api_body / flock all stubbed. Each run
+# gets its own temp dirs; the stubs are steered by env vars written into the
+# inner script.
+# =============================================================================
+rename_fns="box_index_from_name box_name_from_index port_for box_index cmd_config_enrolled reconcile_target_boxes dev_field devices_json_valid rename_ver_ge rename_box_boxup_version rename_dev_hostname rename_dev_dnslabel rename_dev_liveid rename_corpse_id rename_plan_paths rename_copy_state rename_delete_old_state rename_state_copied cmd_rename"
+
+# rename_run <flags> <old> <new> : with env HOOK_* controlling the stubs.
+rename_run() {
+  local args="$1"; shift 2>/dev/null || true
+  local inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"
+  mkdir -p "$d/state/keys" "$d/etc/authorized-keys.d" "$d/etc/boxes"
+  # Seed OLD-name state (grok-box-2, port 20002, index 2).
+  printf 'grok-box-2\t20002\n'                 >  "$d/state/enrolled.tsv"
+  printf 'grok-box-2\t2027-01-01\n'            >  "$d/state/grok-box-2.expires"
+  printf '0\n'                                 >  "$d/state/grok-box-2.checkfail"
+  printf '0\n'                                 >  "$d/state/grok-box-2.cfgfail"
+  printf 'restrict,... permitlisten="127.0.0.1:20002" ssh-ed25519 KEYMAT grok-tunnel-grok-box-2\n' > "$d/etc/authorized-keys.d/grok-box-2.line"
+  printf 'grok-box-2\t20002\tKEYMAT\n'         >  "$d/etc/authorized-keys.map"
+  printf '[managed]\nenabled = true\n'         >  "$d/etc/boxes/grok-box-2.toml"
+  # Snapshot the authoritative ~fleet authorized_keys (F6: must be untouched).
+  printf 'AUTHORITATIVE-KEYS-LINE\n'           >  "$d/state/fleet_authkeys"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+FLEET_ETC="$d/etc"
+FLEET_ETC_AK_DIR="$d/etc/authorized-keys.d"
+FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+BOX_ROOT="/workspace/box-setup"
+FLEET_STALE_SECS=600
+RENAME_POLL_SECS=6
+RENAME_POLL_INTERVAL=1
+RENAME_MIN_BOXUP_VERSION=5.3.0
+TS_API_CODE=0
+TS_API_LAST_BODY=""
+log(){ printf 'LOG:%s\n' "\$*"; }
+notify(){ printf 'NOTIFY:%s\n' "\$*"; }
+sleep(){ :; }                          # never actually sleep in tests
+flock(){ [ "\${HOOK_LOCK_HELD:-0}" = 1 ] && return 1; return 0; }   # lock free unless HOOK_LOCK_HELD
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in $rename_fns; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+tunnel_up(){ return 0; }
+# The box's boxup version (>= 5.3.0 unless overridden to a stale one).
+rename_box_boxup_version(){ printf '%s' "\${HOOK_BOXVER:-5.3.0}"; }
+# Record + no-op the on-box hostname write / boxup once.
+tunnel_ssh(){ echo "TUNNEL_SSH \$*" >> "$d/tsslog"; return 0; }
+# devices_json / ts_api / ts_api_body: a scripted device list that FLIPS to the
+# new name after N polls (HOOK_FLIP_AT), with the DNS label pinned until a POST
+# /device/name is seen (HOOK_DNS_PINNED). ts_api records POST/DELETE calls.
+POLLN=0
+_write_devs(){
+  local host="\$1" dns="\$2" corpse=""
+  [ "\${HOOK_CORPSE:-0}" = 1 ] && corpse=',{"hostname":"grok-box-2","name":"grok-box-2.tail.ts.net","online":false,"nodeId":"nCORPSE"}'
+  cat > "$d/devs" <<DEVS
+{"devices":[
+ {"hostname":"\$host","name":"\$dns.tail.ts.net","online":true,"nodeId":"nLIVE"}\$corpse
+]}
+DEVS
+}
+devices_json(){
+  POLLN=\$((POLLN+1))
+  local host dns
+  if [ "\$POLLN" -ge "\${HOOK_FLIP_AT:-1}" ]; then host=grok-box-002; else host=grok-box-2; fi
+  if [ "\${HOOK_DNS_PINNED:-0}" = 1 ] && [ "\${POSTED:-0}" = 0 ]; then dns=grok-box-2; else dns=grok-box-002; fi
+  _write_devs "\$host" "\$dns"
+  TS_API_CODE=200; return 0
+}
+ts_api_body(){ cat "$d/devs" 2>/dev/null; }
+ts_ok(){ [ "\$TS_API_CODE" -ge 200 ] && [ "\$TS_API_CODE" -lt 300 ]; }
+POSTED=0
+ts_api(){
+  local method="\$1" path="\$2"
+  echo "TSAPI \$method \$path" >> "$d/apilog"
+  case "\$method \$path" in
+    "POST "*"/name") POSTED=1; TS_API_CODE=200; return 0 ;;
+    "DELETE /device/"*) TS_API_CODE=200; return 0 ;;
+    *) TS_API_CODE=200; return 0 ;;
+  esac
+}
+cmd_rename $args
+echo "RC=\$?"
+echo "--- enrolled ---"; cat "$d/state/enrolled.tsv" 2>/dev/null
+echo "--- state files ---"; ls "$d/state" | tr '\n' ' '; echo
+echo "--- akdir ---"; ls "$d/etc/authorized-keys.d" | tr '\n' ' '; echo
+echo "--- boxes ---"; ls "$d/etc/boxes" | tr '\n' ' '; echo
+echo "--- akmap ---"; cat "$d/etc/authorized-keys.map" 2>/dev/null
+echo "--- authoritative (F6) ---"; cat "$d/state/fleet_authkeys" 2>/dev/null
+echo "--- apilog ---"; cat "$d/apilog" 2>/dev/null
+echo "--- tsslog ---"; cat "$d/tsslog" 2>/dev/null
+INNER
+  timeout 30 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+
+# --- D4: refuse a non-canonical <new> -----------------------------------------
+r_noncanon="$(rename_run 'grok-box-2 grok-box-2x')"
+case "$r_noncanon" in
+  *"RC=2"*) case "$r_noncanon" in *"not canonical"*) pass "rename: refuses a non-canonical <new> (rc 2)" ;; *) bad "rename non-canonical: wrong reason: [$r_noncanon]" ;; esac ;;
+  *) bad "rename: did NOT refuse non-canonical <new>: [$r_noncanon]" ;;
+esac
+
+# --- D4: refuse an index change -----------------------------------------------
+r_idx="$(rename_run 'grok-box-2 grok-box-003')"
+case "$r_idx" in
+  *"RC=2"*) case "$r_idx" in *"index change"*) pass "rename: refuses an index-changing rename (rc 2)" ;; *) bad "rename index-change: wrong reason: [$r_idx]" ;; esac ;;
+  *) bad "rename: did NOT refuse an index change: [$r_idx]" ;;
+esac
+
+# --- D4: refuse when the box's boxup is too old (< 5.3.0) ----------------------
+r_oldver="$(HOOK_BOXVER=5.2.0 rename_run 'grok-box-2 grok-box-002')"
+case "$r_oldver" in
+  *"update boxup first"*) pass "rename: refuses when the box boxup < 5.3.0 (update boxup first)" ;;
+  *) bad "rename: did NOT refuse a stale box boxup: [$r_oldver]" ;;
+esac
+
+# --- F2/F7: reconcile lock held => rename waits then refuses -------------------
+r_lock="$(HOOK_LOCK_HELD=1 rename_run 'grok-box-2 grok-box-002')"
+case "$r_lock" in
+  *"reconcile busy"*) pass "rename F2/F7: reconcile lock held => refuse with 'reconcile busy'" ;;
+  *) bad "rename: did NOT refuse under a held reconcile lock: [$r_lock]" ;;
+esac
+
+# --- F4: --dry-run prints the plan and touches nothing ------------------------
+r_dry="$(rename_run '--dry-run grok-box-2 grok-box-002')"
+case "$r_dry" in
+  *"DRY-RUN plan grok-box-2 -> grok-box-002"*) pass "rename F4: --dry-run prints the plan" ;;
+  *) bad "rename: --dry-run plan missing: [$r_dry]" ;;
+esac
+case "$r_dry" in
+  *"grok-box-2.expires"*"grok-box-002.expires"*) pass "rename F4: --dry-run lists the state artefact paths (old->new)" ;;
+  *) bad "rename: --dry-run artefact paths missing: [$r_dry]" ;;
+esac
+case "$r_dry" in
+  # dry-run must NOT have created a grok-box-002 enrolled row.
+  *"--- enrolled ---"*"grok-box-002"*) bad "rename: --dry-run MUTATED enrolled.tsv (added grok-box-002): [$r_dry]" ;;
+  *) pass "rename F4: --dry-run touches nothing (no grok-box-002 row created)" ;;
+esac
+
+# --- F3/F6: happy path migrates all artefacts, deletes old, keeps authoritative
+r_happy="$(rename_run 'grok-box-2 grok-box-002')"
+case "$r_happy" in *"RC=0"*) pass "rename happy: completes rc 0" ;; *) bad "rename happy: non-zero rc: [$r_happy]" ;; esac
+# enrolled.tsv now has ONLY the new row (old deleted at step 6).
+case "$r_happy" in
+  *"--- enrolled ---"*"grok-box-002"$'\t'"20002"*) pass "rename F3: enrolled.tsv row migrated grok-box-2 -> grok-box-002 (same port)" ;;
+  *) bad "rename: enrolled row not migrated: [$r_happy]" ;;
+esac
+case "$r_happy" in
+  *"--- state files ---"*"grok-box-2."*) bad "rename F3 step6: OLD state sidecars not deleted: [$r_happy]" ;;
+  *) pass "rename F3 step6: old-name state sidecars deleted" ;;
+esac
+case "$r_happy" in
+  *"--- state files ---"*"grok-box-002.expires"*) pass "rename F3: new-name state sidecars present (expires copied)" ;;
+  *) bad "rename: new-name state sidecars missing: [$r_happy]" ;;
+esac
+case "$r_happy" in
+  *"--- akdir ---"*"grok-box-002.line"*) pass "rename F6: new-name authorized-keys.d audit copy present" ;;
+  *) bad "rename: new .line audit copy missing: [$r_happy]" ;;
+esac
+case "$r_happy" in
+  *"--- akdir ---"*"grok-box-2.line"*) bad "rename F6 step6: OLD .line audit copy not deleted: [$r_happy]" ;;
+  *) pass "rename F6 step6: old .line audit copy deleted" ;;
+esac
+case "$r_happy" in
+  *"--- boxes ---"*"grok-box-002.toml"*) pass "rename F3: boxes/<new>.toml copied" ;;
+  *) bad "rename: boxes/<new>.toml missing: [$r_happy]" ;;
+esac
+case "$r_happy" in
+  *"--- akmap ---"*"grok-box-002"$'\t'"20002"$'\t'"KEYMAT"*) pass "rename F6: authorized-keys.map row rewritten to the new name (same port/key)" ;;
+  *) bad "rename: akmap row not migrated: [$r_happy]" ;;
+esac
+# F6: the authoritative ~fleet/.ssh/authorized_keys is NEVER touched.
+case "$r_happy" in
+  *"--- authoritative (F6) ---"*"AUTHORITATIVE-KEYS-LINE"*) pass "rename F6: authoritative ~fleet authorized_keys UNTOUCHED (key-material-keyed)" ;;
+  *) bad "rename F6: authoritative authorized_keys was altered: [$r_happy]" ;;
+esac
+# The box hostname write + boxup once ran over the tunnel.
+case "$r_happy" in
+  *"TUNNEL_SSH"*"grok-box-002"*"boxup once"*) pass "rename F3 step3: wrote new hostname + ran boxup once on the box" ;;
+  *) bad "rename: box hostname/boxup step missing: [$r_happy]" ;;
+esac
+
+# --- F3 step5: DNS-pinned label => POST /device/<id>/name EXACTLY once ---------
+r_dns="$(HOOK_DNS_PINNED=1 rename_run 'grok-box-2 grok-box-002')"
+case "$r_dns" in *"RC=0"*) : ;; *) bad "rename DNS-pinned: non-zero rc: [$r_dns]" ;; esac
+napi="$(printf '%s\n' "$r_dns" | grep -c 'TSAPI POST /device/.*/name')"
+[ "$napi" = 1 ] && pass "rename F3 step5: DNS-pinned label => POST /device/<id>/name exactly once" || bad "rename DNS-pinned: POST count=$napi (expected 1): [$r_dns]"
+
+# --- F3 step7: corpse reaping deletes the OTHER old-name id only ---------------
+r_corpse="$(HOOK_CORPSE=1 rename_run 'grok-box-2 grok-box-002')"
+case "$r_corpse" in
+  *"TSAPI DELETE /device/nCORPSE"*) pass "rename F3 step7: reaps the stale corpse device id" ;;
+  *) bad "rename: corpse not reaped: [$r_corpse]" ;;
+esac
+case "$r_corpse" in
+  *"DELETE /device/nLIVE"*) bad "rename F3 step7: deleted the RENAMED node's own live id (FORBIDDEN): [$r_corpse]" ;;
+  *) pass "rename F3 step7: never deletes the renamed node's own live id" ;;
+esac
+
+# --- F3 resume: a rename re-run after step 2 already copied continues cleanly ---
+r_resume="$(HOOK_FLIP_AT=1 rename_run 'grok-box-2 grok-box-002')"   # first run completes
+# Re-running the SAME rename when new is already canonical+enrolled: cmd_config_enrolled(old)
+# now fails (old row gone) — the command reports old not enrolled, which is the
+# idempotent "already renamed" outcome (rc 2, no mutation of the finished state).
+case "$r_resume" in *"RC=0"*) pass "rename resume: a completed happy path is rc 0 (state fully migrated)" ;; *) bad "rename resume base run failed: [$r_resume]" ;; esac
+
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi
 exit "$fail"

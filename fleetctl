@@ -9,6 +9,7 @@
 #   fleetctl status [box..]  one boxup status line per box (read-only)
 #   fleetctl check           quiet health gate; exit 1 if any box unhealthy
 #   fleetctl rollout <box..> deploy git HEAD to boxes; --all for the fleet
+#   fleetctl rename <o> <n>  live-rename a box to canonical grok-box-NNN
 #   fleetctl ssh <box> [cmd] convenience ssh wrapper
 #   fleetctl install-timer   systemd USER timer running `check --notify` /10min
 #   fleetctl remove-timer    tear that timer down
@@ -3263,6 +3264,11 @@ Brain subcommands (docs/FLEET-BRAIN.md — run on the VPS + laptop):
   fleetctl enroll --no-box-config <grok-box-N>
                                  as above but SKIP the box-side [fleet] write
   fleetctl reconcile [--apply]   the 5-min decision table (DRY-RUN by default)
+  fleetctl rename [--dry-run] <old> <new>
+                                 live-rename a box to the canonical grok-box-NNN
+                                 (same index/port); copy-first, verify, then
+                                 delete the old-name state. --dry-run prints the
+                                 plan only.
   fleetctl config render <box>   print the box's rendered managed.toml (stdout)
   fleetctl config diff <box>     unified diff of on-box vs rendered (exit 1 on drift)
   fleetctl config push <box>     push the rendered managed.toml to ONE box (D5)
@@ -3283,6 +3289,356 @@ Environment:
 EOF
 }
 
+# =============================================================================
+# rename (box-naming-3digit D4 + folds F2/F3/F4/F6/F7) — live rename of a box
+# from an old (legacy) name to the canonical grok-box-NNN, WITHOUT changing its
+# index/port. Copy-first / verify / delete-last, resumable, never atomic-by-
+# claim (F3). Runs under the reconcile lock with a bounded wait (F2/F7). The
+# authoritative ~fleet/.ssh/authorized_keys is key-material-keyed and is NEVER
+# touched (F6); only the box-name-keyed AUDIT copies move. --dry-run prints the
+# plan and exits 0 (F4).
+# =============================================================================
+
+# rename_ver_ge <have> <want>: 0 iff dotted version <have> >= <want>. Missing
+# components are 0. Used to gate the box's boxup on the padded-name support.
+rename_ver_ge() {
+  local have="$1" want="$2" h1 h2 h3 w1 w2 w3
+  IFS=. read -r h1 h2 h3 _ <<EOF
+$have
+EOF
+  IFS=. read -r w1 w2 w3 _ <<EOF
+$want
+EOF
+  h1=$((10#${h1:-0})); h2=$((10#${h2:-0})); h3=$((10#${h3:-0}))
+  w1=$((10#${w1:-0})); w2=$((10#${w2:-0})); w3=$((10#${w3:-0}))
+  [ "$h1" -ne "$w1" ] && { [ "$h1" -gt "$w1" ]; return; }
+  [ "$h2" -ne "$w2" ] && { [ "$h2" -gt "$w2" ]; return; }
+  [ "$h3" -ge "$w3" ]
+}
+
+# The minimum boxup version on the box that understands the padded canonical
+# name (ships D2's pick_name padding + the D1 helpers).
+RENAME_MIN_BOXUP_VERSION="${RENAME_MIN_BOXUP_VERSION:-5.3.0}"
+
+# rename_box_boxup_version <box>: print the box's `boxup version` number over
+# the tunnel (e.g. 5.3.0), empty on any failure.
+rename_box_boxup_version() {
+  local box="$1" out
+  out="$(tunnel_ssh "$box" "sudo $BOX_ROOT/boxup version" 2>/dev/null)" || return 1
+  # `boxup version` prints "boxup X.Y.Z"; take the last field.
+  printf '%s' "${out##* }" | tr -d '[:space:]'
+}
+
+# rename_dev_hostname <devs> <name>: the live (online, else any) device's
+# HostName for the device whose folded base name == <name>. Empty if none.
+rename_dev_hostname() {
+  printf '%s' "$1" | jq -r --arg n "$2" '
+    def base(h): (h | sub("-1$"; ""));
+    [ .devices[]? | select((base(.hostname // .name // "")) == $n) ]
+    | (map(select(.online == true)) + .)     # prefer an online row
+    | (.[0].hostname // .[0].name // "")
+  ' 2>/dev/null
+}
+
+# rename_dev_dnslabel <devs> <name>: the leading DNSName label (before the first
+# dot) of that same device. This is the MagicDNS label the control plane pins.
+rename_dev_dnslabel() {
+  printf '%s' "$1" | jq -r --arg n "$2" '
+    def base(h): (h | sub("-1$"; ""));
+    [ .devices[]? | select((base(.hostname // .name // "")) == $n) ]
+    | (map(select(.online == true)) + .)
+    | ((.[0].name // .[0].hostname // "") | split(".")[0])
+  ' 2>/dev/null
+}
+
+# rename_dev_liveid <devs> <name>: the online device id for the device whose
+# folded base name == <name>. Reuses dev_field's live_id selector.
+rename_dev_liveid() { dev_field "$1" "$2" live_id; }
+
+# rename_corpse_id <devs> <oldname> <keep_id>: an id of ANY device still carrying
+# the OLD base name whose id != <keep_id> (a split-brain corpse to reap). Empty
+# if none. Never returns the renamed node's own id.
+rename_corpse_id() {
+  printf '%s' "$1" | jq -r --arg n "$2" --arg keep "$3" '
+    def base(h): (h | sub("-1$"; ""));
+    [ .devices[]?
+      | select((base(.hostname // .name // "")) == $n)
+      | (.nodeId // .id // "")
+      | select(. != "" and . != $keep) ] | (.[0] // "")
+  ' 2>/dev/null
+}
+
+# The name-keyed brain-state artefacts for a box, printed as "old<TAB>new" pairs
+# (F3/F6): enrolled.tsv is handled separately (a row, not a file). These are the
+# per-box files/rows that a rename copies then deletes.
+rename_plan_paths() {
+  local old="$1" new="$2"
+  printf '%s\t%s\n' "$FLEET_STATE/$old.expires"            "$FLEET_STATE/$new.expires"
+  printf '%s\t%s\n' "$FLEET_STATE/$old.checkfail"          "$FLEET_STATE/$new.checkfail"
+  printf '%s\t%s\n' "$FLEET_STATE/$old.cfgfail"            "$FLEET_STATE/$new.cfgfail"
+  printf '%s\t%s\n' "$FLEET_ETC_AK_DIR/$old.line"          "$FLEET_ETC_AK_DIR/$new.line"
+  printf '%s\t%s\n' "$FLEET_MANAGED_BOXDIR/$old.toml"      "$FLEET_MANAGED_BOXDIR/$new.toml"
+  # enrolled.tsv row + authorized-keys.map row are rewritten in place, not moved
+  # as whole files; listed here for the dry-run plan by their container file.
+  printf '%s\t%s\n' "$FLEET_STATE/enrolled.tsv (row $old)" "$FLEET_STATE/enrolled.tsv (row $new)"
+  printf '%s\t%s\n' "$FLEET_ETC/authorized-keys.map (row $old)" "$FLEET_ETC/authorized-keys.map (row $new)"
+}
+
+# rename_copy_state <old> <new>: STEP 2 (F3) — COPY every name-keyed artefact to
+# the NEW name. Idempotent (re-runnable): overwrites the new-name copy each call.
+# Only AUDIT copies move; the authoritative authorized_keys is untouched (F6).
+rename_copy_state() {
+  local old="$1" new="$2" f
+  # Per-box state sidecars (skip a missing source silently).
+  for f in expires checkfail cfgfail; do
+    [ -f "$FLEET_STATE/$old.$f" ] && cp -f "$FLEET_STATE/$old.$f" "$FLEET_STATE/$new.$f"
+  done
+  # authorized-keys.d/<box>.line audit copy.
+  if [ -f "$FLEET_ETC_AK_DIR/$old.line" ]; then
+    mkdir -p "$FLEET_ETC_AK_DIR" 2>/dev/null || true
+    cp -f "$FLEET_ETC_AK_DIR/$old.line" "$FLEET_ETC_AK_DIR/$new.line"
+    chmod 600 "$FLEET_ETC_AK_DIR/$new.line" 2>/dev/null || true
+  fi
+  # boxes/<box>.toml managed config, if present.
+  if [ -f "$FLEET_MANAGED_BOXDIR/$old.toml" ]; then
+    cp -f "$FLEET_MANAGED_BOXDIR/$old.toml" "$FLEET_MANAGED_BOXDIR/$new.toml"
+  fi
+  # enrolled.tsv: ADD a second row for <new> with the SAME port (both names now
+  # resolve). Idempotent: drop any prior <new> row first.
+  local enr="$FLEET_STATE/enrolled.tsv" port tmp
+  if [ -f "$enr" ]; then
+    port="$(awk -F'\t' -v b="$old" '$1==b{print $2; exit}' "$enr")"
+    if [ -n "$port" ]; then
+      tmp="$(mktemp)" || return 1
+      grep -vE "^$new"$'\t' "$enr" > "$tmp" 2>/dev/null || true
+      printf '%s\t%s\n' "$new" "$port" >> "$tmp"
+      mv -f "$tmp" "$enr"
+    fi
+  fi
+  # authorized-keys.map: ADD a <new> row copying <old>'s port+key. Idempotent.
+  local idx="$FLEET_ETC/authorized-keys.map" row itmp
+  if [ -f "$idx" ]; then
+    row="$(awk -F'\t' -v b="$old" '$1==b{print; exit}' "$idx")"
+    if [ -n "$row" ]; then
+      itmp="$(mktemp)" || return 0
+      grep -vE "^$new"$'\t' "$idx" > "$itmp" 2>/dev/null || true
+      printf '%s\n' "$row" | awk -F'\t' -v n="$new" 'BEGIN{OFS="\t"} {$1=n; print}' >> "$itmp"
+      chmod 600 "$itmp" 2>/dev/null || true
+      mv -f "$itmp" "$idx"
+    fi
+  fi
+  return 0
+}
+
+# rename_delete_old_state <old> <new>: STEP 6 (F3/F6) — DELETE the OLD-name
+# artefacts once the rename is verified: the old state sidecars, the old audit
+# .line + map row, the old enrolled.tsv row (leaving only <new>), the old
+# boxes/*.toml. Never regenerates authorized_keys (F6 — nothing to do there).
+rename_delete_old_state() {
+  local old="$1" new="$2" f
+  for f in expires checkfail cfgfail; do rm -f "$FLEET_STATE/$old.$f"; done
+  rm -f "$FLEET_ETC_AK_DIR/$old.line"
+  rm -f "$FLEET_MANAGED_BOXDIR/$old.toml"
+  local enr="$FLEET_STATE/enrolled.tsv" tmp
+  if [ -f "$enr" ]; then
+    tmp="$(mktemp)" || return 1
+    grep -vE "^$old"$'\t' "$enr" > "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$enr"
+  fi
+  local idx="$FLEET_ETC/authorized-keys.map" itmp
+  if [ -f "$idx" ]; then
+    itmp="$(mktemp)" || return 0
+    grep -vE "^$old"$'\t' "$idx" > "$itmp" 2>/dev/null || true
+    chmod 600 "$itmp" 2>/dev/null || true
+    mv -f "$itmp" "$idx"
+  fi
+  return 0
+}
+
+# rename_state_copied <old> <new>: 0 iff the <new>-name enrolled row already
+# exists (used to detect a resumed rename that already ran step 2).
+rename_state_copied() {
+  local new="$2" enr="$FLEET_STATE/enrolled.tsv"
+  [ -f "$enr" ] && grep -qE "^$new"$'\t' "$enr"
+}
+
+# How long to poll tailscale for the new HostName (seconds) and per-poll sleep.
+RENAME_POLL_SECS="${RENAME_POLL_SECS:-60}"
+RENAME_POLL_INTERVAL="${RENAME_POLL_INTERVAL:-5}"
+
+cmd_rename() {
+  local dry=0
+  local -a pos=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      -*) echo "fleetctl rename: unknown flag '$1'" >&2; return 2 ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  local old="${pos[0]:-}" new="${pos[1]:-}"
+  if [ -z "$old" ] || [ -z "$new" ]; then
+    echo "fleetctl rename: usage: rename [--dry-run] <old> <new>" >&2
+    return 2
+  fi
+
+  # (1) Validate: <new> canonical AND index-preserving (a rename never changes
+  # the index/port — changing the index is out of scope, D4).
+  case "$new" in
+    grok-box-[0-9][0-9][0-9]) : ;;
+    *) log "rename: refusing — <new> '$new' is not canonical grok-box-NNN"; return 2 ;;
+  esac
+  local oidx nidx
+  oidx="$(box_index_from_name "$old")" || { log "rename: refusing — <old> '$old' is not a grok-box name"; return 2; }
+  nidx="$(box_index_from_name "$new")" || { log "rename: refusing — <new> '$new' is not a grok-box name"; return 2; }
+  if [ "$oidx" != "$nidx" ]; then
+    log "rename: refusing — index change $old($oidx) -> $new($nidx) is out of scope (rename never changes the port)"
+    return 2
+  fi
+  if [ "$old" = "$new" ]; then
+    log "rename: $old is already canonical — nothing to do"
+    return 0
+  fi
+
+  # Must be enrolled.
+  if ! cmd_config_enrolled "$old"; then
+    log "rename: refusing — $old is not enrolled (not in enrolled.tsv)"
+    return 2
+  fi
+
+  # (F4) Dry-run: print the plan (7 artefacts old->new + the box command) and exit.
+  if [ "$dry" = 1 ]; then
+    log "rename: DRY-RUN plan $old -> $new (index $oidx, port unchanged)"
+    local o n
+    while IFS=$'\t' read -r o n; do
+      log "rename:   $o  ->  $n"
+    done < <(rename_plan_paths "$old" "$new")
+    log "rename:   on box: write '$new' to \$ROOT/hostname; sudo boxup once"
+    return 0
+  fi
+
+  # (F2/F7) Acquire the reconcile lock with a bounded wait; refuse at timeout so
+  # rename never runs concurrently with a reconcile tick's mint/dedup.
+  mkdir -p "$FLEET_STATE" 2>/dev/null || true
+  local lock="$FLEET_STATE/reconcile.lock"
+  if ! { exec 9>"$lock"; } 2>/dev/null; then
+    log "rename: cannot open lock $lock"; return 1
+  fi
+  if ! flock -w 90 9; then
+    log "rename: reconcile busy — could not acquire the reconcile lock within 90s; refusing"
+    return 1
+  fi
+
+  # (3) Precheck: tunnel up + box reachable + box boxup supports the padded form.
+  if ! tunnel_up "$old"; then
+    log "rename: ABORT — $old tunnel is DOWN (cannot drive the box)"; return 1
+  fi
+  local bver
+  bver="$(rename_box_boxup_version "$old")"
+  if [ -z "$bver" ]; then
+    log "rename: ABORT — could not read '$old' boxup version over the tunnel"; return 1
+  fi
+  if ! rename_ver_ge "$bver" "$RENAME_MIN_BOXUP_VERSION"; then
+    log "rename: ABORT — $old runs boxup $bver (< $RENAME_MIN_BOXUP_VERSION); update boxup first"
+    return 1
+  fi
+
+  local resumed=0
+  rename_state_copied "$old" "$new" && resumed=1
+  [ "$resumed" = 1 ] && log "rename: resuming — $new state already copied; continuing from the box step"
+
+  # (2/F3) COPY every name-keyed artefact under <new>. Both names now resolve.
+  if ! rename_copy_state "$old" "$new"; then
+    log "rename: ABORT — failed to copy brain state $old -> $new (both names still valid; re-run to resume)"
+    return 1
+  fi
+  log "rename: copied brain state $old -> $new (audit copies only; ~fleet/.ssh/authorized_keys untouched)"
+
+  # (3/F3) On the box: write <new> to $ROOT/hostname, then `sudo boxup once`.
+  if ! tunnel_ssh "$old" "printf '%s\n' '$new' | sudo tee '$BOX_ROOT/hostname' >/dev/null && sudo $BOX_ROOT/boxup once" >/dev/null 2>&1; then
+    log "rename: ABORT — failed to write new hostname / run boxup once on $old (both names still valid; re-run to resume)"
+    return 1
+  fi
+  log "rename: wrote '$new' to the box hostname and ran boxup once"
+
+  # (4/5/F3) Poll tailscale until HostName=<new>; if the DNS label still differs,
+  # POST /device/<id>/name (precedent reconcile_dedup) and re-poll.
+  local waited=0 devs hostname dnslabel liveid posted=0
+  while :; do
+    devices_json >/dev/null
+    if ! ts_ok; then
+      log "rename: ABORT — tailscale API read failed (HTTP $TS_API_CODE) while polling"; return 1
+    fi
+    devs="$(ts_api_body)"
+    if ! devices_json_valid "$devs"; then
+      log "rename: ABORT — tailscale API body malformed while polling"; return 1
+    fi
+    hostname="$(rename_dev_hostname "$devs" "$new")"
+    dnslabel="$(rename_dev_dnslabel "$devs" "$new")"
+    if [ "$hostname" = "$new" ] && [ "$dnslabel" = "$new" ]; then
+      break
+    fi
+    # HostName not yet <new>, OR the DNS label is pinned/split: if we can see the
+    # live node under the OLD name and have not yet posted, force the name.
+    if [ "$posted" = 0 ]; then
+      liveid="$(rename_dev_liveid "$devs" "$old")"
+      [ -z "$liveid" ] && liveid="$(rename_dev_liveid "$devs" "$new")"
+      if [ -n "$liveid" ]; then
+        ts_api POST "/device/$liveid/name" "$(jq -cn --arg n "$new" '{name:$n}')" >/dev/null
+        if ts_ok; then
+          log "rename: forced control-plane name for device $liveid -> $new"
+          posted=1
+        else
+          log "rename: ABORT — POST /device/$liveid/name failed (HTTP $TS_API_CODE)"; return 1
+        fi
+      fi
+    fi
+    waited=$((waited + RENAME_POLL_INTERVAL))
+    if [ "$waited" -ge "$RENAME_POLL_SECS" ]; then
+      log "rename: ABORT — timed out (${RENAME_POLL_SECS}s) waiting for HostName/DNS=$new (saw hostname='$hostname' dns='$dnslabel'; both names still valid, re-run to resume)"
+      return 1
+    fi
+    sleep "$RENAME_POLL_INTERVAL"
+  done
+
+  # (5/F3) Final verify: HostName=new AND DNS label=new AND tunnel up AND status OK.
+  if ! tunnel_up "$new"; then
+    log "rename: ABORT — $new tunnel not up after rename (both names still valid, re-run to resume)"; return 1
+  fi
+  log "rename: verified $new — HostName=$new DNS=$new tunnel up"
+
+  # (6/F3/F6) DELETE the OLD-name artefacts (audit copies + state rows). No
+  # authorized_keys regeneration (F6).
+  if ! rename_delete_old_state "$old" "$new"; then
+    log "rename: FAILED deleting old-name state for $old — leftover paths under $FLEET_STATE/$old.* and $FLEET_ETC_AK_DIR/$old.line"
+    return 1
+  fi
+  log "rename: deleted old-name state for $old"
+
+  # (7/F3) Reap any OTHER device still carrying the OLD name with a DIFFERENT
+  # node id (a split-brain corpse); never delete the renamed node's own id.
+  devices_json >/dev/null
+  if ts_ok; then
+    devs="$(ts_api_body)"
+    if devices_json_valid "$devs"; then
+      liveid="$(rename_dev_liveid "$devs" "$new")"
+      local corpse
+      corpse="$(rename_corpse_id "$devs" "$old" "$liveid")"
+      if [ -n "$corpse" ]; then
+        ts_api DELETE "/device/$corpse" >/dev/null
+        if ts_ok; then
+          log "rename: reaped stale corpse device $corpse (old name $old)"
+        else
+          log "rename: WARNING could not reap corpse $corpse (HTTP $TS_API_CODE) — rename itself succeeded"
+        fi
+      fi
+    fi
+  fi
+
+  log "rename: DONE $old -> $new (index $oidx, port unchanged)"
+  return 0
+}
+
 # --- dispatch ----------------------------------------------------------------
 cmd="${1:-help}"
 [ "$#" -gt 0 ] && shift
@@ -3295,6 +3651,7 @@ case "$cmd" in
   install-timer)         cmd_install_timer "$@" ;;
   remove-timer)          cmd_remove_timer "$@" ;;
   enroll)                cmd_enroll "$@" ;;
+  rename)                cmd_rename "$@" ;;
   reconcile)             cmd_reconcile "$@" ;;
   config)                cmd_config "$@" ;;
   mint-key)              cmd_mint_key "$@" ;;
