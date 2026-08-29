@@ -1851,16 +1851,29 @@ cur=\$(sha256sum "\$mf" 2>/dev/null | cut -d" " -f1); [ -n "\$cur" ] || cur=none
 support=no; enabled=n/a
 if grep -q ^MANAGED_FILE= "\$bx" 2>/dev/null; then
   support=yes
-  # boxup is #!/bin/bash and its TOML reader uses the bash-only \`read -r -d\`.
-  # Invoking it under \`sh\` (dash on the boxes) makes that read error out, so a
-  # naive \`|| echo true\` fallback ALWAYS reported enabled=true and the
-  # enabled=false escape hatch could never surface (BLOCKER-2, live canary r1).
-  # Invoke via \`bash\` explicitly; on a genuine probe failure report
-  # enabled=unknown (NEVER true) so a failed probe is never mistaken for
-  # "honoured". The brain treats unknown like false for the IGNORED/annotation
-  # and never-report-in-sync paths (D7/D8).
-  enabled=\$(bash "\$bx" config-get managed enabled 2>/dev/null) || enabled=unknown
-  [ -n "\$enabled" ] || enabled=unknown
+  # Probe the box's OWN reader for [managed] enabled (D5b). boxup is
+  # #!/bin/bash and its TOML reader uses the bash-only \`read -r -d\`; invoking
+  # it under \`sh\` (dash on the boxes) makes that read error out, so we invoke
+  # via \`bash\` explicitly (BLOCKER-2, live canary r1).
+  #
+  # Exit-code contract, matched to boxup's REAL codes (boxup:260 awk
+  # \`END{exit(found?0:1)}\`, config-get subcommand :2382-2394; blueprint r5.1
+  # S2): exit 0 => key PRESENT => use the printed value (true/false; anything
+  # else => unknown); exit 1 => key ABSENT => enabled=true, the D1 hoisted-gate
+  # default (boxup:289 \`config_get_file … || echo true\` — the box honours
+  # managed.toml when [managed] is absent, which is EVERY box: the template
+  # ships [managed] commented). Any OTHER exit, EMPTY output on exit 0, or a
+  # bash launch failure => enabled=unknown (never a false "true"). This is the
+  # live grok-box-1 fix: absent [managed] => exit 1 => enabled=true, so
+  # \`config diff\` can finally report in-sync instead of "probe failed".
+  enabled=\$(bash "\$bx" config-get managed enabled 2>/dev/null) && prc=0 || prc=\$?
+  if [ "\$prc" = 0 ]; then
+    case "\$enabled" in true|false) : ;; *) enabled=unknown ;; esac
+  elif [ "\$prc" = 1 ]; then
+    enabled=true
+  else
+    enabled=unknown
+  fi
 fi
 if [ "\$dry" = 1 ]; then
   rm -f "\$tmp"
@@ -1942,9 +1955,10 @@ push_managed() {
   # enabled read ONLY when support=yes, via the box's OWN reader (boxup config-get
   # managed enabled) invoked under BASH (boxup is #!/bin/bash and uses the
   # bash-only `read -r -d`; running it under dash `sh` errored and the old
-  # fallback wrongly reported enabled=true — BLOCKER-2). A genuine probe failure
-  # reports enabled=unknown (never true), which the brain treats like false for
-  # annotation and never-report-in-sync.
+  # fallback wrongly reported enabled=true — BLOCKER-2). Exit-code contract
+  # (D5b/r5.1 S2): exit 0 => printed value (true/false, else unknown); exit 1 =>
+  # true (absent [managed] = the D1 default, the live grok-box-1 case); any
+  # other exit / empty / launch failure => unknown (never a false "true").
   local remote
   remote="$(managed_remote_script "$want_sha" "$dry")"
   local out rc
