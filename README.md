@@ -15,6 +15,28 @@ sudo bash /tmp/grok-box-setup/install.sh
 sudo /workspace/box-setup/boxup once
 ```
 
+Before the first `boxup once`, create the Tailscale auth key as **reusable +
+pre-authorized + tagged `tag:grok-box`** (admin console → Settings → Keys →
+Generate: check *Reusable*, *Pre-approved*, and add the tag `tag:grok-box`),
+and put it in `secrets/ts-authkey` (mode 600). Tagging the node **at
+authentication time is the only path that disables node-key expiry
+automatically** — tagging later in the console does not. This is why the key
+must carry the tag. (`[tailscale] tags` defaults to `tag:grok-box`, so the node
+advertises it at first login with no extra config.)
+
+After `boxup once`, confirm identity is correct:
+
+```bash
+sudo /workspace/box-setup/boxup check   # expect tags=tag:grok-box keyexpiry=disabled
+```
+
+If either is wrong (`tags-missing` or `key-expiry-enabled` in the check
+reason), re-authenticate with the tag:
+
+```bash
+sudo /workspace/box-setup/boxup retag
+```
+
 If the box has never joined the tailnet, `boxup status` prints an `auth=` URL —
 open it, approve the node, run `boxup once` again. With a reusable auth key in
 `secrets/ts-authkey` the join is unattended. Full operator procedure:
@@ -29,6 +51,7 @@ boxup up        converge + start the selfheal worker   (default)
 boxup tick      one health tick
 boxup status    one-line health string
 boxup check     health gate: exit 0 healthy / 1 unhealthy (never 2)
+boxup retag     re-auth WITH config tags to disable node-key expiry (#10)
 boxup stop      stop the selfheal worker (tailscaled stays up)
 boxup update    fresh clone from GitHub + reinstall (never git pull)
 ```
@@ -51,9 +74,12 @@ Design, environment facts, and the reasoning behind every special case:
 
 `/workspace/box-setup/config.toml` (seeded once, never overwritten):
 SSH password (`[ssh] password`, default `12345678`), pinned tailscale version
-(`[tailscale] version`), first-login tags (`[tailscale] tags`, e.g.
-`tag:grok-box` — added to `tailscale up` at first registration only, never on
-re-auth; see AGENT.md §F before enabling), update repo (`[update] repo`). See
+(`[tailscale] version`), first-login tags (`[tailscale] tags`, **default
+`tag:grok-box`** — advertised on `tailscale up` at first registration only,
+never on re-auth; disables node-key expiry automatically because tagging at
+auth time is the only path that does; set `tags = ""` to register untagged on
+purpose; see AGENT.md §G and use `boxup retag` to fix an already-registered
+node), update repo (`[update] repo`). See
 [etc/config.example.toml](etc/config.example.toml).
 
 ## Fleet operations (laptop)

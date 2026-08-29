@@ -34,18 +34,27 @@
 # built-in default is only used when bin/ is empty).
 #version = "1.102.3"
 #
-# Tags advertised at FIRST login only (empty statedir). When set, boxup adds
-# --advertise-tags=<value> to the initial `tailscale up`. It is NEVER added on
-# the ~180-day key-expiry re-auth (--force-reauth) path, and never appears in
-# `tailscale set`. Retagging an already-registered node is a MANUAL operator
-# step — see docs/AGENT.md §F.
+# Tags advertised at FIRST login only (empty statedir — which INCLUDES a
+# state-loss REJOIN after an image swap, not just a brand-new box). When set,
+# boxup adds --advertise-tags=<value> to the initial `tailscale up`. Tagging AT
+# AUTHENTICATION TIME is the ONLY path that disables node-key expiry
+# automatically (Tailscale key-expiry docs); tagging later in the console does
+# NOT. It is NEVER added on the ~180-day key-expiry re-auth (--force-reauth)
+# path, and never appears in `tailscale set`. Retagging an already-registered
+# node is `boxup retag` (see docs/AGENT.md §G).
+#
+# DEFAULT is `tag:grok-box`: a MISSING key resolves to `tag:grok-box` in the
+# code, so a box registers TAGGED + expiry-disabled by default (this line is
+# uncommented for exactly that reason). To register UNTAGGED on purpose, set it
+# to the EMPTY string explicitly — `tags = ""` — which boxup treats as a
+# deliberate opt-out and logs once at first login.
 #
 # ORDERING (do not skip): the tailnet ACL tagOwners/autoApprovers for this tag
 # MUST exist BEFORE you seed this key into any box's config.toml — the
 # empty-statedir branch is also the state-lost recovery path, and a box
 # rebuilding its identity with an unauthorized tag cannot rejoin at all. If the
 # seeded auth key itself carries tags, they must match this value.
-#tags = "tag:grok-box"
+tags = "tag:grok-box"
 
 [update]
 # Repo cloned by `boxup update`. Always a fresh clone to a temp dir + this

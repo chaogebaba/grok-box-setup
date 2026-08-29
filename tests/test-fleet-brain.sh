@@ -2950,6 +2950,56 @@ rm -rf "$CFG_FIXROOT"
 
 rm -f "$seedA" "$seedB" "$seedC"
 
+# =============================================================================
+# #10 D6 — reconcile_identity_pass (LOG-ONLY, F3). Fixture device list => the
+# per-device identity: lines + the `identity: ok=N flagged=M` summary. Asserts
+# NO notify/counter/threshold (F3), correct grok-box-* filtering, and the -1
+# split-brain corpse folding WITHOUT mauling grok-box-1.
+# =============================================================================
+identitypass_test() {
+  local devs="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" reconcile_identity_pass)"
+log(){ printf 'LOG:%s\n' "\$*"; }
+notify(){ printf 'NOTIFY:%s\n' "\$*"; }
+reconcile_identity_pass '$devs'
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+IDENT_DEVS='{"devices":[
+ {"hostname":"grok-box-1","tags":["tag:grok-box"],"keyExpiryDisabled":true},
+ {"hostname":"grok-box-9","keyExpiryDisabled":false,"expires":"2027-02-25T12:55:08Z"},
+ {"name":"grok-box-10","tags":["tag:grok-box"],"keyExpiryDisabled":false,"expires":"2027-02-25T13:47:46Z"},
+ {"hostname":"grok-box-3-1","tags":["tag:grok-box"],"keyExpiryDisabled":true},
+ {"hostname":"some-laptop","tags":[],"keyExpiryDisabled":false}
+]}'
+ident_out="$(identitypass_test "$IDENT_DEVS")"
+case "$ident_out" in
+  *"LOG:identity: grok-box-9 untagged"*) pass "#10 D6 identity: untagged grok-box-9 logged" ;;
+  *) bad "#10 D6 identity untagged line missing: [$ident_out]" ;;
+esac
+case "$ident_out" in
+  *"LOG:identity: grok-box-10 key-expiry-enabled expires=2027-02-25T13:47:46Z"*) pass "#10 D6 identity: key-expiry-enabled grok-box-10 logged with expires" ;;
+  *) bad "#10 D6 identity key-expiry-enabled line missing: [$ident_out]" ;;
+esac
+# ok=2 (grok-box-1 + grok-box-3 corpse-folded), flagged=2 (9 untagged, 10 expiry).
+case "$ident_out" in
+  *"LOG:identity: ok=2 flagged=2"*) pass "#10 D6 identity summary: ok=2 flagged=2 (grok-box-3-1 folded to grok-box-3; grok-box-1 NOT mauled; laptop ignored)" ;;
+  *) bad "#10 D6 identity summary wrong: [$ident_out]" ;;
+esac
+# F3: LOG-ONLY — no notify at all.
+case "$ident_out" in
+  *NOTIFY:*) bad "#10 D6/F3 identity pass emitted a NOTIFY (must be log-only this round): [$ident_out]" ;;
+  *) pass "#10 D6/F3 identity pass is LOG-ONLY (no notify/counter/threshold)" ;;
+esac
+# Empty device list (READ-ONLY run) => silent no-op (no lines at all).
+[ -z "$(identitypass_test '')" ] \
+  && pass "#10 D6 identity pass: empty device list (read-only run) => silent no-op" \
+  || bad  "#10 D6 identity pass not silent on empty list: [$(identitypass_test '')]"
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi
 exit "$fail"

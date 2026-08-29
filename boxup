@@ -10,6 +10,7 @@
 #   boxup tick      one health tick (sysctl / nft / refresh / procs)
 #   boxup status    one-line health string
 #   boxup check     health gate: exit 0 healthy / 1 unhealthy (never 2)
+#   boxup retag     re-auth WITH config tags to disable node-key expiry (#10)
 #   boxup stop      stop the selfheal worker (tailscaled stays up)
 #   boxup update    fresh clone from GitHub + reinstall (never git pull)
 #   boxup worker    internal: the selfheal loop
@@ -122,6 +123,12 @@ CONVERGE_LOCK="$RUN_DIR/converge.v2.lock"
 DEFAULT_SSH_PASSWORD="12345678"
 DEFAULT_TS_VERSION="1.102.3"
 DEFAULT_REPO_URL="https://github.com/chaogebaba/grok-box-setup.git"
+# D1 (#10): the code default for the FIRST-LOGIN advertise-tags. A config
+# [tailscale] tags key that is ABSENT resolves to this value, so a box
+# registers TAGGED + node-key-expiry-disabled by default. A key that is PRESENT
+# but empty (`tags = ""`) is a deliberate untagged opt-out and is honoured as-is
+# — present-empty is distinct from absent. See resolved_config_tags().
+DEFAULT_TS_TAGS="tag:grok-box"
 
 INTERVAL="${BOXUP_INTERVAL:-${SELFHEAL_INTERVAL:-15}}"
 FREEZE_SECS="${BOXUP_FREEZE_SECS:-${SELFHEAL_FREEZE_SECS:-60}}"
@@ -447,12 +454,12 @@ read_box_name() {
 
 # --- status parsing ----------------------------------------------------------
 # One parser for everything. Prints newline-separated key=value pairs:
-#   backend= online= exitn= mapfail= fwdhealth= routes= auth=
+#   backend= online= exitn= mapfail= fwdhealth= routes= auth= tags= keyexpiry=
 ts_fields() {
   ts status --json 2>/dev/null | python3 -c '
 import json, sys
 out = {"backend": "", "online": "no", "exitn": "no", "mapfail": "no",
-       "fwdhealth": "no", "routes": "", "auth": ""}
+       "fwdhealth": "no", "routes": "", "auth": "", "tags": "", "keyexpiry": ""}
 try:
     d = json.load(sys.stdin)
     s = d.get("Self") or {}
@@ -467,6 +474,12 @@ try:
                                or "out of sync" in h) else "no"
     out["fwdhealth"] = "yes" if "forward" in h else "no"
     out["auth"] = (d.get("AuthURL") or "").replace("\n", " ").strip()
+    # #10 (D3/F2): tags the device CURRENTLY carries (Self.Tags), comma-joined.
+    out["tags"] = ",".join(str(x) for x in (s.get("Tags") or []))
+    # #10 (D3/F1): node-key expiry. A node with expiry DISABLED omits KeyExpiry
+    # entirely; an enabled node carries an RFC3339 timestamp. Emit the RAW
+    # string (empty when the field is absent ⇒ expiry disabled).
+    out["keyexpiry"] = str(s.get("KeyExpiry") or "").strip()
 except Exception:
     pass
 for k, v in out.items():
@@ -476,6 +489,7 @@ for k, v in out.items():
 
 read_ts_fields() {
   backend=""; online="no"; exitn="no"; mapfail="no"; fwdhealth="no"; auth=""
+  ts_tags=""; ts_keyexpiry=""
   while IFS= read -r line; do
     case "$line" in
       backend=*)   backend="${line#backend=}" ;;
@@ -484,6 +498,8 @@ read_ts_fields() {
       mapfail=*)   mapfail="${line#mapfail=}" ;;
       fwdhealth=*) fwdhealth="${line#fwdhealth=}" ;;
       auth=*)      auth="${line#auth=}" ;;
+      tags=*)      ts_tags="${line#tags=}" ;;
+      keyexpiry=*) ts_keyexpiry="${line#keyexpiry=}" ;;
     esac
   done <<EOF
 $(ts_fields)
@@ -551,6 +567,61 @@ except Exception:
 ' 2>/dev/null || true)"
   fi
   echo "$tags"
+}
+
+# D1/D2 (#10): resolve the FIRST-LOGIN advertise-tags from config, applying the
+# code default. This is the ONLY tag source for the first-login `up` (F5: it is
+# also passed to run_reauth_up by `boxup retag`; NEVER read on the unattended
+# --force-reauth path — that MENTIONS live tags via current_advertise_tags).
+# Semantics, matching config_get's found/not-found exit code:
+#   * key ABSENT (config_get exit 1)     -> DEFAULT_TS_TAGS ("tag:grok-box")
+#   * key PRESENT, non-empty (exit 0)    -> that value verbatim
+#   * key PRESENT, empty "" (exit 0)     -> empty (deliberate untagged opt-out)
+# Prints the resolved tag string (may be empty). Never fails.
+resolved_config_tags() {
+  local tags
+  if tags="$(config_get tailscale tags)"; then
+    # Present (possibly empty): honour it verbatim — empty is an explicit opt-out.
+    printf '%s' "$tags"
+  else
+    # Absent: the code default applies.
+    printf '%s' "$DEFAULT_TS_TAGS"
+  fi
+}
+
+# D3 (#10): the node-identity predicate, shared by `check` and `boxup retag`.
+# Reads NOTHING itself (F2: no second `tailscale status --json`) — the CALLER
+# must have run read_ts_fields first, so ts_tags / ts_keyexpiry are populated
+# from the SAME single parser pass check_reason already runs. Prints the first
+# failing check_reason-style `kebab:detail` token (empty ⇒ identity OK):
+#   tags-missing:<want>          any wanted tag is not in the device's Self.Tags
+#                                (want empty ⇒ predicate SKIPPED: untagged-by-
+#                                choice is not a failure).
+#   key-expiry-enabled:<date>    node-key expiry is ENABLED (Self.KeyExpiry
+#                                PRESENT, F1) AND the node is supposed to be
+#                                tagged (want non-empty). An untagged-by-choice
+#                                box is NOT flagged for expiry (expected TS
+#                                behaviour, the operator's call).
+# $1 = wanted tags, comma-separated (the resolved_config_tags value).
+verify_node_identity() {
+  local want="$1" reason="" t have=",${ts_tags:-},"
+  # tags-missing: every wanted tag must appear in the device's current tags.
+  if [ -n "$want" ]; then
+    local IFS=,
+    for t in $want; do
+      [ -n "$t" ] || continue
+      case "$have" in
+        *",$t,"*) ;;
+        *) reason="tags-missing:$want"; break ;;
+      esac
+    done
+  fi
+  # key-expiry-enabled: only meaningful when the node is supposed to be tagged.
+  if [ -z "$reason" ] && [ -n "$want" ] && [ -n "${ts_keyexpiry:-}" ]; then
+    # Trim the RFC3339 timestamp to the YYYY-MM-DD date for the token.
+    reason="key-expiry-enabled:${ts_keyexpiry%%T*}"
+  fi
+  printf '%s' "$reason"
 }
 
 wait_for_socket() {
@@ -1177,8 +1248,14 @@ run_reauth_up() {
   b="$(tailscale_bin)"
   [ -x "$b" ] || return 0
   local -a up
+  # F9 (#10 r1.2): --accept-risk=lose-ssh — management of these boxes is BY
+  # DESIGN over ssh-on-tailnet, so tailscale's lose-ssh guard would otherwise
+  # refuse `up --force-reauth` ("this action may result in your SSH session
+  # disconnecting"). The flag is a no-op when no tailscale-carried session
+  # exists (the unattended worker path), so it is safe everywhere.
   up=("$b" up --ssh=false --advertise-exit-node --accept-dns
-      --snat-subnet-routes=true --timeout=25s --force-reauth)
+      --snat-subnet-routes=true --timeout=25s --force-reauth
+      --accept-risk=lose-ssh)
   id box >/dev/null 2>&1 && up+=(--operator=box)
 
   # H6 (#9): resolve the current hostname from THREE sources in order —
@@ -1202,7 +1279,17 @@ except Exception:
   fi
   up+=(--hostname="$hostname")
 
-  tags="$(current_advertise_tags)"
+  # Tag resolution. F5 (#10): `boxup retag` sets REAUTH_TAGS_OVERRIDE to the
+  # config-resolved tags so it can INTRODUCE the tag at re-auth (an operator
+  # action) WITHOUT hand-rolling a second `up` array (the #9 hazard). When the
+  # override is UNSET (the normal unattended re-auth path), tags come from the
+  # device's LIVE prefs via current_advertise_tags — MENTIONING, never
+  # INTRODUCING. An override set to the empty string means "no tags".
+  if [ "${REAUTH_TAGS_OVERRIDE+set}" = set ]; then
+    tags="$REAUTH_TAGS_OVERRIDE"
+  else
+    tags="$(current_advertise_tags)"
+  fi
   if [ -n "$tags" ]; then
     up+=(--advertise-tags="$tags")
     log "login: $reason — mentioning current prefs hostname=$hostname tags=$tags (--force-reauth)"
@@ -1265,16 +1352,32 @@ ensure_login() {
     fi
   else
     # First login (empty statedir). This is the ONLY place --advertise-tags is
-    # added from config: config [tailscale] tags, when non-empty, tags the node
-    # at initial registration. Default unset => flag omitted => byte-identical
-    # to before. Left intentionally UNCHANGED by #9 (first-login branch only).
+    # added from config: config [tailscale] tags tags the node at initial
+    # registration. D1 (#10): the value is now RESOLVED via resolved_config_tags
+    # — an ABSENT key defaults to tag:grok-box (register tagged + expiry-disabled
+    # by default), a PRESENT-empty key ("tags = "") is a deliberate untagged
+    # opt-out. D2: when the resolved tags are empty AND the key was explicitly
+    # present-empty, log ONE line so an intentionally-untagged box is visible.
+    # F4: this branch is ALSO the state-loss REJOIN path, so a rebuilt box comes
+    # back tagged + expiry-disabled by default too. No interactive prompt (boxes
+    # are unattended).
     local -a up
+    # F9 (#10 r1.2): --accept-risk=lose-ssh here too — a state-loss rejoin (F4)
+    # is driven by an operator over ssh-on-tailnet just like retag; the flag is
+    # a harmless no-op on the unattended first-join path.
     up=("$b" up --ssh=false --advertise-exit-node --accept-dns
-        --snat-subnet-routes=true --timeout=25s)
+        --snat-subnet-routes=true --timeout=25s
+        --accept-risk=lose-ssh)
     id box >/dev/null 2>&1 && up+=(--operator=box)
     local tags out
-    tags="$(config_get tailscale tags || true)"
-    [ -n "$tags" ] && up+=(--advertise-tags="$tags")
+    tags="$(resolved_config_tags)"
+    if [ -n "$tags" ]; then
+      up+=(--advertise-tags="$tags")
+    else
+      # Resolved empty ⇒ the key is present-and-empty (absent would have
+      # defaulted). D2: register untagged by explicit config, logged once.
+      log "login: registering UNTAGGED by explicit config (tags = \"\")"
+    fi
     # P1-1: do NOT swallow the first-login `up` rc with `|| true`. Capture the
     # combined output, log it, and surface a non-zero rc so a failing first
     # login is visible (a `check` FAIL + a degraded converge), not silent.
@@ -2026,6 +2129,11 @@ print_status() {
   printf 'backend=%s online=%s exit-node=%s sshd=%s ipfwd=4:%s,6:%s tailscaled=%s selfheal=%s worker=%s hb=%s name=%s v=%s' \
     "${backend:-unknown}" "${online:-no}" "${exitn:-no}" "$sshd" "$v4" "$v6" \
     "${ts_pid:--}" "${sh_pid:--}" "${sh_pid:--}" "$hb" "${name:--}" "$vstr"
+  # D3 (#10): node identity, ALWAYS shown (not only on failure). tags = the
+  # device's current Self.Tags (or `none`); keyexpiry = `disabled` when the
+  # KeyExpiry field is absent (F1), else the RFC3339 timestamp.
+  printf ' tags=%s keyexpiry=%s' \
+    "${ts_tags:-none}" "$([ -n "${ts_keyexpiry:-}" ] && printf '%s' "$ts_keyexpiry" || printf 'disabled')"
   # refresh backoff visibility (D4): surface a persistently failing refresh only
   # at N>=3 consecutive failures, so a healthy box's status line is unchanged.
   local rf
@@ -2115,6 +2223,17 @@ check_reason() {
       grok-box-[0-9]*) ;;
       *) has_peers && reason="name: unnamed" ;;
     esac
+  fi
+  # D3 (#10): node identity — tags present + node-key expiry disabled. Placed
+  # after name (identity before services) and before sshd. Uses the ts_tags /
+  # ts_keyexpiry already populated by the read_ts_fields above (F2: no second
+  # status call). `want` is the config-resolved first-login tags (absent key ⇒
+  # tag:grok-box default; present-empty ⇒ untagged-by-choice, both predicates
+  # skip). WARN-class in status but FAIL in check (the brain keys on check).
+  if [ -z "$reason" ]; then
+    local _idreason
+    _idreason="$(verify_node_identity "$(resolved_config_tags)")"
+    [ -n "$_idreason" ] && reason="$_idreason"
   fi
   if [ -z "$reason" ] && ! pgrep -x sshd >/dev/null 2>&1; then
     reason="sshd=down (want up)"
@@ -2304,6 +2423,94 @@ do_update() {
   fi
 }
 
+# D4 (#10): true (0) iff at least one tailscaled is running bound to our
+# statedir. Factored out of cmd_retag so it is stubbable in tests and mirrors
+# the check_reason tailscaled-count predicate (same NUL-split cmdline match).
+tailscaled_on_statedir() {
+  local pid cmd
+  for pid in $(pgrep -x tailscaled 2>/dev/null || true); do
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    echo "$cmd" | grep -q -- "$STATE_DIR" && return 0
+  done
+  return 1
+}
+
+# D4 (#10): `boxup retag` — operator remediation for a box that registered
+# untagged and/or with node-key expiry enabled (issue #10). Idempotent: it
+# re-authenticates the node WITH the resolved config tags so Tailscale disables
+# key expiry (tagging AT AUTH TIME is the only path that does — key-expiry
+# docs). NOT automatic: converge/tick NEVER retag (a key that cannot mint the
+# tag would loop-fail every hour — the #9 re-auth-churn hazard); converge only
+# REPORTS via the D3 check predicate.
+#
+# F5: reuses run_reauth_up (the SAME flag builder ensure_login's re-auth uses)
+# with REAUTH_TAGS_OVERRIDE, rather than hand-rolling a second `up` array (the
+# #9 bug). F6: exit codes — no seeded auth key -> 3, resolved tags empty -> 4,
+# tailscaled not running -> 5, post-verify still failing -> 6, success -> 0.
+# It never uses exit 2 (that is the unknown-subcommand / "old boxup" signal).
+# On a failed `up` tailscale refuses BEFORE changing prefs, so the node is left
+# as it was (no rollback code needed); the exit-6 path DID change prefs (the up
+# succeeded) but verify still failed — that is surfaced, not described as
+# "untouched".
+cmd_retag() {
+  local b tags before_tags before_kx after_reason rc
+  b="$(tailscale_bin)"
+
+  # Precondition: a seeded auth key. retag re-auths with --auth-key=file:<key>;
+  # without it we cannot complete unattended (F6: exit 3).
+  if [ ! -s "$AUTHKEY_FILE" ]; then
+    log "retag: ERROR no seeded auth key at $AUTHKEY_FILE — retag needs a tag-capable reusable key (see docs/AGENT.md §A/§G)" >&2
+    return 3
+  fi
+
+  # Precondition: resolvable, non-empty tags (F6: exit 4). retag introduces the
+  # tag, so an empty resolution (tags = "") is a no-op we refuse loudly.
+  tags="$(resolved_config_tags)"
+  if [ -z "$tags" ]; then
+    log "retag: ERROR resolved tags are empty ([tailscale] tags = \"\") — nothing to retag with; set a tag first" >&2
+    return 4
+  fi
+
+  # Precondition: tailscaled running on our statedir (F6: exit 5). A retag with
+  # no daemon just churns; refuse honestly.
+  if ! tailscaled_on_statedir; then
+    log "retag: ERROR tailscaled is not running on $STATE_DIR — start it (boxup once) then retry" >&2
+    return 5
+  fi
+
+  # Before snapshot (single parser pass; also feeds verify below implicitly
+  # after the up refreshes it).
+  read_ts_fields
+  before_tags="${ts_tags:-none}"
+  before_kx="$([ -n "${ts_keyexpiry:-}" ] && printf '%s' "$ts_keyexpiry" || printf 'disabled')"
+  log "retag: before tags=$before_tags keyexpiry=$before_kx — re-authenticating with tags=$tags"
+
+  # F5: reuse run_reauth_up with the tag override so the resolved config tags
+  # are INTRODUCED at re-auth (an operator action). This is the one place tags
+  # are legitimately introduced on a --force-reauth `up`.
+  REAUTH_TAGS_OVERRIDE="$tags" run_reauth_up "retag (operator)" \
+    --auth-key="file:$AUTHKEY_FILE"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "retag: tailscale up --force-reauth FAILED rc=$rc — node prefs unchanged (tailscale refuses before applying); see the error above" >&2
+    return 6
+  fi
+
+  # Post-verify (F1/F2): re-read the single parser, then run the shared
+  # identity predicate. exit 0 only if BOTH tags present AND expiry disabled.
+  read_ts_fields
+  after_reason="$(verify_node_identity "$tags")"
+  local after_tags after_kx
+  after_tags="${ts_tags:-none}"
+  after_kx="$([ -n "${ts_keyexpiry:-}" ] && printf '%s' "$ts_keyexpiry" || printf 'disabled')"
+  log "retag: after tags=$after_tags keyexpiry=$after_kx"
+  if [ -n "$after_reason" ]; then
+    log "retag: post-verify STILL FAILING: $after_reason — the seeded key is likely not tag-capable (mint a tagged, pre-authorized, reusable key; see docs/AGENT.md §D5/§G)" >&2
+    return 6
+  fi
+  log "retag: OK tags=$after_tags keyexpiry=$after_kx"
+  return 0
+}
+
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
     if have sudo; then
@@ -2319,7 +2526,7 @@ require_root() {
   fi
 }
 
-usage() { sed -n '4,15p' "$0"; }
+usage() { sed -n '4,16p' "$0"; }
 
 cmd="${1:-up}"
 case "$cmd" in
@@ -2392,6 +2599,13 @@ case "$cmd" in
       exit 0
     fi
     exit 1
+    ;;
+  retag|--retag)
+    # D4 (#10): operator remediation — re-auth WITH the resolved config tags so
+    # Tailscale disables node-key expiry. Exit codes (F6): 3 no key, 4 tags
+    # empty, 5 tailscaled down, 6 post-verify still failing, 0 success. NEVER 2.
+    require_root retag
+    cmd_retag; exit $?
     ;;
   -h|--help|help)
     usage
