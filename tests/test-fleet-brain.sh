@@ -81,6 +81,7 @@ portfor_test() {
 set -u
 FLEETCTL="$FLEETCTL"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" box_index_from_name)"
 eval "\$(extract_from "\$FLEETCTL" port_for)"
 port_for "$n"
 INNER
@@ -146,7 +147,7 @@ TOKF="\$(mktemp)"; printf 'tskey-fake-token\n' > "\$TOKF"
 export FLEET_API_TOKEN_FILE="\$TOKF"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in have api_token_file api_token ts_api ts_api_body ts_ok acl_has_fleet_brain_tagowner; do
+for fn in box_index_from_name box_name_from_index have api_token_file api_token ts_api ts_api_body ts_ok acl_has_fleet_brain_tagowner; do
   eval "\$(extract_from "\$FLEETCTL" "\$fn")"
 done
 # FAKE curl: parse args to find --config <cfg> and -o <out>. If the config file
@@ -349,7 +350,7 @@ BOX_ROOT="/nonexistent"
 log(){ echo "LOG:\$*"; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in box_index reconcile_decide reconcile_one reconcile_bump_checkfail reconcile_reset_checkfail days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index box_index reconcile_decide reconcile_one reconcile_bump_checkfail reconcile_reset_checkfail days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Tunnel up (would trigger mint on an offline box) but this is a READ-ONLY run.
 tunnel_up(){ return 0; }
 tunnel_ssh(){ return 1; }   # boxup check fails, but suppressed
@@ -407,7 +408,7 @@ TS_TAILNET="-"
 TS_API_CODE=0
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_dedup dev_field ts_ok devices_json_valid; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_dedup dev_field ts_ok devices_json_valid; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 FLEET_STALE_SECS=600
 seq="\$(mktemp)"; BODYF="\$(mktemp)"
 DEVS='{"devices":[{"hostname":"grok-box-8","nodeId":"LIVE","online":true,"lastSeen":"2999-01-01T00:00:00Z"},{"hostname":"grok-box-8-1","nodeId":"STALE","online":false,"lastSeen":"2000-01-01T00:00:00Z"}]}'
@@ -444,7 +445,7 @@ TS_API_CODE=0
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_rotate ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_rotate ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 seq="\$(mktemp)"
 # key_meta_id: the recorded OLD id (empty => none recorded).
 key_meta_id(){ [ -n "$old_id" ] && printf '%s' "$old_id"; }
@@ -513,7 +514,7 @@ FLEET_KEYS_DIR="\$FLEET_STATE/keys"
 FLEET_KEY_EXPIRY_SECS=7776000
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_mint_key record_key_meta key_meta_file key_meta_id box_index mint_payload mint_create ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_mint_key record_key_meta key_meta_file key_meta_id box_index mint_payload mint_create ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 BODYF="\$(mktemp)"
 echo '{"key":"tskey-abc","id":"kNEW999","expires":"2099-03-01T00:00:00Z"}' > "\$BODYF"
 ts_api(){ TS_API_CODE=200; return 0; }
@@ -556,7 +557,7 @@ FLEET_BOXES="grok-box-3 grok-box-5 grok-box-8"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }           # no canary_box configured => default 8
 reconcile_stage_rollout_tree(){ FLEET_ROLLOUT_TREE_STAGED=0; return 0; }  # a tree is staged
 reconcile_cleanup_rollout_tree(){ :; }
@@ -612,7 +613,7 @@ FLEET_BOXES="grok-box-3 grok-box-8"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 reconcile_stage_rollout_tree(){ FLEET_ROLLOUT_TREE_STAGED=0; return 0; }
 reconcile_cleanup_rollout_tree(){ :; }
@@ -675,7 +676,7 @@ FLEET_ROLLOUT_TREE="\$(mktemp --suffix=.tar)"; printf 'ARTIFACT' > "\$FLEET_ROLL
 BOX_ROOT="/workspace/box-setup"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 cap="\$(mktemp)"; scpcap="\$(mktemp)"
 # ssh stub: append the full argv of each invocation (one line per call). The
 # 'boxup check' verify + the extract/install/once step both come through here.
@@ -711,7 +712,7 @@ tunnelstate_test() {
 set -u
 BOXUP="$BOXUP"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in fleet_configured tunnel_state; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index fleet_configured tunnel_state; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
 if [ "$configured" = yes ]; then config_get(){ [ "\$1 \$2" = "fleet vps" ] && echo "1.2.3.4"; }; else config_get(){ return 1; }; fi
 if [ "$alive" = yes ]; then tunnel_pid(){ echo 4242; return 0; }; else tunnel_pid(){ return 1; }; fi
 tunnel_state
@@ -734,7 +735,7 @@ log(){ :; }; have(){ command -v "\$1" >/dev/null 2>&1; }
 config_get(){ return 1; }         # nothing configured
 spawn_detached(){ echo SPAWNED >> "\$marker"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in fleet_configured fleet_port supervise_tunnel tunnel_pid tunnel_backoff_window tunnel_fail_count ensure_tunnel_key; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index fleet_configured fleet_port supervise_tunnel tunnel_pid tunnel_backoff_window tunnel_fail_count ensure_tunnel_key; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
 supervise_tunnel
 grep -q SPAWNED "\$marker" && echo SPAWNED || echo NOOP
 rm -f "\$marker"
@@ -763,7 +764,7 @@ tunnel_pid(){ return 1; }            # no live tunnel
 pgrep(){ return 1; }                 # cannot attribute a pid (fine)
 spawn_detached(){ shift; printf '%s\n' "\$@" > "\$capture"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in fleet_configured fleet_port supervise_tunnel tunnel_backoff_window tunnel_fail_count; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index fleet_configured fleet_port supervise_tunnel tunnel_backoff_window tunnel_fail_count; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
 supervise_tunnel
 tr '\n' ' ' < "\$capture"
 rm -rf "\$RUN_DIR" "\$SECRETS_DIR" "\$capture"
@@ -790,7 +791,7 @@ config_get(){ case "\$1 \$2" in "fleet vps") echo "9.9.9.9";; "fleet box_index")
 tunnel_pid(){ echo 4242; return 0; }      # a live tunnel already
 spawn_detached(){ echo SPAWNED >> "\$marker"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in fleet_configured fleet_port supervise_tunnel tunnel_backoff_window tunnel_fail_count ensure_tunnel_key; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index fleet_configured fleet_port supervise_tunnel tunnel_backoff_window tunnel_fail_count ensure_tunnel_key; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
 supervise_tunnel
 grep -q SPAWNED "\$marker" && echo SPAWNED || echo NOSPAWN
 rm -rf "\$RUN_DIR" "\$marker"
@@ -900,7 +901,7 @@ MARK="\$(mktemp)"; : > "\$MARK"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_reconcile reconcile_one reconcile_decide reconcile_target_boxes box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent reconcile_alert_asleep reconcile_alert_incoherent mint_window_valid days_until reconcile_record_api_failure reconcile_reset_api_failure reconcile_backoff_active devices_json_valid key_meta_id key_meta_file ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_reconcile reconcile_one reconcile_decide reconcile_target_boxes box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent reconcile_alert_asleep reconcile_alert_incoherent mint_window_valid days_until reconcile_record_api_failure reconcile_reset_api_failure reconcile_backoff_active devices_json_valid key_meta_id key_meta_file ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # API returns a healthy list where box-8 is OFFLINE (mint-worthy with tunnel up).
 BODYF="\$(mktemp)"
 devices_json(){ TS_API_CODE=200; printf '%s' '{"devices":[]}' > "\$BODYF"; }
@@ -933,7 +934,7 @@ RECONCILE_READONLY=1
 MARK="\$(mktemp)"; : > "\$MARK"
 log(){ :; }; notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_one reconcile_decide box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_one reconcile_decide box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Feed a mint-worthy decision: online=no, tunnel up. dev_field is unused because
 # devs is non-empty here; provide it. But make it read-only (arg 4 = 1) AND apply=1.
 dev_field(){ case "\$3" in online) echo no;; fresh) echo yes;; dupcount) echo 1;; both_online) echo no;; *) echo "";; esac; }
@@ -1188,7 +1189,7 @@ FLEET_STATE="\$(mktemp -d)"
 FLEET_KEYS_DIR="\$FLEET_STATE/keys"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in record_key_meta key_meta_file box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index record_key_meta key_meta_file box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 if record_key_meta grok-box-8 "" "2099-01-01T00:00:00Z"; then echo "rc=0"; else echo "rc=1"; fi
 f="\$FLEET_KEYS_DIR/8.json"
 [ -f "\$f" ] && echo "file=present" || echo "file=absent"
@@ -1213,7 +1214,7 @@ FLEETCTL="$FLEETCTL"
 BOX_ROOT="/workspace/box-setup"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 unset FLEET_ROLLOUT_TREE
 cap="\$(mktemp)"
 ssh(){ printf 'SSH %s\n' "\$*" >> "\$cap"; return 0; }
@@ -1247,7 +1248,7 @@ FLEET_TARGET_SHA=""
 MARK="\$(mktemp)"; : > "\$MARK"
 log(){ :; }; notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_one box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_one box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Two mutating actions this run; neither is 'mint' (avoid the mint-window guard).
 reconcile_decide(){ printf 'delete-then-rename\nrollout\n'; }
 tunnel_up(){ return 1; }          # tunnel down => no boxup check side effects
@@ -1870,7 +1871,7 @@ BOX_CONFIG="/workspace/box-setup/config.toml"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 RECORDED="\$(mktemp)"; : > "\$RECORDED"
 acl_has_fleet_brain_tagowner(){ return 0; }
 enroll_read_box_pubkey(){ echo "ssh-ed25519 AAAAC3fake grok-tunnel-grok-box-3"; }
@@ -1916,7 +1917,7 @@ BOX_CONFIG="/workspace/box-setup/config.toml"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 SIDE="\$(mktemp)"; : > "\$SIDE"
 unset FLEET_VPS_ADDR 2>/dev/null || true
 config_get(){ return 1; }                       # nothing resolves => refuse
@@ -1949,7 +1950,7 @@ BOX_CONFIG="/workspace/box-setup/config.toml"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 CALLED="\$(mktemp)"; : > "\$CALLED"
 # Stub every side-effecting step to success; record if the box-config writer runs.
 acl_has_fleet_brain_tagowner(){ return 0; }
@@ -2008,7 +2009,7 @@ FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/fleet.toml"
 FLEET_MANAGED_BOXDIR="$d/boxes"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 render_managed "$box"
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
@@ -2065,7 +2066,7 @@ FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/fleet.toml"
 FLEET_MANAGED_BOXDIR="$d/boxes"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 [ "$awkfail" = 1 ] && awk(){ return 3; }   # force a genuine render failure
 out="\$(render_managed "$box" 2>/dev/null)"; rc=\$?
 printf '%s\n' "\$out"
@@ -2118,7 +2119,7 @@ FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # render_managed uses awk internally; shadow it AFTER the functions are defined
 # so the render fails but nothing else depends on this stub firing first.
 render_managed(){ managed_header; return 7; }   # simulate a propagated render failure
@@ -2175,7 +2176,7 @@ BOX_ROOT="$d/box"
 BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Fake boxup: MANAGED_FILE= line iff support=yes; answers config-get accordingly.
 if [ "$support" = yes ]; then
   printf 'MANAGED_FILE=/x\ncase "\$1 \$2 \$3" in "config-get managed enabled") echo %s;; esac\n' "$enabled" > "$d/box/boxup"
@@ -2218,7 +2219,7 @@ FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Corrupting tunnel_ssh: append to stdin so the remote sha never matches want.
 tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sed 's/\$/X/' | sh -c "\$s"; }
 push_managed grok-box-8; echo "PUSHRC=\$?"
@@ -2266,7 +2267,7 @@ FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Provide a controllable \`bash\` for the remote probe:
 #   shim=bash => a real bash (the box's actual bash, honours -d) => probe works.
 #   shim=fail => a bash that always errors => probe genuinely fails.
@@ -2320,7 +2321,7 @@ FLEET_BOXES="grok-box-8 grok-box-3 grok-box-5"
 log(){ echo "LOG:\$*"; }
 notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # no canary_box configured => default 8
 tunnel_up(){ return 0; }    # all tunnels up
 seq="$d/seq"
@@ -2373,7 +2374,7 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
 log(){ :; }; notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 # tunnel_up: grok-box-8 always up; grok-box-3 down iff guard=tunnel.
 tunnel_up(){ case "\$1" in grok-box-3) [ "$guard" != tunnel ] ;; *) return 0 ;; esac; }
@@ -2408,7 +2409,7 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
 log(){ echo "LOG:\$*"; }; notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 tunnel_up(){ return 0; }   # both tunnels up: only the checkfail count decides
 seq="$d/seq"
@@ -2448,7 +2449,7 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
 log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # no canary_box configured => default 8
 tunnel_up(){ return 0; }    # both tunnels up: only the canary checkfail decides
 seq="$d/seq"
@@ -2497,7 +2498,7 @@ BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # no canary_box configured => default 8
 tunnel_up(){ return 0; }    # both tunnels up
 # Fake tunnel_ssh: strip the sudo sh -c wrapper, run with stdin passed through.
@@ -2540,7 +2541,7 @@ set -u
 FLEETCTL="$FLEETCTL"
 FLEET_STATE="$d/state"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 FLEET_MANAGED_FLEET="$d/none.toml"; FLEET_MANAGED_BOXDIR="$d/noboxes"
 cmd_config render "$box" >/dev/null 2>&1; echo "RC=\$?"
 INNER
@@ -2565,7 +2566,7 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 if [ "$support" = yes ]; then printf 'MANAGED_FILE=/x\ncase "\$1 \$2 \$3" in "config-get managed enabled") echo %s;; esac\n' "$enabled" > "$d/box/boxup"; else : > "$d/box/boxup"; fi
 # Pre-seed the on-box file to be IN SYNC (exact render) or DRIFTED.
 if [ "$state" = insync ]; then render_managed grok-box-8 > "$d/box/managed.toml"; else printf 'DRIFT\n' > "$d/box/managed.toml"; fi
@@ -2592,7 +2593,7 @@ FLEETCTL="$FLEETCTL"
 FLEET_STATE="$d/state"
 notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_bump_cfgfail reconcile_reset_cfgfail; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_bump_cfgfail reconcile_reset_cfgfail; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 for i in 1 2 3 4; do echo "bump=\$(reconcile_bump_cfgfail grok-box-8)"; done
 reconcile_reset_cfgfail grok-box-8
 [ -f "$d/state/grok-box-8.cfgfail" ] && echo "AFTER-RESET=present" || echo "AFTER-RESET=gone"
@@ -2621,7 +2622,7 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
 log(){ :; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # canary defaults to grok-box-8
 tunnel_up(){ return 0; }
 # canary (grok-box-8) always succeeds; grok-box-3 (non-canary) always fails.
@@ -2685,7 +2686,7 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
 log(){ :; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # canary defaults to grok-box-8
 tunnel_up(){ return 0; }
 # canary verdict is read from \$d/verdict each tick (content failure rc 4);
@@ -2719,7 +2720,7 @@ FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 tunnel_up(){ return 0; }
 # Fake tunnel_ssh: the CANARY (port 20008) is unreachable => emulate ssh's
@@ -2761,7 +2762,7 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 render_managed grok-box-8 > "$d/box/managed.toml"   # on-box file == render => in sync
 tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
 cmd_config diff grok-box-8; echo "DIFFRC=\$?"
@@ -2859,7 +2860,7 @@ BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 PATH="$d/bin:\$PATH"; export PATH
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # REAL wrapping: run the FULL command string through a real shell so the outer
 # single-quote boundary of \`sudo sh -c '<script>'\` is parsed by the shell,
 # not manually stripped. This is the boundary the VPS actually exercises.
@@ -2892,7 +2893,7 @@ FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 case "$mode" in
   nostatus2) tunnel_ssh(){ cat >/dev/null; return 2; } ;;                       # ran, no status line, rc 2
   ssh255)    tunnel_ssh(){ cat >/dev/null; return 255; } ;;                     # transport
@@ -2927,7 +2928,7 @@ FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 tunnel_up(){ return 0; }
 # canary runs the remote for real (succeeds); grok-box-3 fails rc 2, no status.

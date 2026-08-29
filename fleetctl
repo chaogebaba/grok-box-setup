@@ -856,19 +856,47 @@ key_meta_id() {
   jq -r '.id // empty' "$f" 2>/dev/null
 }
 
+# =============================================================================
+# box-naming-3digit D1 — canonical grok-box-NNN name <-> index helpers.
+# These two functions are BYTE-IDENTICAL in boxup and fleetctl (a test diffs the
+# two definitions); edit them TOGETHER. `box_index_from_name` is the ONLY place
+# allowed to turn a name into an integer for arithmetic: it parses with 10# so a
+# padded suffix (008/009) is DECIMAL, not octal — fixing the live bug where
+# $((20000+008)) errored and $((20000+011)) silently became 20009. Parsers stay
+# permissive ([0-9]{1,3}) so legacy unpadded names are still recognised; only
+# emitters (box_name_from_index) produce the padded canonical form.
+# =============================================================================
+# box_name_from_index <int> -> grok-box-NNN (three-digit, zero-padded).
+box_name_from_index() {
+  local n="${1#grok-box-}"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf 'grok-box-%03d' "$((10#$n))"
+}
+
+# box_index_from_name <grok-box-N|N> -> DECIMAL integer via 10#. Rejects (rc 1,
+# empty) anything not matching ^grok-box-[0-9]{1,3}$ (a bare 1..3-digit N is
+# accepted too, for callers that pass a raw index). Never does octal arithmetic.
+box_index_from_name() {
+  local raw="$1" n="${1#grok-box-}"
+  case "$raw" in
+    grok-box-[0-9]|grok-box-[0-9][0-9]|grok-box-[0-9][0-9][0-9]) : ;;
+    [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) : ;;
+    *) return 1 ;;
+  esac
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$((10#$n))"
+}
+
 # port_for <N|grok-box-N> -> 20000+N. The deterministic per-box loopback port.
 port_for() {
-  local n="$1"
-  n="${n#grok-box-}"
-  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  local n; n="$(box_index_from_name "$1")" || return 1
   printf '%s' "$((20000 + n))"
 }
 
-# box_index <name> -> N (integer) from grok-box-N.
+# box_index <name> -> N (integer) from grok-box-N. Thin wrapper on the D1 helper
+# (kept for callers/tests that reference the old name); goes through 10#.
 box_index() {
-  local n="${1#grok-box-}"
-  case "$n" in ''|*[!0-9]*) return 1 ;; esac
-  printf '%s' "$n"
+  box_index_from_name "$1"
 }
 
 # --- notify() (Q4) -----------------------------------------------------------
