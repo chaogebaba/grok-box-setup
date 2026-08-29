@@ -254,6 +254,10 @@ wall above.
    at enroll time — NO password fallback in the reconciler — then `sudo boxup
    once/check`; the box's converge lock serializes.
 
+## Ops notes
+
+- **`~fleet/.ssh/authorized_keys` MUST be owned by the fleet user (dir `700`, file `600`, both `$FLEET_VPS_USER:$FLEET_VPS_USER`)** — sshd `StrictModes` privsep reads it AS `fleet`; a root-owned file yields "Could not open user 'fleet' authorized keys … Permission denied" and every tunnel fails `publickey`. `fleetctl enroll` now chowns it on every write (BUG-E).
+
 ## Prior art / reference URLs
 
 (Consolidated; also inline above.)
