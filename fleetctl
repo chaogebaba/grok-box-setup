@@ -1898,7 +1898,10 @@ REMOTE
 # Prints ONE brain log line and returns:
 #   0  in sync / pushed / dry-run OK
 #   3  remote stdin sha mismatch (a truncated/flapped stream is never installed)
-#   other  transport/write/validation failure (all non-zero => caller does D9)
+#   5  brain read-back mismatch (printed sha != want_sha)
+#   6  transport unreachable (ssh rc 255, or the remote never produced a status
+#      line) — caller SKIPS without bumping .cfgfail (D6a/D6d)
+#   other  write/validation failure (caller does D9)
 # The status the remote prints (`sha=… support=… enabled=…`) is parsed as
 # order-independent key=value tokens; unknown tokens are ignored (an added field
 # never breaks an older brain). The brain asserts the read-back sha == want_sha.
@@ -1964,8 +1967,25 @@ push_managed() {
   local out rc
   out="$(printf '%s\n' "$text" | tunnel_ssh "$box" "sudo sh -c '$remote'" 2>/dev/null)"
   rc=$?
+  # Does the output carry a remote status line (cur=/sha= token)? If the remote
+  # script ran at all it prints one; its ABSENCE means the spool never ran.
+  local had_status=0
+  printf '%s\n' "$out" | grep -Eq '(^| )cur=|(^| )sha=' && had_status=1
   if [ "$rc" != 0 ]; then
-    # rc 3 = remote stdin sha mismatch; anything else = transport/write failure.
+    # Distinguish TRANSPORT failure from a remote-reported failure (D6a, rc 6):
+    #   rc 255            = ssh-level failure (host unreachable/tunnel dead) —
+    #                       OpenSSH's documented convention (255 = ssh error,
+    #                       else the remote command's own code).
+    #   any rc + NO status line = the remote script never produced its status
+    #                       line, i.e. the spool never ran => also transport.
+    # rc 3 = remote stdin sha mismatch (a real content statement) stays 3.
+    # Transport failures return 6 so the caller can SKIP (canary: fall through;
+    # non-canary: skip line) WITHOUT bumping .cfgfail — reachability alerting is
+    # the per-box loop's job (checkfail), never duplicated by the config pass.
+    if [ "$rc" = 255 ] || { [ "$rc" != 3 ] && [ "$had_status" = 0 ]; }; then
+      log "config: $box unreachable over tunnel (ssh rc=$rc) — no change applied"
+      return 6
+    fi
     log "config: $box push FAILED (rc=$rc) — no change applied"
     return "$rc"
   fi
@@ -2042,11 +2062,23 @@ reconcile_reset_cfgfail() { rm -f "$FLEET_STATE/$1.cfgfail" 2>/dev/null || true;
 # reconcile_reset_checkfail rewrites every tick, so gating on file PRESENCE
 # (BLOCKER-1, live canary r1) skipped EVERY healthy box — the whole fleet — on
 # every real tick. An absent file / content 0 = healthy = eligible.
-# DRY-RUN (apply=0) =>
-# push_managed --dry-run; --apply => push_managed. Canary failure (D5 non-zero
-# or D4 refusal) => notify warn, ABORT the rest of the pass this tick; a
-# non-canary failure => D9 for that box, continue. Returns non-zero iff any box
-# failed (folds into cmd_reconcile's rc like reconcile_one).
+# DRY-RUN (apply=0) => push_managed --dry-run; --apply => push_managed.
+# Failure routing (D6a/b/c/d, r5.1 B1):
+#   canary rc 6 (transport unreachable) => SKIP THE CANARY ONLY and FALL THROUGH
+#     to the non-canary loop this tick (an offline default canary — box-8 sleeps
+#     for days — must not freeze fleet convergence; content safety is still held
+#     by the D4 validator and every non-canary push is individually sha-verified).
+#     One info line, NO notify, NO .cfgfail bump. Same rule for a default or an
+#     operator canary_box override.
+#   canary rc 3/4/5 (a CONTENT failure — the canary has told us something about
+#     the rendered text) => ABORT the rest of the pass this tick; notify goes
+#     THROUGH the D9 threshold (bump .cfgfail, notify only when >3), warn-level
+#     log otherwise. Success resets the counter (D6b).
+#   non-canary rc 6 => same info skip line as tunnel-down, NO .cfgfail bump (D6d).
+#   non-canary rc 3/4/5 => D9 for that box, CONTINUE with the rest.
+# The pass is BEST-EFFORT: its return value is LOGGED in the `pass done` summary
+# (ok=N skipped=N failed=N) but NOT folded into cmd_reconcile's rc (D6c) —
+# fleet-reconcile.service Result reflects the per-box loop only, as on main.
 reconcile_config_pass() {
   local apply="${1:-0}"
   managed_files_present || return 0   # feature off => silent no-op
@@ -2066,28 +2098,43 @@ reconcile_config_pass() {
     rest+=("$b")
   done < <(reconcile_target_boxes)
 
-  local rc=0
+  local rc=0 n_ok=0 n_skip=0 n_fail=0
 
-  # canary_skippable <box>: 0 iff tunnel down OR the box is over the checkfail
-  # threshold (>3, like reconcile_decide:2147). A `0`-content .checkfail FILE is
-  # HEALTHY and must NOT skip the box (BLOCKER-1). (drift reported when the box
-  # returns — same guard as the per-box loop below).
+  # _cfg_push_one <box>: run push_managed for this box honouring the apply flag;
+  # returns push_managed's rc verbatim (0 ok, 3/4/5 content failure, 6 transport
+  # unreachable — see the push_managed header).
   _cfg_push_one() {
     local box="$1"
     if [ "$apply" = 1 ]; then push_managed "$box"; else push_managed "$box" --dry-run; fi
   }
 
-  # Canary first. An unreachable/over-threshold canary is skipped SILENTLY (no
-  # abort — abort is reserved for a real push/validation FAILURE, mirroring
-  # rollout).
+  # Canary FIRST. Guard: tunnel up AND checkfail count at/under threshold (>3 =
+  # unhealthy, BLOCKER-1: a 0-content .checkfail is HEALTHY and must not skip).
   if tunnel_up "$canary" && [ "$(reconcile_checkfail_count "$canary")" -le 3 ]; then
-    if _cfg_push_one "$canary"; then
-      reconcile_reset_cfgfail "$canary"
+    _cfg_push_one "$canary"; local crc=$?
+    if [ "$crc" = 0 ]; then
+      reconcile_reset_cfgfail "$canary"; n_ok=$((n_ok + 1))
+    elif [ "$crc" = 6 ]; then
+      # r5.1 B1: transport-unreachable canary => skip the canary ONLY and fall
+      # through to the non-canary loop. This ONE info line supersedes D6a's
+      # earlier `…config pass skipped this tick` wording (one line per skipped
+      # canary, not two). No notify, no cfgfail bump.
+      log "config: canary $canary unreachable over tunnel — canary check skipped this tick, continuing without canary protection"
+      n_skip=$((n_skip + 1))
     else
-      notify warn "config: canary $canary push/validate FAILED — aborting the rest of the config pass this tick"
-      reconcile_bump_cfgfail "$canary" >/dev/null
+      # D6b: canary CONTENT failure (rc 3/4/5) => abort the rest this tick.
+      # notify goes THROUGH the D9 threshold (bump; notify only when >3), like
+      # the non-canary path and seedfail — never an unconditional per-tick warn.
+      local cn; cn="$(reconcile_bump_cfgfail "$canary")"
+      if [ "$cn" -gt 3 ] 2>/dev/null; then
+        notify warn "config push failing for $canary: $cn consecutive failures — config pass aborted"
+      else
+        log "config: canary $canary push/validate FAILED (rc=$crc, count=$cn) — config pass aborted this tick"
+      fi
+      n_fail=$((n_fail + 1)); rc=1
       unset -f _cfg_push_one
-      return 1
+      log "config: pass done ($mode) ok=$n_ok skipped=$n_skip failed=$n_fail"
+      return "$rc"
     fi
   fi
 
@@ -2095,18 +2142,24 @@ reconcile_config_pass() {
   for b in "${rest[@]}"; do
     if ! tunnel_up "$b"; then
       log "config: skip $b — tunnel down (drift reported when the box returns)"
-      continue
+      n_skip=$((n_skip + 1)); continue
     fi
     if [ "$(reconcile_checkfail_count "$b")" -gt 3 ]; then
       log "config: skip $b — checkfail over threshold (>3; drift reported when the box returns)"
-      continue
+      n_skip=$((n_skip + 1)); continue
     fi
-    if _cfg_push_one "$b"; then
-      reconcile_reset_cfgfail "$b"
+    _cfg_push_one "$b"; local brc=$?
+    if [ "$brc" = 0 ]; then
+      reconcile_reset_cfgfail "$b"; n_ok=$((n_ok + 1))
+    elif [ "$brc" = 6 ]; then
+      # D6d: non-canary transport failure => same skip line as tunnel-down, NO
+      # .cfgfail bump (reachability alerting is the per-box loop's job).
+      log "config: skip $b — unreachable over tunnel"
+      n_skip=$((n_skip + 1))
     else
       local n; n="$(reconcile_bump_cfgfail "$b")"   # D9; continue with the rest
       [ "$n" -gt 3 ] 2>/dev/null && notify warn "config push failing for $b: $n consecutive failures"
-      rc=1
+      n_fail=$((n_fail + 1)); rc=1
     fi
   done
   unset -f _cfg_push_one
@@ -2117,7 +2170,7 @@ reconcile_config_pass() {
     _uklist="$(printf '%s\n' "${!CONFIG_UNKNOWN_KEYS[@]}" | sort | paste -sd' ' -)"
     log "config: unknown-but-well-formed keys (allowed, forward-compat): $_uklist"
   fi
-  log "config: pass done ($mode)"
+  log "config: pass done ($mode) ok=$n_ok skipped=$n_skip failed=$n_fail"
   return "$rc"
 }
 

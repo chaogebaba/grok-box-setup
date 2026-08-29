@@ -2349,10 +2349,12 @@ case "$cp_dry" in "PASSRC=0"|*"PUSH grok-box-8 dry=1|PUSH grok-box-3 dry=1|PUSH 
 # present, apply => dry=0.
 cp_apply="$(cfgpass_test yes 1 0 0)"
 case "$cp_apply" in *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*) pass "D6: --apply pass pushes for real (dry=0), canary-first" ;; *) bad "D6 apply order wrong: [$cp_apply]" ;; esac
-# canary FAILS => notify + ABORT (zero other boxes), rc 1.
-cp_canfail="$(cfgpass_test yes 1 1 0)"
-case "$cp_canfail" in *"PUSH grok-box-8 dry=0|"*) case "$cp_canfail" in *"PUSH grok-box-3"*) bad "D6: canary failure did NOT abort (touched grok-box-3): [$cp_canfail]" ;; *"PASSRC=1"*) pass "D6: canary FAILURE => notify + ABORT the rest this tick, rc 1" ;; *) bad "D6 canary-abort rc wrong: [$cp_canfail]" ;; esac ;; *) bad "D6 canary-fail wrong: [$cp_canfail]" ;; esac
-case "$cp_canfail" in *NOTIFY*) pass "D6: canary failure fires notify warn" ;; *) bad "D6 canary failure did not notify: [$cp_canfail]" ;; esac
+# canary CONTENT failure (rc 3/4/5) => ABORT (zero other boxes), rc 1. Under
+# D6b the notify is threshold-gated (D9), so a SINGLE-tick failure warns via a
+# log line, NOT notify — the notify assertions live in the D11b threshold block.
+cp_canfail="$(cfgpass_test yes 1 4 0)"
+case "$cp_canfail" in *"PUSH grok-box-8 dry=0|"*) case "$cp_canfail" in *"PUSH grok-box-3"*) bad "D6: canary failure did NOT abort (touched grok-box-3): [$cp_canfail]" ;; *"PASSRC=1"*) pass "D6b: canary CONTENT FAILURE (rc 4) => ABORT the rest this tick, rc 1" ;; *) bad "D6 canary-abort rc wrong: [$cp_canfail]" ;; esac ;; *) bad "D6 canary-fail wrong: [$cp_canfail]" ;; esac
+case "$cp_canfail" in *NOTIFY*) bad "D6b: a single-tick canary failure must NOT notify (threshold >3): [$cp_canfail]" ;; *) pass "D6b: a single-tick canary failure aborts WITHOUT notify (D9 threshold-gated)" ;; esac
 # non-canary FAILS => D9 bump for that box, CONTINUE with the rest, rc 1.
 cp_restfail="$(cfgpass_test yes 1 0 1)"
 case "$cp_restfail" in *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*) pass "D6: a NON-canary failure continues to the remaining boxes" ;; *) bad "D6 non-canary continue wrong: [$cp_restfail]" ;; esac
