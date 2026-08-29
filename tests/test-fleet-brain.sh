@@ -2026,10 +2026,12 @@ version = "1.80.0"
 '
 render_out="$(render_test "$FLEETC" "$BOXC" grok-box-8)"
 # Order = first-seen over fleet-then-box: update, ssh, tailscale. Box override
-# replaces the ssh.password VALUE in place (never reorders).
+# replaces the ssh.password VALUE in place (never reorders). Values are emitted
+# VERBATIM (D3 "key = value lines verbatim") — quotes are preserved; boxup's own
+# reader strips them at read time, so the on-box effective value is unchanged.
 case "$render_out" in
-  *'[update]'*'repo = https://fleet/repo.git'*'[ssh]'*'password = boxpass'*'[tailscale]'*'version = 1.80.0'*)
-    pass "config render: fleet-then-box merge, box override replaces value in place, first-seen order" ;;
+  *'[update]'*'repo = "https://fleet/repo.git"'*'[ssh]'*'password = "boxpass"'*'[tailscale]'*'version = "1.80.0"'*)
+    pass "config render: fleet-then-box merge, box override replaces value in place, first-seen order (verbatim RHS)" ;;
   *) bad "config render merge/order wrong: [$render_out]" ;;
 esac
 # fleetpass must be SHADOWED by boxpass (last-wins per key).
@@ -2038,9 +2040,11 @@ case "$render_out" in *fleetpass*) bad "config render: box override did NOT shad
 r1="$(render_test "$FLEETC" "$BOXC" grok-box-8 | sha256sum)"
 r2="$(render_test "$FLEETC" "$BOXC" grok-box-8 | sha256sum)"
 [ "$r1" = "$r2" ] && pass "config render: byte-deterministic (identical inputs => identical bytes, no timestamps)" || bad "config render NOT deterministic"
-# No applicable keys => header only (still valid).
+# No applicable keys => header only (still valid). The header itself contains a
+# '=' (the '# [managed] enabled = false' comment line), so a leak is a NON-COMMENT
+# line carrying '=' — strip comment/blank lines before counting.
 hdronly="$(render_test '' __none__ grok-box-9)"
-case "$hdronly" in *'WRITTEN BY THE VPS BRAIN'*) [ "$(printf '%s\n' "$hdronly" | grep -c '=')" = 0 ] && pass "config render: no keys => header only (empty managed is a valid pushed state)" || bad "header-only render leaked keys: [$hdronly]" ;; *) bad "header-only render missing header: [$hdronly]" ;; esac
+case "$hdronly" in *'WRITTEN BY THE VPS BRAIN'*) [ "$(printf '%s\n' "$hdronly" | grep -v '^[[:space:]]*#' | grep -c '=')" = 0 ] && pass "config render: no keys => header only (empty managed is a valid pushed state)" || bad "header-only render leaked keys: [$hdronly]" ;; *) bad "header-only render missing header: [$hdronly]" ;; esac
 
 # validate_managed (D4): drive the REAL function.
 validate_test() {
@@ -2299,11 +2303,40 @@ INNER
   timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
 cf_out="$(cfgfail_test)"
-case "$cf_out" in *"bump=1"*"bump=2"*"bump=3"*"bump=4"*) pass "D9: reconcile_bump_cfgfail increments 1..4" ;; *) bad "D9 bump sequence wrong: [$cf_out]" ;; esac
-case "$cf_out" in *"NOTIFY:warn config push failing for grok-box-8: 4"*) pass "D9: notify warn fires when cfgfail count crosses > 3" ;; *) bad "D9 notify>3 missing: [$cf_out]" ;; esac
-# notify must NOT fire at count 3 (only > 3).
-case "$cf_out" in *"NOTIFY:warn config push failing for grok-box-8: 3"*) bad "D9: notify fired at exactly 3 (should be > 3 only)" ;; *) pass "D9: no notify at count 3 (threshold is strictly > 3)" ;; esac
+# The helper is PURE (like checkfail/seedfail): bump + print the count, NO notify
+# embedded — so a caller's `x=$(reconcile_bump_cfgfail …)` capture is never
+# polluted (and reconcile_config_pass's threshold notify is never swallowed).
+case "$cf_out" in *"bump=1"*"bump=2"*"bump=3"*"bump=4"*) pass "D9: reconcile_bump_cfgfail increments 1..4 (pure: count only)" ;; *) bad "D9 bump sequence wrong: [$cf_out]" ;; esac
+case "$cf_out" in *NOTIFY:*) bad "D9: bump helper must NOT notify (notify lives at the call site, like seedfail): [$cf_out]" ;; *) pass "D9: bump helper is pure — no notify inside (matches checkfail/seedfail shape)" ;; esac
 case "$cf_out" in *"AFTER-RESET=gone"*) pass "D9: reconcile_reset_cfgfail clears the counter file" ;; *) bad "D9 reset did not clear: [$cf_out]" ;; esac
+
+# D9 notify at the CALL SITE (reconcile_config_pass, non-canary path): a box that
+# fails the push on every tick must fire `notify warn` ONLY once its cfgfail
+# count crosses > 3 — exactly like seedfail (fleetctl:2311-2313). Drive the real
+# reconcile_config_pass 4 ticks with a persistently-failing non-canary box.
+cfgnotify_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
+  printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+log(){ :; }; notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # canary defaults to grok-box-8
+tunnel_up(){ return 0; }
+# canary (grok-box-8) always succeeds; grok-box-3 (non-canary) always fails.
+push_managed(){ case "\$1" in grok-box-3) return 1 ;; *) return 0 ;; esac; }
+for tick in 1 2 3 4; do echo "TICK\$tick:"; reconcile_config_pass 1; done
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+cn_out="$(cfgnotify_test)"
+# Isolate the notify lines carrying the count for grok-box-3.
+case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-3: 4"*) pass "D9: notify warn fires at the call site when cfgfail crosses > 3" ;; *) bad "D9 call-site notify>3 missing: [$cn_out]" ;; esac
+case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-3: 3"*) bad "D9: notify fired at exactly 3 (threshold is strictly > 3): [$cn_out]" ;; *) pass "D9: no notify at count 3 (threshold is strictly > 3)" ;; esac
 
 rm -rf "$CFG_FIXROOT"
 

@@ -1912,15 +1912,18 @@ push_managed() {
 }
 
 # reconcile_bump_cfgfail / reconcile_reset_cfgfail (D9): same shape as checkfail.
-# notify warn when the count crosses > 3 (exactly like seedfail). Cleared on the
-# next in-sync or successful push. Never retried within a tick.
+# The helper is PURE (bump the counter file, print the new count) — exactly like
+# reconcile_bump_checkfail / reconcile_bump_seedfail. The `notify warn` at count
+# > 3 lives at the CALL SITE (exactly like seedfail, fleetctl:2311-2313), NOT in
+# the helper: embedding notify here would (a) diverge from the checkfail/seedfail
+# shape and (b) be swallowed by the callers' `>/dev/null` in reconcile_config_pass.
+# Cleared on the next in-sync or successful push. Never retried within a tick.
 reconcile_bump_cfgfail() {
   local box="$1" f n=0
   f="$FLEET_STATE/$box.cfgfail"
   [ -f "$f" ] && n=$(tr -d '[:space:]' < "$f" 2>/dev/null || echo 0)
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
   n=$((n + 1)); echo "$n" > "$f" 2>/dev/null || true
-  [ "$n" -gt 3 ] && notify warn "config push failing for $box: $n consecutive failures"
   printf '%s' "$n"
 }
 reconcile_reset_cfgfail() { rm -f "$FLEET_STATE/$1.cfgfail" 2>/dev/null || true; }
@@ -1980,7 +1983,8 @@ reconcile_config_pass() {
     if _cfg_push_one "$b"; then
       reconcile_reset_cfgfail "$b"
     else
-      reconcile_bump_cfgfail "$b" >/dev/null   # D9; continue with the rest
+      local n; n="$(reconcile_bump_cfgfail "$b")"   # D9; continue with the rest
+      [ "$n" -gt 3 ] 2>/dev/null && notify warn "config push failing for $b: $n consecutive failures"
       rc=1
     fi
   done
