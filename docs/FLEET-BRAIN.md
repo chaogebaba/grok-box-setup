@@ -319,6 +319,14 @@ hatch below; do not hand-edit `managed.toml`.
   falls back to `config.toml` (logging "managed.toml ignored by local config"
   once per converge). Every brain log line and `config diff` for that box carry
   an `IGNORED` annotation, so the tool never reports an ignored file as in-sync.
+  **An ABSENT `[managed]` table (or absent `enabled` key) means ENABLED** — the
+  box honours `managed.toml` by default. This is the normal state of every box
+  (the `config.example.toml` template ships `[managed] enabled` commented), so
+  the brain's on-box probe treats `boxup config-get managed enabled` exit 1
+  (key absent) as `enabled=true`; only an explicit `enabled = false` disables,
+  and only a genuine probe error (any other non-zero, empty, or a bash launch
+  failure) yields `enabled=unknown` (annotated, never reported in-sync). You do
+  NOT need to add a `[managed]` table to opt in — the default is on.
 
 ### Tags unsupported in Phase 2
 
@@ -334,13 +342,43 @@ step (docs/AGENT.md §F). Revisit in Phase 3.
 loop each tick (it needs no device list and must run for in-sync boxes too). It
 mirrors the row-d rollout shape: the **canary box first** (`[fleet-brain].canary_box`,
 default 8), then the rest in enrolled order, SERIALLY — one extra tunnel round
-trip per awake box per tick. A box whose tunnel is down or that has a
-`.checkfail` state is skipped silently (its drift is reported when it returns).
-A DRY RUN (no `--apply`) pushes `--dry-run` and logs `in sync` / `WOULD push
-(old->new)`; `--apply` pushes for real. **Canary failure** (a D5 non-zero or a
-D4 refusal) fires `notify warn` and ABORTS the rest of the pass this tick; a
-**non-canary failure** bumps that box's `.cfgfail` (a warn fires once the count
-crosses > 3, exactly like seedfail) and continues with the rest.
+trip per awake box per tick. A box whose tunnel is down or whose `.checkfail`
+count is over threshold (>3) is skipped silently (its drift is reported when it
+returns). A DRY RUN (no `--apply`) pushes `--dry-run` and logs `in sync` /
+`WOULD push (old->new)`; `--apply` pushes for real.
+
+**Failure handling distinguishes TRANSPORT from CONTENT** (the whole point of
+the canary is to catch a bad *render*, not to gate on reachability):
+
+- **Canary UNREACHABLE over the tunnel** (`push_managed` rc 6 — ssh rc 255, or
+  the remote never produced a status line): the canary is skipped ONLY and the
+  pass **falls through to the non-canary loop** this tick, logging `config:
+  canary <box> unreachable over tunnel — canary check skipped this tick,
+  continuing without canary protection` at info. **No notify, no `.cfgfail`
+  bump.** An offline default canary (a sandbox legitimately sleeps for days)
+  must never freeze the fleet's convergence; content safety is still held per
+  box by the D4 validator and by each push's own sha-in/sha-back verification.
+  Same rule whether the canary is the default or an operator `canary_box`.
+- **Canary CONTENT failure** (rc 3 stdin-sha mismatch / rc 4 D4 refusal / rc 5
+  read-back mismatch — the canary HAS told us something about the rendered
+  text): the pass ABORTS the rest this tick, and the notify is
+  **threshold-gated exactly like the non-canary path** — bump the canary's
+  `.cfgfail` and `notify warn` ONLY once the count crosses > 3 (`config push
+  failing for <box>: N consecutive failures — config pass aborted`); below the
+  threshold it logs a warn line only. A canary success resets the counter.
+- **Non-canary UNREACHABLE** (rc 6): same info skip line as tunnel-down
+  (`config: skip <box> — unreachable over tunnel`), **no `.cfgfail` bump** —
+  reachability alerting is the per-box loop's job, never duplicated here.
+- **Non-canary CONTENT failure**: bump that box's `.cfgfail` (a warn fires once
+  the count crosses > 3, like seedfail) and continue with the rest.
+
+**The config pass is best-effort and its rc is NOT folded into the reconcile
+service's exit code.** Each tick logs a one-line summary `config: pass done
+(dry-run|apply) ok=N skipped=N failed=N`. A failing config push therefore never
+flips `fleet-reconcile.service` to `Result=exit-code` (that Result reflects the
+per-box decision loop only). **Soak criterion:** the service journal is clean
+when there are **no `notify` lines** and **`failed=0`** in the `pass done`
+summary across the soak window.
 
 ### PRECONDITION (do not skip)
 
