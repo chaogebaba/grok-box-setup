@@ -3541,12 +3541,13 @@ log(){ echo "LOG:\$*"; }
 sleep(){ SLEEPS=\$((SLEEPS+1)); }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
 for fn in box_index_from_name port_for enroll_wait_tunnel; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
-# tunnel_up stub keyed by \$upmode:  never | now | third
+# tunnel_up stub keyed by \$upmode:  never | now | third | boxonly
 CALLS=0
 case "$upmode" in
   never) tunnel_up(){ return 1; } ;;
   now)   tunnel_up(){ return 0; } ;;
   third) tunnel_up(){ CALLS=\$((CALLS+1)); [ "\$CALLS" -ge 3 ]; } ;;
+  boxonly) tunnel_up(){ [ "\$1" = grok-box-8 ]; } ;;   # up ONLY when passed the BOX name (F1)
 esac
 enroll_wait_tunnel grok-box-8; rc=\$?
 echo "RC=\$rc SLEEPS=\$SLEEPS"
@@ -3572,6 +3573,12 @@ esac
 case "$(wait_tunnel_test abc now)" in
   *"is not a non-negative integer — using 90"*"RC=0"*) pass "#12 D3/F5: non-numeric ENROLL_TUNNEL_WAIT warns and falls back to 90" ;;
   *) bad "#12 D3/F5: non-numeric fallback wrong: [$(wait_tunnel_test abc now)]" ;;
+esac
+# F1 killer: tunnel_up is up ONLY when called with the BOX name (grok-box-8).
+# Correct code passes "$box" => rc 0; a $port regression passes 20008 => never up.
+case "$(wait_tunnel_test 1 boxonly)" in
+  *"RC=0"*) pass "#12 D3/F1: enroll_wait_tunnel probes tunnel_up with the BOX name, not the port" ;;
+  *) bad "#12 D3/F1: probes with the wrong arg (not the box name): [$(wait_tunnel_test 1 boxonly)]" ;;
 esac
 
 # --- D4 (F2/F6): enroll_permitlisten_verdict. Parses EVERY token (F2), uses
