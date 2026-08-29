@@ -90,6 +90,99 @@ INNER
 [ "$(portfor_test grok-box-1)" = 20001 ] && pass "port_for grok-box-1 => 20001" || bad "port_for grok-box-1 => [$(portfor_test grok-box-1)]"
 [ "$(portfor_test 8)" = 20008 ] && pass "port_for 8 => 20008" || bad "port_for 8 => [$(portfor_test 8)]"
 
+# =============================================================================
+# box-naming-3digit D1/D9 — canonical name<->index helpers + the OCTAL fix (F1)
+# =============================================================================
+# Run a helper from EITHER file (verifies both wire the same helper). Prints
+# "<stdout>|rc=<rc>".
+helper_call() {
+  local file="$1" fn="$2"; shift 2
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+SRC="$file"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$SRC" box_index_from_name)"
+eval "\$(extract_from "\$SRC" box_name_from_index)"
+out="\$($fn $*)"; rc=\$?
+printf '%s|rc=%s' "\$out" "\$rc"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+
+# box_index_from_name: DECIMAL via 10# (008->8, 009->9, 011->11, 1->1); reject
+# an out-of-range or non-numeric suffix.
+[ "$(helper_call "$FLEETCTL" box_index_from_name grok-box-008)" = "8|rc=0" ]  && pass "D1: box_index_from_name grok-box-008 => 8 (decimal, not octal)" || bad "D1 idx 008: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-008)]"
+[ "$(helper_call "$FLEETCTL" box_index_from_name grok-box-009)" = "9|rc=0" ]  && pass "D1: box_index_from_name grok-box-009 => 9 (decimal, not octal)" || bad "D1 idx 009: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-009)]"
+[ "$(helper_call "$FLEETCTL" box_index_from_name grok-box-011)" = "11|rc=0" ] && pass "D1: box_index_from_name grok-box-011 => 11" || bad "D1 idx 011: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-011)]"
+[ "$(helper_call "$FLEETCTL" box_index_from_name grok-box-1)" = "1|rc=0" ]    && pass "D1: box_index_from_name grok-box-1 => 1 (legacy still recognised)" || bad "D1 idx 1: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-1)]"
+case "$(helper_call "$FLEETCTL" box_index_from_name grok-box-1000)" in *"rc=1"*) pass "D1: box_index_from_name grok-box-1000 => rc 1 (>3 digits rejected)" ;; *) bad "D1 reject 1000: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-1000)]" ;; esac
+case "$(helper_call "$FLEETCTL" box_index_from_name grok-box-x)" in *"rc=1"*) pass "D1: box_index_from_name grok-box-x => rc 1 (non-numeric rejected)" ;; *) bad "D1 reject x: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-x)]" ;; esac
+
+# box_name_from_index: pads to three digits.
+[ "$(helper_call "$FLEETCTL" box_name_from_index 8)" = "grok-box-008|rc=0" ]  && pass "D1: box_name_from_index 8 => grok-box-008" || bad "D1 name 8: [$(helper_call "$FLEETCTL" box_name_from_index 8)]"
+[ "$(helper_call "$FLEETCTL" box_name_from_index 11)" = "grok-box-011|rc=0" ] && pass "D1: box_name_from_index 11 => grok-box-011" || bad "D1 name 11: [$(helper_call "$FLEETCTL" box_name_from_index 11)]"
+
+# F1 OCTAL FIX: port_for over the padded 8/9/10/11 must be 20008..20011 (the old
+# raw-suffix arithmetic errored on 008/009 and mis-added 010/011 as octal).
+for i in 8 9 10 11; do
+  want=$((20000 + i)); padded="$(printf 'grok-box-%03d' "$i")"
+  got="$(portfor_test "$padded")"
+  [ "$got" = "$want" ] && pass "F1 octal fix: port_for $padded => $want" || bad "F1 octal fix: port_for $padded => [$got] (want $want)"
+done
+
+# The two helpers are BYTE-IDENTICAL in boxup and fleetctl (D1).
+bx_bifn="$(bx box_index_from_name)"; fc_bifn="$(fc box_index_from_name)"
+[ "$bx_bifn" = "$fc_bifn" ] && [ -n "$bx_bifn" ] && pass "D1: box_index_from_name is byte-identical in boxup and fleetctl" || bad "D1: box_index_from_name differs between boxup and fleetctl"
+bx_bnfi="$(bx box_name_from_index)"; fc_bnfi="$(fc box_name_from_index)"
+[ "$bx_bnfi" = "$fc_bnfi" ] && [ -n "$bx_bnfi" ] && pass "D1: box_name_from_index is byte-identical in boxup and fleetctl" || bad "D1: box_name_from_index differs between boxup and fleetctl"
+
+# D3: key_meta_file goes through box_index_from_name, so grok-box-008 => keys/8.json.
+keymeta_test() {
+  local box="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_KEYS_DIR="/var/lib/grok-fleet/keys"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name box_index key_meta_file; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+key_meta_file "$box"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(keymeta_test grok-box-008)" = "/var/lib/grok-fleet/keys/8.json" ] && pass "D3: key_meta_file grok-box-008 => keys/8.json (index-keyed, unpadded)" || bad "D3 key_meta_file: [$(keymeta_test grok-box-008)]"
+[ "$(keymeta_test grok-box-8)" = "/var/lib/grok-fleet/keys/8.json" ] && pass "D3: key_meta_file grok-box-8 => keys/8.json (legacy same file)" || bad "D3 key_meta_file legacy: [$(keymeta_test grok-box-8)]"
+
+# D2: pick_name (boxup) emits the PADDED name and treats BOTH padded and legacy
+# peers as taken (never mints an index a not-yet-renamed legacy box holds).
+pickname_test() {
+  local peers_json="$1" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+# Stub tailscale_bin so pick_name's python reads our fixture instead of a real
+# tailscale. The fixture is served for 'status --json'; 'status'/'ip' are empty.
+tailscale_bin(){ printf '%s' "$d/fakets"; }
+eval "\$(extract_from "\$BOXUP" pick_name)"
+pick_name
+INNER
+  # A fake tailscale that prints our JSON for \`status --json\`, else nothing.
+  cat > "$d/fakets" <<'FAKETS'
+#!/usr/bin/env bash
+if [ "$1" = status ] && [ "${2:-}" = --json ]; then cat "$FAKE_JSON"; fi
+FAKETS
+  chmod +x "$d/fakets"
+  printf '%s' "$peers_json" > "$d/peers.json"
+  FAKE_JSON="$d/peers.json" timeout 15 bash "$inner"
+  rm -f "$inner"; rm -rf "$d"
+}
+# Peers hold indexes 1 (legacy) and 2 (padded) => lowest free is 3 => grok-box-003.
+pk="$(pickname_test '{"Peer":{"a":{"HostName":"grok-box-1"},"b":{"HostName":"grok-box-002"}}}')"
+[ "$pk" = grok-box-003 ] && pass "D2: pick_name pads AND counts legacy+padded peers (=> grok-box-003)" || bad "D2 pick_name: [$pk]"
+
+
 # ACL precheck: acl_has_fleet_brain_tagowner returns 0 when the tag is present,
 # non-0 (1) when absent. Stub ts_api to return a fixture ACL; jq does the work.
 acl_test() {
