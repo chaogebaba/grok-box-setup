@@ -359,6 +359,15 @@ the canary is to catch a bad *render*, not to gate on reachability):
   must never freeze the fleet's convergence; content safety is still held per
   box by the D4 validator and by each push's own sha-in/sha-back verification.
   Same rule whether the canary is the default or an operator `canary_box`.
+- **Canary UNHEALTHY** (`.checkfail` count > 3 — awake but failing its own
+  boxup check): the canary is skipped ONLY and the pass **falls through to the
+  non-canary loop** this tick (mirroring the rc-6 path), logging `config:
+  canary <box> skipped — checkfail=<n> (>3), continuing without canary
+  protection` at info and counting it in `skipped=`. **No notify, no `.cfgfail`
+  change.** An unhealthy canary must not freeze fleet convergence any more than
+  an unreachable one does. The `==3` boundary is HEALTHY, so a canary at
+  `checkfail=3` is still pushed. (The canary tunnel-DOWN case keeps its existing
+  handling: the guard is simply false, so no canary push and the loop proceeds.)
 - **Canary CONTENT failure** (rc 3 stdin-sha mismatch / rc 4 D4 refusal / rc 5
   read-back mismatch OR a remote script/probe failure — the remote command ran
   (or should have) but produced no valid status line, e.g. a script that could
@@ -389,13 +398,20 @@ the canary is to catch a bad *render*, not to gate on reachability):
 service's exit code.** Each tick logs a one-line summary `config: pass done
 (dry-run|apply) ok=N skipped=N failed=N`. A failing config push therefore never
 flips `fleet-reconcile.service` to `Result=exit-code` (that Result reflects the
-per-box decision loop only). **Soak criterion:** the config pass is healthy when
-there are **no `notify` lines** and, in the `pass done` summary across the soak
-window, **`failed=0` AND `ok>=1`**. The `ok>=1` conjunct is deliberate: `ok=0`
-with `failed=0` is exactly the masked-failure signature the r5.1 gate hit (every
-box skipped by a broken script), so a pass in which no box converged is now a
-FAIL, not a clean soak. (When every enrolled box is awake, the strict form is
-`failed=0 AND ok==<awake boxes>`; `ok>=1` is the floor.)
+per-box decision loop only). **Soak / gate criterion (by NOTIFY ORIGIN, not
+line prefix):** the config pass is healthy over the soak window when there is
+**no `notify[warn]: config push failing …` line** AND, in the `pass done`
+summary, **`failed=0` AND `ok>=1`**. The criterion is scoped to the config
+pass's OWN notify (the `config push failing for <box>` warn); reconcile-LOOP
+`notify[warn]: … incident:…` lines (e.g. `incident:reachable-cannot-converge`
+from an awake box that cannot converge) are **out of this criterion** — they
+are real fleet state to report with their cause and resolve OPERATIONALLY
+(e.g. update boxup on the affected box), never silenced by this diff. The
+`ok>=1` conjunct is deliberate: `ok=0` with `failed=0` is exactly the
+masked-failure signature the r5.1 gate hit (every box skipped by a broken
+script), so a pass in which no box converged is now a FAIL, not a clean soak.
+(When every enrolled box is awake, the strict form is `failed=0 AND
+ok==<awake boxes>`; `ok>=1` is the floor.)
 
 ### PRECONDITION (do not skip)
 
@@ -404,6 +420,18 @@ An older boxup silently ignores `managed.toml`; the brain detects this (the
 box reports `support=no`) and logs it — `config diff` annotates the box as
 inert — but the brain cannot make that box honour the pushed file. Roll boxup
 out first via the canary-first row-d rollout, THEN create `fleet.toml`.
+
+**Live re-gate precondition (checkfail floor).** Before deploying a branch
+`fleetctl` for a live config-pass gate, verify every AWAKE enrolled box has
+`.checkfail` ≤ 3 by reading the state file directly — `cat
+$FLEET_STATE/<box>.checkfail` (absent or `0` = healthy). Do **not** rely on the
+`fleetctl fleet-status` CHECK column: it can read OK for a box whose
+`.checkfail` count is already 6 (the column reflects the last check attempt,
+not the accumulated fail count), which is exactly the state that makes the
+config pass skip the canary. An awake box over the floor must be brought back
+under it operationally (update its boxup) before the gate. The
+`unreachable-canary` case is simulated by stopping box-8's reverse tunnel for
+one run (ssh rc 255), never by leaning on stale checkfail state.
 
 ### Operator recipe
 
