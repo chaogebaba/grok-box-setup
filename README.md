@@ -1,7 +1,7 @@
 # grok-box-setup
 
 Turn a Grok sand box into a self-healing **Tailscale exit node** with password
-SSH, reachable as `grok-box-N` on the tailnet — and keep it that way through
+SSH, reachable as `grok-box-NNN` on the tailnet — and keep it that way through
 sleep/thaw cycles and full image swaps.
 
 Everything is one program: [`boxup`](boxup), installed at
@@ -14,6 +14,13 @@ git clone https://github.com/chaogebaba/grok-box-setup.git /tmp/grok-box-setup
 sudo bash /tmp/grok-box-setup/install.sh
 sudo /workspace/box-setup/boxup once
 ```
+
+**Naming rule.** A box name is `grok-box-` + exactly three decimal digits
+(`grok-box-001` … `grok-box-999`). `boxup` picks the lowest free index and
+zero-pads it; the reverse-tunnel port is `20000 + index` (parsed as decimal, so
+`grok-box-008` → port 20008). Legacy unpadded names are still recognised; to
+convert one in place use `fleetctl rename grok-box-8 grok-box-008` (see
+docs/AGENT.md → "Rename a box").
 
 Before the first `boxup once`, create the Tailscale auth key as **reusable +
 pre-authorized + tagged `tag:grok-box`** (admin console → Settings → Keys →
@@ -87,20 +94,20 @@ node), update repo (`[update] repo`). See
 `boxup` runs on a box; [`fleetctl`](fleetctl) runs on the operator's laptop and
 drives all the boxes at once over the tailnet (needs `tailscale`, `ssh`,
 `sshpass` — `sudo dnf install sshpass` / `sudo apt install sshpass`). It
-discovers every `grok-box-N` peer; it never touches other machines.
+discovers every `grok-box-NNN` peer; it never touches other machines.
 
 ```bash
-./fleetctl list                 # name, tailscale IP, online — all grok-box-N peers
+./fleetctl list                 # name, tailscale IP, online — all grok-box-NNN peers
 ./fleetctl status               # boxup status line per online box + sha/drift (read-only)
 ./fleetctl check                # quiet health gate; exit 1 + prints only problems
-./fleetctl rollout grok-box-3   # deploy current git HEAD to explicit boxes
+./fleetctl rollout grok-box-003 # deploy current git HEAD to explicit boxes
 ./fleetctl rollout --all        # deploy to the whole fleet (canary first, then batch)
-./fleetctl ssh grok-box-3 [cmd] # ssh wrapper
+./fleetctl ssh grok-box-003 [cmd] # ssh wrapper
 ```
 
-`rollout` requires a target: one or more explicit `grok-box-N`, or `--all` for
+`rollout` requires a target: one or more explicit `grok-box-NNN`, or `--all` for
 the whole fleet. A bare `fleetctl rollout` is a usage error (it will not guess).
-`--all` deploys to a canary first (default `grok-box-5`, override with
+`--all` deploys to a canary first (default `grok-box-005`, override with
 `--canary <box>`), verifies it with `boxup check`, and only then rolls the rest
 at 2-concurrency. The first box that fails verification trips an **abort**: no
 new boxes are dispatched (in-flight ones finish and report), the command exits

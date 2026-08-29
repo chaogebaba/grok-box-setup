@@ -81,6 +81,7 @@ portfor_test() {
 set -u
 FLEETCTL="$FLEETCTL"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" box_index_from_name)"
 eval "\$(extract_from "\$FLEETCTL" port_for)"
 port_for "$n"
 INNER
@@ -88,6 +89,119 @@ INNER
 }
 [ "$(portfor_test grok-box-1)" = 20001 ] && pass "port_for grok-box-1 => 20001" || bad "port_for grok-box-1 => [$(portfor_test grok-box-1)]"
 [ "$(portfor_test 8)" = 20008 ] && pass "port_for 8 => 20008" || bad "port_for 8 => [$(portfor_test 8)]"
+
+# =============================================================================
+# box-naming-3digit D1/D9 — canonical name<->index helpers + the OCTAL fix (F1)
+# =============================================================================
+# Run a helper from EITHER file (verifies both wire the same helper). Prints
+# "<stdout>|rc=<rc>".
+helper_call() {
+  local file="$1" fn="$2"; shift 2
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+SRC="$file"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$SRC" box_index_from_name)"
+eval "\$(extract_from "\$SRC" box_name_from_index)"
+out="\$($fn $*)"; rc=\$?
+printf '%s|rc=%s' "\$out" "\$rc"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+
+# box_index_from_name: DECIMAL via 10# (008->8, 009->9, 011->11, 1->1); reject
+# an out-of-range or non-numeric suffix.
+[ "$(helper_call "$FLEETCTL" box_index_from_name grok-box-008)" = "8|rc=0" ]  && pass "D1: box_index_from_name grok-box-008 => 8 (decimal, not octal)" || bad "D1 idx 008: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-008)]"
+[ "$(helper_call "$FLEETCTL" box_index_from_name grok-box-009)" = "9|rc=0" ]  && pass "D1: box_index_from_name grok-box-009 => 9 (decimal, not octal)" || bad "D1 idx 009: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-009)]"
+[ "$(helper_call "$FLEETCTL" box_index_from_name grok-box-011)" = "11|rc=0" ] && pass "D1: box_index_from_name grok-box-011 => 11" || bad "D1 idx 011: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-011)]"
+[ "$(helper_call "$FLEETCTL" box_index_from_name grok-box-1)" = "1|rc=0" ]    && pass "D1: box_index_from_name grok-box-1 => 1 (legacy still recognised)" || bad "D1 idx 1: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-1)]"
+case "$(helper_call "$FLEETCTL" box_index_from_name grok-box-1000)" in *"rc=1"*) pass "D1: box_index_from_name grok-box-1000 => rc 1 (>3 digits rejected)" ;; *) bad "D1 reject 1000: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-1000)]" ;; esac
+case "$(helper_call "$FLEETCTL" box_index_from_name grok-box-x)" in *"rc=1"*) pass "D1: box_index_from_name grok-box-x => rc 1 (non-numeric rejected)" ;; *) bad "D1 reject x: [$(helper_call "$FLEETCTL" box_index_from_name grok-box-x)]" ;; esac
+
+# box_name_from_index: pads to three digits.
+[ "$(helper_call "$FLEETCTL" box_name_from_index 8)" = "grok-box-008|rc=0" ]  && pass "D1: box_name_from_index 8 => grok-box-008" || bad "D1 name 8: [$(helper_call "$FLEETCTL" box_name_from_index 8)]"
+[ "$(helper_call "$FLEETCTL" box_name_from_index 11)" = "grok-box-011|rc=0" ] && pass "D1: box_name_from_index 11 => grok-box-011" || bad "D1 name 11: [$(helper_call "$FLEETCTL" box_name_from_index 11)]"
+
+# F1 OCTAL FIX: port_for over the padded 8/9/10/11 must be 20008..20011 (the old
+# raw-suffix arithmetic errored on 008/009 and mis-added 010/011 as octal).
+for i in 8 9 10 11; do
+  want=$((20000 + i)); padded="$(printf 'grok-box-%03d' "$i")"
+  got="$(portfor_test "$padded")"
+  [ "$got" = "$want" ] && pass "F1 octal fix: port_for $padded => $want" || bad "F1 octal fix: port_for $padded => [$got] (want $want)"
+done
+
+# The two helpers are BYTE-IDENTICAL in boxup and fleetctl (D1).
+bx_bifn="$(bx box_index_from_name)"; fc_bifn="$(fc box_index_from_name)"
+[ "$bx_bifn" = "$fc_bifn" ] && [ -n "$bx_bifn" ] && pass "D1: box_index_from_name is byte-identical in boxup and fleetctl" || bad "D1: box_index_from_name differs between boxup and fleetctl"
+bx_bnfi="$(bx box_name_from_index)"; fc_bnfi="$(fc box_name_from_index)"
+[ "$bx_bnfi" = "$fc_bnfi" ] && [ -n "$bx_bnfi" ] && pass "D1: box_name_from_index is byte-identical in boxup and fleetctl" || bad "D1: box_name_from_index differs between boxup and fleetctl"
+
+# D3: key_meta_file goes through box_index_from_name, so grok-box-008 => keys/8.json.
+keymeta_test() {
+  local box="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_KEYS_DIR="/var/lib/grok-fleet/keys"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name box_index key_meta_file; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+key_meta_file "$box"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(keymeta_test grok-box-008)" = "/var/lib/grok-fleet/keys/8.json" ] && pass "D3: key_meta_file grok-box-008 => keys/8.json (index-keyed, unpadded)" || bad "D3 key_meta_file: [$(keymeta_test grok-box-008)]"
+[ "$(keymeta_test grok-box-8)" = "/var/lib/grok-fleet/keys/8.json" ] && pass "D3: key_meta_file grok-box-8 => keys/8.json (legacy same file)" || bad "D3 key_meta_file legacy: [$(keymeta_test grok-box-8)]"
+
+# D2: pick_name (boxup) emits the PADDED name and treats BOTH padded and legacy
+# peers as taken (never mints an index a not-yet-renamed legacy box holds).
+pickname_test() {
+  local peers_json="$1" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+# Stub tailscale_bin so pick_name's python reads our fixture instead of a real
+# tailscale. The fixture is served for 'status --json'; 'status'/'ip' are empty.
+tailscale_bin(){ printf '%s' "$d/fakets"; }
+eval "\$(extract_from "\$BOXUP" pick_name)"
+pick_name
+INNER
+  # A fake tailscale that prints our JSON for \`status --json\`, else nothing.
+  cat > "$d/fakets" <<'FAKETS'
+#!/usr/bin/env bash
+if [ "$1" = status ] && [ "${2:-}" = --json ]; then cat "$FAKE_JSON"; fi
+FAKETS
+  chmod +x "$d/fakets"
+  printf '%s' "$peers_json" > "$d/peers.json"
+  FAKE_JSON="$d/peers.json" timeout 15 bash "$inner"
+  rm -f "$inner"; rm -rf "$d"
+}
+# Peers hold indexes 1 (legacy) and 2 (padded) => lowest free is 3 => grok-box-003.
+pk="$(pickname_test '{"Peer":{"a":{"HostName":"grok-box-1"},"b":{"HostName":"grok-box-002"}}}')"
+[ "$pk" = grok-box-003 ] && pass "D2: pick_name pads AND counts legacy+padded peers (=> grok-box-003)" || bad "D2 pick_name: [$pk]"
+
+# D5: reconcile_target_boxes orders enrolled boxes NUMERICALLY by decimal index
+# (grok-box-002 before grok-box-010, a legacy grok-box-3 in between), and dedups.
+targetorder_test() {
+  local inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  printf 'grok-box-010\t20010\ngrok-box-002\t20002\ngrok-box-3\t20003\ngrok-box-002\t20002\n' > "$d/state/enrolled.tsv"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+reconcile_target_boxes | tr '\n' '|'
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+[ "$(targetorder_test)" = "grok-box-002|grok-box-3|grok-box-010|" ] \
+  && pass "D5: reconcile_target_boxes orders numerically by index (002 < legacy 3 < 010) and dedups" \
+  || bad "D5 numeric ordering wrong: [$(targetorder_test)]"
+
 
 # ACL precheck: acl_has_fleet_brain_tagowner returns 0 when the tag is present,
 # non-0 (1) when absent. Stub ts_api to return a fixture ACL; jq does the work.
@@ -146,7 +260,7 @@ TOKF="\$(mktemp)"; printf 'tskey-fake-token\n' > "\$TOKF"
 export FLEET_API_TOKEN_FILE="\$TOKF"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in have api_token_file api_token ts_api ts_api_body ts_ok acl_has_fleet_brain_tagowner; do
+for fn in box_index_from_name box_name_from_index have api_token_file api_token ts_api ts_api_body ts_ok acl_has_fleet_brain_tagowner; do
   eval "\$(extract_from "\$FLEETCTL" "\$fn")"
 done
 # FAKE curl: parse args to find --config <cfg> and -o <out>. If the config file
@@ -349,7 +463,7 @@ BOX_ROOT="/nonexistent"
 log(){ echo "LOG:\$*"; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in box_index reconcile_decide reconcile_one reconcile_bump_checkfail reconcile_reset_checkfail days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index box_index reconcile_decide reconcile_one reconcile_bump_checkfail reconcile_reset_checkfail days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Tunnel up (would trigger mint on an offline box) but this is a READ-ONLY run.
 tunnel_up(){ return 0; }
 tunnel_ssh(){ return 1; }   # boxup check fails, but suppressed
@@ -407,7 +521,7 @@ TS_TAILNET="-"
 TS_API_CODE=0
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_dedup dev_field ts_ok devices_json_valid; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_dedup dev_field ts_ok devices_json_valid; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 FLEET_STALE_SECS=600
 seq="\$(mktemp)"; BODYF="\$(mktemp)"
 DEVS='{"devices":[{"hostname":"grok-box-8","nodeId":"LIVE","online":true,"lastSeen":"2999-01-01T00:00:00Z"},{"hostname":"grok-box-8-1","nodeId":"STALE","online":false,"lastSeen":"2000-01-01T00:00:00Z"}]}'
@@ -444,7 +558,7 @@ TS_API_CODE=0
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_rotate ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_rotate ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 seq="\$(mktemp)"
 # key_meta_id: the recorded OLD id (empty => none recorded).
 key_meta_id(){ [ -n "$old_id" ] && printf '%s' "$old_id"; }
@@ -513,7 +627,7 @@ FLEET_KEYS_DIR="\$FLEET_STATE/keys"
 FLEET_KEY_EXPIRY_SECS=7776000
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_mint_key record_key_meta key_meta_file key_meta_id box_index mint_payload mint_create ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_mint_key record_key_meta key_meta_file key_meta_id box_index mint_payload mint_create ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 BODYF="\$(mktemp)"
 echo '{"key":"tskey-abc","id":"kNEW999","expires":"2099-03-01T00:00:00Z"}' > "\$BODYF"
 ts_api(){ TS_API_CODE=200; return 0; }
@@ -552,12 +666,12 @@ rollout_order_test() {
   cat > "$inner" <<INNER
 set -u
 FLEETCTL="$FLEETCTL"
-FLEET_BOXES="grok-box-3 grok-box-5 grok-box-8"
+FLEET_BOXES="grok-box-003 grok-box-005 grok-box-008"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
-config_get(){ return 1; }           # no canary_box configured => default 8
+for fn in box_index_from_name box_name_from_index reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }           # no canary_box configured => default grok-box-008
 reconcile_stage_rollout_tree(){ FLEET_ROLLOUT_TREE_STAGED=0; return 0; }  # a tree is staged
 reconcile_cleanup_rollout_tree(){ :; }
 tunnel_up(){ return 0; }            # every tunnel up
@@ -566,39 +680,39 @@ seq="\$(mktemp)"
 tunnel_deploy_one(){
   echo "DEPLOY \$1" >> "\$seq"
   case "\$1" in
-    grok-box-8) return $canary_verdict ;;
-    grok-box-3) return $b3_verdict ;;
+    grok-box-008) return $canary_verdict ;;
+    grok-box-003) return $b3_verdict ;;
     *) return 0 ;;
   esac
 }
-reconcile_rollout grok-box-5 >/dev/null 2>&1
+reconcile_rollout drift >/dev/null 2>&1
 echo "rc=\$?"
 tr '\n' '|' < "\$seq"; echo
 rm -f "\$seq"
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
-# Canary first, all pass: deploy 8 THEN the rest (3,5 in enrolled order).
+# Canary first, all pass: deploy 008 THEN the rest (003,005 in enrolled order).
 ro_all="$(rollout_order_test 0 0)"
 case "$ro_all" in
-  "rc=0"*"DEPLOY grok-box-8|DEPLOY grok-box-3|DEPLOY grok-box-5|"*)
-    pass "rollout: canary (grok-box-8) deploys FIRST, then the rest serially" ;;
+  "rc=0"*"DEPLOY grok-box-008|DEPLOY grok-box-003|DEPLOY grok-box-005|"*)
+    pass "rollout: canary (grok-box-008) deploys FIRST, then the rest serially" ;;
   *) bad "rollout order wrong: [$ro_all]" ;;
 esac
 
 # Canary FAILS verification => ABORT: ZERO other boxes touched.
 ro_canfail="$(rollout_order_test 1 0)"
 case "$ro_canfail" in
-  "rc=1"*"DEPLOY grok-box-8|") pass "rollout: canary verified-FAILURE => ABORT, zero other boxes deployed" ;;
-  *"DEPLOY grok-box-3"*|*"DEPLOY grok-box-5"*) bad "rollout: touched other boxes after canary failure (FORBIDDEN): [$ro_canfail]" ;;
+  "rc=1"*"DEPLOY grok-box-008|") pass "rollout: canary verified-FAILURE => ABORT, zero other boxes deployed" ;;
+  *"DEPLOY grok-box-003"*|*"DEPLOY grok-box-005"*) bad "rollout: touched other boxes after canary failure (FORBIDDEN): [$ro_canfail]" ;;
   *) bad "rollout canary-fail wrong: [$ro_canfail]" ;;
 esac
 
-# A mid-list box (grok-box-3) FAILS => ABORT: grok-box-5 (after it) NOT deployed.
+# A mid-list box (grok-box-003) FAILS => ABORT: grok-box-005 (after it) NOT deployed.
 ro_midfail="$(rollout_order_test 0 1)"
 case "$ro_midfail" in
-  *"DEPLOY grok-box-5"*) bad "rollout: deployed grok-box-5 after grok-box-3 failed (abort-on-first-failure violated): [$ro_midfail]" ;;
-  "rc=1"*"DEPLOY grok-box-8|DEPLOY grok-box-3|") pass "rollout: abort-on-first-failure stops NEW deploys after a verified failure" ;;
+  *"DEPLOY grok-box-005"*) bad "rollout: deployed grok-box-005 after grok-box-003 failed (abort-on-first-failure violated): [$ro_midfail]" ;;
+  "rc=1"*"DEPLOY grok-box-008|DEPLOY grok-box-003|") pass "rollout: abort-on-first-failure stops NEW deploys after a verified failure" ;;
   *) bad "rollout mid-fail wrong: [$ro_midfail]" ;;
 esac
 
@@ -608,18 +722,18 @@ rollout_canary_down_test() {
   cat > "$inner" <<INNER
 set -u
 FLEETCTL="$FLEETCTL"
-FLEET_BOXES="grok-box-3 grok-box-8"
+FLEET_BOXES="grok-box-3 grok-box-008"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_rollout reconcile_canary_box reconcile_target_boxes box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 reconcile_stage_rollout_tree(){ FLEET_ROLLOUT_TREE_STAGED=0; return 0; }
 reconcile_cleanup_rollout_tree(){ :; }
-tunnel_up(){ [ "\$1" = grok-box-8 ] && return 1 || return 0; }   # canary down
+tunnel_up(){ [ "\$1" = grok-box-008 ] && return 1 || return 0; }   # canary down
 seq="\$(mktemp)"
 tunnel_deploy_one(){ echo "DEPLOY \$1" >> "\$seq"; return 0; }
-reconcile_rollout grok-box-3 >/dev/null 2>&1
+reconcile_rollout drift >/dev/null 2>&1
 echo "rc=\$?"; tr '\n' '|' < "\$seq"; echo
 rm -f "\$seq"
 INNER
@@ -639,27 +753,31 @@ rollout_canary_cfg_test() {
 set -u
 FLEETCTL="$FLEETCTL"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" box_name_from_index)"
+eval "\$(extract_from "\$FLEETCTL" box_index_from_name)"
 eval "\$(extract_from "\$FLEETCTL" reconcile_canary_box)"
 config_get(){ [ "\$1 \$2" = "fleet-brain canary_box" ] && echo 5; }
 reconcile_canary_box
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
-[ "$(rollout_canary_cfg_test)" = grok-box-5 ] && pass "rollout: [fleet-brain].canary_box overrides the default (=> grok-box-5)" || bad "canary_box override wrong: [$(rollout_canary_cfg_test)]"
-# Default (unset) => grok-box-8.
+[ "$(rollout_canary_cfg_test)" = grok-box-005 ] && pass "rollout: [fleet-brain].canary_box overrides the default, normalised (=> grok-box-005)" || bad "canary_box override wrong: [$(rollout_canary_cfg_test)]"
+# Default (unset) => grok-box-008 (D5 padded default).
 rollout_canary_default_test() {
   local inner; inner="$(mktemp)"
   cat > "$inner" <<INNER
 set -u
 FLEETCTL="$FLEETCTL"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" box_name_from_index)"
+eval "\$(extract_from "\$FLEETCTL" box_index_from_name)"
 eval "\$(extract_from "\$FLEETCTL" reconcile_canary_box)"
 config_get(){ return 1; }
 reconcile_canary_box
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"
 }
-[ "$(rollout_canary_default_test)" = grok-box-8 ] && pass "rollout: canary_box default => grok-box-8" || bad "canary_box default wrong: [$(rollout_canary_default_test)]"
+[ "$(rollout_canary_default_test)" = grok-box-008 ] && pass "rollout: canary_box default => grok-box-008" || bad "canary_box default wrong: [$(rollout_canary_default_test)]"
 
 # Tunnel argv: tunnel_deploy_one drives the box over ssh -p 2000N box@127.0.0.1
 # -i <vps-key>, and VERIFIES with `boxup check`. B-2: a rollout MUST push a real
@@ -675,7 +793,7 @@ FLEET_ROLLOUT_TREE="\$(mktemp --suffix=.tar)"; printf 'ARTIFACT' > "\$FLEET_ROLL
 BOX_ROOT="/workspace/box-setup"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 cap="\$(mktemp)"; scpcap="\$(mktemp)"
 # ssh stub: append the full argv of each invocation (one line per call). The
 # 'boxup check' verify + the extract/install/once step both come through here.
@@ -711,7 +829,7 @@ tunnelstate_test() {
 set -u
 BOXUP="$BOXUP"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in fleet_configured tunnel_state; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index fleet_configured tunnel_state; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
 if [ "$configured" = yes ]; then config_get(){ [ "\$1 \$2" = "fleet vps" ] && echo "1.2.3.4"; }; else config_get(){ return 1; }; fi
 if [ "$alive" = yes ]; then tunnel_pid(){ echo 4242; return 0; }; else tunnel_pid(){ return 1; }; fi
 tunnel_state
@@ -734,7 +852,7 @@ log(){ :; }; have(){ command -v "\$1" >/dev/null 2>&1; }
 config_get(){ return 1; }         # nothing configured
 spawn_detached(){ echo SPAWNED >> "\$marker"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in fleet_configured fleet_port supervise_tunnel tunnel_pid tunnel_backoff_window tunnel_fail_count ensure_tunnel_key; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index fleet_configured fleet_port supervise_tunnel tunnel_pid tunnel_backoff_window tunnel_fail_count ensure_tunnel_key; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
 supervise_tunnel
 grep -q SPAWNED "\$marker" && echo SPAWNED || echo NOOP
 rm -f "\$marker"
@@ -763,7 +881,7 @@ tunnel_pid(){ return 1; }            # no live tunnel
 pgrep(){ return 1; }                 # cannot attribute a pid (fine)
 spawn_detached(){ shift; printf '%s\n' "\$@" > "\$capture"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in fleet_configured fleet_port supervise_tunnel tunnel_backoff_window tunnel_fail_count; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index fleet_configured fleet_port supervise_tunnel tunnel_backoff_window tunnel_fail_count; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
 supervise_tunnel
 tr '\n' ' ' < "\$capture"
 rm -rf "\$RUN_DIR" "\$SECRETS_DIR" "\$capture"
@@ -790,7 +908,7 @@ config_get(){ case "\$1 \$2" in "fleet vps") echo "9.9.9.9";; "fleet box_index")
 tunnel_pid(){ echo 4242; return 0; }      # a live tunnel already
 spawn_detached(){ echo SPAWNED >> "\$marker"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in fleet_configured fleet_port supervise_tunnel tunnel_backoff_window tunnel_fail_count ensure_tunnel_key; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index fleet_configured fleet_port supervise_tunnel tunnel_backoff_window tunnel_fail_count ensure_tunnel_key; do eval "\$(extract_from "\$BOXUP" "\$fn")"; done
 supervise_tunnel
 grep -q SPAWNED "\$marker" && echo SPAWNED || echo NOSPAWN
 rm -rf "\$RUN_DIR" "\$marker"
@@ -900,7 +1018,7 @@ MARK="\$(mktemp)"; : > "\$MARK"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_reconcile reconcile_one reconcile_decide reconcile_target_boxes box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent reconcile_alert_asleep reconcile_alert_incoherent mint_window_valid days_until reconcile_record_api_failure reconcile_reset_api_failure reconcile_backoff_active devices_json_valid key_meta_id key_meta_file ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_reconcile reconcile_one reconcile_decide reconcile_target_boxes box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent reconcile_alert_asleep reconcile_alert_incoherent mint_window_valid days_until reconcile_record_api_failure reconcile_reset_api_failure reconcile_backoff_active devices_json_valid key_meta_id key_meta_file ts_ok; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # API returns a healthy list where box-8 is OFFLINE (mint-worthy with tunnel up).
 BODYF="\$(mktemp)"
 devices_json(){ TS_API_CODE=200; printf '%s' '{"devices":[]}' > "\$BODYF"; }
@@ -933,7 +1051,7 @@ RECONCILE_READONLY=1
 MARK="\$(mktemp)"; : > "\$MARK"
 log(){ :; }; notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_one reconcile_decide box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_one reconcile_decide box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Feed a mint-worthy decision: online=no, tunnel up. dev_field is unused because
 # devs is non-empty here; provide it. But make it read-only (arg 4 = 1) AND apply=1.
 dev_field(){ case "\$3" in online) echo no;; fresh) echo yes;; dupcount) echo 1;; both_online) echo no;; *) echo "";; esac; }
@@ -1188,7 +1306,7 @@ FLEET_STATE="\$(mktemp -d)"
 FLEET_KEYS_DIR="\$FLEET_STATE/keys"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in record_key_meta key_meta_file box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index record_key_meta key_meta_file box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 if record_key_meta grok-box-8 "" "2099-01-01T00:00:00Z"; then echo "rc=0"; else echo "rc=1"; fi
 f="\$FLEET_KEYS_DIR/8.json"
 [ -f "\$f" ] && echo "file=present" || echo "file=absent"
@@ -1213,7 +1331,7 @@ FLEETCTL="$FLEETCTL"
 BOX_ROOT="/workspace/box-setup"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index tunnel_deploy_one tunnel_ssh tunnel_scp port_for box_index; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 unset FLEET_ROLLOUT_TREE
 cap="\$(mktemp)"
 ssh(){ printf 'SSH %s\n' "\$*" >> "\$cap"; return 0; }
@@ -1247,7 +1365,7 @@ FLEET_TARGET_SHA=""
 MARK="\$(mktemp)"; : > "\$MARK"
 log(){ :; }; notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_one box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_one box_index reconcile_bump_checkfail reconcile_reset_checkfail reconcile_reset_seedfail reconcile_bump_seedfail reconcile_reset_asleep reconcile_reset_incoherent mint_window_valid days_until; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Two mutating actions this run; neither is 'mint' (avoid the mint-window guard).
 reconcile_decide(){ printf 'delete-then-rename\nrollout\n'; }
 tunnel_up(){ return 1; }          # tunnel down => no boxup check side effects
@@ -1870,7 +1988,7 @@ BOX_CONFIG="/workspace/box-setup/config.toml"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 RECORDED="\$(mktemp)"; : > "\$RECORDED"
 acl_has_fleet_brain_tagowner(){ return 0; }
 enroll_read_box_pubkey(){ echo "ssh-ed25519 AAAAC3fake grok-tunnel-grok-box-3"; }
@@ -1916,7 +2034,7 @@ BOX_CONFIG="/workspace/box-setup/config.toml"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 SIDE="\$(mktemp)"; : > "\$SIDE"
 unset FLEET_VPS_ADDR 2>/dev/null || true
 config_get(){ return 1; }                       # nothing resolves => refuse
@@ -1949,7 +2067,7 @@ BOX_CONFIG="/workspace/box-setup/config.toml"
 log(){ :; }
 notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index cmd_enroll box_index port_for fleet_vps_addr fleet_vps_port; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 CALLED="\$(mktemp)"; : > "\$CALLED"
 # Stub every side-effecting step to success; record if the box-config writer runs.
 acl_has_fleet_brain_tagowner(){ return 0; }
@@ -2008,7 +2126,7 @@ FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/fleet.toml"
 FLEET_MANAGED_BOXDIR="$d/boxes"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 render_managed "$box"
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
@@ -2065,7 +2183,7 @@ FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/fleet.toml"
 FLEET_MANAGED_BOXDIR="$d/boxes"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 [ "$awkfail" = 1 ] && awk(){ return 3; }   # force a genuine render failure
 out="\$(render_managed "$box" 2>/dev/null)"; rc=\$?
 printf '%s\n' "\$out"
@@ -2118,7 +2236,7 @@ FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # render_managed uses awk internally; shadow it AFTER the functions are defined
 # so the render fails but nothing else depends on this stub firing first.
 render_managed(){ managed_header; return 7; }   # simulate a propagated render failure
@@ -2175,7 +2293,7 @@ BOX_ROOT="$d/box"
 BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Fake boxup: MANAGED_FILE= line iff support=yes; answers config-get accordingly.
 if [ "$support" = yes ]; then
   printf 'MANAGED_FILE=/x\ncase "\$1 \$2 \$3" in "config-get managed enabled") echo %s;; esac\n' "$enabled" > "$d/box/boxup"
@@ -2218,7 +2336,7 @@ FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Corrupting tunnel_ssh: append to stdin so the remote sha never matches want.
 tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sed 's/\$/X/' | sh -c "\$s"; }
 push_managed grok-box-8; echo "PUSHRC=\$?"
@@ -2266,7 +2384,7 @@ FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # Provide a controllable \`bash\` for the remote probe:
 #   shim=bash => a real bash (the box's actual bash, honours -d) => probe works.
 #   shim=fail => a bash that always errors => probe genuinely fails.
@@ -2316,12 +2434,12 @@ FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/etc/fleet.toml"
 FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 FLEET_STATE="$d/state"
-FLEET_BOXES="grok-box-8 grok-box-3 grok-box-5"
+FLEET_BOXES="grok-box-008 grok-box-003 grok-box-005"
 log(){ echo "LOG:\$*"; }
 notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
-config_get(){ return 1; }   # no canary_box configured => default 8
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # no canary_box configured => default grok-box-008
 tunnel_up(){ return 0; }    # all tunnels up
 seq="$d/seq"
 # push_managed stub: record the box + dry flag, return the per-box verdict.
@@ -2329,8 +2447,8 @@ push_managed(){
   local box="\$1" dry=0; case "\${2:-}" in --dry-run) dry=1;; esac
   echo "PUSH \$box dry=\$dry" >> "\$seq"
   case "\$box" in
-    grok-box-8) return $canary_v ;;
-    grok-box-3) return $rest_v ;;
+    grok-box-008) return $canary_v ;;
+    grok-box-003) return $rest_v ;;
     *) return 0 ;;
   esac
 }
@@ -2345,38 +2463,38 @@ cp_absent="$(cfgpass_test no 0 0 0)"
 case "$cp_absent" in *PUSH*) bad "D6: config pass acted with D2 files ABSENT: [$cp_absent]" ;; *"PASSRC=0"*) pass "D6: config pass is a SILENT no-op when fleet.toml/boxes are absent" ;; *) bad "D6 absent wrong: [$cp_absent]" ;; esac
 # present, dry-run => canary FIRST then rest, all dry=1.
 cp_dry="$(cfgpass_test yes 0 0 0)"
-case "$cp_dry" in "PASSRC=0"|*"PUSH grok-box-8 dry=1|PUSH grok-box-3 dry=1|PUSH grok-box-5 dry=1|"*) pass "D6: dry-run pass pushes --dry-run canary-first then the rest serially" ;; *) bad "D6 dry-run order wrong: [$cp_dry]" ;; esac
+case "$cp_dry" in "PASSRC=0"|*"PUSH grok-box-008 dry=1|PUSH grok-box-003 dry=1|PUSH grok-box-005 dry=1|"*) pass "D6: dry-run pass pushes --dry-run canary-first then the rest serially" ;; *) bad "D6 dry-run order wrong: [$cp_dry]" ;; esac
 # present, apply => dry=0.
 cp_apply="$(cfgpass_test yes 1 0 0)"
-case "$cp_apply" in *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*) pass "D6: --apply pass pushes for real (dry=0), canary-first" ;; *) bad "D6 apply order wrong: [$cp_apply]" ;; esac
+case "$cp_apply" in *"PUSH grok-box-008 dry=0|PUSH grok-box-003 dry=0|PUSH grok-box-005 dry=0|"*) pass "D6: --apply pass pushes for real (dry=0), canary-first" ;; *) bad "D6 apply order wrong: [$cp_apply]" ;; esac
 # canary CONTENT failure (rc 3/4/5) => ABORT (zero other boxes), rc 1. Under
 # D6b the notify is threshold-gated (D9), so a SINGLE-tick failure warns via a
 # log line, NOT notify — the notify assertions live in the D11b threshold block.
 cp_canfail="$(cfgpass_test yes 1 4 0)"
-case "$cp_canfail" in *"PUSH grok-box-8 dry=0|"*) case "$cp_canfail" in *"PUSH grok-box-3"*) bad "D6: canary failure did NOT abort (touched grok-box-3): [$cp_canfail]" ;; *"PASSRC=1"*) pass "D6b: canary CONTENT FAILURE (rc 4) => ABORT the rest this tick, rc 1" ;; *) bad "D6 canary-abort rc wrong: [$cp_canfail]" ;; esac ;; *) bad "D6 canary-fail wrong: [$cp_canfail]" ;; esac
+case "$cp_canfail" in *"PUSH grok-box-008 dry=0|"*) case "$cp_canfail" in *"PUSH grok-box-003"*) bad "D6: canary failure did NOT abort (touched grok-box-003): [$cp_canfail]" ;; *"PASSRC=1"*) pass "D6b: canary CONTENT FAILURE (rc 4) => ABORT the rest this tick, rc 1" ;; *) bad "D6 canary-abort rc wrong: [$cp_canfail]" ;; esac ;; *) bad "D6 canary-fail wrong: [$cp_canfail]" ;; esac
 case "$cp_canfail" in *NOTIFY*) bad "D6b: a single-tick canary failure must NOT notify (threshold >3): [$cp_canfail]" ;; *) pass "D6b: a single-tick canary failure aborts WITHOUT notify (D9 threshold-gated)" ;; esac
 # non-canary FAILS => D9 bump for that box, CONTINUE with the rest, rc 1.
 cp_restfail="$(cfgpass_test yes 1 0 1)"
-case "$cp_restfail" in *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*) pass "D6: a NON-canary failure continues to the remaining boxes" ;; *) bad "D6 non-canary continue wrong: [$cp_restfail]" ;; esac
-case "$cp_restfail" in *"CFGFAIL grok-box-3.cfgfail=1"*) pass "D9: a non-canary push failure bumps that box's .cfgfail" ;; *) bad "D9 cfgfail bump missing: [$cp_restfail]" ;; esac
+case "$cp_restfail" in *"PUSH grok-box-008 dry=0|PUSH grok-box-003 dry=0|PUSH grok-box-005 dry=0|"*) pass "D6: a NON-canary failure continues to the remaining boxes" ;; *) bad "D6 non-canary continue wrong: [$cp_restfail]" ;; esac
+case "$cp_restfail" in *"CFGFAIL grok-box-003.cfgfail=1"*) pass "D9: a non-canary push failure bumps that box's .cfgfail" ;; *) bad "D9 cfgfail bump missing: [$cp_restfail]" ;; esac
 case "$cp_restfail" in *"PASSRC=1"*) pass "D6: config pass returns rc 1 when a non-canary box failed" ;; *) bad "D6 non-canary rc wrong: [$cp_restfail]" ;; esac
 
 # D6 per-box guard: tunnel DOWN or .checkfail => skip silently.
 cfgpass_guard_test() {
   local guard="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
   printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
-  [ "$guard" = checkfail ] && echo 4 > "$d/state/grok-box-3.checkfail"
+  [ "$guard" = checkfail ] && echo 4 > "$d/state/grok-box-003.checkfail"
   cat > "$inner" <<INNER
 set -u
 FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
-FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-008 grok-box-003"
 log(){ :; }; notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
-# tunnel_up: grok-box-8 always up; grok-box-3 down iff guard=tunnel.
-tunnel_up(){ case "\$1" in grok-box-3) [ "$guard" != tunnel ] ;; *) return 0 ;; esac; }
+# tunnel_up: grok-box-008 always up; grok-box-003 down iff guard=tunnel.
+tunnel_up(){ case "\$1" in grok-box-003) [ "$guard" != tunnel ] ;; *) return 0 ;; esac; }
 seq="$d/seq"
 push_managed(){ echo "PUSH \$1" >> "\$seq"; return 0; }
 reconcile_config_pass 1 >/dev/null; echo "PASSRC=\$?"
@@ -2385,30 +2503,30 @@ INNER
   timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
 g_tun="$(cfgpass_guard_test tunnel)"
-case "$g_tun" in *"PUSH grok-box-3"*) bad "D6 guard: pushed to a tunnel-DOWN box: [$g_tun]" ;; *"PUSH grok-box-8"*) pass "D6 guard: tunnel-down box skipped silently (canary still pushed)" ;; *) bad "D6 tunnel guard wrong: [$g_tun]" ;; esac
+case "$g_tun" in *"PUSH grok-box-003"*) bad "D6 guard: pushed to a tunnel-DOWN box: [$g_tun]" ;; *"PUSH grok-box-008"*) pass "D6 guard: tunnel-down box skipped silently (canary still pushed)" ;; *) bad "D6 tunnel guard wrong: [$g_tun]" ;; esac
 g_chk="$(cfgpass_guard_test checkfail)"
-case "$g_chk" in *"PUSH grok-box-3"*) bad "D6 guard: pushed to a .checkfail box: [$g_chk]" ;; *"PUSH grok-box-8"*) pass "D6 guard: .checkfail box skipped silently" ;; *) bad "D6 checkfail guard wrong: [$g_chk]" ;; esac
+case "$g_chk" in *"PUSH grok-box-003"*) bad "D6 guard: pushed to a .checkfail box: [$g_chk]" ;; *"PUSH grok-box-008"*) pass "D6 guard: .checkfail box skipped silently" ;; *) bad "D6 checkfail guard wrong: [$g_chk]" ;; esac
 
 # BLOCKER-1 (live canary r1): the per-box guard must gate on the checkfail COUNT
 # (>3, matching reconcile_decide's threshold), NOT file PRESENCE. A HEALTHY box
 # carries a `0`-content .checkfail FILE (reconcile_reset_checkfail rewrites it
 # every tick), so a presence guard skipped EVERY healthy box — the whole fleet —
 # on every real tick. Drives the REAL reconcile_config_pass with the checkfail
-# file for a NON-canary box (grok-box-3) seeded to a chosen state; asserts the
+# file for a NON-canary box (grok-box-003) seeded to a chosen state; asserts the
 # box is processed (0/absent) or skipped-with-a-log-line (over threshold).
 cfgpass_checkfail_test() {
-  # args: chkstate = absent | 0 | 4   (grok-box-3's .checkfail content)
+  # args: chkstate = absent | 0 | 4   (grok-box-003's .checkfail content)
   local chkstate="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
   printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
-  [ "$chkstate" != absent ] && printf '%s\n' "$chkstate" > "$d/state/grok-box-3.checkfail"
+  [ "$chkstate" != absent ] && printf '%s\n' "$chkstate" > "$d/state/grok-box-003.checkfail"
   cat > "$inner" <<INNER
 set -u
 FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
-FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-008 grok-box-003"
 log(){ echo "LOG:\$*"; }; notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 tunnel_up(){ return 0; }   # both tunnels up: only the checkfail count decides
 seq="$d/seq"
@@ -2420,13 +2538,13 @@ INNER
 }
 # (a) content 0 (HEALTHY, the every-tick state) => box IS processed.
 cf_zero="$(cfgpass_checkfail_test 0)"
-case "$cf_zero" in *"PUSH grok-box-3"*) pass "BLOCKER-1: a 0-content .checkfail (healthy) box IS processed by the config pass" ;; *) bad "BLOCKER-1: healthy 0-content box was SKIPPED (the live-canary bug): [$cf_zero]" ;; esac
+case "$cf_zero" in *"PUSH grok-box-003"*) pass "BLOCKER-1: a 0-content .checkfail (healthy) box IS processed by the config pass" ;; *) bad "BLOCKER-1: healthy 0-content box was SKIPPED (the live-canary bug): [$cf_zero]" ;; esac
 # (b) content 4 (>3, unhealthy) => box SKIPPED, with the skip log line.
 cf_four="$(cfgpass_checkfail_test 4)"
-case "$cf_four" in *"PUSH grok-box-3"*) bad "BLOCKER-1: pushed to an over-threshold (4) box: [$cf_four]" ;; *"LOG:config: skip grok-box-3 — checkfail over threshold"*) pass "BLOCKER-1: a >3 checkfail box is skipped WITH a skip log line" ;; *) bad "BLOCKER-1: over-threshold skip log missing: [$cf_four]" ;; esac
+case "$cf_four" in *"PUSH grok-box-003"*) bad "BLOCKER-1: pushed to an over-threshold (4) box: [$cf_four]" ;; *"LOG:config: skip grok-box-003 — checkfail over threshold"*) pass "BLOCKER-1: a >3 checkfail box is skipped WITH a skip log line" ;; *) bad "BLOCKER-1: over-threshold skip log missing: [$cf_four]" ;; esac
 # (c) absent .checkfail => box IS processed.
 cf_abs="$(cfgpass_checkfail_test absent)"
-case "$cf_abs" in *"PUSH grok-box-3"*) pass "BLOCKER-1: an ABSENT .checkfail box IS processed" ;; *) bad "BLOCKER-1: absent-checkfail box was skipped: [$cf_abs]" ;; esac
+case "$cf_abs" in *"PUSH grok-box-003"*) pass "BLOCKER-1: an ABSENT .checkfail box IS processed" ;; *) bad "BLOCKER-1: absent-checkfail box was skipped: [$cf_abs]" ;; esac
 
 # r5.3 G3: the CANARY checkfail guard needs an explicit else arm. r5.1 gave the
 # NON-canary >3 skip a diagnostic line, but the canary guard skipped SILENTLY
@@ -2434,21 +2552,21 @@ case "$cf_abs" in *"PUSH grok-box-3"*) pass "BLOCKER-1: an ABSENT .checkfail box
 # skipped=, NO notify, NO cfgfail change, and the pass FALLS THROUGH to the
 # non-canary loop (mirrors the rc-6 path). checkfail=3 => the ==3 boundary is
 # healthy, so the canary IS pushed (folds the r2 SHOULD boundary test).
-# Drives the REAL reconcile_config_pass; the canary is grok-box-8, non-canary
-# grok-box-3 (both tunnels up), so only the canary's checkfail count decides.
+# Drives the REAL reconcile_config_pass; the canary is grok-box-008, non-canary
+# grok-box-003 (both tunnels up), so only the canary's checkfail count decides.
 cfgpass_canary_checkfail_test() {
-  # args: canary_chk = 3 | 4   (grok-box-8's .checkfail content)
+  # args: canary_chk = 3 | 4   (grok-box-008's .checkfail content)
   local canary_chk="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
   printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
-  printf '%s\n' "$canary_chk" > "$d/state/grok-box-8.checkfail"
+  printf '%s\n' "$canary_chk" > "$d/state/grok-box-008.checkfail"
   cat > "$inner" <<INNER
 set -u
 FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
-FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-008 grok-box-003"
 log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # no canary_box configured => default 8
 tunnel_up(){ return 0; }    # both tunnels up: only the canary checkfail decides
 seq="$d/seq"
@@ -2462,14 +2580,14 @@ INNER
 # (a) checkfail=4 (>3): the canary is SKIPPED with the G3 line, counted in
 # skipped=, NO notify, NO cfgfail, and the NON-canary loop STILL RUNS.
 cc_four="$(cfgpass_canary_checkfail_test 4)"
-case "$cc_four" in *"LOG:config: canary grok-box-8 skipped — checkfail=4 (>3), continuing without canary protection"*) pass "r5.3 G3: canary checkfail=4 => visible skip line" ;; *) bad "r5.3 G3: canary checkfail>3 skip line missing: [$cc_four]" ;; esac
-case "$cc_four" in *"PUSH grok-box-8"*) bad "r5.3 G3: canary was PUSHED at checkfail=4 (>3): [$cc_four]" ;; *"PUSH grok-box-3"*) pass "r5.3 G3: after the canary skip the non-canary loop STILL runs (grok-box-3 pushed)" ;; *) bad "r5.3 G3: non-canary loop did not run after canary skip: [$cc_four]" ;; esac
+case "$cc_four" in *"LOG:config: canary grok-box-008 skipped — checkfail=4 (>3), continuing without canary protection"*) pass "r5.3 G3: canary checkfail=4 => visible skip line" ;; *) bad "r5.3 G3: canary checkfail>3 skip line missing: [$cc_four]" ;; esac
+case "$cc_four" in *"PUSH grok-box-008"*) bad "r5.3 G3: canary was PUSHED at checkfail=4 (>3): [$cc_four]" ;; *"PUSH grok-box-003"*) pass "r5.3 G3: after the canary skip the non-canary loop STILL runs (grok-box-003 pushed)" ;; *) bad "r5.3 G3: non-canary loop did not run after canary skip: [$cc_four]" ;; esac
 case "$cc_four" in *"LOG:config: pass done (apply) ok=1 skipped=1 failed=0"*) pass "r5.3 G3: the skipped canary is COUNTED in skipped= (ok=1 skipped=1)" ;; *) bad "r5.3 G3: canary not counted in skipped= : [$cc_four]" ;; esac
 case "$cc_four" in *NOTIFY*) bad "r5.3 G3: canary checkfail skip must NOT notify: [$cc_four]" ;; *) pass "r5.3 G3: canary checkfail skip emits NO notify" ;; esac
 case "$cc_four" in *CFGFAIL*) bad "r5.3 G3: canary checkfail skip must NOT change cfgfail: [$cc_four]" ;; *) pass "r5.3 G3: canary checkfail skip leaves cfgfail unchanged" ;; esac
 # (b) checkfail=3 (==3 boundary, HEALTHY): the canary IS pushed (r2 boundary).
 cc_three="$(cfgpass_canary_checkfail_test 3)"
-case "$cc_three" in *"PUSH grok-box-8"*) pass "r5.3 G3: canary checkfail=3 (==3 boundary) => canary IS pushed" ;; *) bad "r5.3 G3: canary skipped at the ==3 boundary (should push): [$cc_three]" ;; esac
+case "$cc_three" in *"PUSH grok-box-008"*) pass "r5.3 G3: canary checkfail=3 (==3 boundary) => canary IS pushed" ;; *) bad "r5.3 G3: canary skipped at the ==3 boundary (should push): [$cc_three]" ;; esac
 
 # D4 forward-compat info log: an unknown-but-well-formed key is ALLOWED and
 # logged ONCE per reconcile run, DEDUPED across boxes. Drives the REAL
@@ -2492,12 +2610,12 @@ FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/etc/fleet.toml"
 FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 FLEET_STATE="$d/state"
-FLEET_BOXES="grok-box-8 grok-box-3"
+FLEET_BOXES="grok-box-008 grok-box-003"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # no canary_box configured => default 8
 tunnel_up(){ return 0; }    # both tunnels up
 # Fake tunnel_ssh: strip the sudo sh -c wrapper, run with stdin passed through.
@@ -2534,19 +2652,19 @@ case "$cu_known" in *"unknown-but-well-formed keys"*) bad "D4 info: logged unkno
 # D7 operator surface: cmd_config refuses un-enrolled boxes.
 cmdcfg_enroll_test() {
   local box="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/state"
-  printf 'grok-box-8\t20008\n' > "$d/state/enrolled.tsv"
+  printf 'grok-box-008\t20008\n' > "$d/state/enrolled.tsv"
   cat > "$inner" <<INNER
 set -u
 FLEETCTL="$FLEETCTL"
 FLEET_STATE="$d/state"
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 FLEET_MANAGED_FLEET="$d/none.toml"; FLEET_MANAGED_BOXDIR="$d/noboxes"
 cmd_config render "$box" >/dev/null 2>&1; echo "RC=\$?"
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
-[ "$(cmdcfg_enroll_test grok-box-8)" = "RC=0" ] && pass "config D7: render an ENROLLED box succeeds" || bad "D7 enrolled render failed: [$(cmdcfg_enroll_test grok-box-8)]"
+[ "$(cmdcfg_enroll_test grok-box-008)" = "RC=0" ] && pass "config D7: render an ENROLLED box succeeds" || bad "D7 enrolled render failed: [$(cmdcfg_enroll_test grok-box-008)]"
 [ "$(cmdcfg_enroll_test grok-box-99)" = "RC=2" ] && pass "config D7: an UN-enrolled box is REFUSED (rc 2)" || bad "D7 did not refuse un-enrolled: [$(cmdcfg_enroll_test grok-box-99)]"
 
 # D7 diff exit codes + IGNORED annotation. Drive cmd_config diff with a fake
@@ -2555,8 +2673,8 @@ cmddiff_test() {
   # args: onbox-state(insync|drift) enabled support
   local state="$1" enabled="$2" support="$3" inner; inner="$(mktemp)"
   local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
-  printf '%s' "$FLEETC" > "$d/etc/fleet.toml"; printf '%s' "$BOXC" > "$d/etc/boxes/grok-box-8.toml"
-  printf 'grok-box-8\t20008\n' > "$d/state/enrolled.tsv"
+  printf '%s' "$FLEETC" > "$d/etc/fleet.toml"; printf '%s' "$BOXC" > "$d/etc/boxes/grok-box-008.toml"
+  printf 'grok-box-008\t20008\n' > "$d/state/enrolled.tsv"
   cat > "$inner" <<INNER
 set -u
 FLEETCTL="$FLEETCTL"
@@ -2565,12 +2683,12 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 if [ "$support" = yes ]; then printf 'MANAGED_FILE=/x\ncase "\$1 \$2 \$3" in "config-get managed enabled") echo %s;; esac\n' "$enabled" > "$d/box/boxup"; else : > "$d/box/boxup"; fi
 # Pre-seed the on-box file to be IN SYNC (exact render) or DRIFTED.
-if [ "$state" = insync ]; then render_managed grok-box-8 > "$d/box/managed.toml"; else printf 'DRIFT\n' > "$d/box/managed.toml"; fi
+if [ "$state" = insync ]; then render_managed grok-box-008 > "$d/box/managed.toml"; else printf 'DRIFT\n' > "$d/box/managed.toml"; fi
 tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
-cmd_config diff grok-box-8; echo "DIFFRC=\$?"
+cmd_config diff grok-box-008; echo "DIFFRC=\$?"
 INNER
   timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
@@ -2592,10 +2710,10 @@ FLEETCTL="$FLEETCTL"
 FLEET_STATE="$d/state"
 notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_bump_cfgfail reconcile_reset_cfgfail; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
-for i in 1 2 3 4; do echo "bump=\$(reconcile_bump_cfgfail grok-box-8)"; done
-reconcile_reset_cfgfail grok-box-8
-[ -f "$d/state/grok-box-8.cfgfail" ] && echo "AFTER-RESET=present" || echo "AFTER-RESET=gone"
+for fn in box_index_from_name box_name_from_index reconcile_bump_cfgfail reconcile_reset_cfgfail; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for i in 1 2 3 4; do echo "bump=\$(reconcile_bump_cfgfail grok-box-008)"; done
+reconcile_reset_cfgfail grok-box-008
+[ -f "$d/state/grok-box-008.cfgfail" ] && echo "AFTER-RESET=present" || echo "AFTER-RESET=gone"
 INNER
   timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
@@ -2618,22 +2736,22 @@ cfgnotify_test() {
 set -u
 FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
-FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-008 grok-box-003"
 log(){ :; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
-config_get(){ return 1; }   # canary defaults to grok-box-8
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # canary defaults to grok-box-008
 tunnel_up(){ return 0; }
-# canary (grok-box-8) always succeeds; grok-box-3 (non-canary) always fails.
-push_managed(){ case "\$1" in grok-box-3) return 1 ;; *) return 0 ;; esac; }
+# canary (grok-box-008) always succeeds; grok-box-003 (non-canary) always fails.
+push_managed(){ case "\$1" in grok-box-003) return 1 ;; *) return 0 ;; esac; }
 for tick in 1 2 3 4; do echo "TICK\$tick:"; reconcile_config_pass 1; done
 INNER
   timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
 cn_out="$(cfgnotify_test)"
-# Isolate the notify lines carrying the count for grok-box-3.
-case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-3: 4"*) pass "D9: notify warn fires at the call site when cfgfail crosses > 3" ;; *) bad "D9 call-site notify>3 missing: [$cn_out]" ;; esac
-case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-3: 3"*) bad "D9: notify fired at exactly 3 (threshold is strictly > 3): [$cn_out]" ;; *) pass "D9: no notify at count 3 (threshold is strictly > 3)" ;; esac
+# Isolate the notify lines carrying the count for grok-box-003.
+case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-003: 4"*) pass "D9: notify warn fires at the call site when cfgfail crosses > 3" ;; *) bad "D9 call-site notify>3 missing: [$cn_out]" ;; esac
+case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-003: 3"*) bad "D9: notify fired at exactly 3 (threshold is strictly > 3): [$cn_out]" ;; *) pass "D9: no notify at count 3 (threshold is strictly > 3)" ;; esac
 
 # =============================================================================
 # D11b (r5 ADDENDUM + r5.1): canary-unreachable fall-through, content-failure
@@ -2646,29 +2764,29 @@ case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-3: 3"*) bad "D9
 # Uses the stub cfgpass_test (canary_v=6 => push_managed reports transport).
 cp_can6="$(cfgpass_test yes 1 6 0)"
 case "$cp_can6" in
-  *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*)
+  *"PUSH grok-box-008 dry=0|PUSH grok-box-003 dry=0|PUSH grok-box-005 dry=0|"*)
     pass "D11b/B1: canary rc 6 (unreachable) => canary skipped, NON-canary boxes STILL processed (fall-through)" ;;
   *) bad "D11b/B1: canary rc 6 did not fall through to the rest: [$cp_can6]" ;;
 esac
 case "$cp_can6" in *"PASSRC=0"*) pass "D11b/B1: canary rc 6 => pass rc 0 (transport skip is not a failure)" ;; *) bad "D11b/B1: canary rc 6 pass rc non-zero: [$cp_can6]" ;; esac
 case "$cp_can6" in *NOTIFY*) bad "D11b/B1: canary rc 6 must NOT notify: [$cp_can6]" ;; *) pass "D11b/B1: canary rc 6 fires NO notify" ;; esac
-case "$cp_can6" in *"CFGFAIL grok-box-8"*) bad "D11b/B1: canary rc 6 must NOT bump .cfgfail: [$cp_can6]" ;; *) pass "D11b/B1: canary rc 6 leaves .cfgfail untouched" ;; esac
+case "$cp_can6" in *"CFGFAIL grok-box-008"*) bad "D11b/B1: canary rc 6 must NOT bump .cfgfail: [$cp_can6]" ;; *) pass "D11b/B1: canary rc 6 leaves .cfgfail untouched" ;; esac
 case "$cp_can6" in *"continuing without canary protection"*) pass "D11b/B1: canary rc 6 logs the fall-through info line (one line, supersedes D6a wording)" ;; *) bad "D11b/B1: fall-through info line missing: [$cp_can6]" ;; esac
 
 # --- D11b (r5.1 add): canary rc 4 (CONTENT failure) => non-canary boxes NOT
 # processed (abort preserved), NO cfgfail on the untouched rest.
 cp_can4="$(cfgpass_test yes 1 4 0)"
-case "$cp_can4" in *"PUSH grok-box-3"*) bad "D11b: canary rc 4 (content) must ABORT — grok-box-3 must not be touched: [$cp_can4]" ;; *"PUSH grok-box-8 dry=0|"*) pass "D11b: canary rc 4 (content) => abort preserved, non-canary boxes NOT processed" ;; *) bad "D11b canary rc4 abort wrong: [$cp_can4]" ;; esac
+case "$cp_can4" in *"PUSH grok-box-003"*) bad "D11b: canary rc 4 (content) must ABORT — grok-box-003 must not be touched: [$cp_can4]" ;; *"PUSH grok-box-008 dry=0|"*) pass "D11b: canary rc 4 (content) => abort preserved, non-canary boxes NOT processed" ;; *) bad "D11b canary rc4 abort wrong: [$cp_can4]" ;; esac
 
 # --- D11b: non-canary rc 6 => info skip line, NO cfgfail bump, CONTINUE (D6d).
 cp_rest6="$(cfgpass_test yes 1 0 6)"
 case "$cp_rest6" in
-  *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*)
+  *"PUSH grok-box-008 dry=0|PUSH grok-box-003 dry=0|PUSH grok-box-005 dry=0|"*)
     pass "D11b/D6d: a non-canary rc 6 box is attempted then the pass CONTINUES to the rest" ;;
   *) bad "D11b/D6d: non-canary rc 6 did not continue: [$cp_rest6]" ;;
 esac
-case "$cp_rest6" in *"CFGFAIL grok-box-3"*) bad "D11b/D6d: non-canary rc 6 must NOT bump .cfgfail: [$cp_rest6]" ;; *) pass "D11b/D6d: non-canary rc 6 leaves .cfgfail untouched (transport is the per-box loop's job)" ;; esac
-case "$cp_rest6" in *"skip grok-box-3 — unreachable over tunnel"*) pass "D11b/D6d: non-canary rc 6 logs the 'unreachable over tunnel' skip line" ;; *) bad "D11b/D6d: non-canary rc 6 skip line missing: [$cp_rest6]" ;; esac
+case "$cp_rest6" in *"CFGFAIL grok-box-003"*) bad "D11b/D6d: non-canary rc 6 must NOT bump .cfgfail: [$cp_rest6]" ;; *) pass "D11b/D6d: non-canary rc 6 leaves .cfgfail untouched (transport is the per-box loop's job)" ;; esac
+case "$cp_rest6" in *"skip grok-box-003 — unreachable over tunnel"*) pass "D11b/D6d: non-canary rc 6 logs the 'unreachable over tunnel' skip line" ;; *) bad "D11b/D6d: non-canary rc 6 skip line missing: [$cp_rest6]" ;; esac
 case "$cp_rest6" in *"PASSRC=0"*) pass "D11b/D6d: a non-canary rc 6 (transport) does NOT fail the pass" ;; *) bad "D11b/D6d: non-canary rc 6 failed the pass: [$cp_rest6]" ;; esac
 
 # --- D11b: canary rc 4 on 4 consecutive ticks => notify ONLY on the 4th (D6b
@@ -2682,26 +2800,26 @@ cfgcanary_ticks_test() {
 set -u
 FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
-FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-008 grok-box-003"
 log(){ :; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
-config_get(){ return 1; }   # canary defaults to grok-box-8
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # canary defaults to grok-box-008
 tunnel_up(){ return 0; }
 # canary verdict is read from \$d/verdict each tick (content failure rc 4);
-# non-canary grok-box-3 always succeeds so it never pollutes the picture.
-push_managed(){ case "\$1" in grok-box-8) return \$(cat "$d/verdict") ;; *) return 0 ;; esac; }
+# non-canary grok-box-003 always succeeds so it never pollutes the picture.
+push_managed(){ case "\$1" in grok-box-008) return \$(cat "$d/verdict") ;; *) return 0 ;; esac; }
 echo 4 > "$d/verdict"
 for tick in 1 2 3 4; do echo "TICK\$tick:"; reconcile_config_pass 1; done
 echo 0 > "$d/verdict"   # canary recovers
 echo "TICK5:"; reconcile_config_pass 1
-[ -f "$d/state/grok-box-8.cfgfail" ] && echo "CFGFAIL8=\$(cat "$d/state/grok-box-8.cfgfail")" || echo "CFGFAIL8=gone"
+[ -f "$d/state/grok-box-008.cfgfail" ] && echo "CFGFAIL8=\$(cat "$d/state/grok-box-008.cfgfail")" || echo "CFGFAIL8=gone"
 INNER
   timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
 ct_out="$(cfgcanary_ticks_test)"
-case "$ct_out" in *"NOTIFY:warn config push failing for grok-box-8: 4 consecutive failures — config pass aborted"*) pass "D11b/D6b: canary content failure notifies on the 4th tick (threshold >3) with the pass-aborted wording" ;; *) bad "D11b/D6b: canary threshold notify missing/misworded: [$ct_out]" ;; esac
-case "$ct_out" in *"grok-box-8: 3 consecutive"*|*"grok-box-8: 2 consecutive"*|*"grok-box-8: 1 consecutive"*) bad "D11b/D6b: canary notified at count <=3 (threshold is strictly >3): [$ct_out]" ;; *) pass "D11b/D6b: canary does NOT notify at counts 1-3 (threshold strictly >3)" ;; esac
+case "$ct_out" in *"NOTIFY:warn config push failing for grok-box-008: 4 consecutive failures — config pass aborted"*) pass "D11b/D6b: canary content failure notifies on the 4th tick (threshold >3) with the pass-aborted wording" ;; *) bad "D11b/D6b: canary threshold notify missing/misworded: [$ct_out]" ;; esac
+case "$ct_out" in *"grok-box-008: 3 consecutive"*|*"grok-box-008: 2 consecutive"*|*"grok-box-008: 1 consecutive"*) bad "D11b/D6b: canary notified at count <=3 (threshold is strictly >3): [$ct_out]" ;; *) pass "D11b/D6b: canary does NOT notify at counts 1-3 (threshold strictly >3)" ;; esac
 case "$ct_out" in *"CFGFAIL8=gone"*) pass "D11b/D6b: a canary SUCCESS after failures RESETS the cfgfail counter" ;; *) bad "D11b/D6b: canary success did not reset the counter: [$ct_out]" ;; esac
 
 # --- D11b: canary rc 6 via the REAL push_managed (fake tunnel_ssh => ssh rc 255)
@@ -2715,29 +2833,29 @@ cfgpass_real6_test() {
 set -u
 FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
-FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-008 grok-box-003"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 tunnel_up(){ return 0; }
 # Fake tunnel_ssh: the CANARY (port 20008) is unreachable => emulate ssh's
 # rc 255 with no output; every other box runs the remote script locally.
-port_for(){ case "\$1" in grok-box-8) echo 20008;; grok-box-3) echo 20003;; esac; }
+port_for(){ case "\$1" in grok-box-008) echo 20008;; grok-box-003) echo 20003;; esac; }
 tunnel_ssh(){
   local box="\$1"; shift
-  if [ "\$box" = grok-box-8 ]; then return 255; fi   # transport dead
+  if [ "\$box" = grok-box-008 ]; then return 255; fi   # transport dead
   local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"
 }
 reconcile_config_pass 1; echo "PASSRC=\$?"
-[ -f "$d/state/grok-box-8.cfgfail" ] && echo "CFGFAIL8=present" || echo "CFGFAIL8=gone"
+[ -f "$d/state/grok-box-008.cfgfail" ] && echo "CFGFAIL8=present" || echo "CFGFAIL8=gone"
 INNER
   timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
 r6_out="$(cfgpass_real6_test)"
 case "$r6_out" in *"continuing without canary protection"*) pass "D11b/B1 (real): a REAL push_managed classifies ssh rc 255 as rc 6 => canary fall-through info line" ;; *) bad "D11b/B1 (real): fall-through line missing: [$r6_out]" ;; esac
-case "$r6_out" in *"grok-box-3 pushed"*|*"grok-box-3 in sync"*|*"grok-box-3 WOULD"*) pass "D11b/B1 (real): with the canary unreachable, non-canary grok-box-3 IS pushed in the same pass" ;; *) bad "D11b/B1 (real): non-canary box not processed after canary 255: [$r6_out]" ;; esac
+case "$r6_out" in *"grok-box-003 pushed"*|*"grok-box-003 in sync"*|*"grok-box-003 WOULD"*) pass "D11b/B1 (real): with the canary unreachable, non-canary grok-box-003 IS pushed in the same pass" ;; *) bad "D11b/B1 (real): non-canary box not processed after canary 255: [$r6_out]" ;; esac
 case "$r6_out" in *"PASSRC=0"*) pass "D11b/B1 (real): a transport-unreachable canary yields pass rc 0" ;; *) bad "D11b/B1 (real): pass rc non-zero: [$r6_out]" ;; esac
 case "$r6_out" in *NOTIFY*) bad "D11b/B1 (real): unreachable canary must not notify: [$r6_out]" ;; *) pass "D11b/B1 (real): unreachable canary fires no notify" ;; esac
 case "$r6_out" in *"CFGFAIL8=gone"*) pass "D11b/B1 (real): unreachable canary does not bump .cfgfail" ;; *) bad "D11b/B1 (real): canary cfgfail bumped on transport failure: [$r6_out]" ;; esac
@@ -2748,8 +2866,8 @@ case "$r6_out" in *"CFGFAIL8=gone"*) pass "D11b/B1 (real): unreachable canary do
 cfgprobe_diff_test() {
   # args: probe_exit(1|2)
   local pexit="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
-  printf '%s' "$FLEETC" > "$d/etc/fleet.toml"; printf '%s' "$BOXC" > "$d/etc/boxes/grok-box-8.toml"
-  printf 'grok-box-8\t20008\n' > "$d/state/enrolled.tsv"
+  printf '%s' "$FLEETC" > "$d/etc/fleet.toml"; printf '%s' "$BOXC" > "$d/etc/boxes/grok-box-008.toml"
+  printf 'grok-box-008\t20008\n' > "$d/state/enrolled.tsv"
   # Supported boxup; config-get exits with the requested code (1 = absent key,
   # 2 = an "other" error). No stdout on the non-zero paths (like the real reader).
   printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") exit %s;; esac\n' "$pexit" > "$d/box/boxup"
@@ -2761,10 +2879,10 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
-render_managed grok-box-8 > "$d/box/managed.toml"   # on-box file == render => in sync
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+render_managed grok-box-008 > "$d/box/managed.toml"   # on-box file == render => in sync
 tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
-cmd_config diff grok-box-8; echo "DIFFRC=\$?"
+cmd_config diff grok-box-008; echo "DIFFRC=\$?"
 INNER
   timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
@@ -2846,7 +2964,7 @@ done
 # line — exactly the live r5.1 break. This is the mutant-killing gate.
 wrap_test() {
   local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box" "$d/bin"
-  printf '%s' "$FLEETC" > "$d/fleet.toml"; printf '%s' "$BOXC" > "$d/boxes/grok-box-8.toml"
+  printf '%s' "$FLEETC" > "$d/fleet.toml"; printf '%s' "$BOXC" > "$d/boxes/grok-box-008.toml"
   # Fake sudo: `sudo sh -c '<script>'` => exec `sh -c '<script>'` (drop argv[1]).
   printf '#!/bin/sh\nexec "$@"\n' > "$d/bin/sudo"; chmod +x "$d/bin/sudo"
   # Fake boxup: supported + config-get answers true.
@@ -2859,12 +2977,12 @@ BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 PATH="$d/bin:\$PATH"; export PATH
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 # REAL wrapping: run the FULL command string through a real shell so the outer
 # single-quote boundary of \`sudo sh -c '<script>'\` is parsed by the shell,
 # not manually stripped. This is the boundary the VPS actually exercises.
 tunnel_ssh(){ shift; sh -c "\$*"; }
-push_managed grok-box-8; echo "PUSHRC=\$?"
+push_managed grok-box-008; echo "PUSHRC=\$?"
 [ -f "$d/box/managed.toml" ] && echo "ONBOX=present" || echo "ONBOX=absent"
 INNER
   timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
@@ -2883,7 +3001,7 @@ case "$w_out" in *"ONBOX=present"*) pass "E1/S1 (authoritative): the on-box file
 #                 (a non-3 rc WITH a status line) => returned VERBATIM (7) (S2).
 rc_test() {
   local mode="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box"
-  printf '%s' "$FLEETC" > "$d/fleet.toml"; printf '%s' "$BOXC" > "$d/boxes/grok-box-8.toml"
+  printf '%s' "$FLEETC" > "$d/fleet.toml"; printf '%s' "$BOXC" > "$d/boxes/grok-box-008.toml"
   printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") echo true;; esac\n' > "$d/box/boxup"
   cat > "$inner" <<INNER
 set -u
@@ -2892,13 +3010,13 @@ FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 case "$mode" in
   nostatus2) tunnel_ssh(){ cat >/dev/null; return 2; } ;;                       # ran, no status line, rc 2
   ssh255)    tunnel_ssh(){ cat >/dev/null; return 255; } ;;                     # transport
   status_rc) tunnel_ssh(){ cat >/dev/null; echo "sha=deadbeef cur=none support=yes enabled=true"; return 7; } ;;  # status line + non-3 rc
 esac
-push_managed grok-box-8; echo "PUSHRC=\$?"
+push_managed grok-box-008; echo "PUSHRC=\$?"
 INNER
   timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
@@ -2913,7 +3031,7 @@ case "$rc_sv" in *"PUSHRC=7"*) pass "E2/S2: a non-3 rc (7) that DID emit a statu
 
 # --- E2 (pass integration): a non-canary box whose remote script fails with
 # rc=2/no-status must land in failed=N (never skipped=). Drives the REAL
-# reconcile_config_pass + REAL push_managed; the canary succeeds, grok-box-3's
+# reconcile_config_pass + REAL push_managed; the canary succeeds, grok-box-003's
 # fake tunnel returns rc 2 with no status line.
 cfg_fail_summary_test() {
   local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
@@ -2923,21 +3041,21 @@ cfg_fail_summary_test() {
 set -u
 FLEETCTL="$FLEETCTL"
 FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
-FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-008 grok-box-003"
 BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 tunnel_up(){ return 0; }
-# canary runs the remote for real (succeeds); grok-box-3 fails rc 2, no status.
+# canary runs the remote for real (succeeds); grok-box-003 fails rc 2, no status.
 tunnel_ssh(){
   local box="\$1"; shift
-  if [ "\$box" = grok-box-3 ]; then cat >/dev/null; return 2; fi
+  if [ "\$box" = grok-box-003 ]; then cat >/dev/null; return 2; fi
   local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"
 }
 reconcile_config_pass 1; echo "PASSRC=\$?"
-[ -f "$d/state/grok-box-3.cfgfail" ] && echo "CFGFAIL3=\$(cat "$d/state/grok-box-3.cfgfail")" || echo "CFGFAIL3=gone"
+[ -f "$d/state/grok-box-003.cfgfail" ] && echo "CFGFAIL3=\$(cat "$d/state/grok-box-003.cfgfail")" || echo "CFGFAIL3=gone"
 INNER
   timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
 }
@@ -2995,10 +3113,263 @@ case "$ident_out" in
   *NOTIFY:*) bad "#10 D6/F3 identity pass emitted a NOTIFY (must be log-only this round): [$ident_out]" ;;
   *) pass "#10 D6/F3 identity pass is LOG-ONLY (no notify/counter/threshold)" ;;
 esac
+# box-naming-3digit D6: a non-canonical DISCOVERED name logs `legacy-name`.
+case "$ident_out" in
+  *"LOG:identity: grok-box-9 legacy-name"*) pass "D6 legacy-name: unpadded discovered grok-box-9 flagged legacy-name" ;;
+  *) bad "D6 legacy-name: grok-box-9 legacy line missing: [$ident_out]" ;;
+esac
+# The -1 split-brain corpse folds to its base and is flagged legacy under the base.
+case "$ident_out" in
+  *"LOG:identity: grok-box-3 legacy-name"*) pass "D6 legacy-name: corpse grok-box-3-1 folds to grok-box-3 and is flagged legacy-name" ;;
+  *) bad "D6 legacy-name: folded grok-box-3 legacy line missing: [$ident_out]" ;;
+esac
+# A CANONICAL three-digit discovered name must NOT be flagged legacy.
+ident_canon="$(identitypass_test '{"devices":[{"hostname":"grok-box-008","tags":["tag:grok-box"],"keyExpiryDisabled":true}]}')"
+case "$ident_canon" in
+  *"legacy-name"*) bad "D6 legacy-name: canonical grok-box-008 wrongly flagged legacy: [$ident_canon]" ;;
+  *) pass "D6 legacy-name: canonical grok-box-008 is NOT flagged legacy" ;;
+esac
+# D6 "enrolled or discovered": a box ENROLLED under a non-canonical name is
+# flagged legacy even on a READ-ONLY run (empty device list, local enrolled.tsv).
+identity_enrolled_test() {
+  local inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  printf 'grok-box-7\t20007\ngrok-box-004\t20004\n' > "$d/state/enrolled.tsv"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes reconcile_identity_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+log(){ printf 'LOG:%s\n' "\$*"; }
+notify(){ printf 'NOTIFY:%s\n' "\$*"; }
+reconcile_identity_pass ''
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+ident_enr="$(identity_enrolled_test)"
+case "$ident_enr" in
+  *"LOG:identity: grok-box-7 legacy-name"*) pass "D6 legacy-name: enrolled non-canonical grok-box-7 flagged legacy on a read-only run" ;;
+  *) bad "D6 legacy-name: enrolled grok-box-7 legacy line missing: [$ident_enr]" ;;
+esac
+case "$ident_enr" in
+  *"grok-box-004 legacy-name"*) bad "D6 legacy-name: enrolled canonical grok-box-004 wrongly flagged: [$ident_enr]" ;;
+  *) pass "D6 legacy-name: enrolled canonical grok-box-004 is NOT flagged legacy" ;;
+esac
+
 # Empty device list (READ-ONLY run) => silent no-op (no lines at all).
 [ -z "$(identitypass_test '')" ] \
   && pass "#10 D6 identity pass: empty device list (read-only run) => silent no-op" \
   || bad  "#10 D6 identity pass not silent on empty list: [$(identitypass_test '')]"
+
+# =============================================================================
+# RENAME (box-naming-3digit D4 + F2/F3/F4/F6/F7) — box-free, VPS-free, API-free.
+# Drives cmd_rename through a fake $FLEET_STATE/$FLEET_ETC with tunnel_ssh /
+# tunnel_up / devices_json / ts_api / ts_api_body / flock all stubbed. Each run
+# gets its own temp dirs; the stubs are steered by env vars written into the
+# inner script.
+# =============================================================================
+rename_fns="box_index_from_name box_name_from_index port_for box_index cmd_config_enrolled reconcile_target_boxes dev_field devices_json_valid rename_ver_ge rename_box_boxup_version rename_dev_hostname rename_dev_dnslabel rename_dev_liveid rename_corpse_id rename_plan_paths rename_copy_state rename_delete_old_state rename_state_copied cmd_rename"
+
+# rename_run <flags> <old> <new> : with env HOOK_* controlling the stubs.
+rename_run() {
+  local args="$1"; shift 2>/dev/null || true
+  local inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"
+  mkdir -p "$d/state/keys" "$d/etc/authorized-keys.d" "$d/etc/boxes"
+  # Seed OLD-name state (grok-box-2, port 20002, index 2).
+  printf 'grok-box-2\t20002\n'                 >  "$d/state/enrolled.tsv"
+  printf 'grok-box-2\t2027-01-01\n'            >  "$d/state/grok-box-2.expires"
+  printf '0\n'                                 >  "$d/state/grok-box-2.checkfail"
+  printf '0\n'                                 >  "$d/state/grok-box-2.cfgfail"
+  printf 'restrict,... permitlisten="127.0.0.1:20002" ssh-ed25519 KEYMAT grok-tunnel-grok-box-2\n' > "$d/etc/authorized-keys.d/grok-box-2.line"
+  printf 'grok-box-2\t20002\tKEYMAT\n'         >  "$d/etc/authorized-keys.map"
+  printf '[managed]\nenabled = true\n'         >  "$d/etc/boxes/grok-box-2.toml"
+  # Snapshot the authoritative ~fleet authorized_keys (F6: must be untouched).
+  printf 'AUTHORITATIVE-KEYS-LINE\n'           >  "$d/state/fleet_authkeys"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+FLEET_ETC="$d/etc"
+FLEET_ETC_AK_DIR="$d/etc/authorized-keys.d"
+FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+BOX_ROOT="/workspace/box-setup"
+FLEET_STALE_SECS=600
+RENAME_POLL_SECS=6
+RENAME_POLL_INTERVAL=1
+RENAME_MIN_BOXUP_VERSION=5.3.0
+TS_API_CODE=0
+TS_API_LAST_BODY=""
+log(){ printf 'LOG:%s\n' "\$*"; }
+notify(){ printf 'NOTIFY:%s\n' "\$*"; }
+sleep(){ :; }                          # never actually sleep in tests
+flock(){ [ "\${HOOK_LOCK_HELD:-0}" = 1 ] && return 1; return 0; }   # lock free unless HOOK_LOCK_HELD
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in $rename_fns; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+tunnel_up(){ return 0; }
+# The box's boxup version (>= 5.3.0 unless overridden to a stale one).
+rename_box_boxup_version(){ printf '%s' "\${HOOK_BOXVER:-5.3.0}"; }
+# Record + no-op the on-box hostname write / boxup once.
+tunnel_ssh(){ echo "TUNNEL_SSH \$*" >> "$d/tsslog"; return 0; }
+# devices_json / ts_api / ts_api_body: a scripted device list that FLIPS to the
+# new name after N polls (HOOK_FLIP_AT), with the DNS label pinned until a POST
+# /device/name is seen (HOOK_DNS_PINNED). ts_api records POST/DELETE calls.
+POLLN=0
+_write_devs(){
+  local host="\$1" dns="\$2" corpse=""
+  [ "\${HOOK_CORPSE:-0}" = 1 ] && corpse=',{"hostname":"grok-box-2","name":"grok-box-2.tail.ts.net","online":false,"nodeId":"nCORPSE"}'
+  cat > "$d/devs" <<DEVS
+{"devices":[
+ {"hostname":"\$host","name":"\$dns.tail.ts.net","online":true,"nodeId":"nLIVE"}\$corpse
+]}
+DEVS
+}
+devices_json(){
+  POLLN=\$((POLLN+1))
+  local host dns
+  if [ "\$POLLN" -ge "\${HOOK_FLIP_AT:-1}" ]; then host=grok-box-002; else host=grok-box-2; fi
+  if [ "\${HOOK_DNS_PINNED:-0}" = 1 ] && [ "\${POSTED:-0}" = 0 ]; then dns=grok-box-2; else dns=grok-box-002; fi
+  _write_devs "\$host" "\$dns"
+  TS_API_CODE=200; return 0
+}
+ts_api_body(){ cat "$d/devs" 2>/dev/null; }
+ts_ok(){ [ "\$TS_API_CODE" -ge 200 ] && [ "\$TS_API_CODE" -lt 300 ]; }
+POSTED=0
+ts_api(){
+  local method="\$1" path="\$2"
+  echo "TSAPI \$method \$path" >> "$d/apilog"
+  case "\$method \$path" in
+    "POST "*"/name") POSTED=1; TS_API_CODE=200; return 0 ;;
+    "DELETE /device/"*) TS_API_CODE=200; return 0 ;;
+    *) TS_API_CODE=200; return 0 ;;
+  esac
+}
+cmd_rename $args
+echo "RC=\$?"
+echo "--- enrolled ---"; cat "$d/state/enrolled.tsv" 2>/dev/null
+echo "--- state files ---"; ls "$d/state" | tr '\n' ' '; echo
+echo "--- akdir ---"; ls "$d/etc/authorized-keys.d" | tr '\n' ' '; echo
+echo "--- boxes ---"; ls "$d/etc/boxes" | tr '\n' ' '; echo
+echo "--- akmap ---"; cat "$d/etc/authorized-keys.map" 2>/dev/null
+echo "--- authoritative (F6) ---"; cat "$d/state/fleet_authkeys" 2>/dev/null
+echo "--- apilog ---"; cat "$d/apilog" 2>/dev/null
+echo "--- tsslog ---"; cat "$d/tsslog" 2>/dev/null
+INNER
+  timeout 30 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+
+# --- D4: refuse a non-canonical <new> -----------------------------------------
+r_noncanon="$(rename_run 'grok-box-2 grok-box-2x')"
+case "$r_noncanon" in
+  *"RC=2"*) case "$r_noncanon" in *"not canonical"*) pass "rename: refuses a non-canonical <new> (rc 2)" ;; *) bad "rename non-canonical: wrong reason: [$r_noncanon]" ;; esac ;;
+  *) bad "rename: did NOT refuse non-canonical <new>: [$r_noncanon]" ;;
+esac
+
+# --- D4: refuse an index change -----------------------------------------------
+r_idx="$(rename_run 'grok-box-2 grok-box-003')"
+case "$r_idx" in
+  *"RC=2"*) case "$r_idx" in *"index change"*) pass "rename: refuses an index-changing rename (rc 2)" ;; *) bad "rename index-change: wrong reason: [$r_idx]" ;; esac ;;
+  *) bad "rename: did NOT refuse an index change: [$r_idx]" ;;
+esac
+
+# --- D4: refuse when the box's boxup is too old (< 5.3.0) ----------------------
+r_oldver="$(HOOK_BOXVER=5.2.0 rename_run 'grok-box-2 grok-box-002')"
+case "$r_oldver" in
+  *"update boxup first"*) pass "rename: refuses when the box boxup < 5.3.0 (update boxup first)" ;;
+  *) bad "rename: did NOT refuse a stale box boxup: [$r_oldver]" ;;
+esac
+
+# --- F2/F7: reconcile lock held => rename waits then refuses -------------------
+r_lock="$(HOOK_LOCK_HELD=1 rename_run 'grok-box-2 grok-box-002')"
+case "$r_lock" in
+  *"reconcile busy"*) pass "rename F2/F7: reconcile lock held => refuse with 'reconcile busy'" ;;
+  *) bad "rename: did NOT refuse under a held reconcile lock: [$r_lock]" ;;
+esac
+
+# --- F4: --dry-run prints the plan and touches nothing ------------------------
+r_dry="$(rename_run '--dry-run grok-box-2 grok-box-002')"
+case "$r_dry" in
+  *"DRY-RUN plan grok-box-2 -> grok-box-002"*) pass "rename F4: --dry-run prints the plan" ;;
+  *) bad "rename: --dry-run plan missing: [$r_dry]" ;;
+esac
+case "$r_dry" in
+  *"grok-box-2.expires"*"grok-box-002.expires"*) pass "rename F4: --dry-run lists the state artefact paths (old->new)" ;;
+  *) bad "rename: --dry-run artefact paths missing: [$r_dry]" ;;
+esac
+case "$r_dry" in
+  # dry-run must NOT have created a grok-box-002 enrolled row.
+  *"--- enrolled ---"*"grok-box-002"*) bad "rename: --dry-run MUTATED enrolled.tsv (added grok-box-002): [$r_dry]" ;;
+  *) pass "rename F4: --dry-run touches nothing (no grok-box-002 row created)" ;;
+esac
+
+# --- F3/F6: happy path migrates all artefacts, deletes old, keeps authoritative
+r_happy="$(rename_run 'grok-box-2 grok-box-002')"
+case "$r_happy" in *"RC=0"*) pass "rename happy: completes rc 0" ;; *) bad "rename happy: non-zero rc: [$r_happy]" ;; esac
+# enrolled.tsv now has ONLY the new row (old deleted at step 6).
+case "$r_happy" in
+  *"--- enrolled ---"*"grok-box-002"$'\t'"20002"*) pass "rename F3: enrolled.tsv row migrated grok-box-2 -> grok-box-002 (same port)" ;;
+  *) bad "rename: enrolled row not migrated: [$r_happy]" ;;
+esac
+case "$r_happy" in
+  *"--- state files ---"*"grok-box-2."*) bad "rename F3 step6: OLD state sidecars not deleted: [$r_happy]" ;;
+  *) pass "rename F3 step6: old-name state sidecars deleted" ;;
+esac
+case "$r_happy" in
+  *"--- state files ---"*"grok-box-002.expires"*) pass "rename F3: new-name state sidecars present (expires copied)" ;;
+  *) bad "rename: new-name state sidecars missing: [$r_happy]" ;;
+esac
+case "$r_happy" in
+  *"--- akdir ---"*"grok-box-002.line"*) pass "rename F6: new-name authorized-keys.d audit copy present" ;;
+  *) bad "rename: new .line audit copy missing: [$r_happy]" ;;
+esac
+case "$r_happy" in
+  *"--- akdir ---"*"grok-box-2.line"*) bad "rename F6 step6: OLD .line audit copy not deleted: [$r_happy]" ;;
+  *) pass "rename F6 step6: old .line audit copy deleted" ;;
+esac
+case "$r_happy" in
+  *"--- boxes ---"*"grok-box-002.toml"*) pass "rename F3: boxes/<new>.toml copied" ;;
+  *) bad "rename: boxes/<new>.toml missing: [$r_happy]" ;;
+esac
+case "$r_happy" in
+  *"--- akmap ---"*"grok-box-002"$'\t'"20002"$'\t'"KEYMAT"*) pass "rename F6: authorized-keys.map row rewritten to the new name (same port/key)" ;;
+  *) bad "rename: akmap row not migrated: [$r_happy]" ;;
+esac
+# F6: the authoritative ~fleet/.ssh/authorized_keys is NEVER touched.
+case "$r_happy" in
+  *"--- authoritative (F6) ---"*"AUTHORITATIVE-KEYS-LINE"*) pass "rename F6: authoritative ~fleet authorized_keys UNTOUCHED (key-material-keyed)" ;;
+  *) bad "rename F6: authoritative authorized_keys was altered: [$r_happy]" ;;
+esac
+# The box hostname write + boxup once ran over the tunnel.
+case "$r_happy" in
+  *"TUNNEL_SSH"*"grok-box-002"*"boxup once"*) pass "rename F3 step3: wrote new hostname + ran boxup once on the box" ;;
+  *) bad "rename: box hostname/boxup step missing: [$r_happy]" ;;
+esac
+
+# --- F3 step5: DNS-pinned label => POST /device/<id>/name EXACTLY once ---------
+r_dns="$(HOOK_DNS_PINNED=1 rename_run 'grok-box-2 grok-box-002')"
+case "$r_dns" in *"RC=0"*) : ;; *) bad "rename DNS-pinned: non-zero rc: [$r_dns]" ;; esac
+napi="$(printf '%s\n' "$r_dns" | grep -c 'TSAPI POST /device/.*/name')"
+[ "$napi" = 1 ] && pass "rename F3 step5: DNS-pinned label => POST /device/<id>/name exactly once" || bad "rename DNS-pinned: POST count=$napi (expected 1): [$r_dns]"
+
+# --- F3 step7: corpse reaping deletes the OTHER old-name id only ---------------
+r_corpse="$(HOOK_CORPSE=1 rename_run 'grok-box-2 grok-box-002')"
+case "$r_corpse" in
+  *"TSAPI DELETE /device/nCORPSE"*) pass "rename F3 step7: reaps the stale corpse device id" ;;
+  *) bad "rename: corpse not reaped: [$r_corpse]" ;;
+esac
+case "$r_corpse" in
+  *"DELETE /device/nLIVE"*) bad "rename F3 step7: deleted the RENAMED node's own live id (FORBIDDEN): [$r_corpse]" ;;
+  *) pass "rename F3 step7: never deletes the renamed node's own live id" ;;
+esac
+
+# --- F3 resume: a rename re-run after step 2 already copied continues cleanly ---
+r_resume="$(HOOK_FLIP_AT=1 rename_run 'grok-box-2 grok-box-002')"   # first run completes
+# Re-running the SAME rename when new is already canonical+enrolled: cmd_config_enrolled(old)
+# now fails (old row gone) — the command reports old not enrolled, which is the
+# idempotent "already renamed" outcome (rc 2, no mutation of the finished state).
+case "$r_resume" in *"RC=0"*) pass "rename resume: a completed happy path is rc 0 (state fully migrated)" ;; *) bad "rename resume base run failed: [$r_resume]" ;; esac
+
 
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi

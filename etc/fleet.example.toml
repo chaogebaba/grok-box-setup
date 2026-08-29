@@ -4,7 +4,7 @@
 # brain, NOT on a box:
 #
 #   $FLEET_ETC/fleet.toml          fleet-wide desired config (this file)
-#   $FLEET_ETC/boxes/<box>.toml    per-box overrides (e.g. boxes/grok-box-8.toml)
+#   $FLEET_ETC/boxes/<box>.toml    per-box overrides (e.g. boxes/grok-box-008.toml)
 #
 # ($FLEET_ETC defaults to /etc/grok-fleet — same dir, mode 600 root, as the PAT
 # and the tunnel key.) Both files are OPTIONAL. BOTH ABSENT = the feature is
@@ -61,12 +61,12 @@
 # ---------------------------------------------------------------------------
 # Per-box overrides live in a SEPARATE file per box, NOT in this file:
 #
-#   $FLEET_ETC/boxes/grok-box-8.toml
+#   $FLEET_ETC/boxes/grok-box-008.toml
 #   -----------------------------------------------------------------
 #   [update]
-#   # grok-box-8 tracks a canary branch while the rest of the fleet stays on the
+#   # grok-box-008 tracks a canary branch while the rest of the fleet stays on the
 #   # fleet-wide default above. This VALUE replaces the fleet value in place for
-#   # grok-box-8 only; every other box keeps the fleet.toml [update].repo.
+#   # grok-box-008 only; every other box keeps the fleet.toml [update].repo.
 #   repo = "https://github.com/chaogebaba/grok-box-setup.git#canary"
 #   -----------------------------------------------------------------
 #
@@ -77,9 +77,9 @@
 # ---------------------------------------------------------------------------
 # Operator recipe (once boxup is deployed fleet-wide):
 #   1. Create /etc/grok-fleet/fleet.toml (this file) and any boxes/<box>.toml.
-#   2. fleetctl config render grok-box-8      # inspect the merged result
-#   3. fleetctl config diff   grok-box-8      # exit 1 = drift, 0 = in sync
-#   4. fleetctl config push   grok-box-8      # push the canary first, by hand
+#   2. fleetctl config render grok-box-008    # inspect the merged result
+#   3. fleetctl config diff   grok-box-008    # exit 1 = drift, 0 = in sync
+#   4. fleetctl config push   grok-box-008    # push the canary first, by hand
 #   5. fleetctl config diff   grok-box-8      # confirm in sync (exit 0)
 #   6. reconcile converges the rest under --apply (canary-first, serial). A DRY
 #      RUN tick just logs "in sync" / "WOULD push (old->new)" and pushes nothing.

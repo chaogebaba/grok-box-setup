@@ -71,8 +71,8 @@ days):**
   not derived by boxup):** the key in use was minted 2026-08-28 with a 90-day
   lifetime ⇒ expiry `2026-11-26`.
 - The box names itself: once logged in with peers visible, `boxup` picks the
-  lowest free `grok-box-N`, stores it in `/workspace/box-setup/hostname`, and
-  pushes it. Do not invent names by hand.
+  lowest free index and stores the **zero-padded** name `grok-box-NNN` in
+  `/workspace/box-setup/hostname`, then pushes it. Do not invent names by hand.
 
 ## B. Refresh to the latest version
 
@@ -127,9 +127,9 @@ sudo /workspace/box-setup/boxup check   # exit 0 healthy / 1 unhealthy (never 2)
 healthy, else exit 1 and `check=FAIL reason=<first-failed-predicate>`.
 
 Healthy: `backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1`
-with numeric pids and a small `hb=` age (≤ ~30s), and `v=5.2.0/<sha>`.
-Cross-check from another machine on the tailnet: `tailscale ping grok-box-N`
-and `ssh box@grok-box-N` (password from config.toml, default `12345678`).
+with numeric pids and a small `hb=` age (≤ ~30s), and `v=5.3.0/<sha>`.
+Cross-check from another machine on the tailnet: `tailscale ping grok-box-NNN`
+and `ssh box@grok-box-NNN` (password from config.toml, default `12345678`).
 
 If a persistently failing exit-node refresh has escalated, `status` shows
 `refresh=failing:N` (N = consecutive failures; the retry window backs off
@@ -271,3 +271,33 @@ sudo /workspace/box-setup/bin/tailscale up --advertise-tags=tag:grok-box --force
 ```
 
 then `sudo /workspace/box-setup/boxup once` to re-push prefs.
+
+
+## F. Rename a box (to the canonical `grok-box-NNN`)
+
+Box names are `grok-box-` + exactly three decimal digits. A legacy unpadded box
+(`grok-box-8`) is renamed **in place**, keeping the same index and reverse-tunnel
+port, with a single brain-side command run on the VPS:
+
+```bash
+fleetctl rename --dry-run grok-box-8 grok-box-008   # print the plan, touch nothing
+fleetctl rename grok-box-8 grok-box-008             # do it
+```
+
+`rename` refuses unless `<new>` is canonical `grok-box-NNN` **and** its index
+equals `<old>`'s (a rename never changes the port — changing the index is out of
+scope), and unless the box's own `boxup` is ≥ 5.3.0 (the version that understands
+the padded name). It runs under the reconcile lock (so a 5-min tick cannot race
+it) and is **copy-first, verify, delete-last** — it copies every name-keyed
+brain-state artefact under the new name (`enrolled.tsv` row, `.expires`/
+`.checkfail`/`.cfgfail`, the `authorized-keys.d/<box>.line` + `authorized-keys.map`
+audit copies, `boxes/<box>.toml`), writes the new hostname on the box and runs
+`boxup once`, waits for the control plane to report `HostName=<new>` (forcing the
+device name via the API if the MagicDNS label is pinned/split), and only then
+deletes the old-name artefacts. Any interruption before the delete leaves BOTH
+names valid, so the command is re-runnable and resumes. The authoritative
+`~fleet/.ssh/authorized_keys` on the VPS is keyed by key material, not by box
+name, so the tunnel never drops and that file is never touched.
+
+Old MagicDNS names stop resolving once the rename completes; update any memory /
+docs that referenced `grok-box-N` to `grok-box-00N`.
