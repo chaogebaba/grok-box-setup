@@ -1776,6 +1776,39 @@ validate_managed() {
   '
 }
 
+# unknown_managed_keys <text>: print the well-formed but UNKNOWN (table,key)
+# identifiers in the rendered text, one `table.key` per line, in first-seen
+# order. Known set (D4) = ssh.password, tailscale.version, update.repo. The
+# input is assumed to have already passed validate_managed (allowed tables,
+# parseable lines), so anything here is forward-compatible-but-unknown, NOT a
+# refusal. Callers log these at info: once per reconcile run (deduped across
+# boxes via reconcile_config_pass's run-scoped set) or once per CLI invocation.
+unknown_managed_keys() {
+  local text="$1"
+  printf '%s\n' "$text" | awk '
+    function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
+    BEGIN {
+      known["ssh" SUBSEP "password"]=1
+      known["tailscale" SUBSEP "version"]=1
+      known["update" SUBSEP "repo"]=1
+    }
+    {
+      line = trim($0)
+      if (line == "" || line ~ /^#/) next
+      if (line ~ /^\[.*\]$/) { sec = trim(substr(line,2,length(line)-2)); next }
+      eq = index(line, "=")
+      if (eq == 0) next
+      k = trim(substr(line, 1, eq-1))
+      if (k == "") next
+      id = sec SUBSEP k
+      if (id in known) next
+      if (id in seen) next
+      seen[id]=1
+      printf "%s.%s\n", sec, k
+    }
+  '
+}
+
 # managed_remote_script <want_sha> <dry>: emit the POSIX-sh remote script used
 # by BOTH push_managed and `config diff` (ONE remote code path). Interpolates
 # want_sha (not a secret) and the box paths; the rendered text arrives on STDIN.
@@ -1837,6 +1870,22 @@ push_managed() {
   if ! verr="$(validate_managed "$text" 2>&1)"; then
     log "config: $box render REFUSED by D4 validation — $verr"
     return 4
+  fi
+  # D4 forward-compat: well-formed keys outside the known set are ALLOWED but
+  # logged at info. During a reconcile pass, reconcile_config_pass declares the
+  # run-scoped assoc array CONFIG_UNKNOWN_KEYS and we accumulate into it (deduped
+  # across boxes; the pass logs ONCE at the end). Outside a pass (the CLI
+  # `config render|diff|push` path) there is no such array, so we log here, once
+  # per invocation.
+  local _uk
+  if declare -p CONFIG_UNKNOWN_KEYS >/dev/null 2>&1; then
+    while IFS= read -r _uk; do
+      [ -n "$_uk" ] && CONFIG_UNKNOWN_KEYS["$_uk"]=1
+    done < <(unknown_managed_keys "$text")
+  else
+    local _uklist
+    _uklist="$(unknown_managed_keys "$text" | sort | paste -sd' ' -)"
+    [ -n "$_uklist" ] && log "config: $box unknown-but-well-formed keys (allowed, forward-compat): $_uklist"
   fi
   local want_sha
   want_sha="$(printf '%s\n' "$text" | sha256sum | awk '{print $1}')"
@@ -1941,6 +1990,10 @@ reconcile_reset_cfgfail() { rm -f "$FLEET_STATE/$1.cfgfail" 2>/dev/null || true;
 reconcile_config_pass() {
   local apply="${1:-0}"
   managed_files_present || return 0   # feature off => silent no-op
+  # Run-scoped set of unknown-but-well-formed keys (D4 forward-compat). Declared
+  # here so push_managed accumulates into it (deduped) across every box in this
+  # pass; logged ONCE below. `local -A` scopes it to this pass invocation.
+  local -A CONFIG_UNKNOWN_KEYS=()
   local canary; canary="$(reconcile_canary_box)"
   local mode="dry-run"; [ "$apply" = 1 ] && mode="apply"
   log "config: pass start ($mode) — canary-first over tunnels (canary=$canary)"
@@ -1989,6 +2042,13 @@ reconcile_config_pass() {
     fi
   done
   unset -f _cfg_push_one
+  # D4 forward-compat: emit ONE info log per reconcile run listing the unknown-
+  # but-well-formed keys seen across ALL boxes this pass (deduped, sorted).
+  if [ "${#CONFIG_UNKNOWN_KEYS[@]}" -gt 0 ]; then
+    local _uklist
+    _uklist="$(printf '%s\n' "${!CONFIG_UNKNOWN_KEYS[@]}" | sort | paste -sd' ' -)"
+    log "config: unknown-but-well-formed keys (allowed, forward-compat): $_uklist"
+  fi
   log "config: pass done ($mode)"
   return "$rc"
 }

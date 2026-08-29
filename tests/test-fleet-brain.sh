@@ -2234,6 +2234,69 @@ case "$g_tun" in *"PUSH grok-box-3"*) bad "D6 guard: pushed to a tunnel-DOWN box
 g_chk="$(cfgpass_guard_test checkfail)"
 case "$g_chk" in *"PUSH grok-box-3"*) bad "D6 guard: pushed to a .checkfail box: [$g_chk]" ;; *"PUSH grok-box-8"*) pass "D6 guard: .checkfail box skipped silently" ;; *) bad "D6 checkfail guard wrong: [$g_chk]" ;; esac
 
+# D4 forward-compat info log: an unknown-but-well-formed key is ALLOWED and
+# logged ONCE per reconcile run, DEDUPED across boxes. Drives the REAL
+# reconcile_config_pass + REAL push_managed + REAL unknown_managed_keys across
+# TWO boxes in one pass, with a fake tunnel_ssh that runs the remote locally.
+# Both boxes render the SAME fleet.toml, so the unknown key is seen twice but
+# must be logged exactly once (run-scoped dedupe). Known-only keys => no log.
+cfgunknown_test() {
+  # args: fleet-content  (drives both boxes; no per-box overrides)
+  local fleetc="$1" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
+  printf '%s' "$fleetc" > "$d/etc/fleet.toml"
+  # Empty per-box files must EXIST: render_managed's awk reads fleet.toml then
+  # boxes/<box>.toml, and a MISSING second file makes awk fatal before its END
+  # block (dropping the merged output). Every existing render/push test provides
+  # the box file for the same reason.
+  : > "$d/etc/boxes/grok-box-8.toml"
+  : > "$d/etc/boxes/grok-box-3.toml"
+  printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") echo true;; esac\n' > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"
+FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"
+FLEET_BOXES="grok-box-8 grok-box-3"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }
+notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # no canary_box configured => default 8
+tunnel_up(){ return 0; }    # both tunnels up
+# Fake tunnel_ssh: strip the sudo sh -c wrapper, run with stdin passed through.
+tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
+reconcile_config_pass 1; echo "PASSRC=\$?"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+# fleet.toml with a KNOWN key (update.repo) + an UNKNOWN-but-well-formed key
+# (update.channel). Two boxes render it => the unknown key is encountered twice.
+UNK_FLEET='[update]
+repo = "https://fleet/repo.git"
+channel = "beta"
+'
+cu_unknown="$(cfgunknown_test "$UNK_FLEET")"
+# The info log must appear EXACTLY ONCE and name the unknown key (update.channel).
+cu_count="$(printf '%s\n' "$cu_unknown" | grep -c 'unknown-but-well-formed keys')"
+case "$cu_unknown" in
+  *"unknown-but-well-formed keys (allowed, forward-compat): update.channel"*)
+    [ "$cu_count" = 1 ] && pass "D4 info: unknown well-formed key ALLOWED + logged ONCE across two boxes in one pass" || bad "D4 info: unknown-key log fired $cu_count times (want 1): [$cu_unknown]" ;;
+  *) bad "D4 info: unknown-key log missing/misnamed: [$cu_unknown]" ;;
+esac
+# The push itself still succeeds (unknown keys are allowed, not refused).
+case "$cu_unknown" in *"PASSRC=0"*) pass "D4 info: an unknown well-formed key does not fail the pass (forward compatible)" ;; *) bad "D4 info: pass rc non-zero with an allowed unknown key: [$cu_unknown]" ;; esac
+# KNOWN-only fleet.toml => NO such info log at all.
+KNOWN_FLEET='[update]
+repo = "https://fleet/repo.git"
+[ssh]
+password = "p"
+'
+cu_known="$(cfgunknown_test "$KNOWN_FLEET")"
+case "$cu_known" in *"unknown-but-well-formed keys"*) bad "D4 info: logged unknown keys for a KNOWN-ONLY render: [$cu_known]" ;; *) pass "D4 info: known keys only => no unknown-key info log emitted" ;; esac
+
 # D7 operator surface: cmd_config refuses un-enrolled boxes.
 cmdcfg_enroll_test() {
   local box="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/state"
