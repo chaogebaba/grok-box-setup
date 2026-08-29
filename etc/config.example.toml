@@ -55,10 +55,16 @@
 [fleet]
 # FLEET-BRAIN out-of-band reverse-SSH tunnel (docs/FLEET-BRAIN.md §1).
 #
+# WRITTEN BY ENROLL: `fleetctl enroll grok-box-N` now sets `vps` and `box_index`
+# here itself, over the same tailnet SSH session it uses to read the box's
+# tunnel pubkey — so the tunnel comes up on the next `boxup once` with no manual
+# edit. You only touch this block by hand for SPECIAL cases (a non-default VPS
+# address, a manual re-point, or `fleetctl enroll --no-box-config` which skips
+# the box-side write). After any manual edit:  sudo /workspace/box-setup/boxup once
+#
 # UNCONFIGURED BY DEFAULT: with `vps` unset, boxup does NOTHING here — no
 # tunnel, no key use beyond generation — so an un-enrolled box is completely
-# unaffected. Set these ONLY after `fleetctl enroll grok-box-N` has trusted
-# this box's tunnel key on the VPS.
+# unaffected. These stay commented until enroll (or you) set them.
 #
 # vps        the always-on brain host the box dials out to. The box opens a
 #            reverse tunnel  ssh -R 127.0.0.1:2000N:localhost:22 fleet@<vps>

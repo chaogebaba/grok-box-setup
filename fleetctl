@@ -787,6 +787,23 @@ BOX_TUNNEL_PUB="$BOX_ROOT/secrets/tunnel_ed25519.pub"
 BOX_AUTHKEY="$BOX_ROOT/secrets/ts-authkey"
 BOX_AUTHKEY_TMP="$BOX_ROOT/secrets/.ts-authkey.tmp"
 BOX_AUTHKEY_EXPIRES="$BOX_ROOT/secrets/ts-authkey.expires"
+# The box's own config.toml (etc/config.example.toml is seeded here on first
+# install). enroll writes its [fleet] block (vps, box_index) so the box's
+# reverse tunnel comes up without a manual hand-edit (docs/FLEET-BRAIN.md §1).
+BOX_CONFIG="$BOX_ROOT/config.toml"
+
+# FLEET_VPS_ADDR — the VPS address the BOXES dial out to (what lands in the
+# box-side [fleet].vps). Precedence: FLEET_VPS_ADDR env > config.toml
+# [fleet].vps > the known brain host (VPS ground truth, docs/FLEET-BRAIN.md).
+# Derived, NOT hardcoded at the call site: enroll reads it through this resolver
+# so the address is set in one place (env/config) for the whole fleet.
+FLEET_VPS_ADDR_DEFAULT="107.172.132.211"
+fleet_vps_addr() {
+  local a="${FLEET_VPS_ADDR:-}"
+  [ -n "$a" ] || a="$(config_get fleet vps || true)"
+  [ -n "$a" ] || a="$FLEET_VPS_ADDR_DEFAULT"
+  printf '%s' "$a"
+}
 # VPS's own key that authenticates the brain INTO each box (over the tunnel);
 # its PUBKEY is what enroll installs into the box's authorized_keys.
 FLEET_BOX_KEY="${FLEET_BOX_KEY:-$FLEET_ETC/box_access_ed25519}"
@@ -964,8 +981,20 @@ acl_has_fleet_brain_tagowner() {
 }
 
 cmd_enroll() {
+  # Flag parse: --no-box-config (skip the box-side [fleet] write, preserving the
+  # old behavior). Order-independent; the box name is the sole positional arg.
+  local write_box_config=1
+  local -a rest=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --no-box-config) write_box_config=0; shift ;;
+      *)               rest+=("$1"); shift ;;
+    esac
+  done
+  set -- "${rest[@]}"
+
   local box="${1:-}"
-  [ -n "$box" ] || { log "usage: fleetctl enroll <grok-box-N>"; return 2; }
+  [ -n "$box" ] || { log "usage: fleetctl enroll [--no-box-config] <grok-box-N>"; return 2; }
   case "$box" in grok-box-[0-9]*) : ;; *) log "enroll: refusing non-grok box '$box'"; return 2 ;; esac
   local n port; n="$(box_index "$box")" || { log "enroll: bad box name '$box'"; return 2; }
   port="$(port_for "$box")"
@@ -1011,6 +1040,23 @@ cmd_enroll() {
   vpspub="$(enroll_vps_box_access_pubkey)" || { log "enroll: no VPS box-access key at $FLEET_BOX_KEY(.pub) — generate it on the VPS first"; return 1; }
   enroll_install_box_authorized_key "$box" "$vpspub" || { log "enroll: failed to install VPS key into $box authorized_keys"; return 1; }
   log "enroll: installed VPS box-access key into $box:~box/.ssh/authorized_keys"
+
+  # (5) close the two-part-enroll gap: write the box's OWN config.toml [fleet]
+  # block (vps + box_index) over the SAME OpenSSH-on-the-tailnet channel used to
+  # read the pubkey (box_ssh + sudo). Without this the VPS trusts the box's
+  # tunnel key but the box never DIALS OUT — the tunnel stays dead until someone
+  # hand-edits config.toml. Idempotent (same values => byte-for-byte no-op, mode
+  # 600 preserved). --no-box-config skips this and keeps the old behavior.
+  if [ "$write_box_config" = 1 ]; then
+    local vps; vps="$(fleet_vps_addr)"
+    if enroll_write_box_config "$box" "$vps" "$n"; then
+      log "enroll: wrote $box:$BOX_CONFIG [fleet] block (vps=$vps box_index=$n) — tunnel will dial on next 'boxup once'"
+    else
+      log "enroll: WARNING could not write $box $BOX_CONFIG [fleet] block — set [fleet] vps/box_index by hand, then: sudo $BOXUP_REMOTE once"
+    fi
+  else
+    log "enroll: --no-box-config — skipped the box-side [fleet] write; set [fleet] vps/box_index by hand, then: sudo $BOXUP_REMOTE once"
+  fi
 
   # Record the enrollment (idempotent, informational).
   enroll_record_enrolled "$box" "$port"
@@ -1128,6 +1174,91 @@ enroll_install_box_authorized_key() {
     mv -f \"\$tmp\" ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
   " >/dev/null 2>&1
+}
+
+# --- box-side [fleet] block (close the two-part-enroll gap) -------------------
+# enroll_write_box_config <box> <vps> <box_index>: write the box's OWN
+# config.toml [fleet] block over the SAME OpenSSH-on-the-tailnet channel enroll
+# used to READ the tunnel pubkey (box_ssh + sudo — config.toml is root-owned
+# under /workspace). Sets  vps = "<vps>"  and  box_index = <N>  so the box's
+# reverse tunnel comes up on the next `boxup once` with NO manual hand-edit
+# (the historical gap: enroll installed the VPS-side key but left the box side
+# unconfigured, so the tunnel stayed dead until someone edited config.toml).
+#
+# IDEMPOTENT + byte-preserving: an awk pass produces the DESIRED file; the
+# remote script then `cmp`s it against the original — identical => NO write at
+# all (the file, its bytes, and its mode are left completely untouched), so a
+# re-enroll with the same values is a true no-op. Differing values are REPLACED
+# in place (only the two key lines change; every other byte is preserved) and
+# the block is NEVER duplicated. A fresh config (only the commented
+# `#vps`/`#box_index` template lines, or no [fleet] block at all) gets the two
+# active keys added inside the existing [fleet] block, else a [fleet] block is
+# appended. The atomic replace keeps mode 600 (config.toml holds the ssh
+# password; it must not widen).
+#
+# The awk grammar mirrors boxup's config reader: [table] headers, and an ACTIVE
+# key line is `key = value` with optional leading blanks; a `#`-commented line
+# is inert (so the seeded template's `#vps = ...` does not count as set). vps
+# and box_index arrive as the remote script's positional args ("$1"/"$2"), and
+# box_index is the validated integer N and vps the operator-controlled address,
+# so neither can inject shell/awk code. The remote script is delivered on STDIN
+# (sh -s), NOT embedded in a quoted bash string, so awk's own single quotes do
+# not fight the laptop-side quoting.
+enroll_write_box_config() {
+  local box="$1" vps="$2" idx="$3"
+  # The remote script (POSIX sh): read config.toml, produce the DESIRED file via
+  # awk, cmp against the original (identical => true no-op, mode untouched),
+  # else atomic replace at mode 600. $1=vps $2=box_index, $3=config path.
+  local remote='
+set -e
+want_vps="$1"; want_idx="$2"; cf="$3"
+[ -f "$cf" ] || { echo "enroll: box config not found: $cf" >&2; exit 4; }
+tmp="$(mktemp "${cf}.enroll.XXXXXX")" || exit 1
+awk -v want_vps="$want_vps" -v want_idx="$want_idx" '"'"'
+  function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
+  function is_key(line, k,   t,eq,key){
+    t=trim(line)
+    if (t=="" || substr(t,1,1)=="#") return 0
+    eq=index(t,"="); if (eq==0) return 0
+    key=trim(substr(t,1,eq-1))
+    return (key==k)
+  }
+  BEGIN { in_fleet=0; seen_fleet=0; wrote_vps=0; wrote_idx=0 }
+  /^[ \t]*\[/ {
+    t=trim($0)
+    if (in_fleet) {
+      if (!wrote_vps) { print "vps = \"" want_vps "\""; wrote_vps=1 }
+      if (!wrote_idx) { print "box_index = " want_idx; wrote_idx=1 }
+      in_fleet=0
+    }
+    if (t=="[fleet]") { in_fleet=1; seen_fleet=1 }
+    print; next
+  }
+  {
+    if (in_fleet && is_key($0,"vps"))       { print "vps = \"" want_vps "\"";  wrote_vps=1; next }
+    if (in_fleet && is_key($0,"box_index")) { print "box_index = " want_idx;   wrote_idx=1; next }
+    print
+  }
+  END {
+    if (in_fleet) {
+      if (!wrote_vps) print "vps = \"" want_vps "\""
+      if (!wrote_idx) print "box_index = " want_idx
+    } else if (!seen_fleet) {
+      print "[fleet]"
+      print "vps = \"" want_vps "\""
+      print "box_index = " want_idx
+    }
+  }
+'"'"' "$cf" > "$tmp"
+if cmp -s "$cf" "$tmp"; then
+  rm -f "$tmp"
+  exit 0
+fi
+chmod 600 "$tmp"
+mv -f "$tmp" "$cf"
+chmod 600 "$cf"
+'
+  printf '%s' "$remote" | box_ssh "$box" "sudo sh -s -- '$vps' '$idx' '$BOX_CONFIG'" >/dev/null 2>&1
 }
 
 # --- mint-key ----------------------------------------------------------------
@@ -2149,7 +2280,11 @@ Usage:
 
 Brain subcommands (docs/FLEET-BRAIN.md — run on the VPS + laptop):
   fleetctl enroll <grok-box-N>   trust a box's reverse tunnel (OpenSSH/tailnet;
-                                 ACL-prechecks tag:fleet-brain tagOwners)
+                                 ACL-prechecks tag:fleet-brain tagOwners) and
+                                 write the box's [fleet] vps/box_index so its
+                                 tunnel dials on the next 'boxup once'
+  fleetctl enroll --no-box-config <grok-box-N>
+                                 as above but SKIP the box-side [fleet] write
   fleetctl reconcile [--apply]   the 5-min decision table (DRY-RUN by default)
   fleetctl mint-key <grok-box-N> mint a per-box tag-scoped key + atomic seed
   fleetctl fleet-status          brain table: API / tunnel / check / authkey / ver
@@ -2162,6 +2297,8 @@ Environment:
   FLEET_MAX_CONCURRENCY  max concurrent rollouts (default 2)
   FLEET_ETC            brain secrets dir (default /etc/grok-fleet)
   FLEET_STATE          brain state dir (default /var/lib/grok-fleet)
+  FLEET_VPS_ADDR       VPS address boxes dial for the tunnel; enroll writes it
+                       to the box's [fleet].vps (else config [fleet].vps)
   FLEET_API_TOKEN_FILE Tailscale API token file (600; else [fleet-brain].api_token_file)
 EOF
 }
