@@ -2592,6 +2592,179 @@ cn_out="$(cfgnotify_test)"
 case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-3: 4"*) pass "D9: notify warn fires at the call site when cfgfail crosses > 3" ;; *) bad "D9 call-site notify>3 missing: [$cn_out]" ;; esac
 case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-3: 3"*) bad "D9: notify fired at exactly 3 (threshold is strictly > 3): [$cn_out]" ;; *) pass "D9: no notify at count 3 (threshold is strictly > 3)" ;; esac
 
+# =============================================================================
+# D11b (r5 ADDENDUM + r5.1): canary-unreachable fall-through, content-failure
+# threshold, non-canary transport skip, probe exit-code contract, and the
+# cmd_reconcile exit-code-isolation mutant guard.
+# =============================================================================
+
+# --- D11b: canary rc 6 (transport unreachable) => SKIP CANARY ONLY, FALL
+# THROUGH to the non-canary loop; pass rc 0, NO notify, NO cfgfail (r5.1 B1).
+# Uses the stub cfgpass_test (canary_v=6 => push_managed reports transport).
+cp_can6="$(cfgpass_test yes 1 6 0)"
+case "$cp_can6" in
+  *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*)
+    pass "D11b/B1: canary rc 6 (unreachable) => canary skipped, NON-canary boxes STILL processed (fall-through)" ;;
+  *) bad "D11b/B1: canary rc 6 did not fall through to the rest: [$cp_can6]" ;;
+esac
+case "$cp_can6" in *"PASSRC=0"*) pass "D11b/B1: canary rc 6 => pass rc 0 (transport skip is not a failure)" ;; *) bad "D11b/B1: canary rc 6 pass rc non-zero: [$cp_can6]" ;; esac
+case "$cp_can6" in *NOTIFY*) bad "D11b/B1: canary rc 6 must NOT notify: [$cp_can6]" ;; *) pass "D11b/B1: canary rc 6 fires NO notify" ;; esac
+case "$cp_can6" in *"CFGFAIL grok-box-8"*) bad "D11b/B1: canary rc 6 must NOT bump .cfgfail: [$cp_can6]" ;; *) pass "D11b/B1: canary rc 6 leaves .cfgfail untouched" ;; esac
+case "$cp_can6" in *"continuing without canary protection"*) pass "D11b/B1: canary rc 6 logs the fall-through info line (one line, supersedes D6a wording)" ;; *) bad "D11b/B1: fall-through info line missing: [$cp_can6]" ;; esac
+
+# --- D11b (r5.1 add): canary rc 4 (CONTENT failure) => non-canary boxes NOT
+# processed (abort preserved), NO cfgfail on the untouched rest.
+cp_can4="$(cfgpass_test yes 1 4 0)"
+case "$cp_can4" in *"PUSH grok-box-3"*) bad "D11b: canary rc 4 (content) must ABORT — grok-box-3 must not be touched: [$cp_can4]" ;; *"PUSH grok-box-8 dry=0|"*) pass "D11b: canary rc 4 (content) => abort preserved, non-canary boxes NOT processed" ;; *) bad "D11b canary rc4 abort wrong: [$cp_can4]" ;; esac
+
+# --- D11b: non-canary rc 6 => info skip line, NO cfgfail bump, CONTINUE (D6d).
+cp_rest6="$(cfgpass_test yes 1 0 6)"
+case "$cp_rest6" in
+  *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*)
+    pass "D11b/D6d: a non-canary rc 6 box is attempted then the pass CONTINUES to the rest" ;;
+  *) bad "D11b/D6d: non-canary rc 6 did not continue: [$cp_rest6]" ;;
+esac
+case "$cp_rest6" in *"CFGFAIL grok-box-3"*) bad "D11b/D6d: non-canary rc 6 must NOT bump .cfgfail: [$cp_rest6]" ;; *) pass "D11b/D6d: non-canary rc 6 leaves .cfgfail untouched (transport is the per-box loop's job)" ;; esac
+case "$cp_rest6" in *"skip grok-box-3 — unreachable over tunnel"*) pass "D11b/D6d: non-canary rc 6 logs the 'unreachable over tunnel' skip line" ;; *) bad "D11b/D6d: non-canary rc 6 skip line missing: [$cp_rest6]" ;; esac
+case "$cp_rest6" in *"PASSRC=0"*) pass "D11b/D6d: a non-canary rc 6 (transport) does NOT fail the pass" ;; *) bad "D11b/D6d: non-canary rc 6 failed the pass: [$cp_rest6]" ;; esac
+
+# --- D11b: canary rc 4 on 4 consecutive ticks => notify ONLY on the 4th (D6b
+# threshold >3), and a success on the 5th tick RESETS the counter. Drives the
+# REAL reconcile_config_pass with a stub push_managed whose canary verdict is
+# controlled per tick via an env file.
+cfgcanary_ticks_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
+  printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+log(){ :; }; notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # canary defaults to grok-box-8
+tunnel_up(){ return 0; }
+# canary verdict is read from \$d/verdict each tick (content failure rc 4);
+# non-canary grok-box-3 always succeeds so it never pollutes the picture.
+push_managed(){ case "\$1" in grok-box-8) return \$(cat "$d/verdict") ;; *) return 0 ;; esac; }
+echo 4 > "$d/verdict"
+for tick in 1 2 3 4; do echo "TICK\$tick:"; reconcile_config_pass 1; done
+echo 0 > "$d/verdict"   # canary recovers
+echo "TICK5:"; reconcile_config_pass 1
+[ -f "$d/state/grok-box-8.cfgfail" ] && echo "CFGFAIL8=\$(cat "$d/state/grok-box-8.cfgfail")" || echo "CFGFAIL8=gone"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+ct_out="$(cfgcanary_ticks_test)"
+case "$ct_out" in *"NOTIFY:warn config push failing for grok-box-8: 4 consecutive failures — config pass aborted"*) pass "D11b/D6b: canary content failure notifies on the 4th tick (threshold >3) with the pass-aborted wording" ;; *) bad "D11b/D6b: canary threshold notify missing/misworded: [$ct_out]" ;; esac
+case "$ct_out" in *"grok-box-8: 3 consecutive"*|*"grok-box-8: 2 consecutive"*|*"grok-box-8: 1 consecutive"*) bad "D11b/D6b: canary notified at count <=3 (threshold is strictly >3): [$ct_out]" ;; *) pass "D11b/D6b: canary does NOT notify at counts 1-3 (threshold strictly >3)" ;; esac
+case "$ct_out" in *"CFGFAIL8=gone"*) pass "D11b/D6b: a canary SUCCESS after failures RESETS the cfgfail counter" ;; *) bad "D11b/D6b: canary success did not reset the counter: [$ct_out]" ;; esac
+
+# --- D11b: canary rc 6 via the REAL push_managed (fake tunnel_ssh => ssh rc 255)
+# proves the transport classification end-to-end: the canary push returns 6 and
+# the pass falls through to the non-canary boxes with pass rc 0, no notify.
+cfgpass_real6_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
+  printf '[update]\nrepo = "https://fleet/repo.git"\n' > "$d/etc/fleet.toml"
+  printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") echo true;; esac\n' > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }
+tunnel_up(){ return 0; }
+# Fake tunnel_ssh: the CANARY (port 20008) is unreachable => emulate ssh's
+# rc 255 with no output; every other box runs the remote script locally.
+port_for(){ case "\$1" in grok-box-8) echo 20008;; grok-box-3) echo 20003;; esac; }
+tunnel_ssh(){
+  local box="\$1"; shift
+  if [ "\$box" = grok-box-8 ]; then return 255; fi   # transport dead
+  local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"
+}
+reconcile_config_pass 1; echo "PASSRC=\$?"
+[ -f "$d/state/grok-box-8.cfgfail" ] && echo "CFGFAIL8=present" || echo "CFGFAIL8=gone"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+r6_out="$(cfgpass_real6_test)"
+case "$r6_out" in *"continuing without canary protection"*) pass "D11b/B1 (real): a REAL push_managed classifies ssh rc 255 as rc 6 => canary fall-through info line" ;; *) bad "D11b/B1 (real): fall-through line missing: [$r6_out]" ;; esac
+case "$r6_out" in *"grok-box-3 pushed"*|*"grok-box-3 in sync"*|*"grok-box-3 WOULD"*) pass "D11b/B1 (real): with the canary unreachable, non-canary grok-box-3 IS pushed in the same pass" ;; *) bad "D11b/B1 (real): non-canary box not processed after canary 255: [$r6_out]" ;; esac
+case "$r6_out" in *"PASSRC=0"*) pass "D11b/B1 (real): a transport-unreachable canary yields pass rc 0" ;; *) bad "D11b/B1 (real): pass rc non-zero: [$r6_out]" ;; esac
+case "$r6_out" in *NOTIFY*) bad "D11b/B1 (real): unreachable canary must not notify: [$r6_out]" ;; *) pass "D11b/B1 (real): unreachable canary fires no notify" ;; esac
+case "$r6_out" in *"CFGFAIL8=gone"*) pass "D11b/B1 (real): unreachable canary does not bump .cfgfail" ;; *) bad "D11b/B1 (real): canary cfgfail bumped on transport failure: [$r6_out]" ;; esac
+
+# --- D11b: probe exit 1 (absent [managed] key) => enabled=true and `config diff`
+# reports IN SYNC (exit 0) — the live grok-box-1 fix (D5b). Fake boxup whose
+# config-get exits 1 (no [managed] table), supported, on-box file == render.
+cfgprobe_diff_test() {
+  # args: probe_exit(1|2)
+  local pexit="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
+  printf '%s' "$FLEETC" > "$d/etc/fleet.toml"; printf '%s' "$BOXC" > "$d/etc/boxes/grok-box-8.toml"
+  printf 'grok-box-8\t20008\n' > "$d/state/enrolled.tsv"
+  # Supported boxup; config-get exits with the requested code (1 = absent key,
+  # 2 = an "other" error). No stdout on the non-zero paths (like the real reader).
+  printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") exit %s;; esac\n' "$pexit" > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+render_managed grok-box-8 > "$d/box/managed.toml"   # on-box file == render => in sync
+tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
+cmd_config diff grok-box-8; echo "DIFFRC=\$?"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+pd1="$(cfgprobe_diff_test 1)"
+case "$pd1" in *"IGNORED"*) bad "D11b/D5b: absent-key (exit 1) must NOT annotate IGNORED — it means enabled=true: [$pd1]" ;; *"DIFFRC=0"*) pass "D11b/D5b: probe exit 1 (absent [managed]) => enabled=true, config diff reports IN SYNC (exit 0) — the grok-box-1 fix" ;; *) bad "D11b/D5b: absent-key diff not in sync: [$pd1]" ;; esac
+pd2="$(cfgprobe_diff_test 2)"
+case "$pd2" in *"managed-status probe failed"*) case "$pd2" in *"DIFFRC=1"*) pass "D11b/D5b: probe exit 2 (other error) => enabled=unknown => diff annotates 'probe failed' + never in-sync (exit 1)" ;; *) bad "D11b/D5b: probe exit 2 unknown must not be in-sync: [$pd2]" ;; esac ;; *) bad "D11b/D5b: probe exit 2 did not annotate unknown: [$pd2]" ;; esac
+
+# --- D11b MUTANT GUARD (D6c): a FAILING config pass must NOT change
+# cmd_reconcile's rc when the per-box reconcile loop is clean. Drives the REAL
+# cmd_reconcile tail (the per-box loop + the config-pass call + the closing
+# return) with a stubbed reconcile_config_pass that returns 1 (mutant) and a
+# clean per-box loop (reconcile_one returns 0). rc MUST stay 0.
+reconcile_rc_isolation_test() {
+  # args: pass_rc (the config pass's return code) loop_rc (per-box loop verdict)
+  local pass_rc="$1" loop_rc="$2" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"
+  cat > "$inner" <<INNER
+set -u
+# Reproduce the cmd_reconcile tail EXACTLY as shipped (the loop + config pass +
+# return), extracted by anchoring on the shipped source lines so this guard
+# tracks the real control flow, not a hand copy. Wrapped in a function so the
+# shipped \`return "\$rc"\` is legal (return outside a function errors).
+tail_src="\$(awk '/^  local rc=0\$/{p=1} p{print} /^  return "\\\$rc"\$/{if(p){exit}}' "$FLEETCTL")"
+boxes=(a b c)
+devs=x; apply=0; RECONCILE_READONLY=0; mode=dry-run
+log(){ :; }
+reconcile_one(){ return $loop_rc; }               # per-box loop verdict
+reconcile_config_pass(){ return $pass_rc; }        # MUTANT: failing config pass
+eval "_reconcile_tail() {
+\$tail_src
+}"
+_reconcile_tail
+echo "RECONCILE_RC=\$?"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+# mutant: config pass returns 1 but the per-box loop is clean => rc MUST be 0.
+mut_clean="$(reconcile_rc_isolation_test 1 0)"
+case "$mut_clean" in *"RECONCILE_RC=0"*) pass "D11b/D6c MUTANT: a FAILING config pass (rc 1) does NOT flip cmd_reconcile's rc when the per-box loop is clean" ;; *) bad "D11b/D6c MUTANT: config pass rc leaked into cmd_reconcile rc: [$mut_clean]" ;; esac
+# control: a per-box loop failure DOES set rc 1 (the config pass is clean here).
+mut_loop="$(reconcile_rc_isolation_test 0 1)"
+case "$mut_loop" in *"RECONCILE_RC=1"*) pass "D11b/D6c: a per-box loop failure still sets cmd_reconcile rc 1 (isolation is one-way)" ;; *) bad "D11b/D6c: per-box loop failure did not set rc 1: [$mut_loop]" ;; esac
+
 rm -rf "$CFG_FIXROOT"
 
 rm -f "$seedA" "$seedB" "$seedC"
