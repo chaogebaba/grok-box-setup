@@ -2153,7 +2153,19 @@ reconcile_config_pass() {
 
   # Canary FIRST. Guard: tunnel up AND checkfail count at/under threshold (>3 =
   # unhealthy, BLOCKER-1: a 0-content .checkfail is HEALTHY and must not skip).
-  if tunnel_up "$canary" && [ "$(reconcile_checkfail_count "$canary")" -le 3 ]; then
+  # r5.3 G3: the checkfail>3 case gets an EXPLICIT else arm mirroring the rc-6
+  # transport-skip path — one visible info line, counted in skipped=, no notify,
+  # no .cfgfail change, then fall through to the non-canary loop (an unhealthy
+  # canary must not silently freeze fleet convergence). The tunnel-DOWN case
+  # keeps its existing handling (the whole guard is false => no canary push,
+  # skip uncounted, exactly as before).
+  local _canary_cf; _canary_cf="$(reconcile_checkfail_count "$canary")"
+  if ! tunnel_up "$canary"; then
+    :   # tunnel down for the canary: unchanged — no push, fall through
+  elif [ "$_canary_cf" -gt 3 ] 2>/dev/null; then
+    log "config: canary $canary skipped — checkfail=$_canary_cf (>3), continuing without canary protection"
+    n_skip=$((n_skip + 1))
+  else
     _cfg_push_one "$canary"; local crc=$?
     if [ "$crc" = 0 ]; then
       reconcile_reset_cfgfail "$canary"; n_ok=$((n_ok + 1))

@@ -2428,6 +2428,49 @@ case "$cf_four" in *"PUSH grok-box-3"*) bad "BLOCKER-1: pushed to an over-thresh
 cf_abs="$(cfgpass_checkfail_test absent)"
 case "$cf_abs" in *"PUSH grok-box-3"*) pass "BLOCKER-1: an ABSENT .checkfail box IS processed" ;; *) bad "BLOCKER-1: absent-checkfail box was skipped: [$cf_abs]" ;; esac
 
+# r5.3 G3: the CANARY checkfail guard needs an explicit else arm. r5.1 gave the
+# NON-canary >3 skip a diagnostic line, but the canary guard skipped SILENTLY
+# and UNCOUNTED. Fix: checkfail=4 canary => a visible skip line, counted in
+# skipped=, NO notify, NO cfgfail change, and the pass FALLS THROUGH to the
+# non-canary loop (mirrors the rc-6 path). checkfail=3 => the ==3 boundary is
+# healthy, so the canary IS pushed (folds the r2 SHOULD boundary test).
+# Drives the REAL reconcile_config_pass; the canary is grok-box-8, non-canary
+# grok-box-3 (both tunnels up), so only the canary's checkfail count decides.
+cfgpass_canary_checkfail_test() {
+  # args: canary_chk = 3 | 4   (grok-box-8's .checkfail content)
+  local canary_chk="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
+  printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
+  printf '%s\n' "$canary_chk" > "$d/state/grok-box-8.checkfail"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # no canary_box configured => default 8
+tunnel_up(){ return 0; }    # both tunnels up: only the canary checkfail decides
+seq="$d/seq"
+push_managed(){ echo "PUSH \$1" >> "\$seq"; return 0; }
+reconcile_config_pass 1; echo "PASSRC=\$?"
+[ -f "\$seq" ] && tr '\n' '|' < "\$seq"; echo
+for f in "$d"/state/*.cfgfail; do [ -f "\$f" ] && echo "CFGFAIL \$(basename "\$f")=\$(cat "\$f")"; done
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+# (a) checkfail=4 (>3): the canary is SKIPPED with the G3 line, counted in
+# skipped=, NO notify, NO cfgfail, and the NON-canary loop STILL RUNS.
+cc_four="$(cfgpass_canary_checkfail_test 4)"
+case "$cc_four" in *"LOG:config: canary grok-box-8 skipped — checkfail=4 (>3), continuing without canary protection"*) pass "r5.3 G3: canary checkfail=4 => visible skip line" ;; *) bad "r5.3 G3: canary checkfail>3 skip line missing: [$cc_four]" ;; esac
+case "$cc_four" in *"PUSH grok-box-8"*) bad "r5.3 G3: canary was PUSHED at checkfail=4 (>3): [$cc_four]" ;; *"PUSH grok-box-3"*) pass "r5.3 G3: after the canary skip the non-canary loop STILL runs (grok-box-3 pushed)" ;; *) bad "r5.3 G3: non-canary loop did not run after canary skip: [$cc_four]" ;; esac
+case "$cc_four" in *"LOG:config: pass done (apply) ok=1 skipped=1 failed=0"*) pass "r5.3 G3: the skipped canary is COUNTED in skipped= (ok=1 skipped=1)" ;; *) bad "r5.3 G3: canary not counted in skipped= : [$cc_four]" ;; esac
+case "$cc_four" in *NOTIFY*) bad "r5.3 G3: canary checkfail skip must NOT notify: [$cc_four]" ;; *) pass "r5.3 G3: canary checkfail skip emits NO notify" ;; esac
+case "$cc_four" in *CFGFAIL*) bad "r5.3 G3: canary checkfail skip must NOT change cfgfail: [$cc_four]" ;; *) pass "r5.3 G3: canary checkfail skip leaves cfgfail unchanged" ;; esac
+# (b) checkfail=3 (==3 boundary, HEALTHY): the canary IS pushed (r2 boundary).
+cc_three="$(cfgpass_canary_checkfail_test 3)"
+case "$cc_three" in *"PUSH grok-box-8"*) pass "r5.3 G3: canary checkfail=3 (==3 boundary) => canary IS pushed" ;; *) bad "r5.3 G3: canary skipped at the ==3 boundary (should push): [$cc_three]" ;; esac
+
 # D4 forward-compat info log: an unknown-but-well-formed key is ALLOWED and
 # logged ONCE per reconcile run, DEDUPED across boxes. Drives the REAL
 # reconcile_config_pass + REAL push_managed + REAL unknown_managed_keys across
