@@ -2420,38 +2420,50 @@ cmd_reconcile() {
   return "$rc"
 }
 
-# reconcile_identity_pass <devices-json> (#10 D6): LOG-ONLY identity report.
-# For every device whose hostname/name is grok-box-* (the -1 split-brain suffix
-# is folded to the base name, matching dev_field), log one line when it is
-# flagged:
+# reconcile_identity_pass <devices-json> (#10 D6 + box-naming-3digit D6):
+# LOG-ONLY identity report. For every device whose hostname/name is grok-box-*
+# (the -1 split-brain suffix is folded to the base name, matching dev_field),
+# log one line when it is flagged:
 #   identity: <box> untagged
 #   identity: <box> key-expiry-enabled expires=<date>
+#   identity: <box> legacy-name        (name is not the canonical grok-box-NNN)
 # and always a summary `identity: ok=N flagged=M`. A device is "flagged" if it
 # is untagged OR has node-key expiry enabled (keyExpiryDisabled != true). The
-# jq emits `OK <box>` / `UNTAGGED <box>` / `EXPIRY <box> <expires>` tokens and
-# the shell renders + counts them, so there is exactly one jq pass. F3: no
-# notify/counter/threshold/mutation. Never fails the run.
+# jq emits `OK`/`UNTAGGED`/`EXPIRY`/`LEGACY` tokens and the shell renders +
+# counts them, so there is exactly one jq pass over the device list. The
+# legacy-name check ALSO runs over the enrolled box names (box-naming-3digit
+# D6: "enrolled or discovered"), deduped against the devices already reported,
+# so it fires even for a box that is enrolled but not currently discovered and
+# even on a READ-ONLY run with no device list. F3: no notify/counter/threshold/
+# mutation. Never fails the run.
 reconcile_identity_pass() {
   local devs="$1" line ok=0 flagged=0 kind box extra rest
-  [ -n "$devs" ] || return 0            # READ-ONLY run / no list => silent no-op
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    kind="${line%% *}"; rest="${line#* }"; box="${rest%% *}"
-    case "$kind" in
-      OK)
-        ok=$((ok + 1))
-        ;;
-      UNTAGGED)
-        flagged=$((flagged + 1))
-        log "identity: $box untagged"
-        ;;
-      EXPIRY)
-        flagged=$((flagged + 1))
-        extra="${rest#* }"
-        log "identity: $box key-expiry-enabled expires=$extra"
-        ;;
-    esac
-  done < <(printf '%s' "$devs" | jq -r '
+  # Names already reported as legacy from the device list, to dedup the
+  # enrolled-names pass (space-padded for a whole-word membership test).
+  local legacy_seen=" "
+  if [ -n "$devs" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      kind="${line%% *}"; rest="${line#* }"; box="${rest%% *}"
+      case "$kind" in
+        OK)
+          ok=$((ok + 1))
+          ;;
+        UNTAGGED)
+          flagged=$((flagged + 1))
+          log "identity: $box untagged"
+          ;;
+        EXPIRY)
+          flagged=$((flagged + 1))
+          extra="${rest#* }"
+          log "identity: $box key-expiry-enabled expires=$extra"
+          ;;
+        LEGACY)
+          log "identity: $box legacy-name"
+          case "$legacy_seen" in *" $box "*) : ;; *) legacy_seen="$legacy_seen$box " ;; esac
+          ;;
+      esac
+    done < <(printf '%s' "$devs" | jq -r '
     # Match grok-box-N or the -1 split-brain corpse grok-box-N-1, folding the
     # corpse to its base. Do NOT blindly strip a trailing -1 (that would maul
     # grok-box-1 -> grok-box-). Only strip when the remainder is still a valid
@@ -2461,13 +2473,36 @@ reconcile_identity_pass() {
       elif (h | test("^grok-box-[0-9]+-1$"))  then (h | sub("-1$"; ""))
       else "" end;
     .devices[]?
-    | (base(.hostname // .name // "")) as $b
+    | (.hostname // .name // "") as $orig
+    | (base($orig)) as $b
     | select($b != "")
-    | if   ((.tags // []) | length) == 0 then "UNTAGGED \($b)"
-      elif (.keyExpiryDisabled != true)  then "EXPIRY \($b) \(.expires // "")"
-      else "OK \($b)" end
+    | (
+        if   ((.tags // []) | length) == 0 then "UNTAGGED \($b)"
+        elif (.keyExpiryDisabled != true)  then "EXPIRY \($b) \(.expires // "")"
+        else "OK \($b)" end
+      ),
+      # A device is legacy-named when its ORIGINAL name is not the canonical
+      # three-digit grok-box-NNN (an unpadded grok-box-N or a folded -1 corpse).
+      ( select(($orig | test("^grok-box-[0-9]{3}$")) | not) | "LEGACY \($b)" )
   ' 2>/dev/null)
-  log "identity: ok=$ok flagged=$flagged"
+  fi
+  # Enrolled-names legacy pass (box-naming-3digit D6): a box enrolled under a
+  # non-canonical name is flagged even if it was not in the device list.
+  local eb
+  while IFS= read -r eb; do
+    [ -n "$eb" ] || continue
+    case "$eb" in
+      grok-box-[0-9][0-9][0-9]) continue ;;   # already canonical
+    esac
+    case "$eb" in grok-box-*) : ;; *) continue ;; esac
+    case "$legacy_seen" in *" $eb "*) continue ;; esac   # already reported above
+    log "identity: $eb legacy-name"
+    legacy_seen="$legacy_seen$eb "
+  done < <(reconcile_target_boxes 2>/dev/null)
+  # Summary reflects the DEVICE analysis (tags/expiry), which only runs with a
+  # trustworthy device list — stay fully silent on a READ-ONLY run that also has
+  # no enrolled legacy names to report.
+  [ -n "$devs" ] && log "identity: ok=$ok flagged=$flagged"
   return 0
 }
 

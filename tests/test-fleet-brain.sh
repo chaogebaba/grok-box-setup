@@ -3000,6 +3000,50 @@ case "$ident_out" in
   *NOTIFY:*) bad "#10 D6/F3 identity pass emitted a NOTIFY (must be log-only this round): [$ident_out]" ;;
   *) pass "#10 D6/F3 identity pass is LOG-ONLY (no notify/counter/threshold)" ;;
 esac
+# box-naming-3digit D6: a non-canonical DISCOVERED name logs `legacy-name`.
+case "$ident_out" in
+  *"LOG:identity: grok-box-9 legacy-name"*) pass "D6 legacy-name: unpadded discovered grok-box-9 flagged legacy-name" ;;
+  *) bad "D6 legacy-name: grok-box-9 legacy line missing: [$ident_out]" ;;
+esac
+# The -1 split-brain corpse folds to its base and is flagged legacy under the base.
+case "$ident_out" in
+  *"LOG:identity: grok-box-3 legacy-name"*) pass "D6 legacy-name: corpse grok-box-3-1 folds to grok-box-3 and is flagged legacy-name" ;;
+  *) bad "D6 legacy-name: folded grok-box-3 legacy line missing: [$ident_out]" ;;
+esac
+# A CANONICAL three-digit discovered name must NOT be flagged legacy.
+ident_canon="$(identitypass_test '{"devices":[{"hostname":"grok-box-008","tags":["tag:grok-box"],"keyExpiryDisabled":true}]}')"
+case "$ident_canon" in
+  *"legacy-name"*) bad "D6 legacy-name: canonical grok-box-008 wrongly flagged legacy: [$ident_canon]" ;;
+  *) pass "D6 legacy-name: canonical grok-box-008 is NOT flagged legacy" ;;
+esac
+# D6 "enrolled or discovered": a box ENROLLED under a non-canonical name is
+# flagged legacy even on a READ-ONLY run (empty device list, local enrolled.tsv).
+identity_enrolled_test() {
+  local inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  printf 'grok-box-7\t20007\ngrok-box-004\t20004\n' > "$d/state/enrolled.tsv"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes reconcile_identity_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+log(){ printf 'LOG:%s\n' "\$*"; }
+notify(){ printf 'NOTIFY:%s\n' "\$*"; }
+reconcile_identity_pass ''
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+ident_enr="$(identity_enrolled_test)"
+case "$ident_enr" in
+  *"LOG:identity: grok-box-7 legacy-name"*) pass "D6 legacy-name: enrolled non-canonical grok-box-7 flagged legacy on a read-only run" ;;
+  *) bad "D6 legacy-name: enrolled grok-box-7 legacy line missing: [$ident_enr]" ;;
+esac
+case "$ident_enr" in
+  *"grok-box-004 legacy-name"*) bad "D6 legacy-name: enrolled canonical grok-box-004 wrongly flagged: [$ident_enr]" ;;
+  *) pass "D6 legacy-name: enrolled canonical grok-box-004 is NOT flagged legacy" ;;
+esac
+
 # Empty device list (READ-ONLY run) => silent no-op (no lines at all).
 [ -z "$(identitypass_test '')" ] \
   && pass "#10 D6 identity pass: empty device list (read-only run) => silent no-op" \
