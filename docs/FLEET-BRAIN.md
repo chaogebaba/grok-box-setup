@@ -38,8 +38,11 @@ auth, full-root scope, footprint kept to one dir tree + one systemd unit set)
 that reconciles the fleet on a timer, reaches each box over an **out-of-band
 reverse-SSH tunnel** (independent of tailnet health), and mints **per-box
 tag-scoped auth keys via the Tailscale API** (write-scoped token; laptop copy at
-`~/.grok-box-apitoken`, never printed). Alerts go to Telegram via a pluggable
-`notify()` stub (journal-only until the bot token exists).
+`~/.grok-box-apitoken`, never printed). Alerts go through `notify()`: every
+message is written to the journal/stderr ALWAYS, and — when
+`/etc/grok-fleet/telegram.env` (mode 600, `TELEGRAM_BOT_TOKEN=` +
+`TELEGRAM_CHAT_ID=`) exists — also POSTed to the Telegram Bot API. No env file
+⇒ journal-only, no error (the sink is env-gated, not a stub).
 
 ---
 
@@ -143,7 +146,7 @@ row `a`/`c`, per the frozen H11 wall). Device delete: [Remove a device via API](
 | Decision | Alternatives considered / why lost | Breaks if undone | Prior art |
 |---|---|---|---|
 | **Use the existing long-lived write-scoped PAT this iteration** (`~/.grok-box-apitoken` + `/etc/grok-fleet`, mode 600, never printed, never in git). | **OAuth client → short-lived per-run token** — LOST *this iteration* (it is the FOLLOW-UP): it's the smaller blast radius (a leak expires in minutes, no 90-day PAT rotation) but it's an extra moving part (client-id/secret storage, a token-exchange step in every reconcile, failure mode if the exchange 500s), and the PAT is already minted and working. Ship the PAT now; migrate to an OAuth client (`scopes auth_keys + devices:core`, exchanged per run) as a bounded follow-up once the brain is proven. | A long-lived PAT leak is valid until manually revoked/rotated (up to its full lifetime) vs minutes for an OAuth-exchanged token — accepted for now, tracked as the next security step. | Tailscale OAuth clients (short-lived key minting): [OAuth clients](https://tailscale.com/kb/1215/oauth-clients); API access tokens: [API docs](https://tailscale.com/api). |
-| **`notify()` is a pluggable stub — journal-only now, Telegram adapter later.** `notify(level, msg)` writes to the journal/stderr always; if `/etc/grok-fleet/telegram.env` (mode 600, `TELEGRAM_BOT_TOKEN=` + `TELEGRAM_CHAT_ID=`) EXISTS, it also POSTs to the Bot API. No bot ⇒ no Telegram, no error. (Q4) | (a) hard-wire Telegram now — LOST: blocks the whole brain on a bot token that doesn't exist yet. (b) email/other — deferred; the interface is pluggable so the transport is swappable. | Hard-wiring an unavailable transport would either crash reconcile or drop alerts silently; the stub degrades to journal-only. | Bot API sendMessage: [Telegram Bot API](https://core.telegram.org/bots/api#sendmessage). |
+| **`notify()` is a REAL, env-gated Telegram sink (not a stub).** `notify(level, msg)` writes to the journal/stderr always; if `$FLEET_TELEGRAM_ENV` (default `/etc/grok-fleet/telegram.env`, mode 600, `TELEGRAM_BOT_TOKEN=` + `TELEGRAM_CHAT_ID=`) exists, it also POSTs to the Bot API `sendMessage` (10s timeout, text prefixed `[grok-fleet/<level>]`, token sourced in a subshell and never echoed). No file / empty vars / no curl ⇒ journal-only, no error. (Q4) | (a) hard-wire Telegram as mandatory — LOST: blocks the whole brain on a bot token that may not exist yet. (b) email/other — deferred; the interface is pluggable so the transport is swappable. | Hard-wiring an unavailable transport would either crash reconcile or drop alerts silently; the env-file gate degrades to journal-only. | Bot API sendMessage: [Telegram Bot API](https://core.telegram.org/bots/api#sendmessage). |
 
 ### 5. What moves OFF the box (subtraction) vs what MUST stay
 
@@ -246,8 +249,8 @@ wall above.
 3. **`tag:fleet-brain`:** confirmed, NO exit-node/subnet rights. Operator adds
    `"tag:fleet-brain": ["autogroup:admin"]` to `tagOwners`. `fleetctl enroll`
    PRECHECKS this via `GET /acl` and refuses with a clear message if absent.
-4. **`notify()`:** journal-only stub confirmed; Telegram adapter reads
-   `/etc/grok-fleet/telegram.env` (600) when present (§4 row).
+4. **`notify()`:** real env-gated sink, not a stub — journal/stderr always;
+   Telegram POST when `/etc/grok-fleet/telegram.env` (600) is present (§4 row).
 5. **Ports 20001–20008:** verified free on the VPS loopback — confirmed (the
    originally inventoried baseline; #12 lifted the 8-port sshd cap, so ports
    beyond it are used as boxes are added but are not separately inventoried).

@@ -322,3 +322,9 @@ log "  2) generate the box-access key: ssh-keygen -t ed25519 -f $ETC_DIR/box_acc
 log "  3) fleetctl enroll grok-box-N for each box (over the tailnet)"
 log "  4) verify with: $OPT_DIR/fleetctl reconcile   (dry-run)"
 log "  5) flip apply=true in $OPT_DIR/config.toml when ready to mutate"
+# Optional Telegram alert sink: fleetctl notify() always writes to the
+# journal/stderr and additionally POSTs to the Telegram Bot API iff
+# $ETC_DIR/telegram.env (mode 600, TELEGRAM_BOT_TOKEN= + TELEGRAM_CHAT_ID=)
+# exists — see etc/telegram.env.example. The installer deliberately does NOT
+# seed it: no file => journal-only alerts, no error.
+log "  note (optional): Telegram alerts need $ETC_DIR/telegram.env (chmod 600) with TELEGRAM_BOT_TOKEN= and TELEGRAM_CHAT_ID= (see etc/telegram.env.example); without it, alerts stay journal-only"
