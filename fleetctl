@@ -1618,19 +1618,22 @@ seed_status_converged() {
   return 0
 }
 
-# revoke_minted_key <box> <keyid> <why> (D3/F4c): the SINGLE revoke path used by
-# BOTH cmd_mint_key failure arms (seed-failure and persist-failure). A minted key
-# that we cannot both seed AND record is an unrecorded live key on the tailnet —
-# the worse failure — so it MUST be revoked. Logs the reason (NEVER the key
-# value), DELETEs via the API, and:
+# revoke_minted_key <box> <keyid> <why> <suffix> (D3/F4c/S2): the SINGLE revoke
+# path used by BOTH cmd_mint_key failure arms (seed-failure and persist-failure).
+# A minted key that we cannot both seed AND record is an unrecorded live key on
+# the tailnet — the worse failure — so it MUST be revoked. <why> names the arm
+# and <suffix> carries the arm-specific tail (S2's recovery-trigger text for the
+# seed arm; the invariant note for the persist arm). Logs the reason (NEVER the
+# key value), DELETEs via the API, and:
 #   * 2xx or 404 => log revoked (HTTP code); the key is gone / already gone.
 #   * any other  => log `could NOT revoke … (HTTP …) — manual revoke required`
 #                   and latch RECONCILE_READONLY=1 so no later row mutates.
-# The caller returns 1 either way. Revokes even if the seed died before writing
-# anything (the API key exists from the create onward).
+# The caller returns 1 either way. Revokes even if the seed died anywhere in the
+# atomic write (the API key exists from the create onward) — INCLUDING after the
+# remote `mv`, in which case the now-revoked new key may be the one on the box.
 revoke_minted_key() {
-  local box="$1" keyid="$2" why="$3"
-  log "mint-key: $why for $box — REVOKING the just-minted key id=$keyid (invariant: unrecorded key must not stay live)"
+  local box="$1" keyid="$2" why="$3" suffix="$4"
+  log "mint-key: $why $box — REVOKING the just-minted key id=$keyid$suffix"
   ts_api DELETE "/tailnet/$TS_TAILNET/keys/$keyid" >/dev/null
   if ts_ok || [ "$TS_API_CODE" = 404 ]; then
     log "mint-key: revoked the just-minted key id=$keyid (HTTP $TS_API_CODE)"
@@ -1680,22 +1683,27 @@ cmd_mint_key() {
   case "$expdate" in ????-??-??) : ;; *) expdate="$(date -u -d "+90 days" +%Y-%m-%d 2>/dev/null || echo "$expdate")" ;; esac
 
   if ! seed_key_over_tunnel "$box" "$key" "$expdate"; then
-    # F4/S2: revoke UNCONDITIONALLY on any seed/verify failure. A minted-but-not-
-    # seeded key is an unrecorded live key on the tailnet (the worse failure);
-    # the box keeps its OLD key, and the re-mint happens on the next state-loss/
-    # rejoin or known-expiry trigger (docs:117), not this tick.
-    revoke_minted_key "$box" "$keyid" "seed/verify FAILED"
+    # F4/S2: revoke UNCONDITIONALLY on any seed/verify failure — a minted-but-not-
+    # recorded key is an unrecorded live key on the tailnet (the worse failure).
+    # We do NOT advance the mint-window guard or record any meta. If the failure
+    # happened AFTER the remote `mv`, the box may hold the now-revoked NEW key and
+    # thus be left WITHOUT a valid authkey; recovery is the next state-loss/rejoin
+    # (row a) or a known-expiry rotation (row c), with the >3-consecutive-failure
+    # escalation (docs:117) as the operator backstop — never a claim that the OLD
+    # key is necessarily still installed.
+    revoke_minted_key "$box" "$keyid" "seed/verify FAILED on" "; re-mint on next rejoin/expiry trigger"
     return 1
   fi
   # P1-3 PERSISTENCE INVARIANT: the minted {id,expires} MUST be durably recorded
   # before we call the mint a success. If persistence fails, the mint FAILS and
   # we REVOKE the just-minted key (we cannot rely on a later rotation finding its
-  # id, so an unrecorded key must not be left live). The box keeps its OLD key
-  # (the seed already happened, but a re-seed next run restores coherence, and
-  # the OLD key is still valid — we did not advance the mint-window guard).
+  # id, so an unrecorded key must not be left live). The verified seed already
+  # ran, so the box now holds the NEW key that we are about to revoke — it is
+  # thus left WITHOUT a valid authkey; we do NOT advance the mint-window guard,
+  # and recovery is the next state-loss/rejoin or known-expiry rotation.
   mkdir -p "$FLEET_STATE" 2>/dev/null || true
   if ! record_key_meta "$box" "$keyid" "$expires"; then
-    revoke_minted_key "$box" "$keyid" "FAILED to persist key meta"
+    revoke_minted_key "$box" "$keyid" "FAILED to persist key meta for" "; re-mint on next rejoin/expiry trigger"
     return 1
   fi
   # Record the mint window + expiry AFTER verified seed + persisted meta (never
@@ -2915,10 +2923,13 @@ reconcile_rotate() {
   # Capture the OLD key id BEFORE minting (mint overwrites the meta file).
   old_id="$(key_meta_id "$box" 2>/dev/null || true)"
   # Mint + atomically seed + verify the new key. On failure cmd_mint_key has
-  # already REVOKED the just-minted new key (F4), so no dangling key is left; the
-  # box keeps its OLD key and we revoke NOTHING here (the old id is untouched).
+  # already REVOKED the just-minted NEW key (F4), so no dangling API key is left;
+  # we revoke NOTHING here (the OLD key id is untouched at the API). We do NOT
+  # claim the OLD key is still installed on the box: if the seed failed AFTER the
+  # remote `mv`, the box now holds the now-revoked NEW key and is left without a
+  # valid authkey — recovery is the next state-loss/rejoin or known-expiry trigger.
   if ! cmd_mint_key "$box"; then
-    log "reconcile: rotate $box — mint/seed FAILED; new key already revoked by mint-key, old key intact, NOT rotating"
+    log "reconcile: rotate $box — mint/seed FAILED; new key already revoked by mint-key, NOT rotating; box may need re-mint on next rejoin/expiry trigger"
     return 1
   fi
   # New key verified seeded. Now revoke the OLD key (task b).

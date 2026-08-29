@@ -797,20 +797,26 @@ esac
 case "$msf1" in *"rc=1"*"meta=none"*) pass "D5c: seed failure (rc 1) => rc 1 and NO keys/<N>.json persisted" ;; *) bad "D5c rc1: rc/meta wrong: [$msf1]" ;; esac
 
 # S3: seed fails at rc 3 (the SEED_SHA_MISMATCH exit) => the SEED arm revokes.
-# The log must name the SEED arm ('seed/verify FAILED'), proving the revoke came
-# from the seed arm and not a fall-through to the persist arm (m8 kill).
+# The log must name the SEED arm ('seed/verify FAILED on'), proving the revoke
+# came from the seed arm and not a fall-through to the persist arm (m8 kill).
 msf3="$(mint_fail_test 3 200 ok no)"
 case "$msf3" in
-  *"seed/verify FAILED for grok-box-8 — REVOKING the just-minted key id="*"rc=1"*"DELCOUNT=1"*"DELETE /tailnet/-/keys/kNEW999|"*) pass "S3/m8 kill: seed failure (rc 3) revokes from the SEED arm exactly once, rc 1 (revoke fires for EVERY non-zero seed rc, not just rc 1)" ;;
+  *"seed/verify FAILED on grok-box-8 — REVOKING the just-minted key id="*"rc=1"*"DELCOUNT=1"*"DELETE /tailnet/-/keys/kNEW999|"*) pass "S3/m8 kill: seed failure (rc 3) revokes from the SEED arm exactly once, rc 1 (revoke fires for EVERY non-zero seed rc, not just rc 1)" ;;
   *) bad "S3 rc3: seed-arm revoke/rc wrong: [$msf3]" ;;
 esac
 
 # m8 (S3): the seed fails AFTER writing the fake dst (post-mv failure) => the
-# revoke MUST still fire (the API key exists regardless of how far the seed got).
+# revoke MUST still fire (the API key exists regardless of how far the seed got),
+# and the seed-arm log MUST carry the S2 recovery-trigger text verbatim — the box
+# may now hold the now-revoked NEW key, so we never claim the OLD key is intact.
 msf_postmv="$(mint_fail_test 1 200 ok yes)"
 case "$msf_postmv" in
   *"rc=1"*"DELCOUNT=1"*"DELETE /tailnet/-/keys/kNEW999|"*) pass "m8 kill: a post-mv seed failure still revokes the just-minted key (revoke is unconditional on seed failure)" ;;
   *) bad "m8: post-mv seed failure did not revoke: [$msf_postmv]" ;;
+esac
+case "$msf_postmv" in
+  *"mint-key: seed/verify FAILED on grok-box-8 — REVOKING the just-minted key id=kNEW999; re-mint on next rejoin/expiry trigger"*) pass "S2/F4b: post-mv seed failure logs the mandated recovery-trigger line verbatim (never claims the OLD key is intact)" ;;
+  *) bad "S2/F4b: post-mv seed-failure log missing the 're-mint on next rejoin/expiry trigger' text: [$msf_postmv]" ;;
 esac
 
 # D5c 500-DELETE variant: seed fails, DELETE returns 500 => RECONCILE_READONLY=1,
