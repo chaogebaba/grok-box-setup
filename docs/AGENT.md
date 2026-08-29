@@ -16,6 +16,34 @@ sudo bash /tmp/grok-box-setup/install.sh
 sudo /workspace/box-setup/boxup once
 ```
 
+**Required identity steps (issue #10 — a box that skips these registers
+untagged and/or with node-key expiry enabled, which lapses the node in ~180
+days):**
+
+1. **Create the auth key as reusable + pre-authorized + tagged `tag:grok-box`.**
+   In the admin console → Settings → Keys → Generate auth key, check
+   *Reusable*, check *Pre-approved* (pre-authorized), and add the tag
+   `tag:grok-box`. Tagging the node **at authentication time is the only path
+   that disables node-key expiry automatically** — tagging later in the console
+   does NOT (a console-tagged-later node keeps its expiry). So the key itself
+   must carry the tag. **You do NOT need to hunt for an "Expiry disabled"
+   toggle in the console** — following this step is what disables it. Put the
+   key in `/workspace/box-setup/secrets/ts-authkey` (mode 600) before
+   `boxup once`, or install with `BOX_SETUP_AUTHKEY=tskey-...`.
+   (`[tailscale] tags` defaults to `tag:grok-box`, so boxup advertises it at
+   first login with no config edit.)
+2. **After `boxup once`, verify identity:**
+   ```bash
+   sudo /workspace/box-setup/boxup check   # expect: tags=tag:grok-box keyexpiry=disabled
+   ```
+3. **If either is wrong** (`check=FAIL reason=tags-missing:...` or
+   `reason=key-expiry-enabled:...`), re-authenticate WITH the tag:
+   ```bash
+   sudo /workspace/box-setup/boxup retag
+   ```
+   `retag` re-auths with the config tags so Tailscale disables expiry; it needs
+   the seeded key to be tag-capable (step 1). See §G.
+
 - If status ends with `auth=https://login.tailscale.com/...`: relay that URL
   to the human, wait for approval, run `sudo /workspace/box-setup/boxup once`
   again.
@@ -116,6 +144,8 @@ env form in section D.
 | `sshd=down` or login refused | swap wiped shadow/config | `boxup once` re-applies password + drop-in |
 | `ipfwd` not `4:1,6:1` | sysctl wiped | `boxup tick` |
 | `check=FAIL reason=...` | that predicate is unhealthy | act on the named predicate (its own row here); most are fixed by `boxup once` |
+| `check=FAIL reason=tags-missing:tag:grok-box` (`status` shows `tags=none`) | the node registered UNTAGGED — it did not get the tag at auth time, so node-key expiry is NOT disabled (issue #10) | `sudo /workspace/box-setup/boxup retag` (re-auths WITH the config tag; needs a tag-capable seeded key — see §A step 1 / §G). NOT fixed by `boxup once` (converge never retags) |
+| `check=FAIL reason=key-expiry-enabled:<YYYY-MM-DD>` (`status` shows `keyexpiry=<date>`) | the node is tagged but node-key expiry is still ENABLED (it was tagged LATER in the console, which does not disable expiry) — it will lapse on that date (issue #10) | `sudo /workspace/box-setup/boxup retag` (re-auth at auth time with the tag disables expiry). NOT fixed by `boxup once` |
 | `refresh=failing:N` in status | exit-node `tailscale set` has failed N times in a row (backoff 20→60→180→600s) | check `/var/log/boxup-worker.log`; force one immediate retry with `sudo env BOXUP_FORCE_REFRESH=1 /workspace/box-setup/boxup once` |
 | `hb=-` or huge | worker dead | `boxup once` (restarts it) |
 | `authkey=expiring:<date>` in status | seeded auth key expires in < 7 days | mint a new reusable key, write it to `secrets/ts-authkey`, update `secrets/ts-authkey.expires` (see §A) |
@@ -199,8 +229,32 @@ the state-lost recovery path, and a box rebuilding its identity with an
 unauthorized tag cannot rejoin at all. If the seeded auth key itself carries
 tags, they must match the config value.
 
-To retag an ALREADY-registered node, it is a **manual** operator step (never
-automatic): once the ACL authorizes the tag, run on the box
+**Default + state-loss rejoin (issue #10).** `[tailscale] tags` now DEFAULTS to
+`tag:grok-box` (a missing key resolves to it in code; set `tags = ""` to
+register untagged on purpose). Because the empty-statedir/first-login branch is
+ALSO the state-loss REJOIN path (after an image swap that wiped
+`state/tailscale/`), a rebuilt box comes back TAGGED + expiry-disabled by
+default too — provided the seeded key is tag-capable and the `tagOwners`
+precondition above already holds. This is desired: the rejoin heals identity,
+not just connectivity.
+
+**To retag an ALREADY-registered node, use `boxup retag`** (issue #10 — the
+supported operator remediation; idempotent):
+
+```bash
+sudo /workspace/box-setup/boxup retag
+```
+
+It re-authenticates the node WITH the config-resolved tags (reusing the same
+re-auth flag builder as the key-expiry path — never a hand-rolled second `up`),
+so Tailscale disables node-key expiry, then verifies. Exit codes: `3` no seeded
+auth key, `4` resolved tags empty (`tags = ""`), `5` tailscaled not running,
+`6` post-verify still failing (usually the seeded key is not tag-capable — mint
+a tagged, pre-authorized, reusable key per §A step 1), `0` success. A failed
+re-auth leaves the node's prefs unchanged (tailscale refuses before applying).
+
+The equivalent by hand (only if `boxup retag` is unavailable, e.g. an older
+boxup) — note this hand-rolls the `up` and can drop a flag, so prefer `retag`:
 
 ```bash
 h="$(cat /workspace/box-setup/hostname 2>/dev/null)"
