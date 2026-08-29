@@ -2765,6 +2765,144 @@ case "$mut_clean" in *"RECONCILE_RC=0"*) pass "D11b/D6c MUTANT: a FAILING config
 mut_loop="$(reconcile_rc_isolation_test 0 1)"
 case "$mut_loop" in *"RECONCILE_RC=1"*) pass "D11b/D6c: a per-box loop failure still sets cmd_reconcile rc 1 (isolation is one-way)" ;; *) bad "D11b/D6c: per-box loop failure did not set rc 1: [$mut_loop]" ;; esac
 
+# =============================================================================
+# r5.2 (E1/E2): quote-safe remote script + rc-6-means-transport-only. Closes the
+# EMPIRICAL r5.1 FAIL: apostrophes in managed_remote_script comment lines broke
+# the real `sudo sh -c '<script>'` wrapping (every box rc 2, no status line), and
+# the broad rc-6 classifier masked that as transport (ok=0 skipped=7 failed=0).
+# =============================================================================
+
+# --- E1 SECONDARY guard (fast char scan): the REAL managed_remote_script output
+# must contain no `'` (apostrophe, the sole char that terminates the outer
+# `sh -c '…'`) and no backtick. This is a cheap tripwire; the AUTHORITATIVE guard
+# is the push-through-real-wrapping test below.
+mrs_scan_test() {
+  local dry="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+BOX_ROOT=/workspace/box-setup; BOX_MANAGED=/workspace/box-setup/managed.toml
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" managed_remote_script)"
+managed_remote_script deadbeef "$dry"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+for dry in 0 1; do
+  scan="$(mrs_scan_test "$dry")"
+  case "$scan" in *"'"*) bad "E1: managed_remote_script (dry=$dry) emits an apostrophe — breaks sudo sh -c '<script>': [$scan]" ;; *) pass "E1: managed_remote_script (dry=$dry) output carries NO apostrophe (secondary char scan)" ;; esac
+  case "$scan" in *'`'*) bad "E1: managed_remote_script (dry=$dry) emits a backtick: [$scan]" ;; *) pass "E1: managed_remote_script (dry=$dry) output carries NO backtick (secondary char scan)" ;; esac
+done
+
+# --- E1 AUTHORITATIVE guard (S1): push the rendered text through the SAME
+# `sudo sh -c '$remote'` wrapping the live brain uses, parsed by a REAL shell —
+# NOT the manual-strip fake other tests use. tunnel_ssh runs `sh -c "$*"` where
+# $* is literally `sudo sh -c '<script>'`, with a fake `sudo` on PATH that just
+# runs `sh -c` of its argument. An apostrophe anywhere in $remote terminates the
+# outer quote and the remote command dies with a syntax error before any status
+# line — exactly the live r5.1 break. This is the mutant-killing gate.
+wrap_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box" "$d/bin"
+  printf '%s' "$FLEETC" > "$d/fleet.toml"; printf '%s' "$BOXC" > "$d/boxes/grok-box-8.toml"
+  # Fake sudo: `sudo sh -c '<script>'` => exec `sh -c '<script>'` (drop argv[1]).
+  printf '#!/bin/sh\nexec "$@"\n' > "$d/bin/sudo"; chmod +x "$d/bin/sudo"
+  # Fake boxup: supported + config-get answers true.
+  printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") echo true;; esac\n' > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+PATH="$d/bin:\$PATH"; export PATH
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# REAL wrapping: run the FULL command string through a real shell so the outer
+# single-quote boundary of \`sudo sh -c '<script>'\` is parsed by the shell,
+# not manually stripped. This is the boundary the VPS actually exercises.
+tunnel_ssh(){ shift; sh -c "\$*"; }
+push_managed grok-box-8; echo "PUSHRC=\$?"
+[ -f "$d/box/managed.toml" ] && echo "ONBOX=present" || echo "ONBOX=absent"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+w_out="$(wrap_test)"
+case "$w_out" in *"pushed (none->"*"PUSHRC=0"*) pass "E1/S1 (authoritative): push_managed through the REAL sudo sh -c '<script>' wrapping writes managed.toml, rc 0" ;; *) bad "E1/S1: push through real sh -c wrapping FAILED (apostrophe/quoting break): [$w_out]" ;; esac
+case "$w_out" in *"ONBOX=present"*) pass "E1/S1 (authoritative): the on-box file was actually written through the real wrapping" ;; *) bad "E1/S1: real-wrapping push wrote no file: [$w_out]" ;; esac
+
+# --- E2: rc classifier. Drive the REAL push_managed with a fake tunnel_ssh whose
+# remote-side behaviour we control precisely, isolating each rc case.
+# rc_test <mode>: mode selects the fake remote behaviour.
+#   nostatus2  => remote exits 2 emitting NO status line (a script that could not
+#                 run — the r5.1 syntax-break signature) => push_managed MUST 5.
+#   ssh255     => tunnel_ssh returns 255 with no output (transport)         => 6.
+#   status_rc  => remote emits a valid status line THEN the ssh call exits 7
+#                 (a non-3 rc WITH a status line) => returned VERBATIM (7) (S2).
+rc_test() {
+  local mode="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box"
+  printf '%s' "$FLEETC" > "$d/fleet.toml"; printf '%s' "$BOXC" > "$d/boxes/grok-box-8.toml"
+  printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") echo true;; esac\n' > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+case "$mode" in
+  nostatus2) tunnel_ssh(){ cat >/dev/null; return 2; } ;;                       # ran, no status line, rc 2
+  ssh255)    tunnel_ssh(){ cat >/dev/null; return 255; } ;;                     # transport
+  status_rc) tunnel_ssh(){ cat >/dev/null; echo "sha=deadbeef cur=none support=yes enabled=true"; return 7; } ;;  # status line + non-3 rc
+esac
+push_managed grok-box-8; echo "PUSHRC=\$?"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+rc_ns2="$(rc_test nostatus2)"
+case "$rc_ns2" in *"PUSHRC=5"*) pass "E2: a non-3 rc (2) with NO status line => rc 5 (script/probe failure, a CONTENT defect)" ;; *) bad "E2: rc=2/no-status not reclassified to 5: [$rc_ns2]" ;; esac
+case "$rc_ns2" in *"remote script FAILED (rc=2, no status line)"*) pass "E2: rc=2/no-status logs the 'remote script FAILED' content-failure line (not 'unreachable')" ;; *) bad "E2: rc=2/no-status logged the wrong line: [$rc_ns2]" ;; esac
+rc_255="$(rc_test ssh255)"
+case "$rc_255" in *"PUSHRC=6"*) pass "E2: ssh rc 255 => rc 6 (transport unreachable, skip path unchanged)" ;; *) bad "E2: rc=255 not classified as 6: [$rc_255]" ;; esac
+case "$rc_255" in *"unreachable over tunnel (ssh rc=255)"*) pass "E2: rc 255 logs the transport 'unreachable' line" ;; *) bad "E2: rc=255 logged the wrong line: [$rc_255]" ;; esac
+rc_sv="$(rc_test status_rc)"
+case "$rc_sv" in *"PUSHRC=7"*) pass "E2/S2: a non-3 rc (7) that DID emit a status line is returned VERBATIM (not collapsed to 5)" ;; *) bad "E2/S2: non-3 rc with status line not returned verbatim: [$rc_sv]" ;; esac
+
+# --- E2 (pass integration): a non-canary box whose remote script fails with
+# rc=2/no-status must land in failed=N (never skipped=). Drives the REAL
+# reconcile_config_pass + REAL push_managed; the canary succeeds, grok-box-3's
+# fake tunnel returns rc 2 with no status line.
+cfg_fail_summary_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
+  printf '[update]\nrepo = "https://fleet/repo.git"\n' > "$d/etc/fleet.toml"
+  printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") echo true;; esac\n' > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }
+tunnel_up(){ return 0; }
+# canary runs the remote for real (succeeds); grok-box-3 fails rc 2, no status.
+tunnel_ssh(){
+  local box="\$1"; shift
+  if [ "\$box" = grok-box-3 ]; then cat >/dev/null; return 2; fi
+  local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"
+}
+reconcile_config_pass 1; echo "PASSRC=\$?"
+[ -f "$d/state/grok-box-3.cfgfail" ] && echo "CFGFAIL3=\$(cat "$d/state/grok-box-3.cfgfail")" || echo "CFGFAIL3=gone"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+fs_out="$(cfg_fail_summary_test)"
+case "$fs_out" in *"pass done (apply) ok=1 skipped=0 failed=1"*) pass "E2: a non-canary rc=2/no-status box lands in failed=1 (NOT skipped=) in the pass summary" ;; *) bad "E2: rc=2/no-status did not surface as failed=1: [$fs_out]" ;; esac
+case "$fs_out" in *"CFGFAIL3=1"*) pass "E2: a rc=5 (script failure) non-canary box bumps .cfgfail (content-failure routing)" ;; *) bad "E2: rc=5 non-canary did not bump .cfgfail: [$fs_out]" ;; esac
+case "$fs_out" in *"PASSRC=1"*) pass "E2: a script-failure non-canary box makes the pass return rc 1" ;; *) bad "E2: pass rc not 1 with a failed box: [$fs_out]" ;; esac
+
 rm -rf "$CFG_FIXROOT"
 
 rm -f "$seedA" "$seedB" "$seedC"

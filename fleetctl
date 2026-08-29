@@ -1832,8 +1832,46 @@ unknown_managed_keys() {
 # managed_remote_script <want_sha> <dry>: emit the POSIX-sh remote script used
 # by BOTH push_managed and `config diff` (ONE remote code path). Interpolates
 # want_sha (not a secret) and the box paths; the rendered text arrives on STDIN.
-# Contains NO single quotes (sha via `cut`, grep pattern unquoted) so it nests
-# inside the caller's outer `sudo sh -c '<script>'` single-quoted argument.
+#
+# QUOTE-SAFETY (E1, r5.2 — after EMPIRICAL r5.1 FAIL): the emitted script is run
+# as `sudo sh -c '<script>'` (push :1968 / diff :2969), so the WHOLE script sits
+# inside a single-quoted argument. A single literal apostrophe (`'`) anywhere in
+# the emitted text terminates that outer quote and breaks the remote command on
+# every real box (r5.1 defect: comment lines `box's` / `boxup's` inside the
+# heredoc → remote rc 2, no status line). The remedy is structural, not escaping:
+# the heredoc body emits ZERO comment lines — ALL explanatory prose lives HERE,
+# above the heredoc — so no apostrophe (or backtick) can ever leak into the
+# wrapped script. A unit test asserts the real function output carries no `'` and
+# no backtick (a fast secondary guard); the AUTHORITATIVE guard is the test that
+# pushes through a real `sh -c "$*"` wrapping (S1). sha is taken via `cut` (no
+# awk apostrophes), grep patterns are unquoted.
+#
+# Remote script shape:
+#   want/mf/bx/dry  interpolated by the heredoc at emit time (brain shell)
+#   cat > tmp       spool ALL of stdin (the rendered managed.toml) first
+#   sha check       tmp sha != want => rm tmp, MANAGED_SHA_MISMATCH, exit 3
+#   cur             sha of the live managed.toml (or 'none')
+#   support         yes iff the box's boxup has a MANAGED_FILE= line
+#   enabled probe   read ONLY when support=yes, via the box's OWN reader
+#                   (`bash boxup config-get managed enabled`) — boxup is
+#                   #!/bin/bash and its TOML reader uses the bash-only `read -r
+#                   -d`; running it under dash `sh` errors, so invoke via `bash`
+#                   explicitly (BLOCKER-2, live canary r1). Exit-code contract,
+#                   matched to boxup's REAL codes (boxup:260 awk
+#                   END{exit(found?0:1)}, config-get subcommand :2382-2394;
+#                   blueprint r5.1 S2): exit 0 => key PRESENT => use the printed
+#                   value (true/false; anything else => unknown); exit 1 => key
+#                   ABSENT => enabled=true, the D1 hoisted-gate default (boxup:289
+#                   `config_get_file … || echo true` — the box honours
+#                   managed.toml when [managed] is absent, which is EVERY box:
+#                   the template ships [managed] commented). Any OTHER exit,
+#                   EMPTY output on exit 0, or a bash launch failure =>
+#                   enabled=unknown (never a false "true"). This is the live
+#                   grok-box-1 fix: absent [managed] => exit 1 => enabled=true, so
+#                   `config diff` can finally report in-sync, not "probe failed".
+#   dry-run         print cur/want + support/enabled + `---FILE---` + file, rm tmp
+#   apply           cur == want => rm tmp (no write); else mv -f + chmod 600
+#   status line     ALWAYS print one: sha=<now> support=<yes|no> enabled=<…>
 managed_remote_script() {
   local want="$1" dry="$2"
   cat <<REMOTE
@@ -1851,21 +1889,6 @@ cur=\$(sha256sum "\$mf" 2>/dev/null | cut -d" " -f1); [ -n "\$cur" ] || cur=none
 support=no; enabled=n/a
 if grep -q ^MANAGED_FILE= "\$bx" 2>/dev/null; then
   support=yes
-  # Probe the box's OWN reader for [managed] enabled (D5b). boxup is
-  # #!/bin/bash and its TOML reader uses the bash-only \`read -r -d\`; invoking
-  # it under \`sh\` (dash on the boxes) makes that read error out, so we invoke
-  # via \`bash\` explicitly (BLOCKER-2, live canary r1).
-  #
-  # Exit-code contract, matched to boxup's REAL codes (boxup:260 awk
-  # \`END{exit(found?0:1)}\`, config-get subcommand :2382-2394; blueprint r5.1
-  # S2): exit 0 => key PRESENT => use the printed value (true/false; anything
-  # else => unknown); exit 1 => key ABSENT => enabled=true, the D1 hoisted-gate
-  # default (boxup:289 \`config_get_file … || echo true\` — the box honours
-  # managed.toml when [managed] is absent, which is EVERY box: the template
-  # ships [managed] commented). Any OTHER exit, EMPTY output on exit 0, or a
-  # bash launch failure => enabled=unknown (never a false "true"). This is the
-  # live grok-box-1 fix: absent [managed] => exit 1 => enabled=true, so
-  # \`config diff\` can finally report in-sync instead of "probe failed".
   enabled=\$(bash "\$bx" config-get managed enabled 2>/dev/null) && prc=0 || prc=\$?
   if [ "\$prc" = 0 ]; then
     case "\$enabled" in true|false) : ;; *) enabled=unknown ;; esac
@@ -1898,10 +1921,16 @@ REMOTE
 # Prints ONE brain log line and returns:
 #   0  in sync / pushed / dry-run OK
 #   3  remote stdin sha mismatch (a truncated/flapped stream is never installed)
-#   5  brain read-back mismatch (printed sha != want_sha)
-#   6  transport unreachable (ssh rc 255, or the remote never produced a status
-#      line) — caller SKIPS without bumping .cfgfail (D6a/D6d)
-#   other  write/validation failure (caller does D9)
+#   5  brain read-back mismatch (printed sha != want_sha) OR the remote script
+#      ran but produced NO valid status line (a script/probe failure — e.g. the
+#      script could not execute; E2, r5.2). Both are CONTENT failures routed
+#      identically at the call site (caller does D9).
+#   6  transport unreachable — ssh rc 255 ONLY (host unreachable / tunnel dead).
+#      Caller SKIPS without bumping .cfgfail (D6a/D6d). A running-but-broken
+#      remote script is NOT transport: it is rc 5 (E2, r5.2 — the r5.1 broad
+#      "no status line => 6" arm masked a fleet-wide break as skipped=).
+#   other  write/validation failure, OR a non-3 rc that DID emit a status line
+#      (returned verbatim, S2) (caller does D9)
 # The status the remote prints (`sha=… support=… enabled=…`) is parsed as
 # order-independent key=value tokens; unknown tokens are ignored (an added field
 # never breaks an older brain). The brain asserts the read-back sha == want_sha.
@@ -1972,19 +2001,33 @@ push_managed() {
   local had_status=0
   printf '%s\n' "$out" | grep -Eq '(^| )cur=|(^| )sha=' && had_status=1
   if [ "$rc" != 0 ]; then
-    # Distinguish TRANSPORT failure from a remote-reported failure (D6a, rc 6):
-    #   rc 255            = ssh-level failure (host unreachable/tunnel dead) —
-    #                       OpenSSH's documented convention (255 = ssh error,
-    #                       else the remote command's own code).
-    #   any rc + NO status line = the remote script never produced its status
-    #                       line, i.e. the spool never ran => also transport.
-    # rc 3 = remote stdin sha mismatch (a real content statement) stays 3.
-    # Transport failures return 6 so the caller can SKIP (canary: fall through;
-    # non-canary: skip line) WITHOUT bumping .cfgfail — reachability alerting is
-    # the per-box loop's job (checkfail), never duplicated by the config pass.
-    if [ "$rc" = 255 ] || { [ "$rc" != 3 ] && [ "$had_status" = 0 ]; }; then
-      log "config: $box unreachable over tunnel (ssh rc=$rc) — no change applied"
+    # Classify the non-zero remote exit (E2, r5.2 — after EMPIRICAL r5.1 FAIL,
+    # which showed the old broad "(rc!=3 AND no status line) => 6" arm MASKING a
+    # broken remote script (rc=2, no status line) as transport-unreachable, so
+    # the pass reported ok=0 skipped=7 failed=0 — a fleet-wide break that passed
+    # the soak). rc 6 now means TRANSPORT ONLY:
+    #   rc 255 => 6  ssh-level failure (host unreachable / tunnel dead) —
+    #                OpenSSH's documented convention (255 = ssh error, else the
+    #                remote command's own code; an offline box whose tunnel
+    #                listener is still up yields 255). Caller SKIPS (canary: fall
+    #                through; non-canary: skip line) WITHOUT bumping .cfgfail —
+    #                reachability alerting is the per-box loop's job.
+    #   any OTHER rc that is not 3 AND produced NO status line => 5. The remote
+    #                command ran but never emitted its status line: the script
+    #                could not run (e.g. the r5.1 sh-syntax break) — a CONTENT
+    #                defect that MUST surface in failed=N, never hide in
+    #                skipped=. 5 lands in the caller's content-failure arm
+    #                (canary: abort+cfgfail+notify>3; non-canary: failed++).
+    #   rc 3 (stdin sha mismatch) OR any non-3 rc that DID emit a status line
+    #                (S2): fall through and return the rc VERBATIM (unchanged) —
+    #                a status line means the script ran and stated something.
+    if [ "$rc" = 255 ]; then
+      log "config: $box unreachable over tunnel (ssh rc=255) — no change applied"
       return 6
+    fi
+    if [ "$rc" != 3 ] && [ "$had_status" = 0 ]; then
+      log "config: $box remote script FAILED (rc=$rc, no status line) — no change applied"
+      return 5
     fi
     log "config: $box push FAILED (rc=$rc) — no change applied"
     return "$rc"
