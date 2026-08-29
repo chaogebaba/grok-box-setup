@@ -6,7 +6,10 @@ you run, in order, for every situation. The program is
 
 > Driving the whole fleet from a laptop instead of one box? Use `fleetctl`
 > (`fleetctl list|status|check|rollout`) — see the "Fleet operations (laptop)"
-> section in [README.md](../README.md).
+> section in [README.md](../README.md). Note: `fleetctl enroll` is **VPS-only**
+> (#12); after upgrading fleetctl on the VPS, re-run `vps/install-vps.sh` once
+> (idempotent) to drop the old 8-port sshd cap — see
+> [docs/FLEET-BRAIN.md](FLEET-BRAIN.md).
 
 ## A. Fresh box (never set up)
 
