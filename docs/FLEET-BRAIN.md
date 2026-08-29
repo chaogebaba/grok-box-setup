@@ -350,9 +350,9 @@ returns). A DRY RUN (no `--apply`) pushes `--dry-run` and logs `in sync` /
 **Failure handling distinguishes TRANSPORT from CONTENT** (the whole point of
 the canary is to catch a bad *render*, not to gate on reachability):
 
-- **Canary UNREACHABLE over the tunnel** (`push_managed` rc 6 — ssh rc 255, or
-  the remote never produced a status line): the canary is skipped ONLY and the
-  pass **falls through to the non-canary loop** this tick, logging `config:
+- **Canary UNREACHABLE over the tunnel** (`push_managed` rc 6 — ssh rc 255
+  ONLY, i.e. a genuine ssh transport failure): the canary is skipped ONLY and
+  the pass **falls through to the non-canary loop** this tick, logging `config:
   canary <box> unreachable over tunnel — canary check skipped this tick,
   continuing without canary protection` at info. **No notify, no `.cfgfail`
   bump.** An offline default canary (a sandbox legitimately sleeps for days)
@@ -360,25 +360,42 @@ the canary is to catch a bad *render*, not to gate on reachability):
   box by the D4 validator and by each push's own sha-in/sha-back verification.
   Same rule whether the canary is the default or an operator `canary_box`.
 - **Canary CONTENT failure** (rc 3 stdin-sha mismatch / rc 4 D4 refusal / rc 5
-  read-back mismatch — the canary HAS told us something about the rendered
-  text): the pass ABORTS the rest this tick, and the notify is
-  **threshold-gated exactly like the non-canary path** — bump the canary's
-  `.cfgfail` and `notify warn` ONLY once the count crosses > 3 (`config push
-  failing for <box>: N consecutive failures — config pass aborted`); below the
-  threshold it logs a warn line only. A canary success resets the counter.
-- **Non-canary UNREACHABLE** (rc 6): same info skip line as tunnel-down
-  (`config: skip <box> — unreachable over tunnel`), **no `.cfgfail` bump** —
-  reachability alerting is the per-box loop's job, never duplicated here.
-- **Non-canary CONTENT failure**: bump that box's `.cfgfail` (a warn fires once
+  read-back mismatch OR a remote script/probe failure — the remote command ran
+  (or should have) but produced no valid status line, e.g. a script that could
+  not execute: the canary HAS told us something about the rendered text): the
+  pass ABORTS the rest this tick, and the notify is **threshold-gated exactly
+  like the non-canary path** — bump the canary's `.cfgfail` and `notify warn`
+  ONLY once the count crosses > 3 (`config push failing for <box>: N
+  consecutive failures — config pass aborted`); below the threshold it logs a
+  warn line only. A canary success resets the counter.
+- **Non-canary UNREACHABLE** (rc 6 — ssh rc 255 only): same info skip line as
+  tunnel-down (`config: skip <box> — unreachable over tunnel`), **no `.cfgfail`
+  bump** — reachability alerting is the per-box loop's job, never duplicated
+  here.
+- **Non-canary CONTENT failure** (rc 3/4/5, including a remote script that ran
+  but produced no status line): bump that box's `.cfgfail` (a warn fires once
   the count crosses > 3, like seedfail) and continue with the rest.
+
+> **rc 6 means TRANSPORT ONLY (ssh rc 255).** A remote command that RAN but
+> exited non-zero without emitting its status line — e.g. a script that could
+> not execute — is a CONTENT defect and returns **rc 5**, so it surfaces in
+> `failed=` and is never masked as `skipped=`. (Earlier revisions folded any
+> "no status line" result into rc 6; the r5.1 empirical gate showed that masked
+> a fleet-wide breakage — a quoting bug that made every box return rc 2 with no
+> status — as `ok=0 skipped=7 failed=0`, which passed the soak. rc 6 is now
+> `rc == 255` alone.)
 
 **The config pass is best-effort and its rc is NOT folded into the reconcile
 service's exit code.** Each tick logs a one-line summary `config: pass done
 (dry-run|apply) ok=N skipped=N failed=N`. A failing config push therefore never
 flips `fleet-reconcile.service` to `Result=exit-code` (that Result reflects the
-per-box decision loop only). **Soak criterion:** the service journal is clean
-when there are **no `notify` lines** and **`failed=0`** in the `pass done`
-summary across the soak window.
+per-box decision loop only). **Soak criterion:** the config pass is healthy when
+there are **no `notify` lines** and, in the `pass done` summary across the soak
+window, **`failed=0` AND `ok>=1`**. The `ok>=1` conjunct is deliberate: `ok=0`
+with `failed=0` is exactly the masked-failure signature the r5.1 gate hit (every
+box skipped by a broken script), so a pass in which no box converged is now a
+FAIL, not a clean soak. (When every enrolled box is awake, the strict form is
+`failed=0 AND ok==<awake boxes>`; `ok>=1` is the floor.)
 
 ### PRECONDITION (do not skip)
 
