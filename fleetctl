@@ -2320,9 +2320,12 @@ cmd_reconcile() {
   done
   # config-truth fleet-wide pass (D6): runs for in-sync boxes too, needs no
   # device list. Inserted between the per-box loop and the closing log line; the
-  # fd-9 flock is STILL HELD here (released only when cmd_reconcile returns), and
-  # its non-zero result folds into rc like reconcile_one's.
-  reconcile_config_pass "$apply" || rc=1
+  # fd-9 flock is STILL HELD here (released only when cmd_reconcile returns).
+  # BEST-EFFORT (D6c): the pass is self-contained — its rc is LOGGED in its own
+  # `pass done … ok/skipped/failed` summary but is NOT folded into cmd_reconcile's
+  # rc. fleet-reconcile.service Result reflects the per-box loop ONLY, as on main;
+  # a failing config push must never flip the service to Result=exit-code.
+  reconcile_config_pass "$apply"
   log "reconcile: done ($mode)"
   return "$rc"
 }
