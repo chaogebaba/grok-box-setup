@@ -1,0 +1,87 @@
+# fleet.toml — VPS-brain desired config for the fleet (FLEET-BRAIN §config-truth).
+#
+# This is the BRAIN side of config-truth (Phase 2). It lives on the always-on
+# brain, NOT on a box:
+#
+#   $FLEET_ETC/fleet.toml          fleet-wide desired config (this file)
+#   $FLEET_ETC/boxes/<box>.toml    per-box overrides (e.g. boxes/grok-box-8.toml)
+#
+# ($FLEET_ETC defaults to /etc/grok-fleet — same dir, mode 600 root, as the PAT
+# and the tunnel key.) Both files are OPTIONAL. BOTH ABSENT = the feature is
+# OFF, silently — reconcile pushes nothing and generates no tunnel traffic.
+#
+# On each reconcile tick the brain RENDERS a per-box managed.toml by merging
+# fleet.toml then boxes/<box>.toml (key-level, LAST-WINS per (table,key), with
+# a box override replacing the value in place — first-seen order, so identical
+# inputs render identical bytes), then pushes it over the reverse tunnel to
+# /workspace/box-setup/managed.toml. On the box, managed.toml wins over
+# config.toml (precedence: env > managed.toml > config.toml > default).
+#
+# PRECONDITION: deploy a managed.toml-aware boxup to EVERY box BEFORE you create
+# this file. An older boxup silently ignores managed.toml; the brain detects
+# this (reports support=no) and logs it, but cannot make that box honour the
+# pushed file. Roll boxup out first (canary-first, the row-d rollout), then
+# create fleet.toml.
+#
+# Same TOML subset boxup reads: [table] headers and `key = value` lines (values
+# opaque, including arrays). Comments and blank lines are dropped from the
+# rendered output. `key = value` values are pushed VERBATIM — the box's own
+# reader strips quotes at read time.
+#
+# NOT brain-managed (refused by the D4 validator, never pushed):
+#   * [fleet].*            — bootstrap, owned by `fleetctl enroll`; must exist
+#                            before the tunnel does.
+#   * [tailscale].tags     — first-login-only on the box (inert on a registered
+#                            node); retag stays a MANUAL operator step. Phase 2
+#                            does NOT manage tags.
+# Managed tables (the boxup config surface): [ssh], [tailscale] (except tags),
+# [update], [managed].
+
+# ---------------------------------------------------------------------------
+# fleet-wide keys — apply to every enrolled, reachable box unless a per-box
+# override shadows them.
+
+[ssh]
+# Root/box password pushed to the whole fleet. Overrides the box's config.toml
+# [ssh].password; a box can still opt out locally with [managed] enabled=false.
+#password = "12345678"
+
+[tailscale]
+# Pin the vendored tailscale version fleet-wide.
+#version = "1.102.3"
+# NOTE: tags is NOT managed in Phase 2 — a [tailscale].tags key here is REFUSED
+# by validation and the whole render for that box is skipped (its .cfgfail
+# bumps). Retag manually per docs/AGENT.md §F.
+
+[update]
+# Repo that `boxup update` clones. Managing this makes the brain the source of
+# truth for where every box pulls its updates from.
+#repo = "https://github.com/chaogebaba/grok-box-setup.git"
+
+# ---------------------------------------------------------------------------
+# Per-box overrides live in a SEPARATE file per box, NOT in this file:
+#
+#   $FLEET_ETC/boxes/grok-box-8.toml
+#   -----------------------------------------------------------------
+#   [update]
+#   # grok-box-8 tracks a canary branch while the rest of the fleet stays on the
+#   # fleet-wide default above. This VALUE replaces the fleet value in place for
+#   # grok-box-8 only; every other box keeps the fleet.toml [update].repo.
+#   repo = "https://github.com/chaogebaba/grok-box-setup.git#canary"
+#   -----------------------------------------------------------------
+#
+# A per-box override is the brain-side escape hatch (the box-side one is
+# [managed] enabled=false in the box's config.toml). An empty boxes/<box>.toml
+# is valid and means "no overrides for this box".
+
+# ---------------------------------------------------------------------------
+# Operator recipe (once boxup is deployed fleet-wide):
+#   1. Create /etc/grok-fleet/fleet.toml (this file) and any boxes/<box>.toml.
+#   2. fleetctl config render grok-box-8      # inspect the merged result
+#   3. fleetctl config diff   grok-box-8      # exit 1 = drift, 0 = in sync
+#   4. fleetctl config push   grok-box-8      # push the canary first, by hand
+#   5. fleetctl config diff   grok-box-8      # confirm in sync (exit 0)
+#   6. reconcile converges the rest under --apply (canary-first, serial). A DRY
+#      RUN tick just logs "in sync" / "WOULD push (old->new)" and pushes nothing.
+#
+# The canary box is [fleet-brain].canary_box (default 8) in the brain's config.
