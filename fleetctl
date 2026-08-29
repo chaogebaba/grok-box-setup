@@ -2256,8 +2256,66 @@ cmd_reconcile() {
   # fd-9 flock is STILL HELD here (released only when cmd_reconcile returns), and
   # its non-zero result folds into rc like reconcile_one's.
   reconcile_config_pass "$apply" || rc=1
+  # identity pass (#10 D6, LOG-ONLY this round): per grok-box-* device, log
+  # whether it is untagged / has node-key expiry enabled, plus an
+  # `identity: ok=N flagged=M` summary. F3: NO notify, NO counter, NO threshold,
+  # NO API mutation (setting keyExpiryDisabled via API is a separate decision,
+  # out of scope). Read-only; never affects rc. No-op when the device list is
+  # empty (a READ-ONLY run has no trustworthy list).
+  reconcile_identity_pass "$devs"
   log "reconcile: done ($mode)"
   return "$rc"
+}
+
+# reconcile_identity_pass <devices-json> (#10 D6): LOG-ONLY identity report.
+# For every device whose hostname/name is grok-box-* (the -1 split-brain suffix
+# is folded to the base name, matching dev_field), log one line when it is
+# flagged:
+#   identity: <box> untagged
+#   identity: <box> key-expiry-enabled expires=<date>
+# and always a summary `identity: ok=N flagged=M`. A device is "flagged" if it
+# is untagged OR has node-key expiry enabled (keyExpiryDisabled != true). The
+# jq emits `OK <box>` / `UNTAGGED <box>` / `EXPIRY <box> <expires>` tokens and
+# the shell renders + counts them, so there is exactly one jq pass. F3: no
+# notify/counter/threshold/mutation. Never fails the run.
+reconcile_identity_pass() {
+  local devs="$1" line ok=0 flagged=0 kind box extra rest
+  [ -n "$devs" ] || return 0            # READ-ONLY run / no list => silent no-op
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    kind="${line%% *}"; rest="${line#* }"; box="${rest%% *}"
+    case "$kind" in
+      OK)
+        ok=$((ok + 1))
+        ;;
+      UNTAGGED)
+        flagged=$((flagged + 1))
+        log "identity: $box untagged"
+        ;;
+      EXPIRY)
+        flagged=$((flagged + 1))
+        extra="${rest#* }"
+        log "identity: $box key-expiry-enabled expires=$extra"
+        ;;
+    esac
+  done < <(printf '%s' "$devs" | jq -r '
+    # Match grok-box-N or the -1 split-brain corpse grok-box-N-1, folding the
+    # corpse to its base. Do NOT blindly strip a trailing -1 (that would maul
+    # grok-box-1 -> grok-box-). Only strip when the remainder is still a valid
+    # grok-box-N.
+    def base(h):
+      if   (h | test("^grok-box-[0-9]+$"))    then h
+      elif (h | test("^grok-box-[0-9]+-1$"))  then (h | sub("-1$"; ""))
+      else "" end;
+    .devices[]?
+    | (base(.hostname // .name // "")) as $b
+    | select($b != "")
+    | if   ((.tags // []) | length) == 0 then "UNTAGGED \($b)"
+      elif (.keyExpiryDisabled != true)  then "EXPIRY \($b) \(.expires // "")"
+      else "OK \($b)" end
+  ' 2>/dev/null)
+  log "identity: ok=$ok flagged=$flagged"
+  return 0
 }
 
 # devices_json_valid <body>: 0 iff the body parses as JSON AND has a `.devices`
