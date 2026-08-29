@@ -111,6 +111,8 @@ tags = "tag:grok-box"
 #            non-default; at 22 the key is omitted and this default stands.
 #port = 22
 #
-# box_index  N in grok-box-N; the reverse loopback port is 20000+N (range
-#            20001–20008). Leave unset to derive N from the frozen hostname.
+# box_index  N in grok-box-NNN (the decimal index; names are zero-padded to
+#            three digits, e.g. grok-box-008). The reverse loopback port is
+#            20000+N, N parsed as DECIMAL (a padded 008/009 is 8/9, never
+#            octal). Leave unset to derive N from the frozen hostname.
 #box_index = 8

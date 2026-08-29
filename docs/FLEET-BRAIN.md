@@ -270,7 +270,7 @@ the PAT and tunnel key), both files OPTIONAL:
 | Path | What |
 |---|---|
 | `$FLEET_ETC/fleet.toml` | fleet-wide desired config |
-| `$FLEET_ETC/boxes/<box>.toml` | per-box overrides (e.g. `boxes/grok-box-8.toml`) |
+| `$FLEET_ETC/boxes/<box>.toml` | per-box overrides (e.g. `boxes/grok-box-008.toml`) |
 
 Box side: `/workspace/box-setup/managed.toml` — mode 600 root, under
 `/workspace` so it survives an image swap like `config.toml`. **BOTH brain
@@ -341,7 +341,8 @@ step (docs/AGENT.md §F). Revisit in Phase 3.
 `reconcile_config_pass` runs as a fleet-wide pass AFTER the per-box decision
 loop each tick (it needs no device list and must run for in-sync boxes too). It
 mirrors the row-d rollout shape: the **canary box first** (`[fleet-brain].canary_box`,
-default 8), then the rest in enrolled order, SERIALLY — one extra tunnel round
+default `grok-box-008` — a bare `8` or `grok-box-8` is normalised to the padded
+canonical name), then the rest in enrolled order, SERIALLY — one extra tunnel round
 trip per awake box per tick. A box whose tunnel is down or whose `.checkfail`
 count is over threshold (>3) is skipped silently (its drift is reported when it
 returns). A DRY RUN (no `--apply`) pushes `--dry-run` and logs `in sync` /
@@ -438,9 +439,9 @@ one run (ssh rc 255), never by leaning on stale checkfail state.
 ```
 # after boxup is deployed fleet-wide (see PRECONDITION):
 $EDITOR /etc/grok-fleet/fleet.toml                 # + boxes/<box>.toml as needed
-fleetctl config render grok-box-8                  # inspect the merged result
-fleetctl config diff   grok-box-8                  # exit 1 = drift, 0 = in sync
-fleetctl config push   grok-box-8                  # push the canary first, by hand
+fleetctl config render grok-box-008                # inspect the merged result
+fleetctl config diff   grok-box-008                # exit 1 = drift, 0 = in sync
+fleetctl config push   grok-box-008                # push the canary first, by hand
 fleetctl config diff   grok-box-8                  # confirm in sync (exit 0)
 # reconcile then converges the rest under --apply (canary-first, serial)
 ```
