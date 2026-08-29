@@ -612,7 +612,7 @@ rollout_summary() {
 }
 
 cmd_rollout() {
-  local allow_dirty=0 all=0 canary="grok-box-5"
+  local allow_dirty=0 all=0 canary="grok-box-005"
   # Flag parse: --dirty, --all, --canary <box>. Remaining args are explicit
   # targets. Order-independent for the flags.
   local -a rest=()
@@ -2480,7 +2480,12 @@ devices_json_valid() {
   printf '%s' "$body" | jq -e 'has("devices") and (.devices | type == "array")' >/dev/null 2>&1
 }
 
-# Enrolled boxes: FLEET_BOXES override (tests) else the enrolled.tsv names.
+# Enrolled boxes: FLEET_BOXES override (tests) else the enrolled.tsv names,
+# ordered NUMERICALLY by box index (D5) so reconcile order is stable during the
+# padded/legacy transition (grok-box-002 before grok-box-010, a legacy
+# grok-box-3 sorts between them by its decimal index). Dedups by name. A name
+# that will not parse to an index sorts last (index treated as very large) but
+# is still emitted, so a malformed enrolled row is never silently dropped.
 reconcile_target_boxes() {
   if [ -n "${FLEET_BOXES:-}" ]; then
     local -a _fb; read -ra _fb <<< "$FLEET_BOXES"
@@ -2488,7 +2493,17 @@ reconcile_target_boxes() {
     return 0
   fi
   [ -f "$FLEET_STATE/enrolled.tsv" ] || return 0
-  awk -F'\t' '{print $1}' "$FLEET_STATE/enrolled.tsv" | sort -u
+  local box idx
+  # Emit "<idx><TAB><name>" (unparseable => a large sentinel index), dedup by
+  # name, numeric-sort on the index column, then drop the index column.
+  while IFS=$'\t' read -r box _; do
+    [ -n "$box" ] || continue
+    idx="$(box_index_from_name "$box" 2>/dev/null)" || idx=999999
+    printf '%s\t%s\n' "$idx" "$box"
+  done < "$FLEET_STATE/enrolled.tsv" \
+    | sort -u -k2,2 \
+    | sort -n -k1,1 \
+    | awk -F'\t' '{print $2}'
 }
 
 reconcile_record_api_failure() {
@@ -2818,12 +2833,18 @@ reconcile_cleanup_rollout_tree() {
   fi
 }
 
-# reconcile_canary_box -> the canary box name. [fleet-brain].canary_box (a bare
-# N or grok-box-N) else default 8.
+# reconcile_canary_box -> the canary box name, NORMALISED to the canonical
+# padded form (D5). [fleet-brain].canary_box may be a bare N, grok-box-N, or
+# grok-box-NNN; all resolve through the D1 helpers to grok-box-NNN. Default 8
+# (=> grok-box-008). A value that will not parse falls back to the raw
+# grok-box-<suffix> shape so a misconfig is still visible rather than silently
+# retargeted.
 reconcile_canary_box() {
   local c; c="$(config_get fleet-brain canary_box 2>/dev/null || true)"
   [ -n "$c" ] || c="8"
-  case "$c" in grok-box-*) printf '%s' "$c" ;; *) printf 'grok-box-%s' "${c#grok-box-}" ;; esac
+  local name; name="$(box_name_from_index "$c" 2>/dev/null)" \
+    && { printf '%s' "$name"; return 0; }
+  printf 'grok-box-%s' "${c#grok-box-}"
 }
 
 # tunnel_deploy_one <box>: push the target tree over the box's reverse tunnel,
