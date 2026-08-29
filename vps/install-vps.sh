@@ -186,6 +186,14 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# HOME is set to the fleet state tree (STATE_DIR=/var/lib/grok-fleet), NOT /root:
+# breaks-if-undone — systemd does NOT export HOME for a system service, and
+# fleetctl's top-level $HOME expansions abort under set -u when HOME is unset
+# ("HOME: unbound variable" → every timer run status=1/FAILURE before reconcile
+# ever runs). /var/lib/grok-fleet keeps the brain's whole footprint inside the
+# one declared state tree (decision wall: "Footprint: one tree + one unit set");
+# /root would place fleet activity outside the declared footprint.
+Environment=HOME=$STATE_DIR
 Environment=FLEET_CONFIG=$OPT_DIR/config.toml
 Environment=FLEET_ETC=$ETC_DIR
 Environment=FLEET_STATE=$STATE_DIR

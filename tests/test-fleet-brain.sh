@@ -123,6 +123,65 @@ INNER
 [ "$(acl_test no)" = "rc=1" ] && pass "enroll ACL precheck: tag:fleet-brain ABSENT => refuse (rc 1)" || bad "ACL absent wrong: [$(acl_test no)]"
 [ "$(acl_test fail)" = "rc=2" ] && pass "enroll ACL precheck: API failure => refuse fail-closed (rc 2)" || bad "ACL API-fail wrong: [$(acl_test fail)]"
 
+# --- BUG-D: ts_api MUST send `Accept: application/json` on EVERY call, else the
+# Tailscale ACL endpoint returns HuJSON (leading // comment, trailing commas)
+# and acl_has_fleet_brain_tagowner()'s `jq -e` fails (rc 5) => enroll refuses
+# even when tag:fleet-brain IS in tagOwners (proven live on the VPS). Unlike the
+# acl_test above (which stubs ts_api), this drives the REAL ts_api through a
+# FAKE curl that inspects the actual `--config` file ts_api writes: it returns
+# strict JSON iff `Accept: application/json` is present, else HuJSON. The
+# precheck must pass ONLY when the header is sent. breaks-if-undone: drop the
+# Accept header line in ts_api and the header-present run flips to rc 2/non-0.
+acl_hujson_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+TS_TAILNET="-"
+TS_API="https://api.tailscale.com/api/v2"
+TS_API_CODE=0
+TS_API_LAST_BODY=""
+RECONCILE_READONLY=0
+TOKF="\$(mktemp)"; printf 'tskey-fake-token\n' > "\$TOKF"
+export FLEET_API_TOKEN_FILE="\$TOKF"
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in have api_token_file api_token ts_api ts_api_body ts_ok acl_has_fleet_brain_tagowner; do
+  eval "\$(extract_from "\$FLEETCTL" "\$fn")"
+done
+# FAKE curl: parse args to find --config <cfg> and -o <out>. If the config file
+# has an Accept: application/json header, write STRICT json; else HuJSON (a //
+# comment line + a trailing comma) that jq rejects. Always print 200.
+curl() {
+  local cfg="" out="" prev=""
+  for a in "\$@"; do
+    case "\$prev" in
+      --config) cfg="\$a" ;;
+      -o) out="\$a" ;;
+    esac
+    prev="\$a"
+  done
+  if grep -q 'Accept: application/json' "\$cfg"; then
+    printf '{"tagOwners":{"tag:fleet-brain":["autogroup:admin"]}}\n' > "\$out"
+  else
+    printf '// HuJSON ACL — Tailscale default content-type\n{\n  "tagOwners": {\n    "tag:fleet-brain": ["autogroup:admin"],\n  },\n}\n' > "\$out"
+  fi
+  printf '200'
+}
+acl_has_fleet_brain_tagowner; echo "rc=\$?"
+rm -f "\$TOKF"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(acl_hujson_test)" = "rc=0" ] \
+  && pass "BUG-D: ts_api sends Accept: application/json => ACL is strict JSON, precheck passes (jq ok)" \
+  || bad "BUG-D: ACL precheck failed — Accept header missing => HuJSON body jq cannot parse: [$(acl_hujson_test)]"
+# Static belt-and-suspenders: the header line must be in ts_api's config builder.
+grep -q 'header = "Accept: application/json"' "$FLEETCTL" \
+  && pass "BUG-D: ts_api curl --config includes the Accept: application/json header (static)" \
+  || bad "BUG-D: ts_api curl --config is MISSING the Accept: application/json header (static)"
+
+
 # =============================================================================
 # MINT — key-create payload shape + atomic seed failure leaves old key intact
 # =============================================================================
@@ -1208,6 +1267,123 @@ case "$latch" in
   *"EXEC:rollout"*) bad "P1-B/N6: a later mutation RAN after the run-wide latch was set (latch defeated): [$latch]" ;;
   *) bad "P1-B/N6: unexpected reconcile_one behaviour: [$latch]" ;;
 esac
+
+echo "-----"
+# =============================================================================
+# SET -U / HOME + EXEC-STDERR FOOTGUNS (VPS bring-up bugs A & B).
+#   A: fleetctl must load and run under systemd's environment (FLEET_* + PATH,
+#      but NO HOME) without aborting on an unbound $HOME. The load-time footgun
+#      is a top-level `$HOME` expansion evaluated under `set -u` before dispatch.
+#   B: `exec 9>"$lock" 2>/dev/null` (redirections, no command) makes 2>/dev/null
+#      PERMANENT for the process and swallows every log() (all stderr) — so
+#      `reconcile` runs silently. The fix opens the fd without a persistent
+#      stderr redirect, so log lines after the lock still reach stderr.
+# Both are mutation-verified: reverting either fix in a scratch copy flips the
+# matching assertion PASS->FAIL (see the harness comments below).
+# =============================================================================
+
+# --- BUG-A: real fleetctl under `env -i` with ONLY the systemd-unit variables
+# (FLEET_CONFIG/FLEET_ETC/FLEET_STATE, PATH) — exactly what fleet-reconcile.service
+# provides — must NOT abort on an unbound HOME. We drive `version` (a no-op that
+# still executes ALL top-level assignments at load, which is where the unbound
+# $HOME trips). breaks-if-undone: revert either `${HOME:-}` guard (line ~36
+# CONFIG_FILE default arm — only when FLEET_CONFIG is UNSET — or the
+# unconditional line ~705 UNIT_DIR) and this aborts with
+# "HOME: unbound variable", exit 1.
+home_unbound_test() {
+  local st; st="$(mktemp -d)"
+  # env -i: a pristine environment with NO HOME, mirroring the systemd unit.
+  local out rc
+  out="$(env -i \
+      FLEET_CONFIG="$st/config.toml" \
+      FLEET_ETC="$st/etc" \
+      FLEET_STATE="$st" \
+      PATH=/usr/bin:/bin \
+      bash "$FLEETCTL" version 2>&1)"; rc=$?
+  rm -rf "$st"
+  printf '%s|rc=%s' "$out" "$rc"
+}
+hu="$(home_unbound_test)"
+case "$hu" in
+  *"HOME: unbound variable"*|*"unbound variable"*)
+    bad "BUG-A: fleetctl aborts on unbound HOME under systemd env (set -u): [$hu]" ;;
+  "fleetctl "*"|rc=0")
+    pass "BUG-A: fleetctl loads+runs under env -i with only systemd-unit vars (no HOME) — no unbound-\$HOME abort" ;;
+  *) bad "BUG-A: unexpected fleetctl behaviour under env -i (no HOME): [$hu]" ;;
+esac
+
+# Also assert there is NO unguarded top-level `$HOME` expansion left in fleetctl.
+# "Top-level" = a line that is neither indented (inside a function/block) nor a
+# comment. Every top-level $HOME must be written ${HOME:-...}. breaks-if-undone:
+# a future bare top-level $HOME re-introduces the load-time abort.
+unguarded_home="$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*=.*\$(HOME|\{HOME\})([^:-]|$)' "$FLEETCTL" | grep -v '\${HOME:-' || true)"
+if [ -z "$unguarded_home" ]; then
+  pass "BUG-A: no unguarded top-level \$HOME expansion remains in fleetctl (all use \${HOME:-})"
+else
+  bad "BUG-A: unguarded top-level \$HOME expansion(s) still in fleetctl (would abort under set -u): $unguarded_home"
+fi
+
+# --- BUG-B: reconcile's log lines must reach stderr AFTER the lock is taken.
+# Drive the REAL `fleetctl reconcile --dry-run` with the API stubbed to fail
+# fast (FLEET_TS_API pointed at an unreachable loopback port => READ-ONLY run),
+# capturing stderr. The lock is opened before any of these log() calls, so if
+# the lock-open swallowed stderr, we'd see ZERO lines. breaks-if-undone: revert
+# the lock-open to `exec 9>"$lock" 2>/dev/null || {...}` and stderr goes empty
+# (mutation-verified: 4 lines -> 0 lines, still exit 0).
+reconcile_logs_to_stderr_test() {
+  local st; st="$(mktemp -d)"
+  local err; err="$(mktemp)"
+  # HOME is supplied here (interactive-style run); this test is about stderr, not
+  # the HOME footgun. API unreachable => fast READ-ONLY run that still logs.
+  env FLEET_STATE="$st" \
+      FLEET_ETC="$st/etc" \
+      FLEET_CONFIG="$st/config.toml" \
+      FLEET_TS_API="http://127.0.0.1:1" \
+      HOME="$st" \
+      PATH=/usr/bin:/bin \
+      bash "$FLEETCTL" reconcile --dry-run >/dev/null 2>"$err"
+  local n; n="$(wc -l < "$err" | tr -d ' ')"
+  local start=MISSING
+  grep -q "reconcile: start" "$err" && start=PRESENT
+  printf 'lines=%s|start=%s' "$n" "$start"
+  rm -rf "$st" "$err"
+}
+rl="$(reconcile_logs_to_stderr_test)"
+case "$rl" in
+  "lines=0|"*|*"start=MISSING")
+    bad "BUG-B: reconcile log lines did NOT reach stderr after the lock (stderr swallowed): [$rl]" ;;
+  "lines="*"|start=PRESENT")
+    pass "BUG-B: reconcile log lines reach stderr after the lock is taken (no permanent 2>/dev/null): [$rl]" ;;
+  *) bad "BUG-B: unexpected reconcile stderr behaviour: [$rl]" ;;
+esac
+
+# --- BUG-A (installer side): the reconcile service UNIT template must set
+# Environment=HOME= so systemd (which does not export HOME for a system service)
+# gives fleetctl a HOME and the timer run never aborts on unbound $HOME.
+# breaks-if-undone: drop the `Environment=HOME=` line and every timer run fails
+# status=1/FAILURE before cmd_reconcile.
+service_home_env_test() {
+  local pfx; pfx="$(mktemp -d)"
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  local svc="$pfx/etc/systemd/system/fleet-reconcile.service"
+  if grep -q '^Environment=HOME=' "$svc"; then echo "HAS-HOME"; else echo "NO-HOME"; fi
+  rm -rf "$pfx"
+}
+[ "$(service_home_env_test)" = HAS-HOME ] \
+  && pass "BUG-A: fleet-reconcile.service unit sets Environment=HOME= (systemd gives fleetctl a HOME)" \
+  || bad "BUG-A: fleet-reconcile.service unit missing Environment=HOME= (timer runs will abort on unbound \$HOME)"
+
+# --- Footgun sweep: no OTHER `exec N>... 2>/dev/null` (redirections + no
+# command) shape may exist in fleetctl / boxup / install-vps.sh. The ONLY
+# sanctioned form is the brace-scoped `{ exec N>...; } 2>/dev/null`, where the
+# redirect applies to the group, not the whole process. breaks-if-undone: a new
+# bare `exec N>f 2>/dev/null` re-introduces the silent-stderr footgun.
+exec_footgun="$(grep -nE '(^|[^}] *)exec [0-9]+>[^;]*2>/dev/null' "$FLEETCTL" "$BOXUP" "$VPS_INSTALL" 2>/dev/null | grep -vE ':[0-9]+: *#' || true)"
+if [ -z "$exec_footgun" ]; then
+  pass "BUG-B: no bare \`exec N>... 2>/dev/null\` (persistent-stderr) shape in fleetctl/boxup/install-vps.sh"
+else
+  bad "BUG-B: a bare \`exec N>... 2>/dev/null\` shape still present (swallows stderr): $exec_footgun"
+fi
 
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi
