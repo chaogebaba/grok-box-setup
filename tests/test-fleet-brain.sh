@@ -1466,6 +1466,102 @@ else
   bad "BUG-E: install-vps.sh ensure_fleet_user does not chown ~fleet/.ssh to the fleet user"
 fi
 
+# =============================================================================
+# BUG-F — reconcile_alert_asleep MUST NOT crash under `set -u` when no prior
+# .asleep state file exists, and enroll's enrolled.tsv append must be idempotent.
+# =============================================================================
+# LIVE CRASH (fleet-reconcile.service, 4 consecutive failures 01:43-01:59Z):
+# reconcile_alert_asleep declared `since`/`last` as bare locals, then only read
+# them INSIDE `if [ -f "$f" ]`. First-ever both-dead => the file is absent, the
+# read is skipped, and `case "$since"` aborts under `set -u` with
+# "since: unbound variable" (service exits 1, keeps failing every 5-min tick).
+# breaks-if-undone: revert the `since=""`/`last=""` init and this test crashes.
+# Drive the REAL reconcile_alert_asleep via extract_from+eval, FLEET_STATE at a
+# temp dir with NO pre-existing .asleep file, T=0 so the first alert fires.
+asleep_test() {
+  local pre="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="\$(mktemp -d)"
+FLEET_ASLEEP_T_SECS=0
+FLEET_ASLEEP_DIGEST_SECS=86400
+notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" reconcile_alert_asleep)"
+f="\$FLEET_STATE/grok-box-1.asleep"
+# Optionally pre-seed the state file to exercise the parse branch.
+[ -n "$pre" ] && printf '%s\n' "$pre" > "\$f"
+if reconcile_alert_asleep grok-box-1; then echo "rc=0"; else echo "rc=\$?"; fi
+if [ -f "\$f" ]; then
+  read -r s l < "\$f"
+  # Report whether <since> is a plausible epoch (>0) and last was advanced.
+  case "\$s" in ''|*[!0-9]*) echo "since=BAD" ;; *) [ "\$s" -gt 0 ] && echo "since=OK" || echo "since=ZERO" ;; esac
+  case "\$l" in ''|*[!0-9]*) echo "last=BAD" ;; *) echo "last=\$l" ;; esac
+else
+  echo "NO-STATE"
+fi
+rm -rf "\$FLEET_STATE"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+# (a) No pre-existing file: must NOT crash (rc=0), must write "<now> <last>"
+#     with a plausible since epoch (the exact both-dead observation timestamp).
+asleep_fresh="$(asleep_test "")"
+case "$asleep_fresh" in
+  *"rc=0"*"since=OK"*) pass "BUG-F: reconcile_alert_asleep with NO prior .asleep file does not crash under set -u; writes <now> state" ;;
+  *since=BAD*|*NO-STATE*) bad "BUG-F: reconcile_alert_asleep crashed / wrote no since (unbound var regression): [$asleep_fresh]" ;;
+  *) bad "BUG-F: reconcile_alert_asleep fresh run wrong: [$asleep_fresh]" ;;
+esac
+# With T=0 the first-ever call fires the alert and stamps last=<now> (>0).
+case "$asleep_fresh" in
+  *"last=0"*) bad "BUG-F: reconcile_alert_asleep did not advance last after firing first alert (T=0): [$asleep_fresh]" ;;
+  *last=BAD*) bad "BUG-F: reconcile_alert_asleep wrote a bad last field: [$asleep_fresh]" ;;
+  *) pass "BUG-F: reconcile_alert_asleep first alert (T=0) stamps last=<now>" ;;
+esac
+# (b) Second/subsequent call with an EXISTING file parses it (a valid two-epoch
+#     line is preserved, not reset). Pre-seed "<old-since> <recent-last>" so the
+#     digest window has NOT elapsed => last stays exactly as seeded.
+asleep_existing="$(asleep_test "100 4000000000")"
+case "$asleep_existing" in
+  *"rc=0"*"since=OK"*"last=4000000000"*) pass "BUG-F: reconcile_alert_asleep parses an EXISTING .asleep file (since kept, last within digest window preserved)" ;;
+  *) bad "BUG-F: reconcile_alert_asleep did not parse existing state correctly: [$asleep_existing]" ;;
+esac
+
+# (c) enroll append is IDEMPOTENT: two enrolls of the same box leave ONE row.
+# Live enrolled.tsv had grok-box-8 twice (append with no dedup). Drive the REAL
+# enroll_record_enrolled twice and assert a single row survives.
+enroll_idem_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="\$(mktemp -d)"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" enroll_record_enrolled)"
+enroll_record_enrolled grok-box-8 20008
+enroll_record_enrolled grok-box-8 20008
+# A neighbouring box must be untouched by the grok-box-8 dedup (prefix guard).
+enroll_record_enrolled grok-box-1 20001
+enroll_record_enrolled grok-box-1 20001
+enr="\$FLEET_STATE/enrolled.tsv"
+echo "rows8=\$(grep -c '^grok-box-8	' "\$enr")"
+echo "rows1=\$(grep -c '^grok-box-1	' "\$enr")"
+echo "total=\$(wc -l < "\$enr" | tr -d ' ')"
+rm -rf "\$FLEET_STATE"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+enroll_idem="$(enroll_idem_test)"
+case "$enroll_idem" in
+  *"rows8=1"*) pass "BUG-F: enroll append is idempotent — two enrolls of grok-box-8 leave ONE row" ;;
+  *) bad "BUG-F: enroll append not idempotent for grok-box-8: [$enroll_idem]" ;;
+esac
+case "$enroll_idem" in
+  *"rows1=1"*"total=2"*) pass "BUG-F: enroll dedup is per-box (grok-box-1 unaffected by grok-box-8 dedup; total 2 rows)" ;;
+  *) bad "BUG-F: enroll dedup clobbered a neighbouring box or row count wrong: [$enroll_idem]" ;;
+esac
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi
 exit "$fail"

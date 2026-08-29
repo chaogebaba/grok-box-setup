@@ -1013,8 +1013,7 @@ cmd_enroll() {
   log "enroll: installed VPS box-access key into $box:~box/.ssh/authorized_keys"
 
   # Record the enrollment (idempotent, informational).
-  mkdir -p "$FLEET_STATE" 2>/dev/null || true
-  printf '%s\t%s\n' "$box" "$port" >> "$FLEET_STATE/enrolled.tsv" 2>/dev/null || true
+  enroll_record_enrolled "$box" "$port"
   notify info "enrolled $box (reverse port 127.0.0.1:$port)"
   log "enroll: $box DONE"
 }
@@ -1022,6 +1021,25 @@ cmd_enroll() {
 # The three side-effecting enroll steps are separate functions so tests can
 # stub the ssh/curl transport and assert the authorized_keys line SHAPE without
 # a real box or VPS.
+
+# Record this box's enrollment in enrolled.tsv IDEMPOTENTLY: drop any existing
+# row for the same box before appending, so a re-enroll leaves exactly one row.
+# (The reader sort -u's anyway, so behavior is unaffected either way, but a
+# clean file avoids the duplicate rows seen live, e.g. grok-box-8 twice.) The
+# box name is validated ^grok-box-[0-9]+$ upstream, so it is a safe literal for
+# the anchored grep; the trailing $'\t' pins the whole name (grok-box-1 will not
+# match grok-box-10).
+enroll_record_enrolled() {
+  local box="$1" port="$2"
+  mkdir -p "$FLEET_STATE" 2>/dev/null || true
+  local enr="$FLEET_STATE/enrolled.tsv"
+  if [ -f "$enr" ]; then
+    grep -v -E "^$box"$'\t' "$enr" 2>/dev/null > "$enr.tmp" || true
+    mv -f "$enr.tmp" "$enr" 2>/dev/null || rm -f "$enr.tmp" 2>/dev/null || true
+  fi
+  printf '%s\t%s\n' "$box" "$port" >> "$enr" 2>/dev/null || true
+}
+
 enroll_read_box_pubkey() {
   local box="$1"
   box_ssh "$box" "sudo cat '$BOX_TUNNEL_PUB'" 2>/dev/null | head -1
@@ -1987,7 +2005,7 @@ FLEET_ASLEEP_T_SECS="${FLEET_ASLEEP_T_SECS:-7200}"     # 2h before first alert
 FLEET_ASLEEP_DIGEST_SECS="${FLEET_ASLEEP_DIGEST_SECS:-86400}"  # daily digest
 reconcile_alert_asleep() {
   local box="$1"
-  local f="$FLEET_STATE/$box.asleep" now since last
+  local f="$FLEET_STATE/$box.asleep" now since="" last=""
   now="$(date -u +%s 2>/dev/null || echo 0)"
   if [ -f "$f" ]; then
     read -r since last < "$f" 2>/dev/null || { since=""; last=""; }
