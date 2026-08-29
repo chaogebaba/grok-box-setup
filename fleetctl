@@ -1707,15 +1707,35 @@ managed_header() {
 # `key = value` lines are emitted verbatim (the awk preserves the raw RHS). One
 # awk pass, same grammar as boxup's reader (comment/blank rules). No applicable
 # keys => header only (still a valid state; keeps drift detection uniform).
+#
+# The awk input is built from ONLY the files that actually exist and are
+# readable: in production the normal case is a fleet.toml with NO per-box
+# boxes/<box>.toml, and awk goes FATAL (skipping its END block) the moment it
+# cannot open an input file — which would silently render header-only and push
+# an empty managed.toml for every box (feature inert). So we never hand awk a
+# path that does not exist. Neither file present => empty merged body (header
+# only = "nothing managed", a valid state). We DROP `2>/dev/null` and RETURN
+# awk's exit status so a genuine awk failure propagates and callers refuse/skip
+# rather than push a header-only file.
 render_managed() {
   local box="$1"
   local boxf="$FLEET_MANAGED_BOXDIR/$box.toml"
   managed_header
+  # Only pass files that exist AND are readable (a chmod 000 path is a genuine
+  # failure we WANT to surface, not silently skip — so readability is checked
+  # by awk itself below; here we only elide truly-absent paths).
+  local -a inputs=()
+  [ -e "$FLEET_MANAGED_FLEET" ] && inputs+=("$FLEET_MANAGED_FLEET")
+  [ -e "$boxf" ] && inputs+=("$boxf")
+  # Neither D2 file exists => header only, nothing to merge (valid state).
+  [ "${#inputs[@]}" -eq 0 ] && return 0
   # Concatenate fleet-wide then per-box; awk records first-seen (table,key)
   # order and last value, then re-emits in first-seen order. Comments/blank
   # lines are dropped from the merged output (only key=value survives) so the
   # result is canonical and byte-deterministic. Table headers are emitted once,
-  # in first-seen order, before their first key.
+  # in first-seen order, before their first key. NO `2>/dev/null`: a real awk
+  # failure (e.g. an unreadable input) must be visible on stderr AND propagate
+  # via the return status below.
   awk '
     function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
     {
@@ -1738,7 +1758,7 @@ render_managed() {
         printf "%s = %s\n", key[id], val[id]
       }
     }
-  ' "$FLEET_MANAGED_FLEET" "$boxf" 2>/dev/null
+  ' "${inputs[@]}"
 }
 
 # validate_managed <text>: D4 gate. Return 0 iff the rendered text is safe to
@@ -1864,8 +1884,15 @@ REMOTE
 push_managed() {
   local box="$1" dry=0
   case "${2:-}" in --dry-run) dry=1 ;; esac
-  local text
-  text="$(render_managed "$box")"
+  local text rrc
+  text="$(render_managed "$box")"; rrc=$?
+  # A genuine render failure (awk could not read an input, etc.) must NEVER be
+  # pushed as a header-only file. Treat it like the D4-refuse path: warn + skip;
+  # the caller (reconcile_config_pass) bumps .cfgfail on any non-zero return.
+  if [ "$rrc" != 0 ]; then
+    log "config: $box render FAILED (rc=$rrc) — no push (would otherwise be an empty/partial managed.toml)"
+    return 4
+  fi
   local verr
   if ! verr="$(validate_managed "$text" 2>&1)"; then
     log "config: $box render REFUSED by D4 validation — $verr"
@@ -2808,7 +2835,7 @@ cmd_config() {
   case "$sub" in
     render)
       render_managed "$box"
-      return 0
+      return $?
       ;;
     push)
       # D5 for ONE box; the operator canary. Same push_managed as reconcile row-e.
@@ -2817,8 +2844,12 @@ cmd_config() {
       ;;
     diff)
       # Dry-run round trip: status tokens + the on-box file after `---FILE---`.
-      local text want_sha out rc
-      text="$(render_managed "$box")"
+      local text want_sha out rc rrc
+      text="$(render_managed "$box")"; rrc=$?
+      if [ "$rrc" != 0 ]; then
+        echo "fleetctl config diff: $box render FAILED (rc=$rrc) — refusing (would be an empty/partial managed.toml)" >&2
+        return 2
+      fi
       local verr
       if ! verr="$(validate_managed "$text" 2>&1)"; then
         echo "fleetctl config diff: $box render REFUSED by D4 — $verr" >&2

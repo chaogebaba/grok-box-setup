@@ -2046,6 +2046,91 @@ r2="$(render_test "$FLEETC" "$BOXC" grok-box-8 | sha256sum)"
 hdronly="$(render_test '' __none__ grok-box-9)"
 case "$hdronly" in *'WRITTEN BY THE VPS BRAIN'*) [ "$(printf '%s\n' "$hdronly" | grep -v '^[[:space:]]*#' | grep -c '=')" = 0 ] && pass "config render: no keys => header only (empty managed is a valid pushed state)" || bad "header-only render leaked keys: [$hdronly]" ;; *) bad "header-only render missing header: [$hdronly]" ;; esac
 
+# render_present_test: drive REAL render_managed with per-file PRESENCE control
+# and capture BOTH the output and the exit status. Guards the P1 regression:
+# awk goes fatal (END skipped) if handed a path it cannot open, which would
+# silently render header-only + push an empty managed.toml for the normal
+# production case (fleet.toml present, NO per-box file). args:
+#   fleet(__absent__|content)  box(__absent__|content)  box-name  awkfail(0|1)
+# awkfail=1 shadows `awk` with a failing stub to prove a genuine render failure
+# propagates a non-zero rc (robust across users — root can read a chmod-000 file).
+render_present_test() {
+  local fleetc="$1" boxc="$2" box="$3" awkfail="${4:-0}" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/boxes"
+  [ "$fleetc" != "__absent__" ] && printf '%s' "$fleetc" > "$d/fleet.toml"
+  [ "$boxc" != "__absent__" ] && printf '%s' "$boxc" > "$d/boxes/$box.toml"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"
+FLEET_MANAGED_BOXDIR="$d/boxes"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+[ "$awkfail" = 1 ] && awk(){ return 3; }   # force a genuine render failure
+out="\$(render_managed "$box" 2>/dev/null)"; rc=\$?
+printf '%s\n' "\$out"
+echo "RENDRC=\$rc"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+FLEET_ONLY='[update]
+repo = "https://fleet/repo.git"
+'
+BOX_ONLY='[tailscale]
+version = "1.80.0"
+'
+# (a) fleet.toml populated + box file ABSENT => fleet keys render (NOT header-only), rc 0.
+rp_a="$(render_present_test "$FLEET_ONLY" __absent__ grok-box-8)"
+case "$rp_a" in
+  *'repo = "https://fleet/repo.git"'*"RENDRC=0"*) pass "config render P1: fleet.toml present + box file ABSENT => fleet keys render (not header-only), rc 0" ;;
+  *) bad "P1 render (a) lost fleet keys with box absent: [$rp_a]" ;;
+esac
+# (b) box file present + fleet.toml ABSENT => box keys render, rc 0.
+rp_b="$(render_present_test __absent__ "$BOX_ONLY" grok-box-8)"
+case "$rp_b" in
+  *'version = "1.80.0"'*"RENDRC=0"*) pass "config render P1: box file present + fleet.toml ABSENT => box keys render, rc 0" ;;
+  *) bad "P1 render (b) lost box keys with fleet absent: [$rp_b]" ;;
+esac
+# (c) BOTH absent => header only, rc 0.
+rp_c="$(render_present_test __absent__ __absent__ grok-box-8)"
+case "$rp_c" in
+  *"RENDRC=0"*) [ "$(printf '%s\n' "$rp_c" | grep -v '^[[:space:]]*#' | grep -v '^RENDRC=' | grep -c '=')" = 0 ] && pass "config render P1: BOTH D2 files absent => header only, rc 0" || bad "P1 render (c) leaked keys with both absent: [$rp_c]" ;;
+  *) bad "P1 render (c) non-zero rc with both absent: [$rp_c]" ;;
+esac
+# (d) a genuine render (awk) failure => non-zero rc propagates.
+rp_d="$(render_present_test "$FLEET_ONLY" __absent__ grok-box-8 1)"
+case "$rp_d" in
+  *"RENDRC=0"*) bad "P1 render (d) swallowed an awk failure (rc 0): [$rp_d]" ;;
+  *"RENDRC="*) case "$rp_d" in *"RENDRC=3"*) pass "config render P1: a genuine render/awk failure propagates a non-zero rc" ;; *) bad "P1 render (d) wrong rc: [$rp_d]" ;; esac ;;
+  *) bad "P1 render (d) no rc: [$rp_d]" ;;
+esac
+
+# (d') the render failure must reach the PUSH path: push_managed refuses and
+# writes NOTHING. Drives REAL push_managed with a failing awk stub.
+render_fail_push_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box"
+  printf '%s' "$FLEET_ONLY" > "$d/fleet.toml"
+  printf 'MANAGED_FILE=/x\n' > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# render_managed uses awk internally; shadow it AFTER the functions are defined
+# so the render fails but nothing else depends on this stub firing first.
+render_managed(){ managed_header; return 7; }   # simulate a propagated render failure
+tunnel_ssh(){ echo "TUNNEL-CALLED" ; }          # must NOT be reached
+push_managed grok-box-8; echo "PUSHRC=\$?"
+[ -f "$d/box/managed.toml" ] && echo "ONBOX=present" || echo "ONBOX=absent"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+rp_push="$(render_fail_push_test)"
+case "$rp_push" in *"TUNNEL-CALLED"*) bad "P1 push: a render failure still reached the tunnel/push: [$rp_push]" ;; *"PUSHRC=4"*) case "$rp_push" in *"ONBOX=absent"*) pass "config push P1: a render failure => push REFUSES (rc 4), nothing pushed" ;; *) bad "P1 push wrote a file despite render failure: [$rp_push]" ;; esac ;; *) bad "P1 push did not refuse on render failure: [$rp_push]" ;; esac
+
 # validate_managed (D4): drive the REAL function.
 validate_test() {
   local text="$1" inner; inner="$(mktemp)"
@@ -2245,12 +2330,9 @@ cfgunknown_test() {
   local fleetc="$1" inner; inner="$(mktemp)"
   local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
   printf '%s' "$fleetc" > "$d/etc/fleet.toml"
-  # Empty per-box files must EXIST: render_managed's awk reads fleet.toml then
-  # boxes/<box>.toml, and a MISSING second file makes awk fatal before its END
-  # block (dropping the merged output). Every existing render/push test provides
-  # the box file for the same reason.
-  : > "$d/etc/boxes/grok-box-8.toml"
-  : > "$d/etc/boxes/grok-box-3.toml"
+  # No per-box boxes/<box>.toml — the production normal case (fleet-wide only).
+  # This also exercises the P1 fix: render_managed must merge fleet.toml even
+  # when the per-box file is absent (previously awk went fatal => header-only).
   printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") echo true;; esac\n' > "$d/box/boxup"
   cat > "$inner" <<INNER
 set -u
