@@ -2236,6 +2236,74 @@ case "$p_ign" in *"[IGNORED locally: [managed] enabled=false]"*) pass "config pu
 p_inert="$(push_test "$FLEETC" "$BOXC" true no 0)"
 case "$p_inert" in *"[inert: boxup lacks managed support"*) pass "config push D5: support=no => inert annotation (deploy boxup first)" ;; *) bad "D5 inert annotation missing: [$p_inert]" ;; esac
 
+# BLOCKER-2 (live canary r1): the remote managed-status probe must invoke boxup
+# under BASH, not sh. boxup is #!/bin/bash and its TOML reader uses the bash-only
+# `read -r -d`; on the boxes /bin/sh is dash, so `sh boxup config-get …` errored
+# and the old `|| echo true` fallback ALWAYS reported enabled=true — the
+# enabled=false escape hatch could never surface. Drives the REAL push_managed +
+# REAL managed_remote_script with a fake boxup whose config-get path is bash-only
+# (fails under dash), so ONLY a bash invocation returns the real enabled value.
+# probe_test: args = enabled_value shim(bash|dash|fail)
+#   bash  = a working bash on PATH (the box reality: the fix uses `bash "$bx"`)
+#   fail  = every invocation of the boxup file errors (probe genuinely fails)
+probe_test() {
+  local want_enabled="$1" shim="$2" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box" "$d/bin"
+  printf '%s' "$FLEETC" > "$d/fleet.toml"; printf '%s' "$BOXC" > "$d/boxes/grok-box-8.toml"
+  # Fake boxup: supported (MANAGED_FILE=) and its config-get uses a BASH-ONLY
+  # construct (`read -r -d`), so invoking it under dash errors out (exit != 0).
+  cat > "$d/box/boxup" <<BOXUP
+MANAGED_FILE=/x
+if [ "\$1 \$2 \$3" = "config-get managed enabled" ]; then
+  # bash-only: dash's read has no -d and aborts the script here.
+  printf '%s' "$want_enabled" | { read -r -d '' v || true; echo "\$v"; }
+fi
+BOXUP
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# Provide a controllable \`bash\` for the remote probe:
+#   shim=bash => a real bash (the box's actual bash, honours -d) => probe works.
+#   shim=fail => a bash that always errors => probe genuinely fails.
+mkdir -p "$d/bin"
+if [ "$shim" = fail ]; then
+  printf '#!/bin/sh\nexit 2\n' > "$d/bin/bash"; chmod +x "$d/bin/bash"
+  PATH="$d/bin:\$PATH"
+fi
+export PATH
+# Fake tunnel_ssh: strip the sudo sh -c wrapper, run the remote script under sh
+# (dash-equivalent posix mode) so ONLY the inner \`bash "\$bx"\` can honour -d.
+tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
+push_managed grok-box-8 --dry-run
+echo "PUSHRC=\$?"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+# (a) bash probe honours the box's real enabled=false => IGNORED annotation shows
+# (this is exactly the state the live canary could never reach under sh).
+pb_false="$(probe_test false bash)"
+case "$pb_false" in *"[IGNORED locally: [managed] enabled=false]"*) pass "BLOCKER-2: boxup probed via bash => real enabled=false surfaces the IGNORED annotation" ;; *) bad "BLOCKER-2: bash probe did not surface enabled=false: [$pb_false]" ;; esac
+# (b) bash probe with enabled=true => NO false IGNORED annotation (real value).
+pb_true="$(probe_test true bash)"
+case "$pb_true" in *"IGNORED locally"*) bad "BLOCKER-2: enabled=true wrongly annotated IGNORED: [$pb_true]" ;; *"PUSHRC=0"*) pass "BLOCKER-2: boxup probed via bash => real enabled=true reported (no spurious IGNORED)" ;; *) bad "BLOCKER-2: enabled=true probe wrong: [$pb_true]" ;; esac
+# (c) a genuine probe FAILURE must NEVER be reported as enabled=true — it reports
+# enabled=unknown and annotates the log line (never a silent false "true").
+pb_fail="$(probe_test true fail)"
+case "$pb_fail" in *"IGNORED locally: [managed] enabled=false]"*) bad "BLOCKER-2: a failed probe was reported as enabled=false: [$pb_fail]" ;; *"enabled UNKNOWN"*) pass "BLOCKER-2: a failed managed-status probe => enabled=unknown + annotation (never a false enabled=true)" ;; *) bad "BLOCKER-2: failed probe not reported as unknown: [$pb_fail]" ;; esac
+# (c') and the remote script must invoke boxup via bash and must NOT fall back to
+# a hardcoded enabled=true on probe failure. (The heredoc-built body escapes $,
+# so match the escaped forms; strip comment lines before the negative check so a
+# doc mention of the old fallback doesn't trip it.)
+mrs="$(sed -n '/^managed_remote_script() {/,/^}/p' "$FLEETCTL")"
+mrs_code="$(printf '%s\n' "$mrs" | grep -v '^[[:space:]]*#')"
+case "$mrs_code" in *'bash "\$bx" config-get'*) pass "BLOCKER-2: managed_remote_script invokes the box reader via bash" ;; *) bad "BLOCKER-2: managed_remote_script does not invoke boxup via bash: [$mrs_code]" ;; esac
+case "$mrs_code" in *'config-get managed enabled 2>/dev/null || echo true'*) bad "BLOCKER-2: managed_remote_script still falls back to enabled=true on probe failure" ;; *) pass "BLOCKER-2: managed_remote_script no longer falls back to enabled=true on probe failure" ;; esac
+
 # D6 reconcile_config_pass: SILENT no-op when the D2 files are absent.
 cfgpass_test() {
   # args: files_present(yes|no) apply canary_verdict rest_verdict tunnel_map...

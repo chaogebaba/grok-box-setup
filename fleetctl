@@ -1851,8 +1851,16 @@ cur=\$(sha256sum "\$mf" 2>/dev/null | cut -d" " -f1); [ -n "\$cur" ] || cur=none
 support=no; enabled=n/a
 if grep -q ^MANAGED_FILE= "\$bx" 2>/dev/null; then
   support=yes
-  enabled=\$(sh "\$bx" config-get managed enabled 2>/dev/null || echo true)
-  [ -n "\$enabled" ] || enabled=true
+  # boxup is #!/bin/bash and its TOML reader uses the bash-only \`read -r -d\`.
+  # Invoking it under \`sh\` (dash on the boxes) makes that read error out, so a
+  # naive \`|| echo true\` fallback ALWAYS reported enabled=true and the
+  # enabled=false escape hatch could never surface (BLOCKER-2, live canary r1).
+  # Invoke via \`bash\` explicitly; on a genuine probe failure report
+  # enabled=unknown (NEVER true) so a failed probe is never mistaken for
+  # "honoured". The brain treats unknown like false for the IGNORED/annotation
+  # and never-report-in-sync paths (D7/D8).
+  enabled=\$(bash "\$bx" config-get managed enabled 2>/dev/null) || enabled=unknown
+  [ -n "\$enabled" ] || enabled=unknown
 fi
 if [ "\$dry" = 1 ]; then
   rm -f "\$tmp"
@@ -1932,7 +1940,11 @@ push_managed() {
   #   step5  ALWAYS print one status line: sha=<now> support=<yes|no> enabled=<…>
   # support = the box's boxup has a MANAGED_FILE= line (understands managed.toml)
   # enabled read ONLY when support=yes, via the box's OWN reader (boxup config-get
-  # managed enabled) so brain and boxup can never disagree on the grammar.
+  # managed enabled) invoked under BASH (boxup is #!/bin/bash and uses the
+  # bash-only `read -r -d`; running it under dash `sh` errored and the old
+  # fallback wrongly reported enabled=true — BLOCKER-2). A genuine probe failure
+  # reports enabled=unknown (never true), which the brain treats like false for
+  # annotation and never-report-in-sync.
   local remote
   remote="$(managed_remote_script "$want_sha" "$dry")"
   local out rc
@@ -1960,8 +1972,9 @@ push_managed() {
 
   # Annotations from the status line (D5/D8).
   local ann=""
-  [ "$enabled" = false ] && ann="$ann [IGNORED locally: [managed] enabled=false]"
-  [ "$support" = no ]    && ann="$ann [inert: boxup lacks managed support — deploy boxup first]"
+  [ "$enabled" = false ]   && ann="$ann [IGNORED locally: [managed] enabled=false]"
+  [ "$enabled" = unknown ] && ann="$ann [enabled UNKNOWN: box managed-status probe failed — cannot confirm the file is honoured]"
+  [ "$support" = no ]      && ann="$ann [inert: boxup lacks managed support — deploy boxup first]"
 
   if [ "$dry" = 1 ]; then
     if [ "$cur" = "$want_sha" ]; then
@@ -2836,8 +2849,8 @@ dev_field() {
 # diff = push_managed --dry-run + a unified diff of on-box vs rendered, fetching
 # the on-box file in the SAME round trip (remote prints it after a `---FILE---`
 # marker), exit 1 on drift / 0 in sync; ALWAYS annotates enabled=false /
-# support=no as "pushed values are IGNORED on this box" so it never reports
-# in-sync for an ignored file.
+# enabled=unknown / support=no as "pushed values are IGNORED/unverifiable on
+# this box" so it never reports in-sync for an ignored or unverifiable file.
 cmd_config_enrolled() {
   local box="$1" b
   while IFS= read -r b; do [ "$b" = "$box" ] && return 0; done < <(reconcile_target_boxes)
@@ -2904,15 +2917,19 @@ cmd_config() {
       # Unified diff: on-box (current) vs rendered (desired).
       diff -u <(printf '%s\n' "$onbox") <(printf '%s\n' "$text") \
         --label "on-box:$box/managed.toml" --label "rendered:$box" || true
-      # ALWAYS annotate an ignored file so we never report in-sync for one.
+      # ALWAYS annotate an ignored/unverifiable file so we never report in-sync for one.
       if [ "$enabled" = false ]; then
         echo "NOTE: [managed] enabled=false on $box — pushed values are IGNORED on this box"
+      fi
+      if [ "$enabled" = unknown ]; then
+        echo "NOTE: could not read [managed] enabled on $box (managed-status probe failed) — cannot confirm pushed values are honoured"
       fi
       if [ "$support" = no ]; then
         echo "NOTE: boxup on $box lacks managed support — pushed values are IGNORED (deploy boxup first)"
       fi
-      # Exit 1 on drift, 0 in sync. An ignored file is NEVER reported in sync.
-      if [ "$cur" = "$want_sha" ] && [ "$enabled" != false ] && [ "$support" != no ]; then
+      # Exit 1 on drift, 0 in sync. An ignored OR unverifiable file is NEVER
+      # reported in sync (enabled must be positively not-false and not-unknown).
+      if [ "$cur" = "$want_sha" ] && [ "$enabled" != false ] && [ "$enabled" != unknown ] && [ "$support" != no ]; then
         return 0
       fi
       return 1
