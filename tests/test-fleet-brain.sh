@@ -3204,10 +3204,13 @@ TS_API_LAST_BODY=""
 log(){ printf 'LOG:%s\n' "\$*"; }
 notify(){ printf 'NOTIFY:%s\n' "\$*"; }
 sleep(){ :; }                          # never actually sleep in tests
-flock(){ [ "\${HOOK_LOCK_HELD:-0}" = 1 ] && return 1; return 0; }   # lock free unless HOOK_LOCK_HELD
+flock(){ echo "\$*" >> "$d/flockargs"; [ "\${HOOK_LOCK_HELD:-0}" = 1 ] && return 1; return 0; }   # arg-aware; lock free unless HOOK_LOCK_HELD
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
 for fn in $rename_fns; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
-tunnel_up(){ return 0; }
+# tunnel_up: normally every tunnel is up. HOOK_VERIFY_FAIL=1 fails ONLY the
+# post-rename verify (tunnel_up <new>=grok-box-002) so the delete-last property
+# (old-name state survives a FAILED verify => resumable) is observable (S2).
+tunnel_up(){ [ "\${HOOK_VERIFY_FAIL:-0}" = 1 ] && [ "\$1" = grok-box-002 ] && return 1; return 0; }
 # The box's boxup version (>= 5.3.0 unless overridden to a stale one).
 rename_box_boxup_version(){ printf '%s' "\${HOOK_BOXVER:-5.3.0}"; }
 # Record + no-op the on-box hostname write / boxup once.
@@ -3254,6 +3257,7 @@ echo "--- boxes ---"; ls "$d/etc/boxes" | tr '\n' ' '; echo
 echo "--- akmap ---"; cat "$d/etc/authorized-keys.map" 2>/dev/null
 echo "--- authoritative (F6) ---"; cat "$d/state/fleet_authkeys" 2>/dev/null
 echo "--- apilog ---"; cat "$d/apilog" 2>/dev/null
+echo "--- flockargs ---"; cat "$d/flockargs" 2>/dev/null
 echo "--- tsslog ---"; cat "$d/tsslog" 2>/dev/null
 INNER
   timeout 30 bash "$inner"; rm -f "$inner"; rm -rf "$d"
@@ -3346,6 +3350,15 @@ case "$r_happy" in
   *) bad "rename: box hostname/boxup step missing: [$r_happy]" ;;
 esac
 
+# --- S1 / F2/F7: the reconcile lock is taken with a BOUNDED WAIT (-w 90), not -n
+# The flock stub is argument-aware (records its args); a happy rename must have
+# acquired fd 9 with `-w 90`. This kills mutant f (`flock -w 90` -> `flock -n`),
+# which the old argument-blind stub could not distinguish.
+case "$r_happy" in
+  *"--- flockargs ---"*"-w 90"*) pass "rename F2/F7: acquires the reconcile lock with a bounded wait (-w 90), not -n" ;;
+  *) bad "rename F2/F7: lock not taken with -w 90 (bounded wait): [$r_happy]" ;;
+esac
+
 # --- F3 step5: DNS-pinned label => POST /device/<id>/name EXACTLY once ---------
 r_dns="$(HOOK_DNS_PINNED=1 rename_run 'grok-box-2 grok-box-002')"
 case "$r_dns" in *"RC=0"*) : ;; *) bad "rename DNS-pinned: non-zero rc: [$r_dns]" ;; esac
@@ -3369,6 +3382,25 @@ r_resume="$(HOOK_FLIP_AT=1 rename_run 'grok-box-2 grok-box-002')"   # first run 
 # now fails (old row gone) — the command reports old not enrolled, which is the
 # idempotent "already renamed" outcome (rc 2, no mutation of the finished state).
 case "$r_resume" in *"RC=0"*) pass "rename resume: a completed happy path is rc 0 (state fully migrated)" ;; *) bad "rename resume base run failed: [$r_resume]" ;; esac
+
+# --- S2 / F3 delete-last: a FAILED post-rename verify leaves OLD state INTACT ---
+# HOOK_VERIFY_FAIL forces the verify (tunnel_up <new>) to fail. The rename must
+# abort rc 1 BEFORE deleting the old-name artefacts, so grok-box-2 state survives
+# and the rename is resumable. This kills mutant d (delete-old-state moved BEFORE
+# the verify), which the old unconditional `tunnel_up(){ return 0; }` stub missed.
+r_vf="$(HOOK_VERIFY_FAIL=1 rename_run 'grok-box-2 grok-box-002')"
+case "$r_vf" in
+  *"RC=1"*) pass "rename S2: a failed post-rename verify aborts rc 1" ;;
+  *) bad "rename S2: expected rc 1 on a failed verify: [$r_vf]" ;;
+esac
+case "$r_vf" in
+  *"--- state files ---"*"grok-box-2."*) pass "rename S2/F3 delete-last: OLD state SURVIVES a failed verify (resumable)" ;;
+  *) bad "rename S2/F3: old state deleted despite a FAILED verify (not delete-last / not resumable): [$r_vf]" ;;
+esac
+case "$r_vf" in
+  *"--- enrolled ---"*"grok-box-2"$'\t'"20002"*) pass "rename S2/F3 delete-last: OLD enrolled row SURVIVES a failed verify" ;;
+  *) bad "rename S2/F3: old enrolled row deleted despite a FAILED verify: [$r_vf]" ;;
+esac
 
 
 echo "-----"
