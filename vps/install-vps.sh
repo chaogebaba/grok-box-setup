@@ -241,7 +241,11 @@ EOF
 # daemon config. The Match block pins the fleet user to:
 #   AllowTcpForwarding remote  — reverse (-R) forwards only; NO local (-L)
 #   PermitOpen none            — cannot open local-forward destinations
-#   PermitListen 127.0.0.1:20001-20008 — reverse listens only on our loopback range
+#   PermitListen any           — reverse-listen cap is per-key (authorized_keys
+#     permitlisten="127.0.0.1:2000N", fleetctl); no fixed 8-box list here. The
+#     explicit `any` in THIS Match block deliberately overrides any main-section
+#     PermitListen for the fleet user ONLY, so the per-key option alone decides
+#     which 127.0.0.1:2000N a box may listen on (#12; docs/FLEET-BRAIN.md §2).
 #   X11Forwarding no / AllowAgentForwarding no / PermitTTY no — no shell surface
 #   ForceCommand <no-op>       — never runs a program even if a client asks
 # The config is VALIDATED with `sshd -t` before any reload; if validation fails
@@ -258,7 +262,9 @@ install_sshd_dropin() {
 Match User $FLEET_USER
     AllowTcpForwarding remote
     PermitOpen none
-    PermitListen 127.0.0.1:20001 127.0.0.1:20002 127.0.0.1:20003 127.0.0.1:20004 127.0.0.1:20005 127.0.0.1:20006 127.0.0.1:20007 127.0.0.1:20008
+    # #12: per-key permitlisten= is the real cap; explicit \`any\` here so a main-
+    # section PermitListen cannot silently cap the fleet user (fleet user only).
+    PermitListen any
     X11Forwarding no
     AllowAgentForwarding no
     AllowStreamLocalForwarding no
@@ -278,7 +284,9 @@ EOF
     if sshd -t >/dev/null 2>&1; then
       log "installed sshd drop-in $SSHD_DROPIN (validated with sshd -t)"
       if command -v systemctl >/dev/null 2>&1; then
-        systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || log "note: could not reload sshd (drop-in is valid; reload manually)"
+        # F8 (#12): a failed reload is FATAL — the drop-in is on disk but not
+        # live, so the running daemon still has the OLD cap. Never swallow it.
+        systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || { log "sshd reload FAILED — drop-in on disk but not live"; return 1; }
       fi
     else
       log "ERROR: sshd -t REJECTED the drop-in — rolling back, sshd left UNCHANGED"
@@ -307,7 +315,7 @@ ensure_fleet_user
 install_fleetctl
 install_config_template
 install_units
-install_sshd_dropin
+install_sshd_dropin || exit 1   # F8 (#12): drop-in validate/reload failure is FATAL
 log "install complete. Next:"
 log "  1) put the write-scoped Tailscale API token at $ETC_DIR/api-token (chmod 600)"
 log "  2) generate the box-access key: ssh-keygen -t ed25519 -f $ETC_DIR/box_access_ed25519 -N ''"
