@@ -2009,7 +2009,13 @@ reconcile_reset_cfgfail() { rm -f "$FLEET_STATE/$1.cfgfail" 2>/dev/null || true;
 # in-sync boxes too. Mirrors reconcile_rollout's shape: returns immediately
 # (SILENT) when the D2 files are absent; otherwise iterates the canary FIRST
 # then the remaining reconcile_target_boxes order, SERIALLY. Per box guard:
-# tunnel_up AND no .checkfail state, else skip silently. DRY-RUN (apply=0) =>
+# tunnel_up AND the box's checkfail COUNT is at/under the threshold (>3 =
+# unhealthy, matching reconcile_decide's fleetctl:2147 gate), else skip
+# silently. A HEALTHY box carries a `0`-content .checkfail FILE that
+# reconcile_reset_checkfail rewrites every tick, so gating on file PRESENCE
+# (BLOCKER-1, live canary r1) skipped EVERY healthy box — the whole fleet — on
+# every real tick. An absent file / content 0 = healthy = eligible.
+# DRY-RUN (apply=0) =>
 # push_managed --dry-run; --apply => push_managed. Canary failure (D5 non-zero
 # or D4 refusal) => notify warn, ABORT the rest of the pass this tick; a
 # non-canary failure => D9 for that box, continue. Returns non-zero iff any box
@@ -2035,16 +2041,19 @@ reconcile_config_pass() {
 
   local rc=0
 
-  # canary_skippable <box>: 0 iff tunnel down OR a .checkfail state exists.
-  # (drift reported when the box returns — same guard as the per-box loop).
+  # canary_skippable <box>: 0 iff tunnel down OR the box is over the checkfail
+  # threshold (>3, like reconcile_decide:2147). A `0`-content .checkfail FILE is
+  # HEALTHY and must NOT skip the box (BLOCKER-1). (drift reported when the box
+  # returns — same guard as the per-box loop below).
   _cfg_push_one() {
     local box="$1"
     if [ "$apply" = 1 ]; then push_managed "$box"; else push_managed "$box" --dry-run; fi
   }
 
-  # Canary first. An unreachable/checkfail canary is skipped SILENTLY (no abort —
-  # abort is reserved for a real push/validation FAILURE, mirroring rollout).
-  if tunnel_up "$canary" && [ ! -f "$FLEET_STATE/$canary.checkfail" ]; then
+  # Canary first. An unreachable/over-threshold canary is skipped SILENTLY (no
+  # abort — abort is reserved for a real push/validation FAILURE, mirroring
+  # rollout).
+  if tunnel_up "$canary" && [ "$(reconcile_checkfail_count "$canary")" -le 3 ]; then
     if _cfg_push_one "$canary"; then
       reconcile_reset_cfgfail "$canary"
     else
@@ -2057,8 +2066,13 @@ reconcile_config_pass() {
 
   # The rest, serially.
   for b in "${rest[@]}"; do
-    if ! tunnel_up "$b" || [ -f "$FLEET_STATE/$b.checkfail" ]; then
-      continue   # skip silently; drift reported when the box returns
+    if ! tunnel_up "$b"; then
+      log "config: skip $b — tunnel down (drift reported when the box returns)"
+      continue
+    fi
+    if [ "$(reconcile_checkfail_count "$b")" -gt 3 ]; then
+      log "config: skip $b — checkfail over threshold (>3; drift reported when the box returns)"
+      continue
     fi
     if _cfg_push_one "$b"; then
       reconcile_reset_cfgfail "$b"
@@ -2692,6 +2706,17 @@ reconcile_bump_checkfail() {
   printf '%s' "$n"
 }
 reconcile_reset_checkfail() { echo 0 > "$FLEET_STATE/$1.checkfail" 2>/dev/null || true; }
+# reconcile_checkfail_count <box>: print the box's current consecutive-checkfail
+# COUNT (0 when the file is absent, empty, or non-numeric). A HEALTHY box carries
+# a `0`-content file (reconcile_reset_checkfail writes `echo 0 >` every tick), so
+# file PRESENCE is not "unhealthy" — only a count over the threshold is. Same
+# read/normalise idiom as reconcile_bump_checkfail's own preamble.
+reconcile_checkfail_count() {
+  local f="$FLEET_STATE/$1.checkfail" n=0
+  [ -f "$f" ] && n=$(tr -d '[:space:]' < "$f" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
 
 # --- P1-2 seed-failure counter (mint 2xx but seed never converges) -----------
 reconcile_bump_seedfail() {

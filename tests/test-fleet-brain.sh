@@ -2252,7 +2252,7 @@ FLEET_BOXES="grok-box-8 grok-box-3 grok-box-5"
 log(){ echo "LOG:\$*"; }
 notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # no canary_box configured => default 8
 tunnel_up(){ return 0; }    # all tunnels up
 seq="$d/seq"
@@ -2303,7 +2303,7 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
 log(){ :; }; notify(){ :; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }
 # tunnel_up: grok-box-8 always up; grok-box-3 down iff guard=tunnel.
 tunnel_up(){ case "\$1" in grok-box-3) [ "$guard" != tunnel ] ;; *) return 0 ;; esac; }
@@ -2318,6 +2318,45 @@ g_tun="$(cfgpass_guard_test tunnel)"
 case "$g_tun" in *"PUSH grok-box-3"*) bad "D6 guard: pushed to a tunnel-DOWN box: [$g_tun]" ;; *"PUSH grok-box-8"*) pass "D6 guard: tunnel-down box skipped silently (canary still pushed)" ;; *) bad "D6 tunnel guard wrong: [$g_tun]" ;; esac
 g_chk="$(cfgpass_guard_test checkfail)"
 case "$g_chk" in *"PUSH grok-box-3"*) bad "D6 guard: pushed to a .checkfail box: [$g_chk]" ;; *"PUSH grok-box-8"*) pass "D6 guard: .checkfail box skipped silently" ;; *) bad "D6 checkfail guard wrong: [$g_chk]" ;; esac
+
+# BLOCKER-1 (live canary r1): the per-box guard must gate on the checkfail COUNT
+# (>3, matching reconcile_decide's threshold), NOT file PRESENCE. A HEALTHY box
+# carries a `0`-content .checkfail FILE (reconcile_reset_checkfail rewrites it
+# every tick), so a presence guard skipped EVERY healthy box — the whole fleet —
+# on every real tick. Drives the REAL reconcile_config_pass with the checkfail
+# file for a NON-canary box (grok-box-3) seeded to a chosen state; asserts the
+# box is processed (0/absent) or skipped-with-a-log-line (over threshold).
+cfgpass_checkfail_test() {
+  # args: chkstate = absent | 0 | 4   (grok-box-3's .checkfail content)
+  local chkstate="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
+  printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
+  [ "$chkstate" != absent ] && printf '%s\n' "$chkstate" > "$d/state/grok-box-3.checkfail"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+log(){ echo "LOG:\$*"; }; notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }
+tunnel_up(){ return 0; }   # both tunnels up: only the checkfail count decides
+seq="$d/seq"
+push_managed(){ echo "PUSH \$1" >> "\$seq"; return 0; }
+reconcile_config_pass 1; echo "PASSRC=\$?"
+[ -f "\$seq" ] && tr '\n' '|' < "\$seq"; echo
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+# (a) content 0 (HEALTHY, the every-tick state) => box IS processed.
+cf_zero="$(cfgpass_checkfail_test 0)"
+case "$cf_zero" in *"PUSH grok-box-3"*) pass "BLOCKER-1: a 0-content .checkfail (healthy) box IS processed by the config pass" ;; *) bad "BLOCKER-1: healthy 0-content box was SKIPPED (the live-canary bug): [$cf_zero]" ;; esac
+# (b) content 4 (>3, unhealthy) => box SKIPPED, with the skip log line.
+cf_four="$(cfgpass_checkfail_test 4)"
+case "$cf_four" in *"PUSH grok-box-3"*) bad "BLOCKER-1: pushed to an over-threshold (4) box: [$cf_four]" ;; *"LOG:config: skip grok-box-3 — checkfail over threshold"*) pass "BLOCKER-1: a >3 checkfail box is skipped WITH a skip log line" ;; *) bad "BLOCKER-1: over-threshold skip log missing: [$cf_four]" ;; esac
+# (c) absent .checkfail => box IS processed.
+cf_abs="$(cfgpass_checkfail_test absent)"
+case "$cf_abs" in *"PUSH grok-box-3"*) pass "BLOCKER-1: an ABSENT .checkfail box IS processed" ;; *) bad "BLOCKER-1: absent-checkfail box was skipped: [$cf_abs]" ;; esac
 
 # D4 forward-compat info log: an unknown-but-well-formed key is ALLOWED and
 # logged ONCE per reconcile run, DEDUPED across boxes. Drives the REAL
@@ -2345,7 +2384,7 @@ BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
 log(){ echo "LOG:\$*"; }
 notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # no canary_box configured => default 8
 tunnel_up(){ return 0; }    # both tunnels up
 # Fake tunnel_ssh: strip the sudo sh -c wrapper, run with stdin passed through.
@@ -2469,7 +2508,7 @@ FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
 FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
 log(){ :; }; notify(){ echo "NOTIFY:\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
 config_get(){ return 1; }   # canary defaults to grok-box-8
 tunnel_up(){ return 0; }
 # canary (grok-box-8) always succeeds; grok-box-3 (non-canary) always fails.
