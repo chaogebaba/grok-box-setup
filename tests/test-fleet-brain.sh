@@ -764,9 +764,13 @@ ts_api(){ echo "\$1 \$2" >> "\$seq"; TS_API_CODE=$del_code; }
 # seed got.
 seed_key_over_tunnel(){ [ "$writes" = yes ] && echo NEW > "\$BOX_AUTHKEY"; return $seed_rc; }
 INNER
-  # record_key_meta stub only for the persist-failure arm; otherwise use the real one.
+  # record_key_meta: fail arm returns 1; ok arm SUCCEEDS (writes the meta) so a
+  # seed-arm mutation that wrongly lets a failed seed fall through would reach a
+  # SUCCEEDING persist (mint rc 0, no DELETE) and be caught, not masked.
   if [ "$persist" = fail ]; then
     printf 'record_key_meta(){ return 1; }\n' >> "$inner"
+  else
+    printf 'record_key_meta(){ mkdir -p "$FLEET_KEYS_DIR"; printf "{\\"id\\":\\"%%s\\"}" "$2" > "$FLEET_KEYS_DIR/8.json"; return 0; }\n' >> "$inner"
   fi
   cat >> "$inner" <<INNER
 cmd_mint_key grok-box-8
@@ -792,11 +796,13 @@ case "$msf1" in
 esac
 case "$msf1" in *"rc=1"*"meta=none"*) pass "D5c: seed failure (rc 1) => rc 1 and NO keys/<N>.json persisted" ;; *) bad "D5c rc1: rc/meta wrong: [$msf1]" ;; esac
 
-# S3: seed fails at rc 3 (the SEED_SHA_MISMATCH exit) => revoke STILL fires.
+# S3: seed fails at rc 3 (the SEED_SHA_MISMATCH exit) => the SEED arm revokes.
+# The log must name the SEED arm ('seed/verify FAILED'), proving the revoke came
+# from the seed arm and not a fall-through to the persist arm (m8 kill).
 msf3="$(mint_fail_test 3 200 ok no)"
 case "$msf3" in
-  *"rc=1"*"DELCOUNT=1"*"DELETE /tailnet/-/keys/kNEW999|"*) pass "S3: seed failure (rc 3) also revokes exactly once, rc 1 (revoke fires for EVERY non-zero seed rc)" ;;
-  *) bad "S3 rc3: DELETE/rc wrong: [$msf3]" ;;
+  *"seed/verify FAILED for grok-box-8 — REVOKING the just-minted key id="*"rc=1"*"DELCOUNT=1"*"DELETE /tailnet/-/keys/kNEW999|"*) pass "S3/m8 kill: seed failure (rc 3) revokes from the SEED arm exactly once, rc 1 (revoke fires for EVERY non-zero seed rc, not just rc 1)" ;;
+  *) bad "S3 rc3: seed-arm revoke/rc wrong: [$msf3]" ;;
 esac
 
 # m8 (S3): the seed fails AFTER writing the fake dst (post-mv failure) => the
