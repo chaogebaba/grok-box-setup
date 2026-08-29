@@ -170,6 +170,11 @@ case "$argv_tags" in *--hostname=grok-box-8*) pass "#9 argv has --hostname=<curr
 case "$argv_tags" in *--advertise-tags=tag:grok-box*) pass "#9 argv mentions held tags" ;; *) bad "#9 argv missing held tags: [$argv_tags]" ;; esac
 case "$argv_notags" in *--advertise-tags*) bad "#9 argv INTRODUCED tags when none held: [$argv_notags]" ;; *) pass "#9 argv omits tags when none held" ;; esac
 case "$argv_tags" in *--reset*) bad "#9 argv used --reset (forbidden)" ;; *) pass "#9 argv never uses --reset" ;; esac
+# F9 (#10 r1.2) — run_reauth_up MUST carry --accept-risk=lose-ssh so tailscale's
+# lose-ssh guard does not refuse re-auth over an ssh-on-tailnet session (the
+# by-design management path). Mutant: drop the flag from run_reauth_up's up
+# array => this assertion FAILS.
+case "$argv_tags" in *--accept-risk=lose-ssh*) pass "F9 run_reauth_up argv carries --accept-risk=lose-ssh" ;; *) bad "F9 run_reauth_up argv MISSING --accept-risk=lose-ssh: [$argv_tags]" ;; esac
 # H6: no hostname resolvable => run_reauth_up must NOT invoke up at all (empty capture).
 if [ -z "${argv_nohost// /}" ]; then
   pass "H6 re-auth REFUSES (no up) when no hostname resolves"
@@ -470,6 +475,13 @@ esac
 case "$h12join" in
   *--advertise-tags=tag:grok-box*) pass "H12 first-login join argv carries --advertise-tags from config" ;;
   *) bad "H12 join argv missing --advertise-tags: [$h12join]" ;;
+esac
+# F9 (#10 r1.2) — the first-login `up` array must ALSO carry
+# --accept-risk=lose-ssh (a state-loss rejoin is operator-driven over
+# ssh-on-tailnet; harmless no-op on the unattended fresh-join path).
+case "$h12join" in
+  *--accept-risk=lose-ssh*) pass "F9 first-login join argv carries --accept-risk=lose-ssh" ;;
+  *) bad "F9 first-login join argv MISSING --accept-risk=lose-ssh: [$h12join]" ;;
 esac
 
 # ---------------------------------------------------------------------------

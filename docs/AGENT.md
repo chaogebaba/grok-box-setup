@@ -43,6 +43,9 @@ days):**
    ```
    `retag` re-auths with the config tags so Tailscale disables expiry; it needs
    the seeded key to be tag-capable (step 1). See §G.
+   `retag` is safe to run from an ssh-over-tailnet session; the session may drop
+   for a few seconds while the node re-authenticates — rerun `boxup check` after
+   reconnecting.
 
 - If status ends with `auth=https://login.tailscale.com/...`: relay that URL
   to the human, wait for approval, run `sudo /workspace/box-setup/boxup once`

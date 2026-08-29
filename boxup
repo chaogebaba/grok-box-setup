@@ -1248,8 +1248,14 @@ run_reauth_up() {
   b="$(tailscale_bin)"
   [ -x "$b" ] || return 0
   local -a up
+  # F9 (#10 r1.2): --accept-risk=lose-ssh — management of these boxes is BY
+  # DESIGN over ssh-on-tailnet, so tailscale's lose-ssh guard would otherwise
+  # refuse `up --force-reauth` ("this action may result in your SSH session
+  # disconnecting"). The flag is a no-op when no tailscale-carried session
+  # exists (the unattended worker path), so it is safe everywhere.
   up=("$b" up --ssh=false --advertise-exit-node --accept-dns
-      --snat-subnet-routes=true --timeout=25s --force-reauth)
+      --snat-subnet-routes=true --timeout=25s --force-reauth
+      --accept-risk=lose-ssh)
   id box >/dev/null 2>&1 && up+=(--operator=box)
 
   # H6 (#9): resolve the current hostname from THREE sources in order —
@@ -1356,8 +1362,12 @@ ensure_login() {
     # back tagged + expiry-disabled by default too. No interactive prompt (boxes
     # are unattended).
     local -a up
+    # F9 (#10 r1.2): --accept-risk=lose-ssh here too — a state-loss rejoin (F4)
+    # is driven by an operator over ssh-on-tailnet just like retag; the flag is
+    # a harmless no-op on the unattended first-join path.
     up=("$b" up --ssh=false --advertise-exit-node --accept-dns
-        --snat-subnet-routes=true --timeout=25s)
+        --snat-subnet-routes=true --timeout=25s
+        --accept-risk=lose-ssh)
     id box >/dev/null 2>&1 && up+=(--operator=box)
     local tags out
     tags="$(resolved_config_tags)"
