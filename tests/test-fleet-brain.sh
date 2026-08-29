@@ -182,6 +182,26 @@ FAKETS
 pk="$(pickname_test '{"Peer":{"a":{"HostName":"grok-box-1"},"b":{"HostName":"grok-box-002"}}}')"
 [ "$pk" = grok-box-003 ] && pass "D2: pick_name pads AND counts legacy+padded peers (=> grok-box-003)" || bad "D2 pick_name: [$pk]"
 
+# D5: reconcile_target_boxes orders enrolled boxes NUMERICALLY by decimal index
+# (grok-box-002 before grok-box-010, a legacy grok-box-3 in between), and dedups.
+targetorder_test() {
+  local inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  printf 'grok-box-010\t20010\ngrok-box-002\t20002\ngrok-box-3\t20003\ngrok-box-002\t20002\n' > "$d/state/enrolled.tsv"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name box_name_from_index reconcile_target_boxes; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+reconcile_target_boxes | tr '\n' '|'
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+[ "$(targetorder_test)" = "grok-box-002|grok-box-3|grok-box-010|" ] \
+  && pass "D5: reconcile_target_boxes orders numerically by index (002 < legacy 3 < 010) and dedups" \
+  || bad "D5 numeric ordering wrong: [$(targetorder_test)]"
+
 
 # ACL precheck: acl_has_fleet_brain_tagowner returns 0 when the tag is present,
 # non-0 (1) when absent. Stub ts_api to return a fixture ACL; jq does the work.
