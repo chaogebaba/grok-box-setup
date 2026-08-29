@@ -168,7 +168,7 @@ any special case.
 | Worker reaper matches exact argv, skips `-c` | same `pkill -f` lesson | agent shells reaped |
 | Reusable non-ephemeral auth keys; Tailscale SSH off | ephemeral nodes vanish on restart and mint duplicates; OpenSSH is the only login | duplicate nodes; lost the only login path |
 | Non-printable config passwords refused | chpasswd round-trip would set an unknown password | box locked out |
-| config.toml seeded once, never overwritten | user's password/pins must survive upgrades | every install resets the login |
+| config.toml seeded once, never overwritten (except `[fleet]`.vps/box_index/port, written idempotently by `fleetctl enroll`) | user's password/pins must survive upgrades | every install resets the login |
 | ROOT never auto-detected from a checkout | a stray clone must not become the live root | dev tree silently drives a real box |
 | Vendored tailscale bins in `bin/` | recovery after swap must not wait on apt/network | daemon can't restart offline |
 | `set -u`, not blanket `set -e` | the worker loop must keep looping past transient failures | one transient error kills the self-heal loop |

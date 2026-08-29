@@ -55,12 +55,16 @@
 [fleet]
 # FLEET-BRAIN out-of-band reverse-SSH tunnel (docs/FLEET-BRAIN.md §1).
 #
-# WRITTEN BY ENROLL: `fleetctl enroll grok-box-N` now sets `vps` and `box_index`
-# here itself, over the same tailnet SSH session it uses to read the box's
-# tunnel pubkey — so the tunnel comes up on the next `boxup once` with no manual
-# edit. You only touch this block by hand for SPECIAL cases (a non-default VPS
-# address, a manual re-point, or `fleetctl enroll --no-box-config` which skips
-# the box-side write). After any manual edit:  sudo /workspace/box-setup/boxup once
+# WRITTEN BY ENROLL — MANUAL EDIT ONLY FOR SPECIAL CASES. `fleetctl enroll
+# grok-box-N` sets `vps` and `box_index` here itself (and `port`, but only when
+# the VPS sshd port is non-default), over the same tailnet SSH session it uses
+# to read the box's tunnel pubkey — so the tunnel comes up on the next
+# `boxup once` with no manual edit. The address enroll writes comes from the
+# BRAIN side (`FLEET_VPS_ADDR` env, else `[fleet-brain].vps` in the brain's
+# config) — there is no baked default. You only touch this block by hand for
+# SPECIAL cases (a manual re-point, or `fleetctl enroll --no-box-config` which
+# skips the box-side write). After any manual edit:
+#   sudo /workspace/box-setup/boxup once
 #
 # UNCONFIGURED BY DEFAULT: with `vps` unset, boxup does NOTHING here — no
 # tunnel, no key use beyond generation — so an un-enrolled box is completely
@@ -71,9 +75,11 @@
 #            supervised by the boxup tick (respawn with backoff, like
 #            tailscaled). Liveness is client-driven (ServerAlive*), because the
 #            VPS runs ClientAliveInterval 0 and never reaps a dead tunnel.
-#vps = "107.172.132.211"
+#vps = "203.0.113.10"
 #
-# port       the VPS sshd port (default 22).
+# port       the VPS sshd port (default 22). enroll writes it ONLY when the
+#            brain's port (`FLEET_VPS_PORT` env / `[fleet-brain].vps_port`) is
+#            non-default; at 22 the key is omitted and this default stands.
 #port = 22
 #
 # box_index  N in grok-box-N; the reverse loopback port is 20000+N (range
