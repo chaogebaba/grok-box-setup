@@ -57,6 +57,16 @@ AUTHKEY_EXPIRES="$SECRETS_DIR/ts-authkey.expires"
 BIN_DIR="$ROOT/bin"
 CONFIG_FILE="${BOX_SETUP_CONFIG:-$ROOT/config.toml}"
 
+# FLEET-BRAIN §config-truth (D1): the brain-managed config file. Written ONLY
+# by the VPS brain over the reverse tunnel (fleetctl push_managed); hand edits
+# are overwritten on the next reconcile. Lives under /workspace (like
+# config.toml) so it survives an image swap; mode 600 root. Precedence per key:
+# env override (where one exists) > managed.toml > config.toml > baked default.
+# Missing managed.toml == today's behaviour exactly (zero-diff for un-managed
+# fleets). The `[managed] enabled = false` gate in config.toml turns the whole
+# managed layer off locally (D8).
+MANAGED_FILE="${BOX_SETUP_MANAGED:-$ROOT/managed.toml}"
+
 # FLEET-BRAIN (docs/FLEET-BRAIN.md §1): the out-of-band reverse-SSH tunnel key
 # + supervision state. The per-box ed25519 key lives under /workspace so it
 # survives an image swap; it authenticates THIS box's tunnel to the VPS. The
@@ -250,10 +260,44 @@ function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
 END { exit(found ? 0 : 1) }
 AWK
 
+# config_get_file <file> <table> <key> -> prints value, non-zero when unset.
+# The single awk reader, invoked on an EXPLICIT file. FIRST match in the wanted
+# table wins (the awk exits at the first hit). This is the only reader; the two
+# public wrappers below layer file precedence on top of it.
+config_get_file() {
+  [ -f "$1" ] || return 1
+  awk -v want_t="$2" -v want_k="$3" "$_BOX_TOML_AWK" "$1" 2>/dev/null
+}
+
+# MANAGED_ENABLED: the hoisted [managed].enabled gate (D1). Set once per
+# converge by do_ensure_body so the log line (D8) fires at most once. Default
+# "true" — the managed layer is on unless config.toml explicitly disables it.
+# A tick/subcommand that reads config before the hoist still behaves correctly:
+# the wrapper below re-reads the gate lazily when MANAGED_ENABLED is unset.
+MANAGED_ENABLED=""
+
 # config_get <table> <key> -> prints value, non-zero when unset.
+# Two-file precedence (D1): if the managed layer is enabled AND managed.toml
+# exists AND the key is found there, that value wins; otherwise fall back to
+# today's config.toml lookup. FIRST-match-per-file semantics are unchanged.
+# Missing managed.toml == config.toml-only behaviour exactly.
 config_get() {
-  [ -f "$CONFIG_FILE" ] || return 1
-  awk -v want_t="$1" -v want_k="$2" "$_BOX_TOML_AWK" "$CONFIG_FILE" 2>/dev/null
+  local en="$MANAGED_ENABLED"
+  # Lazy gate read for callers outside a converge (e.g. `boxup status`), so we
+  # never spuriously honour a disabled managed layer. Empty default => true.
+  if [ -z "$en" ]; then
+    en="$(config_get_file "$CONFIG_FILE" managed enabled || echo true)"
+    [ -n "$en" ] || en=true
+  fi
+  if [ "$en" = true ] && [ -f "$MANAGED_FILE" ]; then
+    local mv
+    if mv="$(config_get_file "$MANAGED_FILE" "$1" "$2")"; then
+      printf '%s' "$mv"
+      echo
+      return 0
+    fi
+  fi
+  config_get_file "$CONFIG_FILE" "$1" "$2"
 }
 
 # Password applied to root and box. Precedence: BOX_SSH_PASSWORD env >
@@ -2189,6 +2233,16 @@ _ensure_step() {
 do_ensure_body() {
   local _degraded=0
   ensure_dirs
+  # D1/D8: hoist the [managed].enabled gate ONCE per converge so config_get
+  # honours the managed layer uniformly and the "ignored" notice fires at most
+  # once. Default true (managed layer on). When a managed.toml is present but
+  # the operator has set `[managed] enabled = false` in config.toml, log the
+  # escape hatch exactly once per converge (D8).
+  MANAGED_ENABLED="$(config_get_file "$CONFIG_FILE" managed enabled || echo true)"
+  [ -n "$MANAGED_ENABLED" ] || MANAGED_ENABLED=true
+  if [ "$MANAGED_ENABLED" != true ] && [ -f "$MANAGED_FILE" ]; then
+    log "converge: managed.toml ignored by local config ([managed] enabled=$MANAGED_ENABLED)"
+  fi
   _ensure_step packages       ensure_packages
   _ensure_step tailscale-bin  ensure_tailscale_bin
   _ensure_step sshd           ensure_sshd
@@ -2324,6 +2378,20 @@ case "$cmd" in
     ;;
   version|--version)
     echo "boxup $BOXUP_VERSION"
+    ;;
+  config-get|--config-get)
+    # D1/D5: read-only probe of the LOCAL config.toml value (never the managed
+    # layer). Used by the brain's push_managed status line so brain and boxup
+    # can never disagree on the TOML grammar. Prints the value, exit 1 if unset.
+    if [ $# -lt 3 ]; then
+      echo "boxup: usage: config-get <table> <key>" >&2
+      exit 1
+    fi
+    if v="$(config_get_file "$CONFIG_FILE" "$2" "$3")"; then
+      printf '%s\n' "$v"
+      exit 0
+    fi
+    exit 1
     ;;
   -h|--help|help)
     usage
