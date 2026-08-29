@@ -25,6 +25,10 @@
 # tailscale / ssh / sshpass / python3 / git.
 set -u
 
+# FLEETCTL_VERSION versions the brain CLI INDEPENDENTLY of the box agent: it is
+# not tied to VERSION/BOXUP_VERSION (which track each other, D10). The box's
+# minimum boxup version for a padded-name rename is gated separately by
+# RENAME_MIN_BOXUP_VERSION (see cmd_rename), not by this value.
 FLEETCTL_VERSION=1.0.0
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -3596,6 +3600,13 @@ cmd_rename() {
     waited=$((waited + RENAME_POLL_INTERVAL))
     if [ "$waited" -ge "$RENAME_POLL_SECS" ]; then
       log "rename: ABORT — timed out (${RENAME_POLL_SECS}s) waiting for HostName/DNS=$new (saw hostname='$hostname' dns='$dnslabel'; both names still valid, re-run to resume)"
+      # Diagnostic (S3): a DNS-label pin (the box applies HostName but the control
+      # plane keeps the old MagicDNS label) is only diagnosable from the name POST's
+      # response — surface the device id we posted to and the last API body so this
+      # needs no manual /device probe. Empty id => we never found a live node to post.
+      local _post_body=""
+      [ -n "${TS_API_LAST_BODY:-}" ] && [ -f "$TS_API_LAST_BODY" ] && _post_body="$(cat "$TS_API_LAST_BODY")"
+      log "rename: timeout diagnosis — POST /device/<id>/name device_id='${liveid:-}' response_body='${_post_body}'"
       return 1
     fi
     sleep "$RENAME_POLL_INTERVAL"
