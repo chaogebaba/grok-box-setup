@@ -774,6 +774,15 @@ TS_API="${FLEET_TS_API:-https://api.tailscale.com/api/v2}"
 TS_TAILNET="${FLEET_TS_TAILNET:--}"          # "-" = the token's default tailnet
 FLEET_ETC="${FLEET_ETC:-/etc/grok-fleet}"
 FLEET_STATE="${FLEET_STATE:-/var/lib/grok-fleet}"
+# --- config-truth (D2): the brain's desired-state files for box config -------
+# fleet.toml is fleet-wide; boxes/<box>.toml is per-box override. Both optional,
+# mode 600 root (alongside the PAT/box key). Same TOML subset boxup reads
+# (tables + `key = value`, values opaque incl. arrays). BOTH ABSENT = feature
+# off, SILENT (no log, no tunnel traffic). See docs/FLEET-BRAIN.md §config-truth.
+FLEET_MANAGED_FLEET="${FLEET_MANAGED_FLEET:-$FLEET_ETC/fleet.toml}"
+FLEET_MANAGED_BOXDIR="${FLEET_MANAGED_BOXDIR:-$FLEET_ETC/boxes}"
+# The on-box managed file path (matches boxup's MANAGED_FILE under /workspace).
+BOX_MANAGED="${BOX_MANAGED:-/workspace/box-setup/managed.toml}"
 # The VPS-side user whose ~/.ssh/authorized_keys carries the per-box tunnel
 # lines. sshd privsep reads this file AS this user, so the dir + file MUST end
 # up owned by it (BUG-E): a root:root authorized_keys yields StrictModes/privsep
@@ -1658,6 +1667,446 @@ tunnel_ssh() {
       -p "$port" "box@127.0.0.1" "$@"
 }
 
+# =============================================================================
+# config-truth (docs/FLEET-BRAIN.md §config-truth) — the brain renders the
+# desired managed.toml for a box (D3), validates it (D4), and pushes it over the
+# tunnel with the seed_key_over_tunnel atomic idiom (D5). NO scratch file: the
+# rendered text lives in a shell variable and is fed to the push on stdin, so
+# nothing world-readable ever holds a managed value.
+# =============================================================================
+
+# managed_files_present: 0 iff at least one D2 file exists (fleet.toml or ANY
+# boxes/*.toml). BOTH-absent = feature OFF (callers stay silent). We treat a
+# populated boxes/ dir as "on" even without fleet.toml (per-box-only is valid).
+managed_files_present() {
+  [ -f "$FLEET_MANAGED_FLEET" ] && return 0
+  [ -d "$FLEET_MANAGED_BOXDIR" ] || return 1
+  local f
+  for f in "$FLEET_MANAGED_BOXDIR"/*.toml; do
+    [ -f "$f" ] && return 0
+  done
+  return 1
+}
+
+# The fixed, byte-deterministic header for a rendered managed.toml (NO
+# timestamps — identical inputs MUST give identical bytes so drift detection is
+# a pure sha compare). Kept as a function so render and any doc reference agree.
+managed_header() {
+  printf '%s\n' \
+    '# managed.toml — WRITTEN BY THE VPS BRAIN (fleetctl). DO NOT EDIT.' \
+    '# Hand edits are overwritten on the next reconcile. Precedence on the box:' \
+    '# env > managed.toml > config.toml > default. Disable locally with' \
+    '# [managed] enabled = false in config.toml.'
+}
+
+# render_managed <box>: print the merged desired managed.toml to stdout.
+# Merge = fleet.toml then boxes/<box>.toml, key-level, LAST-WINS per (table,key);
+# (table,key) order = first-seen order over the CONCATENATED stream, and a box
+# override replaces the VALUE in place at the key's first-seen position (never
+# reorders) — a total ordering, so identical inputs give identical bytes.
+# `key = value` lines are emitted verbatim (the awk preserves the raw RHS). One
+# awk pass, same grammar as boxup's reader (comment/blank rules). No applicable
+# keys => header only (still a valid state; keeps drift detection uniform).
+#
+# The awk input is built from ONLY the files that actually exist and are
+# readable: in production the normal case is a fleet.toml with NO per-box
+# boxes/<box>.toml, and awk goes FATAL (skipping its END block) the moment it
+# cannot open an input file — which would silently render header-only and push
+# an empty managed.toml for every box (feature inert). So we never hand awk a
+# path that does not exist. Neither file present => empty merged body (header
+# only = "nothing managed", a valid state). We DROP `2>/dev/null` and RETURN
+# awk's exit status so a genuine awk failure propagates and callers refuse/skip
+# rather than push a header-only file.
+render_managed() {
+  local box="$1"
+  local boxf="$FLEET_MANAGED_BOXDIR/$box.toml"
+  managed_header
+  # Only pass files that exist AND are readable (a chmod 000 path is a genuine
+  # failure we WANT to surface, not silently skip — so readability is checked
+  # by awk itself below; here we only elide truly-absent paths).
+  local -a inputs=()
+  [ -e "$FLEET_MANAGED_FLEET" ] && inputs+=("$FLEET_MANAGED_FLEET")
+  [ -e "$boxf" ] && inputs+=("$boxf")
+  # Neither D2 file exists => header only, nothing to merge (valid state).
+  [ "${#inputs[@]}" -eq 0 ] && return 0
+  # Concatenate fleet-wide then per-box; awk records first-seen (table,key)
+  # order and last value, then re-emits in first-seen order. Comments/blank
+  # lines are dropped from the merged output (only key=value survives) so the
+  # result is canonical and byte-deterministic. Table headers are emitted once,
+  # in first-seen order, before their first key. NO `2>/dev/null`: a real awk
+  # failure (e.g. an unreadable input) must be visible on stderr AND propagate
+  # via the return status below.
+  awk '
+    function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
+    {
+      line = trim($0)
+      if (line == "" || line ~ /^#/) next
+      if (line ~ /^\[.*\]$/) { sec = trim(substr(line,2,length(line)-2)); next }
+      eq = index(line, "=")
+      if (eq == 0) next
+      k = trim(substr(line, 1, eq-1))
+      v = trim(substr(line, eq+1))
+      id = sec SUBSEP k
+      if (!(id in seen)) { seen[id]=1; order[++n]=id; tbl[id]=sec; key[id]=k }
+      val[id] = v
+    }
+    END {
+      lasttbl = "\x01"
+      for (i=1; i<=n; i++) {
+        id = order[i]
+        if (tbl[id] != lasttbl) { printf "[%s]\n", tbl[id]; lasttbl = tbl[id] }
+        printf "%s = %s\n", key[id], val[id]
+      }
+    }
+  ' "${inputs[@]}"
+}
+
+# validate_managed <text>: D4 gate. Return 0 iff the rendered text is safe to
+# push. REFUSE (return 1, caller logs at warn + bumps .cfgfail + skips) when the
+# merged result contains a [fleet] table, a [tailscale].tags key, a table/key
+# outside the boxup TOML subset, or a line the reader cannot parse. Unknown-but-
+# well-formed keys are ALLOWED (forward compatible); the caller logs them at
+# info once per reconcile. Prints the refusal reason on stderr.
+# Allowed tables (the boxup config surface, D0): ssh, tailscale, update, managed.
+validate_managed() {
+  local text="$1"
+  printf '%s\n' "$text" | awk '
+    function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
+    BEGIN { ok=1 }
+    {
+      line = trim($0)
+      if (line == "" || line ~ /^#/) next
+      if (line ~ /^\[.*\]$/) {
+        sec = trim(substr(line,2,length(line)-2))
+        # [fleet] is bootstrap (enroll-owned), never managed.
+        if (sec == "fleet") { print "refuse: [fleet] table is not brain-managed (enroll owns it)" > "/dev/stderr"; ok=0 }
+        else if (sec != "ssh" && sec != "tailscale" && sec != "update" && sec != "managed") {
+          print "refuse: table [" sec "] is outside the boxup config subset" > "/dev/stderr"; ok=0
+        }
+        next
+      }
+      eq = index(line, "=")
+      if (eq == 0) { print "refuse: unparsable line (no key=value): " line > "/dev/stderr"; ok=0; next }
+      k = trim(substr(line, 1, eq-1))
+      if (k == "") { print "refuse: empty key in: " line > "/dev/stderr"; ok=0; next }
+      # [tailscale].tags is first-login-only on the box (inert) — explicitly out.
+      if (sec == "tailscale" && k == "tags") { print "refuse: [tailscale].tags is not managed in Phase 2" > "/dev/stderr"; ok=0 }
+    }
+    END { exit(ok ? 0 : 1) }
+  '
+}
+
+# unknown_managed_keys <text>: print the well-formed but UNKNOWN (table,key)
+# identifiers in the rendered text, one `table.key` per line, in first-seen
+# order. Known set (D4) = ssh.password, tailscale.version, update.repo. The
+# input is assumed to have already passed validate_managed (allowed tables,
+# parseable lines), so anything here is forward-compatible-but-unknown, NOT a
+# refusal. Callers log these at info: once per reconcile run (deduped across
+# boxes via reconcile_config_pass's run-scoped set) or once per CLI invocation.
+unknown_managed_keys() {
+  local text="$1"
+  printf '%s\n' "$text" | awk '
+    function trim(s){ sub(/^[ \t\r]+/,"",s); sub(/[ \t\r]+$/,"",s); return s }
+    BEGIN {
+      known["ssh" SUBSEP "password"]=1
+      known["tailscale" SUBSEP "version"]=1
+      known["update" SUBSEP "repo"]=1
+    }
+    {
+      line = trim($0)
+      if (line == "" || line ~ /^#/) next
+      if (line ~ /^\[.*\]$/) { sec = trim(substr(line,2,length(line)-2)); next }
+      eq = index(line, "=")
+      if (eq == 0) next
+      k = trim(substr(line, 1, eq-1))
+      if (k == "") next
+      id = sec SUBSEP k
+      if (id in known) next
+      if (id in seen) next
+      seen[id]=1
+      printf "%s.%s\n", sec, k
+    }
+  '
+}
+
+# managed_remote_script <want_sha> <dry>: emit the POSIX-sh remote script used
+# by BOTH push_managed and `config diff` (ONE remote code path). Interpolates
+# want_sha (not a secret) and the box paths; the rendered text arrives on STDIN.
+# Contains NO single quotes (sha via `cut`, grep pattern unquoted) so it nests
+# inside the caller's outer `sudo sh -c '<script>'` single-quoted argument.
+managed_remote_script() {
+  local want="$1" dry="$2"
+  cat <<REMOTE
+set -e
+umask 077
+want=$want
+mf=$BOX_MANAGED
+bx=$BOX_ROOT/boxup
+dry=$dry
+tmp=\$mf.tmp
+cat > "\$tmp"
+got=\$(sha256sum "\$tmp" | cut -d" " -f1)
+if [ "\$got" != "\$want" ]; then echo MANAGED_SHA_MISMATCH >&2; rm -f "\$tmp"; exit 3; fi
+cur=\$(sha256sum "\$mf" 2>/dev/null | cut -d" " -f1); [ -n "\$cur" ] || cur=none
+support=no; enabled=n/a
+if grep -q ^MANAGED_FILE= "\$bx" 2>/dev/null; then
+  support=yes
+  # boxup is #!/bin/bash and its TOML reader uses the bash-only \`read -r -d\`.
+  # Invoking it under \`sh\` (dash on the boxes) makes that read error out, so a
+  # naive \`|| echo true\` fallback ALWAYS reported enabled=true and the
+  # enabled=false escape hatch could never surface (BLOCKER-2, live canary r1).
+  # Invoke via \`bash\` explicitly; on a genuine probe failure report
+  # enabled=unknown (NEVER true) so a failed probe is never mistaken for
+  # "honoured". The brain treats unknown like false for the IGNORED/annotation
+  # and never-report-in-sync paths (D7/D8).
+  enabled=\$(bash "\$bx" config-get managed enabled 2>/dev/null) || enabled=unknown
+  [ -n "\$enabled" ] || enabled=unknown
+fi
+if [ "\$dry" = 1 ]; then
+  rm -f "\$tmp"
+  echo "cur=\$cur want=\$want support=\$support enabled=\$enabled"
+  echo ---FILE---
+  cat "\$mf" 2>/dev/null || true
+  exit 0
+fi
+if [ "\$cur" = "\$want" ]; then
+  rm -f "\$tmp"
+else
+  mv -f "\$tmp" "\$mf"; chmod 600 "\$mf"
+fi
+now=\$(sha256sum "\$mf" 2>/dev/null | cut -d" " -f1); [ -n "\$now" ] || now=none
+echo "sha=\$now cur=\$cur support=\$support enabled=\$enabled"
+REMOTE
+}
+
+# push_managed <box> [--dry-run]: render + validate + push the managed.toml over
+# the tunnel using the seed_key_over_tunnel atomic idiom (D5). NOT enroll's
+# box_ssh awk transform — the whole-file-over-stdin, spool-then-sha-then-mv path.
+# Prints ONE brain log line and returns:
+#   0  in sync / pushed / dry-run OK
+#   3  remote stdin sha mismatch (a truncated/flapped stream is never installed)
+#   other  transport/write/validation failure (all non-zero => caller does D9)
+# The status the remote prints (`sha=… support=… enabled=…`) is parsed as
+# order-independent key=value tokens; unknown tokens are ignored (an added field
+# never breaks an older brain). The brain asserts the read-back sha == want_sha.
+push_managed() {
+  local box="$1" dry=0
+  case "${2:-}" in --dry-run) dry=1 ;; esac
+  local text rrc
+  text="$(render_managed "$box")"; rrc=$?
+  # A genuine render failure (awk could not read an input, etc.) must NEVER be
+  # pushed as a header-only file. Treat it like the D4-refuse path: warn + skip;
+  # the caller (reconcile_config_pass) bumps .cfgfail on any non-zero return.
+  if [ "$rrc" != 0 ]; then
+    log "config: $box render FAILED (rc=$rrc) — no push (would otherwise be an empty/partial managed.toml)"
+    return 4
+  fi
+  local verr
+  if ! verr="$(validate_managed "$text" 2>&1)"; then
+    log "config: $box render REFUSED by D4 validation — $verr"
+    return 4
+  fi
+  # D4 forward-compat: well-formed keys outside the known set are ALLOWED but
+  # logged at info. During a reconcile pass, reconcile_config_pass declares the
+  # run-scoped assoc array CONFIG_UNKNOWN_KEYS and we accumulate into it (deduped
+  # across boxes; the pass logs ONCE at the end). Outside a pass (the CLI
+  # `config render|diff|push` path) there is no such array, so we log here, once
+  # per invocation.
+  local _uk
+  if declare -p CONFIG_UNKNOWN_KEYS >/dev/null 2>&1; then
+    while IFS= read -r _uk; do
+      [ -n "$_uk" ] && CONFIG_UNKNOWN_KEYS["$_uk"]=1
+    done < <(unknown_managed_keys "$text")
+  else
+    local _uklist
+    _uklist="$(unknown_managed_keys "$text" | sort | paste -sd' ' -)"
+    [ -n "$_uklist" ] && log "config: $box unknown-but-well-formed keys (allowed, forward-compat): $_uklist"
+  fi
+  local want_sha
+  want_sha="$(printf '%s\n' "$text" | sha256sum | awk '{print $1}')"
+
+  # Remote script — the seed_key_over_tunnel idiom: the rendered text arrives on
+  # STDIN to `cat` (exactly as the seed feeds the key; nothing world-readable
+  # ever holds [ssh].password), and want_sha (NOT a secret) is interpolated into
+  # the script string. Run under `sudo sh -c '<script>'` so writes to the
+  # root-owned /workspace tree succeed while stdin stays the file bytes. The
+  # script deliberately contains NO single quotes (sha via cut, not awk) so it
+  # nests inside the outer single-quoted sh -c argument without escaping games.
+  #   step1  spool ALL of stdin to a tmp
+  #   step2  sha the tmp; mismatch => rm + MANAGED_SHA_MISMATCH + exit 3
+  #   step3  cur = sha of the live managed.toml (or 'none')
+  #   dry-run: print cur/want + support/enabled + `---FILE---` + file, rm tmp
+  #   step4  cur == want => rm tmp (no write, mtime untouched); else mv -f + chmod
+  #   step5  ALWAYS print one status line: sha=<now> support=<yes|no> enabled=<…>
+  # support = the box's boxup has a MANAGED_FILE= line (understands managed.toml)
+  # enabled read ONLY when support=yes, via the box's OWN reader (boxup config-get
+  # managed enabled) invoked under BASH (boxup is #!/bin/bash and uses the
+  # bash-only `read -r -d`; running it under dash `sh` errored and the old
+  # fallback wrongly reported enabled=true — BLOCKER-2). A genuine probe failure
+  # reports enabled=unknown (never true), which the brain treats like false for
+  # annotation and never-report-in-sync.
+  local remote
+  remote="$(managed_remote_script "$want_sha" "$dry")"
+  local out rc
+  out="$(printf '%s\n' "$text" | tunnel_ssh "$box" "sudo sh -c '$remote'" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    # rc 3 = remote stdin sha mismatch; anything else = transport/write failure.
+    log "config: $box push FAILED (rc=$rc) — no change applied"
+    return "$rc"
+  fi
+
+  # Parse the status line as order-independent key=value tokens. The status line
+  # is the FIRST line carrying a cur=/want=/sha= token (a dry-run diff appends
+  # `---FILE---` + file bytes AFTER it — those are ignored here).
+  local tok cur="" now_sha="" support="" enabled="" tokline
+  tokline="$(printf '%s\n' "$out" | awk '/(^| )cur=|(^| )sha=/{print; exit}')"
+  for tok in $tokline; do
+    case "$tok" in
+      cur=*)      cur="${tok#cur=}" ;;
+      sha=*)      now_sha="${tok#sha=}" ;;
+      support=*)  support="${tok#support=}" ;;
+      enabled=*)  enabled="${tok#enabled=}" ;;
+    esac
+  done
+
+  # Annotations from the status line (D5/D8).
+  local ann=""
+  [ "$enabled" = false ]   && ann="$ann [IGNORED locally: [managed] enabled=false]"
+  [ "$enabled" = unknown ] && ann="$ann [enabled UNKNOWN: box managed-status probe failed — cannot confirm the file is honoured]"
+  [ "$support" = no ]      && ann="$ann [inert: boxup lacks managed support — deploy boxup first]"
+
+  if [ "$dry" = 1 ]; then
+    if [ "$cur" = "$want_sha" ]; then
+      log "config: $box in sync${ann}"
+    else
+      log "config: $box WOULD push (${cur:-none}->$want_sha)${ann}"
+    fi
+    return 0
+  fi
+
+  # Apply path: read-back assertion (printed sha == want_sha, unless a no-op that
+  # left an already-identical file — in which case now_sha also == want_sha).
+  if [ "$now_sha" != "$want_sha" ]; then
+    log "config: $box push read-back MISMATCH (got ${now_sha:-none}, want $want_sha)"
+    return 5
+  fi
+  # Distinguish no-op from a real write for the operator log.
+  if [ "$cur" = "$want_sha" ]; then
+    log "config: $box in sync${ann}"
+  else
+    log "config: $box pushed (${cur:-none}->$want_sha)${ann}"
+  fi
+  return 0
+}
+
+# reconcile_bump_cfgfail / reconcile_reset_cfgfail (D9): same shape as checkfail.
+# The helper is PURE (bump the counter file, print the new count) — exactly like
+# reconcile_bump_checkfail / reconcile_bump_seedfail. The `notify warn` at count
+# > 3 lives at the CALL SITE (exactly like seedfail, fleetctl:2311-2313), NOT in
+# the helper: embedding notify here would (a) diverge from the checkfail/seedfail
+# shape and (b) be swallowed by the callers' `>/dev/null` in reconcile_config_pass.
+# Cleared on the next in-sync or successful push. Never retried within a tick.
+reconcile_bump_cfgfail() {
+  local box="$1" f n=0
+  f="$FLEET_STATE/$box.cfgfail"
+  [ -f "$f" ] && n=$(tr -d '[:space:]' < "$f" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1)); echo "$n" > "$f" 2>/dev/null || true
+  printf '%s' "$n"
+}
+reconcile_reset_cfgfail() { rm -f "$FLEET_STATE/$1.cfgfail" 2>/dev/null || true; }
+
+# reconcile_config_pass <apply>: FLEET-WIDE config-truth pass (D6). NOT a
+# reconcile_decide token — it needs no device-list input and must run for
+# in-sync boxes too. Mirrors reconcile_rollout's shape: returns immediately
+# (SILENT) when the D2 files are absent; otherwise iterates the canary FIRST
+# then the remaining reconcile_target_boxes order, SERIALLY. Per box guard:
+# tunnel_up AND the box's checkfail COUNT is at/under the threshold (>3 =
+# unhealthy, matching reconcile_decide's fleetctl:2147 gate), else skip
+# silently. A HEALTHY box carries a `0`-content .checkfail FILE that
+# reconcile_reset_checkfail rewrites every tick, so gating on file PRESENCE
+# (BLOCKER-1, live canary r1) skipped EVERY healthy box — the whole fleet — on
+# every real tick. An absent file / content 0 = healthy = eligible.
+# DRY-RUN (apply=0) =>
+# push_managed --dry-run; --apply => push_managed. Canary failure (D5 non-zero
+# or D4 refusal) => notify warn, ABORT the rest of the pass this tick; a
+# non-canary failure => D9 for that box, continue. Returns non-zero iff any box
+# failed (folds into cmd_reconcile's rc like reconcile_one).
+reconcile_config_pass() {
+  local apply="${1:-0}"
+  managed_files_present || return 0   # feature off => silent no-op
+  # Run-scoped set of unknown-but-well-formed keys (D4 forward-compat). Declared
+  # here so push_managed accumulates into it (deduped) across every box in this
+  # pass; logged ONCE below. `local -A` scopes it to this pass invocation.
+  local -A CONFIG_UNKNOWN_KEYS=()
+  local canary; canary="$(reconcile_canary_box)"
+  local mode="dry-run"; [ "$apply" = 1 ] && mode="apply"
+  log "config: pass start ($mode) — canary-first over tunnels (canary=$canary)"
+
+  # Ordered target list: canary FIRST, then the rest in enrolled order.
+  local -a rest=() b
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    [ "$b" = "$canary" ] && continue
+    rest+=("$b")
+  done < <(reconcile_target_boxes)
+
+  local rc=0
+
+  # canary_skippable <box>: 0 iff tunnel down OR the box is over the checkfail
+  # threshold (>3, like reconcile_decide:2147). A `0`-content .checkfail FILE is
+  # HEALTHY and must NOT skip the box (BLOCKER-1). (drift reported when the box
+  # returns — same guard as the per-box loop below).
+  _cfg_push_one() {
+    local box="$1"
+    if [ "$apply" = 1 ]; then push_managed "$box"; else push_managed "$box" --dry-run; fi
+  }
+
+  # Canary first. An unreachable/over-threshold canary is skipped SILENTLY (no
+  # abort — abort is reserved for a real push/validation FAILURE, mirroring
+  # rollout).
+  if tunnel_up "$canary" && [ "$(reconcile_checkfail_count "$canary")" -le 3 ]; then
+    if _cfg_push_one "$canary"; then
+      reconcile_reset_cfgfail "$canary"
+    else
+      notify warn "config: canary $canary push/validate FAILED — aborting the rest of the config pass this tick"
+      reconcile_bump_cfgfail "$canary" >/dev/null
+      unset -f _cfg_push_one
+      return 1
+    fi
+  fi
+
+  # The rest, serially.
+  for b in "${rest[@]}"; do
+    if ! tunnel_up "$b"; then
+      log "config: skip $b — tunnel down (drift reported when the box returns)"
+      continue
+    fi
+    if [ "$(reconcile_checkfail_count "$b")" -gt 3 ]; then
+      log "config: skip $b — checkfail over threshold (>3; drift reported when the box returns)"
+      continue
+    fi
+    if _cfg_push_one "$b"; then
+      reconcile_reset_cfgfail "$b"
+    else
+      local n; n="$(reconcile_bump_cfgfail "$b")"   # D9; continue with the rest
+      [ "$n" -gt 3 ] 2>/dev/null && notify warn "config push failing for $b: $n consecutive failures"
+      rc=1
+    fi
+  done
+  unset -f _cfg_push_one
+  # D4 forward-compat: emit ONE info log per reconcile run listing the unknown-
+  # but-well-formed keys seen across ALL boxes this pass (deduped, sorted).
+  if [ "${#CONFIG_UNKNOWN_KEYS[@]}" -gt 0 ]; then
+    local _uklist
+    _uklist="$(printf '%s\n' "${!CONFIG_UNKNOWN_KEYS[@]}" | sort | paste -sd' ' -)"
+    log "config: unknown-but-well-formed keys (allowed, forward-compat): $_uklist"
+  fi
+  log "config: pass done ($mode)"
+  return "$rc"
+}
+
 # --- reconcile — the decision table (§3) -------------------------------------
 # reconcile [--apply]. DRY-RUN by default (log intended actions, mutate
 # nothing). Per-run flock. On ANY API non-2xx the run is READ-ONLY (S3).
@@ -1802,6 +2251,11 @@ cmd_reconcile() {
   for b in "${boxes[@]}"; do
     reconcile_one "$b" "$devs" "$apply" "$RECONCILE_READONLY" || rc=1
   done
+  # config-truth fleet-wide pass (D6): runs for in-sync boxes too, needs no
+  # device list. Inserted between the per-box loop and the closing log line; the
+  # fd-9 flock is STILL HELD here (released only when cmd_reconcile returns), and
+  # its non-zero result folds into rc like reconcile_one's.
+  reconcile_config_pass "$apply" || rc=1
   log "reconcile: done ($mode)"
   return "$rc"
 }
@@ -2265,6 +2719,17 @@ reconcile_bump_checkfail() {
   printf '%s' "$n"
 }
 reconcile_reset_checkfail() { echo 0 > "$FLEET_STATE/$1.checkfail" 2>/dev/null || true; }
+# reconcile_checkfail_count <box>: print the box's current consecutive-checkfail
+# COUNT (0 when the file is absent, empty, or non-numeric). A HEALTHY box carries
+# a `0`-content file (reconcile_reset_checkfail writes `echo 0 >` every tick), so
+# file PRESENCE is not "unhealthy" — only a count over the threshold is. Same
+# read/normalise idiom as reconcile_bump_checkfail's own preamble.
+reconcile_checkfail_count() {
+  local f="$FLEET_STATE/$1.checkfail" n=0
+  [ -f "$f" ] && n=$(tr -d '[:space:]' < "$f" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
 
 # --- P1-2 seed-failure counter (mint 2xx but seed never converges) -----------
 reconcile_bump_seedfail() {
@@ -2377,6 +2842,101 @@ dev_field() {
   ' 2>/dev/null
 }
 
+# --- config-truth operator surface (D7) --------------------------------------
+# fleetctl config render|diff|push <box>. All three REFUSE for boxes not in
+# enrolled.tsv. render = stdout only; push = D5 for ONE box (independent of the
+# reconcile apply flag — the operator canary + the empirical gate's live tool);
+# diff = push_managed --dry-run + a unified diff of on-box vs rendered, fetching
+# the on-box file in the SAME round trip (remote prints it after a `---FILE---`
+# marker), exit 1 on drift / 0 in sync; ALWAYS annotates enabled=false /
+# enabled=unknown / support=no as "pushed values are IGNORED/unverifiable on
+# this box" so it never reports in-sync for an ignored or unverifiable file.
+cmd_config_enrolled() {
+  local box="$1" b
+  while IFS= read -r b; do [ "$b" = "$box" ] && return 0; done < <(reconcile_target_boxes)
+  return 1
+}
+
+cmd_config() {
+  local sub="${1:-}"; shift 2>/dev/null || true
+  local box="${1:-}"
+  case "$sub" in
+    render|diff|push) : ;;
+    *) echo "fleetctl config: usage: config render|diff|push <box>" >&2; return 2 ;;
+  esac
+  if [ -z "$box" ]; then echo "fleetctl config $sub: need a box name" >&2; return 2; fi
+  if ! cmd_config_enrolled "$box"; then
+    echo "fleetctl config $sub: $box is not enrolled (not in enrolled.tsv) — refusing" >&2
+    return 2
+  fi
+
+  case "$sub" in
+    render)
+      render_managed "$box"
+      return $?
+      ;;
+    push)
+      # D5 for ONE box; the operator canary. Same push_managed as reconcile row-e.
+      push_managed "$box"
+      return $?
+      ;;
+    diff)
+      # Dry-run round trip: status tokens + the on-box file after `---FILE---`.
+      local text want_sha out rc rrc
+      text="$(render_managed "$box")"; rrc=$?
+      if [ "$rrc" != 0 ]; then
+        echo "fleetctl config diff: $box render FAILED (rc=$rrc) — refusing (would be an empty/partial managed.toml)" >&2
+        return 2
+      fi
+      local verr
+      if ! verr="$(validate_managed "$text" 2>&1)"; then
+        echo "fleetctl config diff: $box render REFUSED by D4 — $verr" >&2
+        return 2
+      fi
+      want_sha="$(printf '%s\n' "$text" | sha256sum | awk '{print $1}')"
+      local remote
+      remote="$(managed_remote_script "$want_sha" 1)"
+      out="$(printf '%s\n' "$text" | tunnel_ssh "$box" "sudo sh -c '$remote'" 2>/dev/null)"
+      rc=$?
+      if [ "$rc" != 0 ]; then
+        echo "fleetctl config diff: $box unreachable/failed (rc=$rc)" >&2
+        return 2
+      fi
+      # Split at the ---FILE--- marker.
+      local statusline onbox cur support enabled tok
+      statusline="$(printf '%s\n' "$out" | awk '/(^| )cur=/{print; exit}')"
+      onbox="$(printf '%s\n' "$out" | awk 'f{print} /^---FILE---$/{f=1}')"
+      cur=""; support=""; enabled=""
+      for tok in $statusline; do
+        case "$tok" in
+          cur=*)     cur="${tok#cur=}" ;;
+          support=*) support="${tok#support=}" ;;
+          enabled=*) enabled="${tok#enabled=}" ;;
+        esac
+      done
+      # Unified diff: on-box (current) vs rendered (desired).
+      diff -u <(printf '%s\n' "$onbox") <(printf '%s\n' "$text") \
+        --label "on-box:$box/managed.toml" --label "rendered:$box" || true
+      # ALWAYS annotate an ignored/unverifiable file so we never report in-sync for one.
+      if [ "$enabled" = false ]; then
+        echo "NOTE: [managed] enabled=false on $box — pushed values are IGNORED on this box"
+      fi
+      if [ "$enabled" = unknown ]; then
+        echo "NOTE: could not read [managed] enabled on $box (managed-status probe failed) — cannot confirm pushed values are honoured"
+      fi
+      if [ "$support" = no ]; then
+        echo "NOTE: boxup on $box lacks managed support — pushed values are IGNORED (deploy boxup first)"
+      fi
+      # Exit 1 on drift, 0 in sync. An ignored OR unverifiable file is NEVER
+      # reported in sync (enabled must be positively not-false and not-unknown).
+      if [ "$cur" = "$want_sha" ] && [ "$enabled" != false ] && [ "$enabled" != unknown ] && [ "$support" != no ]; then
+        return 0
+      fi
+      return 1
+      ;;
+  esac
+}
+
 # --- status (brain fleet table) ----------------------------------------------
 # fleetctl status is ALREADY defined above (laptop-side, boxup status per box).
 # The brain adds `fleet-status`: API online/lastSeen + tunnel up + boxup check
@@ -2436,6 +2996,9 @@ Brain subcommands (docs/FLEET-BRAIN.md — run on the VPS + laptop):
   fleetctl enroll --no-box-config <grok-box-N>
                                  as above but SKIP the box-side [fleet] write
   fleetctl reconcile [--apply]   the 5-min decision table (DRY-RUN by default)
+  fleetctl config render <box>   print the box's rendered managed.toml (stdout)
+  fleetctl config diff <box>     unified diff of on-box vs rendered (exit 1 on drift)
+  fleetctl config push <box>     push the rendered managed.toml to ONE box (D5)
   fleetctl mint-key <grok-box-N> mint a per-box tag-scoped key + atomic seed
   fleetctl fleet-status          brain table: API / tunnel / check / authkey / ver
   fleetctl version | help
@@ -2466,6 +3029,7 @@ case "$cmd" in
   remove-timer)          cmd_remove_timer "$@" ;;
   enroll)                cmd_enroll "$@" ;;
   reconcile)             cmd_reconcile "$@" ;;
+  config)                cmd_config "$@" ;;
   mint-key)              cmd_mint_key "$@" ;;
   fleet-status)          cmd_fleet_status "$@" ;;
   version|--version)     echo "fleetctl $FLEETCTL_VERSION" ;;

@@ -52,6 +52,26 @@
 # install.sh — never `git pull` in place.
 #repo = "https://github.com/chaogebaba/grok-box-setup.git"
 
+[managed]
+# FLEET-BRAIN config-truth escape hatch (docs/FLEET-BRAIN.md §config-truth).
+#
+# When the VPS brain manages this fleet it pushes a SEPARATE file,
+# /workspace/box-setup/managed.toml (written only by the brain — hand edits are
+# overwritten on the next reconcile). For any key present there, managed.toml
+# WINS over this file: precedence is env > managed.toml > config.toml > default.
+#
+# Set `enabled = false` to make THIS box ignore managed.toml entirely — the
+# brain still pushes and records the file, but boxup falls back to the
+# config.toml value below (and logs "managed.toml ignored by local config" once
+# per converge). `fleetctl config diff` annotates such a box as IGNORED and
+# never reports it in-sync. Default (key absent) is true: the managed layer is
+# on. This is the box-side escape hatch; the brain-side one is a per-box
+# override in the brain's boxes/<box>.toml (see etc/fleet.example.toml).
+#
+# Missing managed.toml = today's behaviour exactly (config.toml only), so an
+# un-managed fleet is unaffected whether or not this key is set.
+#enabled = true
+
 [fleet]
 # FLEET-BRAIN out-of-band reverse-SSH tunnel (docs/FLEET-BRAIN.md §1).
 #

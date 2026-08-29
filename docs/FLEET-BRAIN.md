@@ -255,6 +255,117 @@ wall above.
    at enroll time — NO password fallback in the reconciler — then `sudo boxup
    once/check`; the box's converge lock serializes.
 
+## §config-truth — the brain is the source of truth for box config (Phase 2)
+
+The operator edits box configuration ONCE, on the brain; `reconcile` converges
+every enrolled, reachable box to it. Boxes stay correct across image swaps and
+hand edits without anyone ssh-ing to a box. `config.toml` stays the box's own
+file; a SEPARATE brain-pushed file carries the managed layer.
+
+### Layout
+
+Brain side (`$FLEET_ETC`, default `/etc/grok-fleet`, mode 600 root — alongside
+the PAT and tunnel key), both files OPTIONAL:
+
+| Path | What |
+|---|---|
+| `$FLEET_ETC/fleet.toml` | fleet-wide desired config |
+| `$FLEET_ETC/boxes/<box>.toml` | per-box overrides (e.g. `boxes/grok-box-8.toml`) |
+
+Box side: `/workspace/box-setup/managed.toml` — mode 600 root, under
+`/workspace` so it survives an image swap like `config.toml`. **BOTH brain
+files absent = the feature is OFF, silently:** reconcile pushes nothing and
+generates no tunnel traffic. See `etc/fleet.example.toml` for the annotated
+brain file and `etc/config.example.toml` `[managed]` for the box-side gate.
+
+### Render / merge
+
+Each tick the brain renders a per-box `managed.toml` by merging `fleet.toml`
+then `boxes/<box>.toml`: key-level, **last-wins per `(table,key)`**. The
+`(table,key)` order is first-seen over the concatenated fleet-then-box stream,
+and a box override replaces the VALUE in place at the key's first-seen position
+(never reorders) — a total ordering, so **identical inputs render identical
+bytes** (the header carries no timestamp). Drift detection is then a pure
+`sha256` compare. `key = value` values are rendered **verbatim** (quotes and
+all); the box's own reader strips quotes at read time, so brain and box never
+disagree on the grammar. Comments/blank lines are dropped. No applicable keys
+⇒ header only (a valid, still-pushed state that keeps drift detection uniform).
+
+The push is atomic and never touches a world-readable scratch file: the
+rendered text is fed to the box on stdin (the `seed_key_over_tunnel` idiom),
+spooled to a tmp, sha-checked against the brain's `want_sha` (a truncated or
+flapped stream can never be installed — `exit 3`, file unchanged), and only
+then `mv -f` into place. An unchanged file is a no-op (mtime untouched).
+
+### Precedence
+
+On the box, per key: **env override (where one exists) > `managed.toml` >
+`config.toml` > baked default.** A key present in BOTH box files is shadowed by
+`managed.toml` (the brain wins). `config diff` shows the effective value.
+
+### Brain-wins semantics
+
+The brain wins **every tick**: `managed.toml` is written only by the brain, and
+any hand edit to it on a box is transient — the next reconcile overwrites it
+back to the rendered desired state. If you need a box to differ, use an escape
+hatch below; do not hand-edit `managed.toml`.
+
+### Escape hatches
+
+- **Brain side:** a `boxes/<box>.toml` override IS the per-box mechanism — its
+  value replaces the fleet-wide value in place for that box only.
+- **Box side:** `[managed] enabled = false` in that box's `config.toml`. The
+  brain still pushes and records the file in-sync, but boxup ignores it and
+  falls back to `config.toml` (logging "managed.toml ignored by local config"
+  once per converge). Every brain log line and `config diff` for that box carry
+  an `IGNORED` annotation, so the tool never reports an ignored file as in-sync.
+
+### Tags unsupported in Phase 2
+
+`[tailscale].tags` is **not** brain-managed: it is first-login-only on the box
+(inert on an already-registered node), so pushing it would be a no-op. The D4
+validator REFUSES a render containing `[tailscale].tags` (and any `[fleet]`
+table — that is enroll-owned bootstrap). Retagging stays the manual operator
+step (docs/AGENT.md §F). Revisit in Phase 3.
+
+### Canary flow
+
+`reconcile_config_pass` runs as a fleet-wide pass AFTER the per-box decision
+loop each tick (it needs no device list and must run for in-sync boxes too). It
+mirrors the row-d rollout shape: the **canary box first** (`[fleet-brain].canary_box`,
+default 8), then the rest in enrolled order, SERIALLY — one extra tunnel round
+trip per awake box per tick. A box whose tunnel is down or that has a
+`.checkfail` state is skipped silently (its drift is reported when it returns).
+A DRY RUN (no `--apply`) pushes `--dry-run` and logs `in sync` / `WOULD push
+(old->new)`; `--apply` pushes for real. **Canary failure** (a D5 non-zero or a
+D4 refusal) fires `notify warn` and ABORTS the rest of the pass this tick; a
+**non-canary failure** bumps that box's `.cfgfail` (a warn fires once the count
+crosses > 3, exactly like seedfail) and continues with the rest.
+
+### PRECONDITION (do not skip)
+
+**Deploy a managed.toml-aware boxup to EVERY box BEFORE you create `fleet.toml`.**
+An older boxup silently ignores `managed.toml`; the brain detects this (the
+box reports `support=no`) and logs it — `config diff` annotates the box as
+inert — but the brain cannot make that box honour the pushed file. Roll boxup
+out first via the canary-first row-d rollout, THEN create `fleet.toml`.
+
+### Operator recipe
+
+```
+# after boxup is deployed fleet-wide (see PRECONDITION):
+$EDITOR /etc/grok-fleet/fleet.toml                 # + boxes/<box>.toml as needed
+fleetctl config render grok-box-8                  # inspect the merged result
+fleetctl config diff   grok-box-8                  # exit 1 = drift, 0 = in sync
+fleetctl config push   grok-box-8                  # push the canary first, by hand
+fleetctl config diff   grok-box-8                  # confirm in sync (exit 0)
+# reconcile then converges the rest under --apply (canary-first, serial)
+```
+
+All three `config` subcommands refuse a box that is not in `enrolled.tsv`.
+`config push` uses the SAME `push_managed` as the reconcile pass — one code
+path, no second implementation.
+
 ## Ops notes
 
 - **`fleetctl enroll grok-box-N` now writes the BOX side too (one-step enroll).** Enroll installs the VPS-side `authorized_keys` line AND writes the box's own `/workspace/box-setup/config.toml` `[fleet]` block (`vps` + `box_index`, plus `port` when the VPS sshd port is non-default) over the SAME OpenSSH-on-the-tailnet session it uses to read the tunnel pubkey (`box_ssh` + `sudo`). So the box starts dialing its reverse tunnel on the next `boxup once` with **no manual hand-edit** — closing the historical two-part-enroll gap where the VPS trusted the box's key but the box never dialed out (tunnel stayed dead until someone edited `config.toml`). The write is **idempotent**: same values ⇒ a byte-for-byte no-op (file + mode `600` untouched); differing values ⇒ the key lines are replaced in place (the rest of the file preserved), and the `[fleet]` block is never duplicated. After writing, enroll **reads every key back off the box and asserts it** — a mismatch is treated as a write failure. The box-config write is the **last side effect before the enrollment is recorded**: on failure enroll logs a WARNING, does **not** record the enrollment, and returns non-zero (the VPS-side key is left in place — harmless, the retry is idempotent). If the box's `config.toml` is **absent** (box never ran `install.sh`), enroll says so distinctly ("run install.sh on the box first") and never creates the file.

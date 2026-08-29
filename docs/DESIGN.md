@@ -31,6 +31,7 @@ Everything the box must remember lives in `/workspace/box-setup/`:
 | `hostname` | chosen `grok-box-N` | naming survives everything |
 | `bin/tailscale{,d}` | vendored static binaries | daemon restarts after swap without apt or network |
 | `config.toml` | user config (password, pins) | seeded once, never overwritten |
+| `managed.toml` | brain-pushed config (FLEET-BRAIN §config-truth) | written ONLY by the VPS brain; hand edits are overwritten on the next reconcile. Missing = feature off. Under `/workspace` so it survives a swap like `config.toml` |
 | `secrets/ts-authkey` | optional reusable join key | unattended re-join if state is ever lost |
 
 `/run/box-setup/` (hb, ipfwd.env, last-recycle, last-online, offline-ticks,

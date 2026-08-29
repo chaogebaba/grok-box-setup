@@ -1979,6 +1979,619 @@ INNER
 [ "$(noboxcfg_test after)" = "WRITER=skipped" ] && pass "enroll-cfg: --no-box-config (after name) SKIPS the box-side write (order-independent)" || bad "enroll-cfg --no-box-config(after) did not skip: [$(noboxcfg_test after)]"
 [ "$(noboxcfg_test none)" = "WRITER=called" ] && pass "enroll-cfg: default (no flag) DOES write the box-side [fleet] block" || bad "enroll-cfg default did not write: [$(noboxcfg_test none)]"
 
+# =============================================================================
+# CONFIG-TRUTH (PHASE 2, blueprint D2-D9/D11) — render/validate/push/reconcile/
+# operator surface. Box-free + VPS-free: the on-box side of push runs LOCALLY
+# via a fake tunnel_ssh that strips the `sudo sh -c '<script>'` wrapper and runs
+# the script with STDIN PASSED THROUGH UNMODIFIED (a trailing-newline-stripping
+# stub would spuriously trip the sha gate — the real ssh streams stdin verbatim).
+# =============================================================================
+
+# cfg_env: emit the common preamble that extracts the config-truth functions and
+# points the D2 files at a fresh fixture dir. $1 = fixture dir.
+CFG_FIXROOT="$(mktemp -d)"
+cfg_fixture() {
+  # $1 = subdir name; writes fleet.toml (+ optional boxes/<box>.toml via $2/$3).
+  local d="$CFG_FIXROOT/$1"; mkdir -p "$d/boxes"; printf '%s' "$d"
+}
+
+# render_test: drive the REAL render_managed over fixtures. args: fleet-content
+# boxcontent(|__none__) box
+render_test() {
+  local fleetc="$1" boxc="$2" box="$3" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/boxes"
+  printf '%s' "$fleetc" > "$d/fleet.toml"
+  [ "$boxc" != "__none__" ] && printf '%s' "$boxc" > "$d/boxes/$box.toml"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"
+FLEET_MANAGED_BOXDIR="$d/boxes"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+render_managed "$box"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+
+FLEETC='[update]
+repo = "https://fleet/repo.git"
+[ssh]
+password = "fleetpass"
+'
+BOXC='[ssh]
+password = "boxpass"
+[tailscale]
+version = "1.80.0"
+'
+render_out="$(render_test "$FLEETC" "$BOXC" grok-box-8)"
+# Order = first-seen over fleet-then-box: update, ssh, tailscale. Box override
+# replaces the ssh.password VALUE in place (never reorders). Values are emitted
+# VERBATIM (D3 "key = value lines verbatim") — quotes are preserved; boxup's own
+# reader strips them at read time, so the on-box effective value is unchanged.
+case "$render_out" in
+  *'[update]'*'repo = "https://fleet/repo.git"'*'[ssh]'*'password = "boxpass"'*'[tailscale]'*'version = "1.80.0"'*)
+    pass "config render: fleet-then-box merge, box override replaces value in place, first-seen order (verbatim RHS)" ;;
+  *) bad "config render merge/order wrong: [$render_out]" ;;
+esac
+# fleetpass must be SHADOWED by boxpass (last-wins per key).
+case "$render_out" in *fleetpass*) bad "config render: box override did NOT shadow fleet value" ;; *) pass "config render: box override shadows the fleet value (last-wins per key)" ;; esac
+# Byte determinism: two renders of identical inputs are byte-identical.
+r1="$(render_test "$FLEETC" "$BOXC" grok-box-8 | sha256sum)"
+r2="$(render_test "$FLEETC" "$BOXC" grok-box-8 | sha256sum)"
+[ "$r1" = "$r2" ] && pass "config render: byte-deterministic (identical inputs => identical bytes, no timestamps)" || bad "config render NOT deterministic"
+# No applicable keys => header only (still valid). The header itself contains a
+# '=' (the '# [managed] enabled = false' comment line), so a leak is a NON-COMMENT
+# line carrying '=' — strip comment/blank lines before counting.
+hdronly="$(render_test '' __none__ grok-box-9)"
+case "$hdronly" in *'WRITTEN BY THE VPS BRAIN'*) [ "$(printf '%s\n' "$hdronly" | grep -v '^[[:space:]]*#' | grep -c '=')" = 0 ] && pass "config render: no keys => header only (empty managed is a valid pushed state)" || bad "header-only render leaked keys: [$hdronly]" ;; *) bad "header-only render missing header: [$hdronly]" ;; esac
+
+# render_present_test: drive REAL render_managed with per-file PRESENCE control
+# and capture BOTH the output and the exit status. Guards the P1 regression:
+# awk goes fatal (END skipped) if handed a path it cannot open, which would
+# silently render header-only + push an empty managed.toml for the normal
+# production case (fleet.toml present, NO per-box file). args:
+#   fleet(__absent__|content)  box(__absent__|content)  box-name  awkfail(0|1)
+# awkfail=1 shadows `awk` with a failing stub to prove a genuine render failure
+# propagates a non-zero rc (robust across users — root can read a chmod-000 file).
+render_present_test() {
+  local fleetc="$1" boxc="$2" box="$3" awkfail="${4:-0}" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/boxes"
+  [ "$fleetc" != "__absent__" ] && printf '%s' "$fleetc" > "$d/fleet.toml"
+  [ "$boxc" != "__absent__" ] && printf '%s' "$boxc" > "$d/boxes/$box.toml"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"
+FLEET_MANAGED_BOXDIR="$d/boxes"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+[ "$awkfail" = 1 ] && awk(){ return 3; }   # force a genuine render failure
+out="\$(render_managed "$box" 2>/dev/null)"; rc=\$?
+printf '%s\n' "\$out"
+echo "RENDRC=\$rc"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+FLEET_ONLY='[update]
+repo = "https://fleet/repo.git"
+'
+BOX_ONLY='[tailscale]
+version = "1.80.0"
+'
+# (a) fleet.toml populated + box file ABSENT => fleet keys render (NOT header-only), rc 0.
+rp_a="$(render_present_test "$FLEET_ONLY" __absent__ grok-box-8)"
+case "$rp_a" in
+  *'repo = "https://fleet/repo.git"'*"RENDRC=0"*) pass "config render P1: fleet.toml present + box file ABSENT => fleet keys render (not header-only), rc 0" ;;
+  *) bad "P1 render (a) lost fleet keys with box absent: [$rp_a]" ;;
+esac
+# (b) box file present + fleet.toml ABSENT => box keys render, rc 0.
+rp_b="$(render_present_test __absent__ "$BOX_ONLY" grok-box-8)"
+case "$rp_b" in
+  *'version = "1.80.0"'*"RENDRC=0"*) pass "config render P1: box file present + fleet.toml ABSENT => box keys render, rc 0" ;;
+  *) bad "P1 render (b) lost box keys with fleet absent: [$rp_b]" ;;
+esac
+# (c) BOTH absent => header only, rc 0.
+rp_c="$(render_present_test __absent__ __absent__ grok-box-8)"
+case "$rp_c" in
+  *"RENDRC=0"*) [ "$(printf '%s\n' "$rp_c" | grep -v '^[[:space:]]*#' | grep -v '^RENDRC=' | grep -c '=')" = 0 ] && pass "config render P1: BOTH D2 files absent => header only, rc 0" || bad "P1 render (c) leaked keys with both absent: [$rp_c]" ;;
+  *) bad "P1 render (c) non-zero rc with both absent: [$rp_c]" ;;
+esac
+# (d) a genuine render (awk) failure => non-zero rc propagates.
+rp_d="$(render_present_test "$FLEET_ONLY" __absent__ grok-box-8 1)"
+case "$rp_d" in
+  *"RENDRC=0"*) bad "P1 render (d) swallowed an awk failure (rc 0): [$rp_d]" ;;
+  *"RENDRC="*) case "$rp_d" in *"RENDRC=3"*) pass "config render P1: a genuine render/awk failure propagates a non-zero rc" ;; *) bad "P1 render (d) wrong rc: [$rp_d]" ;; esac ;;
+  *) bad "P1 render (d) no rc: [$rp_d]" ;;
+esac
+
+# (d') the render failure must reach the PUSH path: push_managed refuses and
+# writes NOTHING. Drives REAL push_managed with a failing awk stub.
+render_fail_push_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box"
+  printf '%s' "$FLEET_ONLY" > "$d/fleet.toml"
+  printf 'MANAGED_FILE=/x\n' > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# render_managed uses awk internally; shadow it AFTER the functions are defined
+# so the render fails but nothing else depends on this stub firing first.
+render_managed(){ managed_header; return 7; }   # simulate a propagated render failure
+tunnel_ssh(){ echo "TUNNEL-CALLED" ; }          # must NOT be reached
+push_managed grok-box-8; echo "PUSHRC=\$?"
+[ -f "$d/box/managed.toml" ] && echo "ONBOX=present" || echo "ONBOX=absent"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+rp_push="$(render_fail_push_test)"
+case "$rp_push" in *"TUNNEL-CALLED"*) bad "P1 push: a render failure still reached the tunnel/push: [$rp_push]" ;; *"PUSHRC=4"*) case "$rp_push" in *"ONBOX=absent"*) pass "config push P1: a render failure => push REFUSES (rc 4), nothing pushed" ;; *) bad "P1 push wrote a file despite render failure: [$rp_push]" ;; esac ;; *) bad "P1 push did not refuse on render failure: [$rp_push]" ;; esac
+
+# validate_managed (D4): drive the REAL function.
+validate_test() {
+  local text="$1" inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "\$FLEETCTL" validate_managed)"
+if validate_managed "$text" >/dev/null 2>&1; then echo OK; else echo REFUSE; fi
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+[ "$(validate_test '[update]
+repo = x')" = OK ] && pass "config D4: a clean [update] block validates OK" || bad "D4 clean rejected"
+[ "$(validate_test '[fleet]
+vps = x')" = REFUSE ] && pass "config D4: [fleet] table REFUSED (enroll owns it)" || bad "D4 did not refuse [fleet]"
+[ "$(validate_test '[tailscale]
+tags = a')" = REFUSE ] && pass "config D4: [tailscale].tags REFUSED (first-login-only, out of scope)" || bad "D4 did not refuse tags"
+[ "$(validate_test '[ssh]
+garbage no equals')" = REFUSE ] && pass "config D4: unparsable line REFUSED" || bad "D4 did not refuse unparsable"
+[ "$(validate_test '[weird]
+k = v')" = REFUSE ] && pass "config D4: table outside boxup subset REFUSED" || bad "D4 did not refuse unknown table"
+[ "$(validate_test '[update]
+future_key = 1')" = OK ] && pass "config D4: unknown-but-well-formed key ALLOWED (forward compatible)" || bad "D4 wrongly refused a well-formed unknown key"
+
+# push_test: drive the REAL push_managed with a fake tunnel_ssh that runs the
+# remote script locally. args: fleet-content box-content enabled support dryflag
+#   support=yes => fake boxup has MANAGED_FILE= ; enabled controls config-get
+#   preseed: optional pre-existing on-box managed.toml content ($6)
+push_test() {
+  local fleetc="$1" boxc="$2" enabled="$3" support="$4" dry="$5" preseed="${6:-__none__}" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box"
+  printf '%s' "$fleetc" > "$d/fleet.toml"
+  [ "$boxc" != "__none__" ] && printf '%s' "$boxc" > "$d/boxes/grok-box-8.toml"
+  [ "$preseed" != "__none__" ] && printf '%s' "$preseed" > "$d/box/managed.toml"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"
+FLEET_MANAGED_BOXDIR="$d/boxes"
+BOX_ROOT="$d/box"
+BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# Fake boxup: MANAGED_FILE= line iff support=yes; answers config-get accordingly.
+if [ "$support" = yes ]; then
+  printf 'MANAGED_FILE=/x\ncase "\$1 \$2 \$3" in "config-get managed enabled") echo %s;; esac\n' "$enabled" > "$d/box/boxup"
+else
+  : > "$d/box/boxup"
+fi
+# Fake tunnel_ssh: strip the sudo sh -c wrapper, run with stdin passed through.
+tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
+if [ "$dry" = 1 ]; then push_managed grok-box-8 --dry-run; else push_managed grok-box-8; fi
+echo "PUSHRC=\$?"
+[ -f "$d/box/managed.toml" ] && echo "ONBOX-SHA=\$(sha256sum "$d/box/managed.toml" | cut -d' ' -f1)" || echo "ONBOX=absent"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+
+# D5 write path (support=yes, enabled=true, empty box): pushes, rc 0.
+p_write="$(push_test "$FLEETC" "$BOXC" true yes 0)"
+case "$p_write" in *"pushed (none->"*"PUSHRC=0"*) pass "config push D5: first push writes managed.toml (none->sha), rc 0" ;; *) bad "D5 write wrong: [$p_write]" ;; esac
+
+# D5 no-op: pre-seed the box with the EXACT rendered bytes => in sync, rc 0.
+rendered="$(render_test "$FLEETC" "$BOXC" grok-box-8)"
+p_noop="$(push_test "$FLEETC" "$BOXC" true yes 0 "$rendered
+")"
+case "$p_noop" in *"in sync"*"PUSHRC=0"*) pass "config push D5: identical on-box file => in sync (no write), rc 0" ;; *) bad "D5 no-op wrong: [$p_noop]" ;; esac
+
+# D5 dry-run WOULD push wording.
+p_dry="$(push_test "$FLEETC" "$BOXC" true yes 1)"
+case "$p_dry" in *"WOULD push (none->"*"PUSHRC=0"*) pass "config push D5: dry-run => 'WOULD push', writes NOTHING, rc 0" ;; *) bad "D5 dry-run wording wrong: [$p_dry]" ;; esac
+case "$p_dry" in *ONBOX=absent*) pass "config push D5: dry-run leaves the box file absent (no write)" ;; *) bad "D5 dry-run WROTE a file: [$p_dry]" ;; esac
+
+# D5 truncated-stdin => exit 3, file unchanged. Fake a corrupting tunnel_ssh.
+trunc_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box"
+  printf '%s' "$FLEETC" > "$d/fleet.toml"; printf '%s' "$BOXC" > "$d/boxes/grok-box-8.toml"
+  printf 'PRE-EXISTING\n' > "$d/box/managed.toml"; printf 'MANAGED_FILE=/x\n' > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# Corrupting tunnel_ssh: append to stdin so the remote sha never matches want.
+tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sed 's/\$/X/' | sh -c "\$s"; }
+push_managed grok-box-8; echo "PUSHRC=\$?"
+echo "FILE=\$(cat "$d/box/managed.toml")"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+p_trunc="$(trunc_test)"
+case "$p_trunc" in *"PUSHRC=3"*) pass "config push D5: truncated/corrupt stdin => exit 3 (sha mismatch)" ;; *) bad "D5 truncated exit wrong: [$p_trunc]" ;; esac
+case "$p_trunc" in *"FILE=PRE-EXISTING"*) pass "config push D5: sha mismatch leaves the on-box file UNCHANGED" ;; *) bad "D5 truncated clobbered file: [$p_trunc]" ;; esac
+
+# D5/D8 status-line annotations: enabled=false => IGNORED; support=no => inert.
+p_ign="$(push_test "$FLEETC" "$BOXC" false yes 0)"
+case "$p_ign" in *"[IGNORED locally: [managed] enabled=false]"*) pass "config push D8: enabled=false => IGNORED annotation on the log line" ;; *) bad "D8 IGNORED annotation missing: [$p_ign]" ;; esac
+p_inert="$(push_test "$FLEETC" "$BOXC" true no 0)"
+case "$p_inert" in *"[inert: boxup lacks managed support"*) pass "config push D5: support=no => inert annotation (deploy boxup first)" ;; *) bad "D5 inert annotation missing: [$p_inert]" ;; esac
+
+# BLOCKER-2 (live canary r1): the remote managed-status probe must invoke boxup
+# under BASH, not sh. boxup is #!/bin/bash and its TOML reader uses the bash-only
+# `read -r -d`; on the boxes /bin/sh is dash, so `sh boxup config-get …` errored
+# and the old `|| echo true` fallback ALWAYS reported enabled=true — the
+# enabled=false escape hatch could never surface. Drives the REAL push_managed +
+# REAL managed_remote_script with a fake boxup whose config-get path is bash-only
+# (fails under dash), so ONLY a bash invocation returns the real enabled value.
+# probe_test: args = enabled_value shim(bash|dash|fail)
+#   bash  = a working bash on PATH (the box reality: the fix uses `bash "$bx"`)
+#   fail  = every invocation of the boxup file errors (probe genuinely fails)
+probe_test() {
+  local want_enabled="$1" shim="$2" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/boxes" "$d/box" "$d/bin"
+  printf '%s' "$FLEETC" > "$d/fleet.toml"; printf '%s' "$BOXC" > "$d/boxes/grok-box-8.toml"
+  # Fake boxup: supported (MANAGED_FILE=) and its config-get uses a BASH-ONLY
+  # construct (`read -r -d`), so invoking it under dash errors out (exit != 0).
+  cat > "$d/box/boxup" <<BOXUP
+MANAGED_FILE=/x
+if [ "\$1 \$2 \$3" = "config-get managed enabled" ]; then
+  # bash-only: dash's read has no -d and aborts the script here.
+  printf '%s' "$want_enabled" | { read -r -d '' v || true; echo "\$v"; }
+fi
+BOXUP
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/boxes"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_header render_managed validate_managed managed_remote_script push_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+# Provide a controllable \`bash\` for the remote probe:
+#   shim=bash => a real bash (the box's actual bash, honours -d) => probe works.
+#   shim=fail => a bash that always errors => probe genuinely fails.
+mkdir -p "$d/bin"
+if [ "$shim" = fail ]; then
+  printf '#!/bin/sh\nexit 2\n' > "$d/bin/bash"; chmod +x "$d/bin/bash"
+  PATH="$d/bin:\$PATH"
+fi
+export PATH
+# Fake tunnel_ssh: strip the sudo sh -c wrapper, run the remote script under sh
+# (dash-equivalent posix mode) so ONLY the inner \`bash "\$bx"\` can honour -d.
+tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
+push_managed grok-box-8 --dry-run
+echo "PUSHRC=\$?"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+# (a) bash probe honours the box's real enabled=false => IGNORED annotation shows
+# (this is exactly the state the live canary could never reach under sh).
+pb_false="$(probe_test false bash)"
+case "$pb_false" in *"[IGNORED locally: [managed] enabled=false]"*) pass "BLOCKER-2: boxup probed via bash => real enabled=false surfaces the IGNORED annotation" ;; *) bad "BLOCKER-2: bash probe did not surface enabled=false: [$pb_false]" ;; esac
+# (b) bash probe with enabled=true => NO false IGNORED annotation (real value).
+pb_true="$(probe_test true bash)"
+case "$pb_true" in *"IGNORED locally"*) bad "BLOCKER-2: enabled=true wrongly annotated IGNORED: [$pb_true]" ;; *"PUSHRC=0"*) pass "BLOCKER-2: boxup probed via bash => real enabled=true reported (no spurious IGNORED)" ;; *) bad "BLOCKER-2: enabled=true probe wrong: [$pb_true]" ;; esac
+# (c) a genuine probe FAILURE must NEVER be reported as enabled=true — it reports
+# enabled=unknown and annotates the log line (never a silent false "true").
+pb_fail="$(probe_test true fail)"
+case "$pb_fail" in *"IGNORED locally: [managed] enabled=false]"*) bad "BLOCKER-2: a failed probe was reported as enabled=false: [$pb_fail]" ;; *"enabled UNKNOWN"*) pass "BLOCKER-2: a failed managed-status probe => enabled=unknown + annotation (never a false enabled=true)" ;; *) bad "BLOCKER-2: failed probe not reported as unknown: [$pb_fail]" ;; esac
+# (c') and the remote script must invoke boxup via bash and must NOT fall back to
+# a hardcoded enabled=true on probe failure. (The heredoc-built body escapes $,
+# so match the escaped forms; strip comment lines before the negative check so a
+# doc mention of the old fallback doesn't trip it.)
+mrs="$(sed -n '/^managed_remote_script() {/,/^}/p' "$FLEETCTL")"
+mrs_code="$(printf '%s\n' "$mrs" | grep -v '^[[:space:]]*#')"
+case "$mrs_code" in *'bash "\$bx" config-get'*) pass "BLOCKER-2: managed_remote_script invokes the box reader via bash" ;; *) bad "BLOCKER-2: managed_remote_script does not invoke boxup via bash: [$mrs_code]" ;; esac
+case "$mrs_code" in *'config-get managed enabled 2>/dev/null || echo true'*) bad "BLOCKER-2: managed_remote_script still falls back to enabled=true on probe failure" ;; *) pass "BLOCKER-2: managed_remote_script no longer falls back to enabled=true on probe failure" ;; esac
+
+# D6 reconcile_config_pass: SILENT no-op when the D2 files are absent.
+cfgpass_test() {
+  # args: files_present(yes|no) apply canary_verdict rest_verdict tunnel_map...
+  local present="$1" apply="$2" canary_v="$3" rest_v="$4" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
+  if [ "$present" = yes ]; then printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"; fi
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"
+FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"
+FLEET_BOXES="grok-box-8 grok-box-3 grok-box-5"
+log(){ echo "LOG:\$*"; }
+notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # no canary_box configured => default 8
+tunnel_up(){ return 0; }    # all tunnels up
+seq="$d/seq"
+# push_managed stub: record the box + dry flag, return the per-box verdict.
+push_managed(){
+  local box="\$1" dry=0; case "\${2:-}" in --dry-run) dry=1;; esac
+  echo "PUSH \$box dry=\$dry" >> "\$seq"
+  case "\$box" in
+    grok-box-8) return $canary_v ;;
+    grok-box-3) return $rest_v ;;
+    *) return 0 ;;
+  esac
+}
+reconcile_config_pass "$apply"; echo "PASSRC=\$?"
+[ -f "\$seq" ] && tr '\n' '|' < "\$seq"; echo
+for f in "$d"/state/*.cfgfail; do [ -f "\$f" ] && echo "CFGFAIL \$(basename "\$f")=\$(cat "\$f")"; done
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+# absent D2 files => SILENT (no push, no log, rc 0).
+cp_absent="$(cfgpass_test no 0 0 0)"
+case "$cp_absent" in *PUSH*) bad "D6: config pass acted with D2 files ABSENT: [$cp_absent]" ;; *"PASSRC=0"*) pass "D6: config pass is a SILENT no-op when fleet.toml/boxes are absent" ;; *) bad "D6 absent wrong: [$cp_absent]" ;; esac
+# present, dry-run => canary FIRST then rest, all dry=1.
+cp_dry="$(cfgpass_test yes 0 0 0)"
+case "$cp_dry" in "PASSRC=0"|*"PUSH grok-box-8 dry=1|PUSH grok-box-3 dry=1|PUSH grok-box-5 dry=1|"*) pass "D6: dry-run pass pushes --dry-run canary-first then the rest serially" ;; *) bad "D6 dry-run order wrong: [$cp_dry]" ;; esac
+# present, apply => dry=0.
+cp_apply="$(cfgpass_test yes 1 0 0)"
+case "$cp_apply" in *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*) pass "D6: --apply pass pushes for real (dry=0), canary-first" ;; *) bad "D6 apply order wrong: [$cp_apply]" ;; esac
+# canary FAILS => notify + ABORT (zero other boxes), rc 1.
+cp_canfail="$(cfgpass_test yes 1 1 0)"
+case "$cp_canfail" in *"PUSH grok-box-8 dry=0|"*) case "$cp_canfail" in *"PUSH grok-box-3"*) bad "D6: canary failure did NOT abort (touched grok-box-3): [$cp_canfail]" ;; *"PASSRC=1"*) pass "D6: canary FAILURE => notify + ABORT the rest this tick, rc 1" ;; *) bad "D6 canary-abort rc wrong: [$cp_canfail]" ;; esac ;; *) bad "D6 canary-fail wrong: [$cp_canfail]" ;; esac
+case "$cp_canfail" in *NOTIFY*) pass "D6: canary failure fires notify warn" ;; *) bad "D6 canary failure did not notify: [$cp_canfail]" ;; esac
+# non-canary FAILS => D9 bump for that box, CONTINUE with the rest, rc 1.
+cp_restfail="$(cfgpass_test yes 1 0 1)"
+case "$cp_restfail" in *"PUSH grok-box-8 dry=0|PUSH grok-box-3 dry=0|PUSH grok-box-5 dry=0|"*) pass "D6: a NON-canary failure continues to the remaining boxes" ;; *) bad "D6 non-canary continue wrong: [$cp_restfail]" ;; esac
+case "$cp_restfail" in *"CFGFAIL grok-box-3.cfgfail=1"*) pass "D9: a non-canary push failure bumps that box's .cfgfail" ;; *) bad "D9 cfgfail bump missing: [$cp_restfail]" ;; esac
+case "$cp_restfail" in *"PASSRC=1"*) pass "D6: config pass returns rc 1 when a non-canary box failed" ;; *) bad "D6 non-canary rc wrong: [$cp_restfail]" ;; esac
+
+# D6 per-box guard: tunnel DOWN or .checkfail => skip silently.
+cfgpass_guard_test() {
+  local guard="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
+  printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
+  [ "$guard" = checkfail ] && echo 4 > "$d/state/grok-box-3.checkfail"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+log(){ :; }; notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }
+# tunnel_up: grok-box-8 always up; grok-box-3 down iff guard=tunnel.
+tunnel_up(){ case "\$1" in grok-box-3) [ "$guard" != tunnel ] ;; *) return 0 ;; esac; }
+seq="$d/seq"
+push_managed(){ echo "PUSH \$1" >> "\$seq"; return 0; }
+reconcile_config_pass 1 >/dev/null; echo "PASSRC=\$?"
+[ -f "\$seq" ] && tr '\n' '|' < "\$seq"; echo
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+g_tun="$(cfgpass_guard_test tunnel)"
+case "$g_tun" in *"PUSH grok-box-3"*) bad "D6 guard: pushed to a tunnel-DOWN box: [$g_tun]" ;; *"PUSH grok-box-8"*) pass "D6 guard: tunnel-down box skipped silently (canary still pushed)" ;; *) bad "D6 tunnel guard wrong: [$g_tun]" ;; esac
+g_chk="$(cfgpass_guard_test checkfail)"
+case "$g_chk" in *"PUSH grok-box-3"*) bad "D6 guard: pushed to a .checkfail box: [$g_chk]" ;; *"PUSH grok-box-8"*) pass "D6 guard: .checkfail box skipped silently" ;; *) bad "D6 checkfail guard wrong: [$g_chk]" ;; esac
+
+# BLOCKER-1 (live canary r1): the per-box guard must gate on the checkfail COUNT
+# (>3, matching reconcile_decide's threshold), NOT file PRESENCE. A HEALTHY box
+# carries a `0`-content .checkfail FILE (reconcile_reset_checkfail rewrites it
+# every tick), so a presence guard skipped EVERY healthy box — the whole fleet —
+# on every real tick. Drives the REAL reconcile_config_pass with the checkfail
+# file for a NON-canary box (grok-box-3) seeded to a chosen state; asserts the
+# box is processed (0/absent) or skipped-with-a-log-line (over threshold).
+cfgpass_checkfail_test() {
+  # args: chkstate = absent | 0 | 4   (grok-box-3's .checkfail content)
+  local chkstate="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
+  printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
+  [ "$chkstate" != absent ] && printf '%s\n' "$chkstate" > "$d/state/grok-box-3.checkfail"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+log(){ echo "LOG:\$*"; }; notify(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }
+tunnel_up(){ return 0; }   # both tunnels up: only the checkfail count decides
+seq="$d/seq"
+push_managed(){ echo "PUSH \$1" >> "\$seq"; return 0; }
+reconcile_config_pass 1; echo "PASSRC=\$?"
+[ -f "\$seq" ] && tr '\n' '|' < "\$seq"; echo
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+# (a) content 0 (HEALTHY, the every-tick state) => box IS processed.
+cf_zero="$(cfgpass_checkfail_test 0)"
+case "$cf_zero" in *"PUSH grok-box-3"*) pass "BLOCKER-1: a 0-content .checkfail (healthy) box IS processed by the config pass" ;; *) bad "BLOCKER-1: healthy 0-content box was SKIPPED (the live-canary bug): [$cf_zero]" ;; esac
+# (b) content 4 (>3, unhealthy) => box SKIPPED, with the skip log line.
+cf_four="$(cfgpass_checkfail_test 4)"
+case "$cf_four" in *"PUSH grok-box-3"*) bad "BLOCKER-1: pushed to an over-threshold (4) box: [$cf_four]" ;; *"LOG:config: skip grok-box-3 — checkfail over threshold"*) pass "BLOCKER-1: a >3 checkfail box is skipped WITH a skip log line" ;; *) bad "BLOCKER-1: over-threshold skip log missing: [$cf_four]" ;; esac
+# (c) absent .checkfail => box IS processed.
+cf_abs="$(cfgpass_checkfail_test absent)"
+case "$cf_abs" in *"PUSH grok-box-3"*) pass "BLOCKER-1: an ABSENT .checkfail box IS processed" ;; *) bad "BLOCKER-1: absent-checkfail box was skipped: [$cf_abs]" ;; esac
+
+# D4 forward-compat info log: an unknown-but-well-formed key is ALLOWED and
+# logged ONCE per reconcile run, DEDUPED across boxes. Drives the REAL
+# reconcile_config_pass + REAL push_managed + REAL unknown_managed_keys across
+# TWO boxes in one pass, with a fake tunnel_ssh that runs the remote locally.
+# Both boxes render the SAME fleet.toml, so the unknown key is seen twice but
+# must be logged exactly once (run-scoped dedupe). Known-only keys => no log.
+cfgunknown_test() {
+  # args: fleet-content  (drives both boxes; no per-box overrides)
+  local fleetc="$1" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
+  printf '%s' "$fleetc" > "$d/etc/fleet.toml"
+  # No per-box boxes/<box>.toml — the production normal case (fleet-wide only).
+  # This also exercises the P1 fix: render_managed must merge fleet.toml even
+  # when the per-box file is absent (previously awk went fatal => header-only).
+  printf 'MANAGED_FILE=/x\ncase "$1 $2 $3" in "config-get managed enabled") echo true;; esac\n' > "$d/box/boxup"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"
+FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"
+FLEET_BOXES="grok-box-8 grok-box-3"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ echo "LOG:\$*"; }
+notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail managed_header render_managed validate_managed unknown_managed_keys managed_remote_script push_managed reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # no canary_box configured => default 8
+tunnel_up(){ return 0; }    # both tunnels up
+# Fake tunnel_ssh: strip the sudo sh -c wrapper, run with stdin passed through.
+tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
+reconcile_config_pass 1; echo "PASSRC=\$?"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+# fleet.toml with a KNOWN key (update.repo) + an UNKNOWN-but-well-formed key
+# (update.channel). Two boxes render it => the unknown key is encountered twice.
+UNK_FLEET='[update]
+repo = "https://fleet/repo.git"
+channel = "beta"
+'
+cu_unknown="$(cfgunknown_test "$UNK_FLEET")"
+# The info log must appear EXACTLY ONCE and name the unknown key (update.channel).
+cu_count="$(printf '%s\n' "$cu_unknown" | grep -c 'unknown-but-well-formed keys')"
+case "$cu_unknown" in
+  *"unknown-but-well-formed keys (allowed, forward-compat): update.channel"*)
+    [ "$cu_count" = 1 ] && pass "D4 info: unknown well-formed key ALLOWED + logged ONCE across two boxes in one pass" || bad "D4 info: unknown-key log fired $cu_count times (want 1): [$cu_unknown]" ;;
+  *) bad "D4 info: unknown-key log missing/misnamed: [$cu_unknown]" ;;
+esac
+# The push itself still succeeds (unknown keys are allowed, not refused).
+case "$cu_unknown" in *"PASSRC=0"*) pass "D4 info: an unknown well-formed key does not fail the pass (forward compatible)" ;; *) bad "D4 info: pass rc non-zero with an allowed unknown key: [$cu_unknown]" ;; esac
+# KNOWN-only fleet.toml => NO such info log at all.
+KNOWN_FLEET='[update]
+repo = "https://fleet/repo.git"
+[ssh]
+password = "p"
+'
+cu_known="$(cfgunknown_test "$KNOWN_FLEET")"
+case "$cu_known" in *"unknown-but-well-formed keys"*) bad "D4 info: logged unknown keys for a KNOWN-ONLY render: [$cu_known]" ;; *) pass "D4 info: known keys only => no unknown-key info log emitted" ;; esac
+
+# D7 operator surface: cmd_config refuses un-enrolled boxes.
+cmdcfg_enroll_test() {
+  local box="$1" inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  printf 'grok-box-8\t20008\n' > "$d/state/enrolled.tsv"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+FLEET_MANAGED_FLEET="$d/none.toml"; FLEET_MANAGED_BOXDIR="$d/noboxes"
+cmd_config render "$box" >/dev/null 2>&1; echo "RC=\$?"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+[ "$(cmdcfg_enroll_test grok-box-8)" = "RC=0" ] && pass "config D7: render an ENROLLED box succeeds" || bad "D7 enrolled render failed: [$(cmdcfg_enroll_test grok-box-8)]"
+[ "$(cmdcfg_enroll_test grok-box-99)" = "RC=2" ] && pass "config D7: an UN-enrolled box is REFUSED (rc 2)" || bad "D7 did not refuse un-enrolled: [$(cmdcfg_enroll_test grok-box-99)]"
+
+# D7 diff exit codes + IGNORED annotation. Drive cmd_config diff with a fake
+# tunnel_ssh running the dry-run remote locally.
+cmddiff_test() {
+  # args: onbox-state(insync|drift) enabled support
+  local state="$1" enabled="$2" support="$3" inner; inner="$(mktemp)"
+  local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state" "$d/box"
+  printf '%s' "$FLEETC" > "$d/etc/fleet.toml"; printf '%s' "$BOXC" > "$d/etc/boxes/grok-box-8.toml"
+  printf 'grok-box-8\t20008\n' > "$d/state/enrolled.tsv"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+BOX_ROOT="$d/box"; BOX_MANAGED="$d/box/managed.toml"
+log(){ :; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in reconcile_target_boxes cmd_config_enrolled cmd_config render_managed managed_header validate_managed managed_remote_script; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+if [ "$support" = yes ]; then printf 'MANAGED_FILE=/x\ncase "\$1 \$2 \$3" in "config-get managed enabled") echo %s;; esac\n' "$enabled" > "$d/box/boxup"; else : > "$d/box/boxup"; fi
+# Pre-seed the on-box file to be IN SYNC (exact render) or DRIFTED.
+if [ "$state" = insync ]; then render_managed grok-box-8 > "$d/box/managed.toml"; else printf 'DRIFT\n' > "$d/box/managed.toml"; fi
+tunnel_ssh(){ shift; local c="\$*"; local s="\${c#sudo sh -c \\'}"; s="\${s%\\'}"; sh -c "\$s"; }
+cmd_config diff grok-box-8; echo "DIFFRC=\$?"
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+d_sync="$(cmddiff_test insync true yes)"
+case "$d_sync" in *"DIFFRC=0"*) pass "config D7 diff: in-sync box (enabled, supported) => exit 0" ;; *) bad "D7 diff in-sync exit wrong: [$d_sync]" ;; esac
+d_drift="$(cmddiff_test drift true yes)"
+case "$d_drift" in *"DIFFRC=1"*) pass "config D7 diff: drifted box => exit 1" ;; *) bad "D7 diff drift exit wrong: [$d_drift]" ;; esac
+d_ign="$(cmddiff_test insync false yes)"
+case "$d_ign" in *"IGNORED on this box"*) case "$d_ign" in *"DIFFRC=1"*) pass "config D7 diff: enabled=false => annotates IGNORED AND never reports in-sync (exit 1)" ;; *) bad "D7 diff enabled=false must not be in-sync: [$d_ign]" ;; esac ;; *) bad "D7 diff missing IGNORED annotation: [$d_ign]" ;; esac
+d_nosup="$(cmddiff_test insync true no)"
+case "$d_nosup" in *"IGNORED"*) case "$d_nosup" in *"DIFFRC=1"*) pass "config D7 diff: support=no => annotates IGNORED AND never in-sync (exit 1)" ;; *) bad "D7 diff support=no must not be in-sync: [$d_nosup]" ;; esac ;; *) bad "D7 diff missing support=no annotation: [$d_nosup]" ;; esac
+
+# D9 cfgfail bump/reset + notify at >3. Drive the REAL helpers.
+cfgfail_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_STATE="$d/state"
+notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in reconcile_bump_cfgfail reconcile_reset_cfgfail; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+for i in 1 2 3 4; do echo "bump=\$(reconcile_bump_cfgfail grok-box-8)"; done
+reconcile_reset_cfgfail grok-box-8
+[ -f "$d/state/grok-box-8.cfgfail" ] && echo "AFTER-RESET=present" || echo "AFTER-RESET=gone"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+cf_out="$(cfgfail_test)"
+# The helper is PURE (like checkfail/seedfail): bump + print the count, NO notify
+# embedded — so a caller's `x=$(reconcile_bump_cfgfail …)` capture is never
+# polluted (and reconcile_config_pass's threshold notify is never swallowed).
+case "$cf_out" in *"bump=1"*"bump=2"*"bump=3"*"bump=4"*) pass "D9: reconcile_bump_cfgfail increments 1..4 (pure: count only)" ;; *) bad "D9 bump sequence wrong: [$cf_out]" ;; esac
+case "$cf_out" in *NOTIFY:*) bad "D9: bump helper must NOT notify (notify lives at the call site, like seedfail): [$cf_out]" ;; *) pass "D9: bump helper is pure — no notify inside (matches checkfail/seedfail shape)" ;; esac
+case "$cf_out" in *"AFTER-RESET=gone"*) pass "D9: reconcile_reset_cfgfail clears the counter file" ;; *) bad "D9 reset did not clear: [$cf_out]" ;; esac
+
+# D9 notify at the CALL SITE (reconcile_config_pass, non-canary path): a box that
+# fails the push on every tick must fire `notify warn` ONLY once its cfgfail
+# count crosses > 3 — exactly like seedfail (fleetctl:2311-2313). Drive the real
+# reconcile_config_pass 4 ticks with a persistently-failing non-canary box.
+cfgnotify_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
+  printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-8 grok-box-3"
+log(){ :; }; notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # canary defaults to grok-box-8
+tunnel_up(){ return 0; }
+# canary (grok-box-8) always succeeds; grok-box-3 (non-canary) always fails.
+push_managed(){ case "\$1" in grok-box-3) return 1 ;; *) return 0 ;; esac; }
+for tick in 1 2 3 4; do echo "TICK\$tick:"; reconcile_config_pass 1; done
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+cn_out="$(cfgnotify_test)"
+# Isolate the notify lines carrying the count for grok-box-3.
+case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-3: 4"*) pass "D9: notify warn fires at the call site when cfgfail crosses > 3" ;; *) bad "D9 call-site notify>3 missing: [$cn_out]" ;; esac
+case "$cn_out" in *"NOTIFY:warn config push failing for grok-box-3: 3"*) bad "D9: notify fired at exactly 3 (threshold is strictly > 3): [$cn_out]" ;; *) pass "D9: no notify at count 3 (threshold is strictly > 3)" ;; esac
+
+rm -rf "$CFG_FIXROOT"
+
 rm -f "$seedA" "$seedB" "$seedC"
 
 echo "-----"
