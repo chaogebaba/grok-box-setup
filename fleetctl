@@ -774,6 +774,12 @@ TS_API="${FLEET_TS_API:-https://api.tailscale.com/api/v2}"
 TS_TAILNET="${FLEET_TS_TAILNET:--}"          # "-" = the token's default tailnet
 FLEET_ETC="${FLEET_ETC:-/etc/grok-fleet}"
 FLEET_STATE="${FLEET_STATE:-/var/lib/grok-fleet}"
+# The VPS-side user whose ~/.ssh/authorized_keys carries the per-box tunnel
+# lines. sshd privsep reads this file AS this user, so the dir + file MUST end
+# up owned by it (BUG-E): a root:root authorized_keys yields StrictModes/privsep
+# "Could not open user 'fleet' authorized keys ... Permission denied" and every
+# tunnel fails publickey. Honors FLEET_USER (install-vps.sh's name) too.
+FLEET_VPS_USER="${FLEET_VPS_USER:-${FLEET_USER:-fleet}}"
 FLEET_TELEGRAM_ENV="${FLEET_TELEGRAM_ENV:-$FLEET_ETC/telegram.env}"
 # The box-side tunnel key + boxup live under /workspace on the box.
 BOX_ROOT="/workspace/box-setup"
@@ -1031,20 +1037,34 @@ enroll_vps_box_access_pubkey() {
 # permitlisten). Runs LOCALLY on the VPS (the brain IS fleet@vps's host root),
 # writing ~fleet/.ssh/authorized_keys.
 FLEET_VPS_AUTHKEYS="${FLEET_VPS_AUTHKEYS:-/home/fleet/.ssh/authorized_keys}"
+
+# ensure_vps_authkeys_perms: BUG-E — make ~fleet/.ssh and its authorized_keys
+# safe for sshd privsep to read AS the fleet user. Idempotent: dir 700, file
+# 600, and BOTH owned by $FLEET_VPS_USER:$FLEET_VPS_USER. Without the chown the
+# enroll writes them root:root (the brain runs as root), sshd StrictModes/privsep
+# then refuses to open them and every tunnel gets "Permission denied (publickey)".
+# Must be called after EVERY write of the file (enroll / re-enroll / any rewrite).
+ensure_vps_authkeys_perms() {
+  local akdir; akdir="$(dirname "$FLEET_VPS_AUTHKEYS")"
+  chmod 700 "$akdir" 2>/dev/null || true
+  [ -e "$FLEET_VPS_AUTHKEYS" ] && chmod 600 "$FLEET_VPS_AUTHKEYS" 2>/dev/null || true
+  # Owner LAST so the mode above isn't clobbered; -R so the dir + file both flip.
+  chown -R "$FLEET_VPS_USER":"$FLEET_VPS_USER" "$akdir" 2>/dev/null || true
+}
+
 enroll_install_vps_authorized_key() {
   local line="$1" key akdir
   key="$(printf '%s' "$line" | awk '{print $3}')"   # the base64 key material
   akdir="$(dirname "$FLEET_VPS_AUTHKEYS")"
   mkdir -p "$akdir" 2>/dev/null || return 1
   touch "$FLEET_VPS_AUTHKEYS" 2>/dev/null || return 1
-  chmod 700 "$akdir" 2>/dev/null || true
-  chmod 600 "$FLEET_VPS_AUTHKEYS" 2>/dev/null || true
   local tmp; tmp="$(mktemp)" || return 1
   # Drop any prior line carrying the same key, then append the new one.
   grep -vF "$key" "$FLEET_VPS_AUTHKEYS" > "$tmp" 2>/dev/null || true
   printf '%s\n' "$line" >> "$tmp"
   mv -f "$tmp" "$FLEET_VPS_AUTHKEYS"
-  chmod 600 "$FLEET_VPS_AUTHKEYS" 2>/dev/null || true
+  # BUG-E: sshd reads this AS $FLEET_VPS_USER — dir 700, file 600, both fleet-owned.
+  ensure_vps_authkeys_perms
 }
 
 # enroll_record_etc_mapping <box> <port> <authorized_keys-line>: P2-3 — write a

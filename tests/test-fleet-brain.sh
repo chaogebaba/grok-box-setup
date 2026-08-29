@@ -1385,6 +1385,87 @@ else
   bad "BUG-B: a bare \`exec N>... 2>/dev/null\` shape still present (swallows stderr): $exec_footgun"
 fi
 
+# --- BUG-E: after ANY write of ~fleet/.ssh/authorized_keys, the dir must end
+# 700 and the file 600, and BOTH must be chown'd to the configured fleet user
+# ($FLEET_VPS_USER, honoring FLEET_USER) — NOT left root:root. The brain runs as
+# root; sshd privsep reads authorized_keys AS the fleet user, so a root-owned
+# file yields "Could not open user 'fleet' authorized keys ... Permission denied"
+# and every tunnel fails publickey. We drive the REAL enroll_install_vps_authorized_key
+# against a temp dir with a PATH shim that RECORDS every chown/chmod invocation
+# (the test user cannot actually chown to 'fleet', so the shim logs + no-ops).
+# breaks-if-undone (mutation-verified below): drop the chown and the recorder
+# shows no `chown ... fleet:fleet` line -> this test FAILS.
+enroll_authkeys_owner_test() {
+  local pfx; pfx="$(mktemp -d)"
+  local bindir="$pfx/bin"; mkdir -p "$bindir"
+  local rec="$pfx/rec.log"
+  # Recorder shims: log the full argv, then no-op success (real chown to 'fleet'
+  # is not possible as an unprivileged test user). Fall through to real tools for
+  # everything else via the appended real PATH.
+  cat > "$bindir/chown" <<SHIM
+#!/usr/bin/env bash
+printf 'chown %s\n' "\$*" >> "$rec"
+exit 0
+SHIM
+  cat > "$bindir/chmod" <<SHIM
+#!/usr/bin/env bash
+printf 'chmod %s\n' "\$*" >> "$rec"
+exit 0
+SHIM
+  chmod +x "$bindir/chown" "$bindir/chmod"
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+export PATH="$bindir:\$PATH"
+FLEETCTL="$FLEETCTL"
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+# The REAL config var + the two REAL functions under test.
+FLEET_VPS_USER="fleet"
+FLEET_VPS_AUTHKEYS="$pfx/home/.ssh/authorized_keys"
+eval "\$(extract_from "\$FLEETCTL" ensure_vps_authkeys_perms)"
+eval "\$(extract_from "\$FLEETCTL" enroll_install_vps_authorized_key)"
+enroll_install_vps_authorized_key 'restrict,port-forwarding,permitlisten="127.0.0.1:20003" ssh-ed25519 AAAAKEY grok-tunnel-grok-box-3'
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+  # Emit the recorder log for the caller to assert against.
+  cat "$rec" 2>/dev/null
+  rm -rf "$pfx"
+}
+akrec="$(enroll_authkeys_owner_test)"
+# (a) a chown to fleet:fleet on the .ssh dir/file must have happened.
+case "$akrec" in
+  *"chown "*"fleet:fleet"*)
+    pass "BUG-E: enroll chowns ~fleet/.ssh authorized_keys to fleet:fleet (sshd privsep can read it)" ;;
+  *) bad "BUG-E: enroll did NOT chown authorized_keys to the fleet user (stays root:root -> Permission denied publickey): [$akrec]" ;;
+esac
+# (b) the file must be chmod'd 600 and the dir 700 (belt-and-braces on perms).
+case "$akrec" in
+  *"chmod 600 "*) pass "BUG-E: enroll chmods authorized_keys file 600" ;;
+  *) bad "BUG-E: enroll missing chmod 600 on authorized_keys file: [$akrec]" ;;
+esac
+case "$akrec" in
+  *"chmod 700 "*) pass "BUG-E: enroll chmods ~fleet/.ssh dir 700" ;;
+  *) bad "BUG-E: enroll missing chmod 700 on ~fleet/.ssh dir: [$akrec]" ;;
+esac
+
+# --- BUG-E (var): the fleet user must come from a CONFIGURED var, not a literal.
+# Assert FLEET_VPS_USER exists in fleetctl and defaults through FLEET_USER.
+# breaks-if-undone: hardcode a literal 'fleet' in the chown and this fails.
+if grep -qE '^FLEET_VPS_USER="\$\{FLEET_VPS_USER:-\$\{FLEET_USER:-fleet\}\}"' "$FLEETCTL"; then
+  pass "BUG-E: FLEET_VPS_USER is a configured var (honors FLEET_VPS_USER / FLEET_USER, default fleet)"
+else
+  bad "BUG-E: FLEET_VPS_USER not defined as a configurable var in fleetctl (chown must not use a literal)"
+fi
+
+# --- BUG-E (installer): install-vps.sh's ensure_fleet_user must chown ~fleet/.ssh
+# to the fleet user when it creates it. breaks-if-undone: drop the chown -R and
+# a freshly-installed box's dir is root:root before the first enroll.
+if grep -qE 'chown -R "\$FLEET_USER":"\$FLEET_USER" "\$home/\.ssh"' "$VPS_INSTALL"; then
+  pass "BUG-E: install-vps.sh ensure_fleet_user chowns ~fleet/.ssh to the fleet user on create"
+else
+  bad "BUG-E: install-vps.sh ensure_fleet_user does not chown ~fleet/.ssh to the fleet user"
+fi
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL FLEET-BRAIN TESTS PASSED"; else echo "SOME FLEET-BRAIN TESTS FAILED"; fi
 exit "$fail"
