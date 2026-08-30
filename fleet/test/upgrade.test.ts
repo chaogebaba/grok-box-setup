@@ -15,11 +15,27 @@ import {
 import { CHECK_COMMAND, POLL_COMMAND, renderInstallCommand } from "../src/remote.ts";
 import { FakeRunner, result, isSs, isScp } from "./fake-runner.ts";
 import { testEnv, testRollout } from "./helpers.ts";
-import type { FsSeam } from "../src/state.ts";
+import type { FsSeam, Inventory } from "../src/state.ts";
 import type { StageFs, Target } from "../src/stage.ts";
 
 const KEY = "/etc/grok-fleet/box_access_ed25519";
 const TARGET: Target = { ref: "main", sha: "abc1234", version: "5.3.0" };
+
+/** A memFs that exposes its backing store so tests can read what was written. */
+function memFsWithStore(): { fs: FsSeam; store: Map<string, string> } {
+  const store = new Map<string, string>();
+  const fs: FsSeam = {
+    async writeFile(p, d) { store.set(p, d); },
+    async chmod() {},
+    async rename(f, t) { const v = store.get(f); if (v !== undefined) { store.set(t, v); store.delete(f); } },
+    async readFile(p) { return store.get(p); },
+  };
+  return { fs, store };
+}
+
+function readInv(store: Map<string, string>): Inventory {
+  return JSON.parse(store.get("/var/lib/grok-fleet/inventory.json")!) as Inventory;
+}
 
 function memFs(): FsSeam {
   const store = new Map<string, string>();
@@ -516,5 +532,92 @@ describe("T13 (H1): truncate is inside the install command, which precedes the p
     expect(installIdx).toBeLessThan(pollIdx);
     // the install command carries the H1 self-truncate.
     expect(sshCmds[installIdx]).toContain("sudo truncate -s 0 /var/log/boxup-install.log");
+  });
+});
+
+
+describe("gate-r1 fix 2: --apply persists inventory.json with lastUpgrade (F7.6/S-E)", () => {
+  test("every deployed box records lastUpgrade{target,result:ok,at,detail} and sha=target", async () => {
+    const r = new FakeRunner(
+      responder({
+        "grok-box-008": { sha: "old" },
+        "grok-box-009": { sha: "old" },
+        "grok-box-011": { sha: "old" },
+      }),
+    );
+    const { fs, store } = memFsWithStore();
+    const res = await runUpgradePass(baseDeps(r, { fs }), args({ apply: true }));
+    expect(res.rc).toBe(RC.OK);
+
+    const inv = readInv(store);
+    // written after the applied pass, with the target recorded
+    expect(inv.target).toEqual({ ref: "main", sha: "abc1234", version: "5.3.0" });
+    for (const box of ["grok-box-008", "grok-box-009", "grok-box-011"]) {
+      const e = inv.boxes[box]!;
+      expect(e.lastUpgrade).toBeDefined();
+      expect(e.lastUpgrade!.target).toBe("abc1234");
+      expect(e.lastUpgrade!.result).toBe("ok");
+      expect(e.lastUpgrade!.detail).toBe("verified");
+      expect(typeof e.lastUpgrade!.at).toBe("string");
+      // a converged box's sha is the target sha
+      expect(e.sha).toBe("abc1234");
+    }
+  });
+
+  test("mixed pass: skip + fail + not-reached all recorded per box", async () => {
+    // 008 canary ok, 009 in-sync (skip), 011 tunnel-down (skip) — but reorder so
+    // a LATER box fails to exercise not-reached. Use 4 boxes.
+    const r = new FakeRunner(
+      responder({
+        "grok-box-008": { sha: "old" }, // canary, ok
+        "grok-box-009": { sha: "abc1234" }, // in-sync → skip
+        "grok-box-010": { sha: "old", done: 1 }, // verified failure → stop
+        "grok-box-011": { sha: "old" }, // never reached
+      }),
+    );
+    const { fs, store } = memFsWithStore();
+    const res = await runUpgradePass(
+      baseDeps(r, { fs }),
+      args({
+        apply: true,
+        boxes: ["grok-box-008", "grok-box-009", "grok-box-010", "grok-box-011"],
+        canary: "grok-box-008",
+      }),
+    );
+    expect(res.rc).toBe(RC.FAILURE);
+
+    const inv = readInv(store);
+    expect(inv.boxes["grok-box-008"]!.lastUpgrade!.result).toBe("ok");
+    expect(inv.boxes["grok-box-009"]!.lastUpgrade!.result).toBe("skipped");
+    expect(inv.boxes["grok-box-009"]!.lastUpgrade!.detail).toBe("in-sync");
+    expect(inv.boxes["grok-box-010"]!.lastUpgrade!.result).toBe("failed");
+    // 011 was never reached (loop stopped at 010's failure)
+    expect(inv.boxes["grok-box-011"]!.lastUpgrade!.result).toBe("skipped");
+    expect(inv.boxes["grok-box-011"]!.lastUpgrade!.detail).toBe("not-reached (pass aborted)");
+  });
+
+  test("canary abort records aborted for the canary and not-reached for the rest", async () => {
+    const r = new FakeRunner(
+      responder({
+        "grok-box-008": { tunnel: false }, // canary down → abort
+        "grok-box-009": { sha: "old" },
+        "grok-box-011": { sha: "old" },
+      }),
+    );
+    const { fs, store } = memFsWithStore();
+    const res = await runUpgradePass(baseDeps(r, { fs }), args({ apply: true }));
+    expect(res.rc).toBe(RC.FAILURE);
+
+    const inv = readInv(store);
+    expect(inv.boxes["grok-box-008"]!.lastUpgrade!.result).toBe("aborted");
+    expect(inv.boxes["grok-box-009"]!.lastUpgrade!.result).toBe("skipped");
+    expect(inv.boxes["grok-box-009"]!.lastUpgrade!.detail).toBe("not-reached (pass aborted)");
+  });
+
+  test("dry-run does NOT write inventory.json", async () => {
+    const r = new FakeRunner(responder({ "grok-box-008": { sha: "old" } }));
+    const { fs, store } = memFsWithStore();
+    await runUpgradePass(baseDeps(r, { fs }), args({ apply: false, boxes: ["grok-box-008"], canary: "grok-box-008" }));
+    expect(store.has("/var/lib/grok-fleet/inventory.json")).toBe(false);
   });
 });

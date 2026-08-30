@@ -11,7 +11,8 @@
 import type { Runner, RunResult } from "./runner.ts";
 import type { Env } from "./env.ts";
 import type { RolloutConfig } from "./config.ts";
-import type { FsSeam } from "./state.ts";
+import type { FsSeam, Inventory, BoxEntry } from "./state.ts";
+import { inventoryPath, writeInventory, readInventory } from "./state.ts";
 import type { Target } from "./stage.ts";
 import { classify } from "./runner.ts";
 import { tunnelUp, tunnelScp, tunnelSsh } from "./tunnel.ts";
@@ -327,7 +328,7 @@ export async function runUpgradePass(deps: UpgradeDeps, args: UpgradeArgs): Prom
     };
   }
 
-  const { plan } = await buildPlan(deps, args.boxes, target);
+  const { plan, probes } = await buildPlan(deps, args.boxes, target);
 
   if (!args.apply) {
     return {
@@ -423,7 +424,68 @@ export async function runUpgradePass(deps: UpgradeDeps, args: UpgradeArgs): Prom
 
   const rc = failed > 0 || aborted ? RC.FAILURE : RC.OK;
   const summary = `upgrade: pass done (apply) target=${target.version}/${target.sha} ok=${ok} skipped=${skipped} failed=${failed}`;
+
+  // F7.6 / G4-S-E: rewrite inventory.json after the applied pass, recording a
+  // per-box lastUpgrade{target,result,at,detail} for EVERY box probed in the
+  // plan (including untouched/aborted ones) so a partial/aborted rollout is
+  // visible. Best-effort: a write failure logs but does not change the pass rc.
+  await persistApplyInventory(deps, args.boxes, target, probes, outcomes).catch((e) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`upgrade: inventory.json write failed after apply — ${msg}`);
+  });
+
   return { rc, mode: "apply", plan, outcomes, target, summary };
+}
+
+/**
+ * Persist inventory.json after an applied pass (F7.6/S-E). Merges over any
+ * existing inventory so untouched boxes keep their last snapshot, and stamps a
+ * `lastUpgrade` on every box in this pass's target set from its outcome (a box
+ * with no outcome — e.g. after an abort short-circuited the loop — records
+ * `result:"skipped", detail:"not-reached (pass aborted)"`). Atomic (tmp→rename,
+ * 0600) via the same state seam inventory uses.
+ */
+export async function persistApplyInventory(
+  deps: UpgradeDeps,
+  boxes: string[],
+  target: Target,
+  probes: Map<string, ProbeResult>,
+  outcomes: DeployOutcome[],
+): Promise<void> {
+  const path = inventoryPath(deps.env.FLEET_STATE);
+  const prev = await readInventory(deps.fs, path);
+  const at = new Date().toISOString();
+  const outcomeByBox = new Map<string, DeployOutcome>(outcomes.map((o) => [o.box, o]));
+
+  const boxesObj: Record<string, BoxEntry> = { ...(prev?.boxes ?? {}) };
+  for (const box of boxes) {
+    const p = probes.get(box);
+    const o = outcomeByBox.get(box);
+    const result = o?.result ?? "skipped";
+    const detail = o?.detail ?? "not-reached (pass aborted)";
+    // The recorded sha is the TARGET on success, else the box's last-known sha.
+    const runningSha = p && p.sha !== "-" && p.sha !== "?" ? p.sha : null;
+    const entry: BoxEntry = {
+      ...(boxesObj[box] ?? {
+        api: null,
+        tunnel: p?.tunnel ?? null,
+        check: p && p.check !== "-" ? p.check : null,
+        version: p && p.version !== "-" && p.version !== "?" ? p.version : null,
+        sha: runningSha,
+        checkedAt: at,
+      }),
+      sha: result === "ok" ? target.sha : (boxesObj[box]?.sha ?? runningSha),
+      lastUpgrade: { target: target.sha, result, at, detail },
+    };
+    boxesObj[box] = entry;
+  }
+
+  const inventory: Inventory = {
+    generatedAt: at,
+    target: { ref: target.ref, sha: target.sha, version: target.version },
+    boxes: boxesObj,
+  };
+  await writeInventory(deps.fs, path, inventory);
 }
 
 /** Ordering for --apply: canary first (if present), then the rest in order. */
