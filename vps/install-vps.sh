@@ -70,8 +70,10 @@ uninstall() {
   if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+    systemctl disable --now "fleet-api.service" >/dev/null 2>&1 || true
+    systemctl stop "fleet-api.service" >/dev/null 2>&1 || true
   fi
-  rm -f "$SYSTEMD_DIR/$SERVICE" "$SYSTEMD_DIR/$TIMER"
+  rm -f "$SYSTEMD_DIR/$SERVICE" "$SYSTEMD_DIR/$TIMER" "$SYSTEMD_DIR/fleet-api.service"
   if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
@@ -156,6 +158,9 @@ install_fleet2() {
   # (M6/Q4): move it to $OPT_DIR/fleetctl.retired-c303696 at mode 0644 (non-
   # executable) as the documented one-release manual fallback. A fresh install
   # (no incumbent) has no retired copy and that is correct.
+  # TUI-D12: the retired-bash-fallback removal ("until 5.5.0" below) is NOT this
+  # blueprint's (fleet2 admin panel) scope — it belongs to phase-3 r2. Left as-is
+  # here deliberately; do not remove it as part of the 5.5.0 admin-panel work.
   if [ -e "$OPT_DIR/fleetctl" ] && [ ! -e "$OPT_DIR/fleetctl.retired-c303696" ]; then
     mv -f "$OPT_DIR/fleetctl" "$OPT_DIR/fleetctl.retired-c303696"
     chmod 0644 "$OPT_DIR/fleetctl.retired-c303696" 2>/dev/null || true
@@ -304,6 +309,48 @@ EOF
   fi
 }
 
+# TUI-D8: install the fleet2 admin API unit (fleet-api.service). Idempotent.
+# NOT enabled by default — the empirical gate starts/enables it on PASS. The
+# unit runs `fleet2 serve` (tailnet-bound token-auth API, port 9891), env EXACTLY
+# as fleet-reconcile INCLUDING HOME=$STATE_DIR (A18; refuse-to-start + Restart IS
+# the boot-order retry). Restart=on-failure/RestartSec=5/StartLimitIntervalSec=0
+# (slow tailscaled must not park the unit in failed, R2-A9).
+API_SERVICE="fleet-api.service"
+install_fleet_api() {
+  install -m 0644 /dev/stdin "$SYSTEMD_DIR/$API_SERVICE" <<EOF
+[Unit]
+Description=grok-fleet admin API (fleet2 serve — tailnet-bound token-auth HTTP/JSON)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Same env as fleet-reconcile INCLUDING HOME=$STATE_DIR (A18): fleet2's top-level
+# \$HOME expansions abort under set -u when HOME is unset. The API refuses to
+# start (rc 6) until the tailnet IPv4 resolves; Restart=on-failure + RestartSec
+# make that the boot-order retry (a slow tailscaled just means a few restarts).
+Environment=HOME=$STATE_DIR
+Environment=FLEET_CONFIG=$OPT_DIR/config.toml
+Environment=FLEET_ETC=$ETC_DIR
+Environment=FLEET_STATE=$STATE_DIR
+ExecStart=$OPT_DIR/fleet2 serve
+Restart=on-failure
+RestartSec=5
+# Never park the unit in 'failed' while tailscaled is slow to bring the tailnet
+# IP up (R2-A9): unlimited restart attempts within any interval.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  log "installed $API_SERVICE (NOT enabled — the empirical gate enables it on PASS)"
+  # NOTE: deliberately NO 'systemctl enable --now' here (TUI-D8). We daemon-reload
+  # so the unit is known to systemd, but leave it stopped/disabled.
+  if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
 # B-3: constrain the fleet user to REMOTE-FORWARD-ONLY via a single sshd drop-in.
 # We write ONLY a drop-in under the drop-in directory and NEVER edit the main
 # daemon config. The Match block pins the fleet user to:
@@ -397,6 +444,7 @@ ensure_fleet_user
 install_fleet2 || exit 1
 install_config_template
 install_units
+install_fleet_api
 install_sshd_dropin || exit 1   # F8 (#12): drop-in validate/reload failure is FATAL
 log "install complete. Next:"
 log "  1) put the write-scoped Tailscale API token at $ETC_DIR/api-token (chmod 600)"
