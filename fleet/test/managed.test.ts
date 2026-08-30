@@ -281,4 +281,111 @@ describe("T11 config pass canary routing (F1/F2)", () => {
     expect(r.skipped).toBe(3);
     expect(r.rc).toBe(0);
   });
+
+  // A runner where every push returns a chosen ssh code (for rc classification).
+  function pushRunner(upPorts: number[], pushCode: number, pushOut: string): FakeRunner {
+    return new FakeRunner((argv) => {
+      if (isSs(argv)) {
+        const lines = upPorts.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:*`);
+        return result({ stdout: lines.join("\n") + "\n" });
+      }
+      return result({ code: pushCode, stdout: pushOut });
+    });
+  }
+
+  test("m6: non-canary checkfail>3 ⇒ skipped, no push", async () => {
+    const { fs, store } = memState();
+    store.set("/s/grok-box-004.checkfail", "5\n"); // unhealthy
+    const runner = pushRunner([20002, 20004], 0, "sha=X cur=X support=yes enabled=true");
+    const r = await configPass({
+      runner,
+      env: testEnv(),
+      source: { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined },
+      state: new ReconcileState("/s", fs),
+      notify: () => {},
+      targetBoxes: ["grok-box-002", "grok-box-004"],
+      configCanary: "grok-box-002", // fixed canary so 004 goes through the non-canary arm
+      managedFilesPresent: true,
+      apply: false,
+    });
+    // 004 skipped for checkfail>3 (m6: a presence-gate would push it)
+    expect(r.skipped).toBeGreaterThanOrEqual(1);
+    // exactly one push (the canary 002); 004 skipped
+    const pushes = runner.calls.filter((c) => (c.argv[c.argv.length - 1] ?? "").startsWith("sudo sh -c"));
+    expect(pushes.length).toBe(1);
+  });
+
+  test("m7: canary rc 6 (transport) ⇒ skip canary + fall through (not content-abort)", async () => {
+    const { fs } = memState();
+    // canary push returns ssh rc 255 ⇒ push rc 6; a non-canary box then pushes ok.
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20002 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:20004 0.0.0.0:*\n" });
+      // canary 002 (port 20002) ⇒ transport rc 255; others push ok.
+      if (argv.includes("20002")) return result({ code: 255, stdout: "" });
+      return result({ code: 0, stdout: "sha=X cur=X support=yes enabled=true" });
+    });
+    const r = await configPass({
+      runner,
+      env: testEnv(),
+      source: { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined },
+      state: new ReconcileState("/s", fs),
+      notify: () => {},
+      targetBoxes: ["grok-box-002", "grok-box-004"],
+      configCanary: "grok-box-002",
+      managedFilesPresent: true,
+      apply: false,
+    });
+    // rc6 canary ⇒ NOT a content abort: the pass continues (004 attempted).
+    expect(r.rc).toBe(0);
+    expect(r.failed).toBe(0);
+    // 004 was pushed (fall-through happened)
+    const pushed004 = runner.calls.some(
+      (c) => c.argv.includes("20004") && (c.argv[c.argv.length - 1] ?? "").startsWith("sudo sh -c"),
+    );
+    expect(pushed004).toBe(true);
+  });
+
+  test("m8: canary content-fail cn<=3 ⇒ NO notify (log only); cn>3 ⇒ notify", async () => {
+    // canary push returns rc 2 no status ⇒ push rc 5 (content) ⇒ bump cfgfail.
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20002 0.0.0.0:*\n" });
+      return result({ code: 2, stdout: "" });
+    });
+    // cn=1 (first failure) ⇒ NO notify
+    {
+      const { fs } = memState();
+      const notes: string[] = [];
+      const r = await configPass({
+        runner,
+        env: testEnv(),
+        source: { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined },
+        state: new ReconcileState("/s", fs),
+        notify: (_l, m) => void notes.push(m),
+        targetBoxes: ["grok-box-002"],
+        configCanary: "grok-box-002",
+        managedFilesPresent: true,
+        apply: true,
+      });
+      expect(r.rc).toBe(1);
+      expect(notes.length).toBe(0); // m8: >0 would notify here
+    }
+    // cn already 3 ⇒ this failure makes 4 (>3) ⇒ notify
+    {
+      const { fs, store } = memState();
+      store.set("/s/grok-box-002.cfgfail", "3\n");
+      const notes: string[] = [];
+      await configPass({
+        runner,
+        env: testEnv(),
+        source: { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined },
+        state: new ReconcileState("/s", fs),
+        notify: (_l, m) => void notes.push(m),
+        targetBoxes: ["grok-box-002"],
+        configCanary: "grok-box-002",
+        managedFilesPresent: true,
+        apply: true,
+      });
+      expect(notes.some((m) => m.includes("config push failing for grok-box-002") && m.includes("config pass aborted"))).toBe(true);
+    }
+  });
 });

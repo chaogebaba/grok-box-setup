@@ -266,3 +266,32 @@ describe("T13 D6c: config pass failure never changes run rc", () => {
     expect(logs.some((l) => l.includes("config: pass done") && l.includes("failed=1"))).toBe(true);
   });
 });
+
+
+describe("T2 latch suppresses a mint-worthy box even in apply mode (m2)", () => {
+  test("apply + PRE-LATCHED ctx + offline box ⇒ WOULD mint, no createKey", async () => {
+    // 008 offline in the device list, tunnel up ⇒ row a mint. Apply mode, but the
+    // run-context is already latched (an earlier box's API failure) ⇒ the mutation
+    // gate must WOULD-log, never call the API. m2 (latch not consulted) would mint.
+    const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: false, lastSeen: "2000-01-01T00:00:00Z" }] });
+    const { keys, ctx, apiCalls } = fakeKeys(() => ({ code: 200, body: devs }));
+    ctx.latch(); // pre-latched
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
+      return result({ code: 1 });
+    });
+    const deps = baseDeps({
+      keys,
+      ctx,
+      runner,
+      apply: true,
+      targetBoxes: ["grok-box-008"],
+      nowSec: Date.parse("2099-01-01T00:00:00Z") / 1000,
+    });
+    await runReconcile(deps);
+    expect(logs.some((l) => l.includes("grok-box-008 WOULD mint"))).toBe(true);
+    // m2 guard: the API createKey (POST /keys) was NEVER called (latch honoured).
+    expect(apiCalls.some((c) => c.includes("POST") && c.includes("/keys"))).toBe(false);
+  });
+});

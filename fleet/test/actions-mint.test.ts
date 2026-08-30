@@ -192,11 +192,14 @@ describe("T5 mint rc map + revoke arms", () => {
     });
     // seed fails (ssh rc 1)
     const runner = new FakeRunner(() => result({ code: 1, stderr: "SEED_SHA_MISMATCH" }));
-    const { fs } = memState();
+    const { fs, store } = memState();
     const r = await mintKey("grok-box-8", mintDeps({ keys, runner, state: new ReconcileState("/s", fs) }));
     expect(r.rc).toBe(1);
     // revoke DELETE was issued for the just-minted key
     expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/keys/kID"))).toBe(true);
+    // m5: .expires must NOT be written and meta NOT recorded on a seed failure
+    expect(store.has("/s/grok-box-8.expires")).toBe(false);
+    expect(store.has("/s/keys/8.json")).toBe(false);
   });
 
   test("rc 0: verified seed + meta persisted + expires written", async () => {
