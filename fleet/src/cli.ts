@@ -26,6 +26,7 @@ import {
   type UpgradeDeps,
 } from "./upgrade.ts";
 import { fsTelegramSource, fetchPoster } from "./notify.ts";
+import { buildGitSha } from "./build-flags.ts";
 import { log } from "./log.ts";
 
 const PKG_VERSION = "5.3.0";
@@ -43,8 +44,24 @@ function usage(): string {
   ].join("\n");
 }
 
-/** `fleet2 version` → `fleet2 <pkg version> (<git sha>) (bun <Bun.version>)`. */
-async function gitSha(): Promise<string> {
+/**
+ * Resolve the git sha for `fleet2 version` (gate-r1 finding 1). Precedence:
+ *  - the BUILD-embedded sha (`buildGitSha`, injected by `--define FLEET2_GIT_SHA`)
+ *    when non-empty — the compiled binary prints its OWN build sha regardless of
+ *    the invocation directory;
+ *  - otherwise (dev/test) fall back to `git rev-parse --short HEAD` at runtime.
+ * Pure/injectable so the build-flag path is unit-testable without a compile.
+ */
+export async function resolveGitSha(
+  buildSha: string,
+  runGit: () => Promise<string>,
+): Promise<string> {
+  if (buildSha !== "") return buildSha;
+  return runGit();
+}
+
+/** Runtime `git rev-parse --short HEAD`, "unknown" on any failure. */
+async function gitShaFromGit(): Promise<string> {
   try {
     const r = new BunRunner();
     const res = await r.run(["git", "rev-parse", "--short", "HEAD"], { timeoutMs: 5000 });
@@ -80,7 +97,7 @@ async function main(argv: string[]): Promise<number> {
   }
 
   if (cmd === "version") {
-    const sha = await gitSha();
+    const sha = await resolveGitSha(buildGitSha, gitShaFromGit);
     process.stdout.write(`fleet2 ${PKG_VERSION} (${sha}) (bun ${Bun.version})\n`);
     return RC.OK;
   }
@@ -225,10 +242,14 @@ async function main(argv: string[]): Promise<number> {
   return RC.USAGE;
 }
 
-main(process.argv)
-  .then((rc) => process.exit(rc))
-  .catch((e) => {
-    const msg = e instanceof Error ? e.message : String(e);
-    log(`fatal: ${msg}`);
-    process.exit(1);
-  });
+// Only auto-run when executed as the entry point — importing this module (e.g.
+// from a test) must NOT kick off the CLI.
+if (import.meta.main) {
+  main(process.argv)
+    .then((rc) => process.exit(rc))
+    .catch((e) => {
+      const msg = e instanceof Error ? e.message : String(e);
+      log(`fatal: ${msg}`);
+      process.exit(1);
+    });
+}

@@ -13,6 +13,7 @@
 // falls back to `false` when the define is absent (dev/test).
 
 declare const IS_COMPILED: boolean;
+declare const FLEET2_GIT_SHA: string;
 
 function readFlag(): boolean {
   // In dev/test the identifier is not defined; `typeof` guards the ReferenceError.
@@ -22,3 +23,18 @@ function readFlag(): boolean {
 }
 
 export const isCompiled: boolean = readFlag();
+
+// FLEET2_GIT_SHA — the git short-sha embedded at build time by
+// `ts-build` (`--define FLEET2_GIT_SHA="<sha>"`). Empty in dev/test, where the
+// runtime falls back to `git rev-parse` (see cli.ts resolveGitSha). This is the
+// gate-r1 finding-1 fix: the COMPILED binary must print its OWN build sha, not
+// re-run git in whatever directory it happens to be invoked from (which prints
+// `unknown` on the VPS where there is no repo).
+function readGitSha(): string {
+  // `--define FLEET2_GIT_SHA="abc1234"` substitutes the bare identifier with the
+  // string literal at build time; absent in dev ⇒ typeof guard yields "".
+  return typeof FLEET2_GIT_SHA !== "undefined" ? FLEET2_GIT_SHA : "";
+}
+
+/** The build-embedded git sha, or "" when not injected (dev/test). */
+export const buildGitSha: string = readGitSha();

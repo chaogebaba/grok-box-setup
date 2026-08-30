@@ -24,7 +24,9 @@ ts-test:
 
 ts-build:
 	cd fleet && bun build src/cli.ts --compile --minify --sourcemap \
-		--target=bun-linux-x64 --define IS_COMPILED=true --outfile dist/fleet2
+		--target=bun-linux-x64 --define IS_COMPILED=true \
+		--define FLEET2_GIT_SHA="\"$$(git rev-parse --short HEAD)\"" \
+		--outfile dist/fleet2
 
 # Atomic deploy (D10/S9): scp to a temp name, keep the previous binary as
 # fleet2.prev, chmod, then `mv -f` over the live path, and smoke `version`.
