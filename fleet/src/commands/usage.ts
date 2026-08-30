@@ -44,6 +44,10 @@ Brain subcommands (docs/FLEET-BRAIN.md — VPS-side unless noted):
   fleet2 config push <box>       push the rendered managed.toml to ONE box (D5)
   fleet2 mint-key <grok-box-N>   mint a per-box tag-scoped key + atomic seed
   fleet2 fleet-status            brain table: API / tunnel / check / authkey / ver
+  fleet2 serve [--bind <ip>] [--port <n>]
+                                 run the tailnet-bound token-auth admin API
+                                 (VPS-ONLY, refuses rc 6 off the VPS; port 9891)
+  fleet2 tui                     laptop admin panel over the serve API (lane B)
   fleet2 version | help
 
 Environment:

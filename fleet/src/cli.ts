@@ -44,7 +44,7 @@ import {
 import { makeEnrollSideEffects } from "./commands/enroll-wiring.ts";
 import { makeRenameDeps } from "./commands/rename-wiring.ts";
 
-const PKG_VERSION = "5.4.0"; // D17: retirement release.
+const PKG_VERSION = "5.5.0"; // A17: fleet2 admin panel (serve API + TUI) release.
 
 async function gitShaFromGit(): Promise<string> {
   try {
@@ -154,6 +154,22 @@ async function main(argv: string[]): Promise<number> {
       return cmdEnroll(rest, makeEnrollSideEffects(env, cfg, runner));
     case "rename":
       return cmdRename(rest, makeRenameDeps(env, cfg, runner));
+
+    // --- fleet2 admin panel (TUI-D11) ---
+    case "serve": {
+      // VPS-only (refuseVpsOnly precedent, rc 6) — the API drives boxes over the
+      // reverse tunnels, so it only makes sense on the VPS.
+      if (await refuseIfNoKey("serve", env.FLEET_BOX_KEY)) return RC.REFUSED;
+      const { cmdServe } = await import("./serve/server.ts");
+      return cmdServe(rest, { env, cfg, rollout, runner });
+    }
+    case "tui": {
+      // Laptop-runnable (lane B). The TUI implementation ships in lane B; in
+      // this lane-A binary it refuses cleanly rather than pretending to run.
+      // Lane B replaces this arm with `cmdTui` from ./tui/main.ts.
+      stderr("fleet2 tui: the admin panel (lane B) is not built in this binary yet\n");
+      return RC.REFUSED;
+    }
   }
 
   // Unreachable (decide() only routes KNOWN_COMMANDS), but keep the compiler happy.

@@ -34,6 +34,8 @@ export const KNOWN_COMMANDS = [
   "fleet-status",
   "inventory",
   "upgrade",
+  "serve", // TUI-D11: the VPS-side admin API (VPS-only, locality-guarded)
+  "tui", // TUI-D11: the laptop admin panel (lane B)
 ] as const;
 
 export type KnownCommand = (typeof KNOWN_COMMANDS)[number];
