@@ -71,6 +71,8 @@ export interface CreateKeyResult {
   key: string | undefined;
   id: string | undefined;
   expires: string | undefined; // normalized YYYY-MM-DD (when a 2xx body parsed)
+  /** the RAW `.expires` from the response (bash records this in keys/<N>.json). */
+  expiresRaw: string | undefined;
 }
 
 // A minimal transport shape we depend on (subset of tailscale.ts TailscaleTransport).
@@ -137,7 +139,7 @@ export class TailscaleKeys {
     );
     if (!is2xx(r.code)) {
       this.ctx.latch();
-      return { code: r.code, key: undefined, id: undefined, expires: undefined };
+      return { code: r.code, key: undefined, id: undefined, expires: undefined, expiresRaw: undefined };
     }
     let parsed: { key?: unknown; id?: unknown; expires?: unknown } = {};
     try {
@@ -147,8 +149,9 @@ export class TailscaleKeys {
     }
     const key = typeof parsed.key === "string" && parsed.key !== "" ? parsed.key : undefined;
     const id = typeof parsed.id === "string" && parsed.id !== "" ? parsed.id : undefined;
+    const expiresRaw = typeof parsed.expires === "string" ? parsed.expires : undefined;
     const expires = normalizeExpires(parsed.expires, () => plus90Days(nowMs));
-    return { code: r.code, key, id, expires };
+    return { code: r.code, key, id, expires, expiresRaw };
   }
 
   /**
