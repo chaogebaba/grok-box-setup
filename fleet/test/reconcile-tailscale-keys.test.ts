@@ -82,6 +82,18 @@ describe("createKey", () => {
     expect(ctx.readonly).toBe(false);
   });
 
+  test("m14: an over-max expiry is clamped at the createKey call site (POST body = 7776000)", async () => {
+    // The mint call site (createKey) MUST clamp via clampExpirySecs. Passing an
+    // over-max value proves the clamp runs HERE, not just in the pure helper: if
+    // the call-site clamp is bypassed (m14) the POST body carries 9999999.
+    const { keys, calls } = mk(() => ({
+      code: 200,
+      body: JSON.stringify({ key: "tskey-abc", id: "kID", expires: "2026-11-27T00:00:00Z" }),
+    }));
+    await keys.createKey(9999999); // > FLEET_KEY_EXPIRY_MAX (7776000)
+    expect(JSON.parse(calls[0]!.body!).expirySeconds).toBe(7776000);
+  });
+
   test("non-2xx ⇒ latch + undefined fields", async () => {
     const { keys, ctx } = mk(() => ({ code: 500, body: "" }));
     const r = await keys.createKey(7776000);

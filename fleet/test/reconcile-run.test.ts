@@ -211,14 +211,34 @@ describe("T7 D4: WOULD 'read-only ' prefix is CONDITIONAL on the latch (F3, m9)"
     expect(would!).toContain("(read-only dry-run/no-apply)"); // latched ⇒ prefix present
   });
 
-  test("m16: neither the config-pass nor the rollout WOULD line ever carries 'read-only '", async () => {
-    // Every WOULD line the run emits: only the reconcile mutation-gate line may
-    // carry the prefix (and only when latched). config/rollout WOULD lines never do.
-    for (const l of logs) {
-      if (l.includes("WOULD push") || l.includes("WOULD rollout")) {
-        expect(l).not.toContain("read-only ");
-      }
-    }
+  test("m16: a real config-pass WOULD push line (dry-run) carries NO 'read-only ' prefix", async () => {
+    // Drive an ACTUAL config pass: dry-run, managed files present, a box whose
+    // on-box managed sha DIFFERS from the render ⇒ pushManaged(dry) logs
+    // `config: <box> WOULD push (<cur>-><want>)`. m16 (add the read-only prefix
+    // to the config-pass WOULD line) is killed here — bash's config WOULD line
+    // never carried a prefix.
+    const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: true, lastSeen: "2999-01-01T00:00:00Z" }] });
+    const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
+      // the config-pass dry-run remote: report a DIFFERENT cur sha ⇒ WOULD push.
+      return result({ code: 0, stdout: "cur=OTHERSHA want=IGNORED support=yes enabled=true" });
+    });
+    const src: ManagedSource = { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined };
+    const deps = baseDeps({
+      keys,
+      runner,
+      apply: false, // DRY-RUN ⇒ pushManaged(dry=true) ⇒ WOULD push
+      targetBoxes: ["grok-box-008"],
+      managedSource: src,
+      managedFilesPresent: true,
+      nowSec: Date.parse("2999-01-01T00:00:00Z") / 1000,
+    });
+    await runReconcile(deps);
+    const would = logs.find((l) => l.includes("grok-box-008 WOULD push"));
+    expect(would).toBeDefined(); // the config-pass WOULD line was actually emitted
+    expect(would!).not.toContain("read-only "); // m16 kill: no prefix on it
   });
 });
 

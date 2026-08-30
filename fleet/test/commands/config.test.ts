@@ -116,6 +116,25 @@ describe("T4 diff (F12)", () => {
     expect(out).not.toMatch(/@@ [^\n]*@@\n(?:[ +-]\S.*\n)* \S+\n-\n$/);
   });
 
+  test("m8: config diff sends the remote script with the DRY-RUN flag (dry=1), never a push", async () => {
+    // The diff MUST run the remote managed script in dry-run mode
+    // (managedRemoteScript(want, 1) ⇒ `dry=1`), which reads the on-box file and
+    // writes NOTHING. m8 (drop the dry-run flag ⇒ dry=0) would PUSH on a diff.
+    const text = renderManaged(FLEET_TOML, undefined);
+    const dry = await dryRunOutput("grok-box-8", text, {});
+    let remoteCmd = "";
+    const runner = new FakeRunner((argv) => {
+      if (argv[0] === "/usr/bin/diff") return result({ stdout: "", code: 0 });
+      // the tunnel-ssh dry-run call — capture the remote command (last argv elt).
+      remoteCmd = argv[argv.length - 1] ?? "";
+      return result({ code: 0, stdout: dry });
+    });
+    await cmdConfig(["diff", "grok-box-8"], { runner, env, source, enrolled, whichDiff, write: () => {} });
+    // the remote managed script must carry the dry-run flag and NOT the apply path.
+    expect(remoteCmd).toContain("dry=1");
+    expect(remoteCmd).not.toContain("dry=0");
+  });
+
   test("in sync (cur==want, enabled true, support yes) ⇒ rc 0", async () => {
     const text = renderManaged(FLEET_TOML, undefined);
     const dry = await dryRunOutput("grok-box-8", text.replace(/\n$/, ""), {});

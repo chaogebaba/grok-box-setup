@@ -2,6 +2,10 @@
 
 import { describe, test, expect } from "bun:test";
 import { cmdRename, renameVerGe, renamePlanPaths, type RenameStore, type RenameOps, type PollResult } from "../../src/commands/rename.ts";
+import { makeRenameDeps } from "../../src/commands/rename-wiring.ts";
+import { testEnv } from "../helpers.ts";
+import { parseConfig } from "../../src/config.ts";
+import { FakeRunner, result } from "../fake-runner.ts";
 import { setLogSink } from "../../src/log.ts";
 
 function captureLog(): { lines: string[]; restore: () => void } {
@@ -194,5 +198,33 @@ describe("T3 happy path + resume", () => {
     expect(rc).toBe(1);
     expect(rec.deleted).toBe(false);
     expect(cap.lines.some((l) => l.includes("timed out (5s) waiting for HostName/DNS=grok-box-003"))).toBe(true);
+  });
+});
+
+
+describe("T3 m6: rename lock wiring uses flock -w 90 (bounded wait), never -n", () => {
+  test("acquireLock runs `flock -w 90 <lock> -c :` (the real RenameOps wiring)", async () => {
+    // The gate memo m6: the cited rename test stubbed the lock RESULT and never
+    // asserted the wiring argv, so a `-n` (non-blocking, no 90s wait) mutation
+    // survived. Drive the REAL makeRenameDeps().ops.acquireLock() through a
+    // FakeRunner and assert the argv carries `-w 90` and NOT `-n`.
+    const env = testEnv({ FLEET_STATE: "/var/lib/grok-fleet" });
+    const cfg = parseConfig(undefined, "/x");
+    const runner = new FakeRunner(() => result({ code: 0 }));
+    const deps = makeRenameDeps(env, cfg, runner);
+    const verdict = await deps.ops.acquireLock();
+    // flock is present on the CI/dev box; the lock argv must have been run.
+    const flockCall = runner.calls.find((c) => c.argv[0] === "flock");
+    expect(flockCall).toBeDefined();
+    const argv = flockCall!.argv;
+    // -w 90 present as adjacent tokens.
+    const wIdx = argv.indexOf("-w");
+    expect(wIdx).toBeGreaterThanOrEqual(0);
+    expect(argv[wIdx + 1]).toBe("90");
+    // never the non-blocking -n form (m6 kill).
+    expect(argv).not.toContain("-n");
+    // and the lock file is the reconcile.lock under FLEET_STATE.
+    expect(argv.some((a) => a.endsWith("/reconcile.lock"))).toBe(true);
+    expect(verdict).toBe("ok"); // FakeRunner rc 0 ⇒ lock acquired
   });
 });

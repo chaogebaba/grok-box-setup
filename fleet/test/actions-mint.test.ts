@@ -215,6 +215,35 @@ describe("T5 mint rc map + revoke arms", () => {
     expect(store.get("/s/keys/8.json")).toBe('{"id":"kID","expires":"2026-11-27T00:00:00Z"}');
     expect(store.get("/s/grok-box-8.expires")).toBe("grok-box-8\t2026-11-27\n");
   });
+
+  test("m4: rc 1 + REVOKE on meta-persist failure (verified seed, recordKeyMeta fails)", async () => {
+    // Seed + verify succeed, but persisting the key meta fails (the atomic
+    // tmp→rename throws). fleet2 MUST revoke the just-minted key (an unrecorded
+    // live key on the tailnet is the exact hazard) and NOT write <box>.expires.
+    // m4 (skip revoke on persist failure) leaves the key live ⇒ no DELETE.
+    const { keys, calls } = fakeKeys((c) => {
+      if (c.method === "POST" && c.url.endsWith("/keys"))
+        return { code: 200, body: JSON.stringify({ key: "tskey-x", id: "kID", expires: "2026-11-27T00:00:00Z" }) };
+      if (c.method === "DELETE") return { code: 200, body: "" }; // revoke ok
+      return { code: 500, body: "" };
+    });
+    const runner = seedOkRunner("2026-11-27");
+    // A StateFs whose rename ALWAYS throws ⇒ recordKeyMeta returns false.
+    const { fs, store } = memState();
+    const failFs: StateFs = {
+      ...fs,
+      rename: () => {
+        throw new Error("simulated ENOSPC on the keys/<n>.json rename");
+      },
+    };
+    const state = new ReconcileState("/s", failFs);
+    const r = await mintKey("grok-box-8", mintDeps({ keys, runner, state }));
+    expect(r.rc).toBe(1);
+    // revoke DELETE was issued for the just-minted key id (the m4 kill).
+    expect(calls.some((c) => c.method === "DELETE" && c.url.endsWith("/keys/kID"))).toBe(true);
+    // and the mint-window marker was NEVER advanced (no <box>.expires).
+    expect(store.has("/s/grok-box-8.expires")).toBe(false);
+  });
 });
 
 describe("T5 mint_window_valid (main:1724-1736)", () => {
