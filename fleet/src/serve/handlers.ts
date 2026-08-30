@@ -121,8 +121,9 @@ export function handleHistory(ctx: ServerContext, box: string | null, hours: num
 // --- GET /v1/boxes/:name/diff (readonly; ssh to that box only) ---------------
 export async function handleDiff(ctx: ServerContext, box: string): Promise<Response> {
   const { value, log } = await withCapture(async () => {
-    // config diff core; diff handler re-emits its nonzero reason (R2-A1) — the
-    // core already writes NOTE/diff to the provided write() sink.
+    // config diff core; the core writes the unified diff + NOTE lines to the
+    // provided write() sink, and its refusal/unreachable reasons to
+    // process.stderr (NOT the ALS log). The buffer collects the write() body.
     const buf: string[] = [];
     const rc = await cmdConfig(["diff", box], {
       runner: ctx.runner,
@@ -132,8 +133,15 @@ export async function handleDiff(ctx: ServerContext, box: string): Promise<Respo
     });
     return { rc, body: buf };
   });
-  // combine the diff body (captured via write) and any log lines.
-  return opResult(value.rc, [...value.body, ...log.filter((l) => !value.body.includes(l))]);
+  // R2-A1: the diff core emits its D4-refused / diff(1)-missing / box-unreachable
+  // reasons to process.stderr, which the ALS tee does NOT capture. So for ANY
+  // nonzero rc with no body, re-emit a one-line reason into log[] so the client
+  // never gets an empty explanation.
+  const combined = [...value.body, ...log.filter((l) => !value.body.includes(l))];
+  if (value.rc !== 0 && combined.length === 0) {
+    combined.push(`config diff ${box}: rc=${value.rc} (drift, unreachable, or diff(1) missing — see journald)`);
+  }
+  return opResult(value.rc, combined);
 }
 
 // --- GET /v1/boxes/:name/journal?lines= (admin) ------------------------------

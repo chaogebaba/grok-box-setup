@@ -113,21 +113,22 @@ export function openLibcFlock(): FlockSyscalls {
 }
 
 /** In-process async mutex (single-writer) — serialises SAME-process mutations. */
-class AsyncMutex {
+export class AsyncMutex {
   private tail: Promise<void> = Promise.resolve();
 
   /**
-   * Acquire within `deadline` (epoch ms). Returns a release fn, or "timeout"
-   * when the wait exceeds the deadline. The mutex chain is advanced only when
-   * acquisition succeeds; a timed-out waiter never jumps the queue.
+   * Acquire within `deadline` (epoch ms per the SAME clock the caller uses).
+   * Returns a release fn, or "timeout" when the wait exceeds the deadline. The
+   * `now` clock is injected so a fake-clock caller and the mutex agree (a real
+   * `Date.now()` here with a fake caller deadline would spuriously time out).
    */
-  async acquire(deadlineMs: number): Promise<(() => void) | "timeout"> {
+  async acquire(deadlineMs: number, now: () => number = () => Date.now()): Promise<(() => void) | "timeout"> {
     // Snapshot the current tail; append our gate.
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     const prior = this.tail;
     this.tail = prior.then(() => gate);
-    const remaining = deadlineMs - Date.now();
+    const remaining = deadlineMs - now();
     if (remaining <= 0) {
       // We must still not deadlock the chain: release immediately.
       release();
@@ -188,7 +189,7 @@ export async function withReconcileLock<T>(
   const deadline = now() + timeoutMs;
 
   // Stage 1: in-process mutex, sharing the deadline.
-  const release = await mutex.acquire(deadline);
+  const release = await mutex.acquire(deadline, now);
   if (release === "timeout") {
     return { ok: false, reason: "lock_busy" };
   }
