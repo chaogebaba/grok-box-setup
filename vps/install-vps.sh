@@ -271,6 +271,12 @@ Match User $FLEET_USER
     PermitTunnel no
     PermitTTY no
     ForceCommand /usr/sbin/nologin
+    # #11: reap a dead tunnel session fast so a sleep/wake box can rebind its
+    # reverse -R port. Without this the OLD session holds :2000N until sshd's
+    # (long) default keepalive fires, costing minutes of tunnel=down. 30s * 3 =
+    # ~90s worst case, scoped to the fleet user ONLY.
+    ClientAliveInterval 30
+    ClientAliveCountMax 3
 EOF
   chmod 644 "$tmp" 2>/dev/null || true
   # On a real install, VALIDATE before installing/reloading. sshd -t parses the

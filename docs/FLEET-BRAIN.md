@@ -71,10 +71,15 @@ Design against THESE facts, not assumptions:
   and anything we add must not collide with these.
 - **sshd:** port 22, `PermitRootLogin yes`, `PasswordAuthentication yes`,
   `AllowTcpForwarding yes`, **`GatewayPorts no`** (GOOD — reverse forwards bind
-  `127.0.0.1` only, exactly the design), **`ClientAliveInterval 0`** (so the
-  VPS will NOT reap dead tunnels — **liveness MUST be client-driven**:
+  `127.0.0.1` only, exactly the design), **`ClientAliveInterval 0`** globally (so
+  the VPS will NOT reap dead tunnels by default — **liveness MUST be client-driven**:
   `ServerAliveInterval`/`ServerAliveCountMax` from the box, plus a VPS-side
-  `ss -tln` probe on `127.0.0.1:2000N` in reconcile). No fail2ban. No existing
+  `ss -tln` probe on `127.0.0.1:2000N` in reconcile). **#11 exception (fleet user
+  ONLY):** the `Match User fleet` drop-in written by `vps/install-vps.sh` sets
+  `ClientAliveInterval 30` + `ClientAliveCountMax 3`, so a dead tunnel session is
+  reaped in ~90 s and a sleep/wake box can rebind its stale `-R 127.0.0.1:2000N`
+  port instead of waiting minutes for the default timeout. Scoped to the fleet
+  user, so the global VPS keepalive policy is untouched. No fail2ban. No existing
   `/opt/*` and no systemd timers — `/opt/grok-fleet` + our timer are greenfield.
 
 ## Decision wall
