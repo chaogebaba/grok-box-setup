@@ -103,6 +103,14 @@ export interface TailscaleTransport {
   readToken(path: string): Promise<string | undefined>;
   /** GET the URL with the given headers; return {code, body}. */
   get(url: string, headers: Record<string, string>, timeoutMs: number): Promise<{ code: number; body: string }>;
+  /** Generic request (POST/DELETE/GET) with an optional JSON body (D7). */
+  request(
+    method: string,
+    url: string,
+    headers: Record<string, string>,
+    timeoutMs: number,
+    body?: string,
+  ): Promise<{ code: number; body: string }>;
 }
 
 /** Production transport: Bun.file for the token, fetch for the request. */
@@ -114,13 +122,19 @@ export const fetchTransport: TailscaleTransport = {
     return t === "" ? undefined : t;
   },
   async get(url, headers, timeoutMs) {
+    return this.request("GET", url, headers, timeoutMs);
+  },
+  async request(method, url, headers, timeoutMs, body) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { method: "GET", headers, signal: ctrl.signal });
-      const body = await res.text();
-      return { code: res.status, body };
+      const init: RequestInit = { method, headers, signal: ctrl.signal };
+      if (body !== undefined) init.body = body;
+      const res = await fetch(url, init);
+      const text = await res.text();
+      return { code: res.status, body: text };
     } catch {
+      // transport failure ⇒ code 0 (bash TS_API_CODE=0), never throws
       return { code: 0, body: "" };
     } finally {
       clearTimeout(timer);
