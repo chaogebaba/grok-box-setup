@@ -80,7 +80,11 @@ export async function pushManaged(box: string, dry: boolean, deps: PushDeps): Pr
   const remote = managedRemoteScript(wantSha, dry ? 1 : 0);
   const cmd = wrapSudoShC(remote);
   const r = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, cmd, {
-    stdin: `${text}\n`,
+    // `text` already ends in exactly one trailing newline (renderManaged),
+    // matching bash's `printf '%s\n' "$text"` canonical bytes — send it AS-IS so
+    // the STDIN bytes the box hashes equal want_sha (gate-r1 fix: an extra `\n`
+    // here + in textSha256 hashed a double newline, disagreeing with bash).
+    stdin: text,
     timeoutMs: PUSH_TIMEOUT_MS,
   });
   const out = r.stdout;

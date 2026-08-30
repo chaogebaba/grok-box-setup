@@ -85,6 +85,29 @@ describe("T11 managed_remote_script (mrs_scan E1)", () => {
 
 // ---- wrap_test (E1 AUTHORITATIVE real sh -c, tests:3204-3239) ----
 describe("T11 wrap_test — managed_remote_script through a REAL sh -c", () => {
+  test("gate-r1 fix: want_sha pins to bash's byte-for-byte sha (single trailing \\n) and == the sha the remote hashes from the SAME stdin", async () => {
+    // The exact VPS fleet.toml from the r1 gate. Bash computed
+    // dd15bf79…d83ff4 = printf '%s\n' "$(render)" | sha256sum (render body + ONE
+    // trailing \n). renderManaged already ends in one \n, so textSha256 must
+    // hash it AS-IS (no extra \n) to match — and that must equal what the box
+    // hashes from the STDIN bytes fleet2 sends (also `text` as-is).
+    const fleetToml =
+      "# fleet-wide managed config (config-truth Phase 2). Behaviour-neutral seed:\n" +
+      "# [update].repo = boxup DEFAULT_REPO_URL. Created 2026-08-29 by supervisor.\n" +
+      "[update]\n" +
+      'repo = "https://github.com/chaogebaba/grok-box-setup.git"\n';
+    const text = renderManaged(fleetToml, undefined);
+    expect(text.endsWith("\n")).toBe(true);
+    expect(text.endsWith("\n\n")).toBe(false); // exactly ONE trailing newline
+    const want = await textSha256(text);
+    // pin to bash's value
+    expect(want).toBe("dd15bf797cb949f6edf07287d45c0c13da4eca669b05e0a59ef20b0c5cd83ff4");
+    // want_sha == sha256 of the STDIN bytes the box receives (text as-is)
+    const onBox = new Bun.CryptoHasher("sha256");
+    onBox.update(text); // production sends `stdin: text` (config-push.ts)
+    expect(want).toBe(onBox.digest("hex"));
+  });
+
   test("matching sha writes the file; status line printed", async () => {
     const { mkdtempSync, writeFileSync, rmSync, readFileSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
@@ -102,13 +125,15 @@ describe("T11 wrap_test — managed_remote_script through a REAL sh -c", () => {
     // config-get would need bash boxup; our fake boxup lacks it ⇒ prc!=0/1 ⇒
     // support=yes but enabled=unknown. That's fine — we assert the WRITE.
     const proc = Bun.spawnSync(["sh", "-c", script], {
-      stdin: Buffer.from(`${text}\n`),
+      // send the rendered text AS-IS (matches production: text already ends in
+      // one \n and want_sha hashes those exact bytes — gate-r1 fix).
+      stdin: Buffer.from(text),
       stdout: "pipe",
       stderr: "pipe",
     });
     const out = proc.stdout.toString();
     expect(proc.exitCode).toBe(0);
-    expect(readFileSync(mf, "utf8")).toBe(`${text}\n`);
+    expect(readFileSync(mf, "utf8")).toBe(text); // stdin sent AS-IS (one trailing \n)
     expect(out).toContain(`sha=${want}`);
     rmSync(dir, { recursive: true, force: true });
   });

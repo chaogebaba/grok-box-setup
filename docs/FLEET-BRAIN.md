@@ -523,6 +523,8 @@ Phase 2 ports the **whole reconcile tick** to `fleet2 reconcile` (blueprint `blu
 ### State-file compatibility
 `fleet2` reads and writes every `$FLEET_STATE` file byte-identically to bash (`enrolled.tsv`, `keys/<N>.json`, `<box>.expires`, `<box>.checkfail`/`.seedfail`/`.cfgfail`/`.asleep`/`.incoherent`, `api.fails`/`.backoff_min`/`.next_retry`), so bash and fleet2 can be swapped either direction mid-soak with no migration. Counters use the same read/normalise idiom (strip whitespace, non-numeric ⇒ 0; a healthy `.checkfail` is a literal `0`, gated on count not presence).
 
+**Written on a dry-run tick by BOTH engines** (a `--dry-run`/`apply=false` reconcile does NOT leave `$FLEET_STATE` untouched — this is bash parity, not a fleet2 mutation): `<box>.checkfail` (reset/bump on every tunnel-up box), `<box>.cfgfail` (config-pass), `<box>.asleep` and `<box>.incoherent` (row-e alert throttles — `reconcile_alert_asleep`/`reconcile_alert_incoherent` run BEFORE the mutation gate, fleetctl main:2842/2848), and the `api.*` counters (on an API failure/backoff). Only the API/tunnel MUTATIONS (mint/rotate/dedup key + device writes) are suppressed in dry-run. A cross-engine dry-run parity diff must therefore expect these files to change under both engines.
+
 ### Cutover / soak / apply-flip / cutback
 Same unit, timer, env, and lock ⇒ bash and fleet2 never run concurrently.
 - `make ts-cutover SOAK=1` — install the SOAK drop-in (`ExecStart=/opt/grok-fleet/fleet2 reconcile --dry-run`, config ignored). This is the ONLY path into the timer during the gate/soak.

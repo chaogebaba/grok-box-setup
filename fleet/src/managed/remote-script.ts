@@ -59,10 +59,17 @@ export function wrapSudoShC(script: string): string {
   return `sudo sh -c '${script}'`;
 }
 
-/** sha256 hex of `<text>\n` (bash: printf '%s\n' | sha256sum | awk '{print $1}'). */
+/**
+ * sha256 hex of the rendered managed.toml bytes — EXACTLY the bytes sent to the
+ * box on STDIN. `renderManaged` already returns text terminated by a single
+ * trailing `\n` (matching bash's `printf '%s\n' "$text"` canonical form:
+ * render body + one newline, main:2191/2217), so we hash `text` AS-IS. Appending
+ * another `\n` here (the gate-r1 bug) hashed a DOUBLE trailing newline, giving a
+ * want_sha that disagreed with bash's byte-for-byte identical render.
+ */
 export async function textSha256(text: string): Promise<string> {
   const h = new Bun.CryptoHasher("sha256");
-  h.update(`${text}\n`);
+  h.update(text);
   return h.digest("hex");
 }
 
