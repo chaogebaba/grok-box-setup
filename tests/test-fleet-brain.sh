@@ -2710,6 +2710,49 @@ case "$g_tun" in *"PUSH grok-box-003"*) bad "D6 guard: pushed to a tunnel-DOWN b
 g_chk="$(cfgpass_guard_test checkfail)"
 case "$g_chk" in *"PUSH grok-box-003"*) bad "D6 guard: pushed to a .checkfail box: [$g_chk]" ;; *"PUSH grok-box-008"*) pass "D6 guard: .checkfail box skipped silently" ;; *) bad "D6 checkfail guard wrong: [$g_chk]" ;; esac
 
+# --- #14: a tunnel-DOWN CANARY must LOG a skip line and be COUNTED in skipped=
+# (previously a silent `:` no-op — no journal line, uncounted). Drive the REAL
+# reconcile_config_pass with the canary (grok-box-008) tunnel DOWN and the rest
+# up; assert the exact log line, skipped>=1 in the `pass done` summary, that the
+# canary got NO push, and that the rest still ran (fall-through preserved).
+cfgpass_canary_down_test() {
+  local inner; inner="$(mktemp)"; local d; d="$(mktemp -d)"; mkdir -p "$d/etc/boxes" "$d/state"
+  printf '[update]\nrepo = x\n' > "$d/etc/fleet.toml"
+  cat > "$inner" <<INNER
+set -u
+FLEETCTL="$FLEETCTL"
+FLEET_MANAGED_FLEET="$d/etc/fleet.toml"; FLEET_MANAGED_BOXDIR="$d/etc/boxes"
+FLEET_STATE="$d/state"; FLEET_BOXES="grok-box-008 grok-box-003 grok-box-005"
+log(){ echo "LOG:\$*"; }; notify(){ echo "NOTIFY:\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+for fn in box_index_from_name box_name_from_index managed_files_present reconcile_canary_box reconcile_target_boxes reconcile_checkfail_count reconcile_bump_cfgfail reconcile_reset_cfgfail reconcile_config_pass; do eval "\$(extract_from "\$FLEETCTL" "\$fn")"; done
+config_get(){ return 1; }   # default canary = grok-box-008
+# Canary tunnel DOWN; the rest up.
+tunnel_up(){ case "\$1" in grok-box-008) return 1 ;; *) return 0 ;; esac; }
+seq="$d/seq"
+push_managed(){ echo "PUSH \$1" >> "\$seq"; return 0; }
+reconcile_config_pass 1
+[ -f "\$seq" ] && tr '\n' '|' < "\$seq"; echo
+INNER
+  timeout 20 bash "$inner"; rm -f "$inner"; rm -rf "$d"
+}
+cp_cdn="$(cfgpass_canary_down_test)"
+case "$cp_cdn" in
+  *"LOG:config: canary grok-box-008 tunnel down — canary check skipped this tick, continuing without canary protection"*)
+    pass "#14: a tunnel-down canary LOGS the skip line (no longer a silent no-op)" ;;
+  *) bad "#14: tunnel-down canary skip line missing: [$cp_cdn]" ;;
+esac
+case "$cp_cdn" in
+  *"LOG:config: pass done (apply) ok=2 skipped=1 failed=0"*)
+    pass "#14: a tunnel-down canary is COUNTED in skipped= (skipped=1, rest ok=2)" ;;
+  *) bad "#14: tunnel-down canary not counted in skipped=: [$cp_cdn]" ;;
+esac
+case "$cp_cdn" in
+  *"PUSH grok-box-008"*) bad "#14: pushed to the tunnel-down canary (must not): [$cp_cdn]" ;;
+  *"PUSH grok-box-003"*) pass "#14: tunnel-down canary => no canary push, but the rest still ran (fall-through preserved)" ;;
+  *) bad "#14: fall-through to the rest broke: [$cp_cdn]" ;;
+esac
+
 # BLOCKER-1 (live canary r1): the per-box guard must gate on the checkfail COUNT
 # (>3, matching reconcile_decide's threshold), NOT file PRESENCE. A HEALTHY box
 # carries a `0`-content .checkfail FILE (reconcile_reset_checkfail rewrites it
