@@ -9,7 +9,6 @@ lint:
 
 test:
 	bash tests/test-iter3-fixes.sh
-	bash tests/test-fleet-brain.sh
 	bash tests/test-install-vps.sh
 	bash tests/test-boxup-config.sh
 

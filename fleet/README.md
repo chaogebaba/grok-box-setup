@@ -2,7 +2,7 @@
 
 `fleet2` is the fleet brain rewritten in bun + TypeScript. Phase 1 provides two
 commands — **inventory** and batch **upgrade** — as a single compiled binary
-that runs on the VPS alongside the bash `fleetctl` (see `../docs/FLEET-BRAIN.md`
+that runs on the VPS alongside the bash `fleet2` (see `../docs/FLEET-BRAIN.md`
 §"Upgrades and inventory (fleet2, phase 1)" for the full contract).
 
 Zero runtime npm dependencies. Requires bun 1.4.0.

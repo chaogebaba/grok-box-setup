@@ -19,7 +19,7 @@ sudo /workspace/box-setup/boxup once
 (`grok-box-001` … `grok-box-999`). `boxup` picks the lowest free index and
 zero-pads it; the reverse-tunnel port is `20000 + index` (parsed as decimal, so
 `grok-box-008` → port 20008). Legacy unpadded names are still recognised; to
-convert one in place use `fleetctl rename grok-box-8 grok-box-008` (see
+convert one in place use `fleet2 rename grok-box-8 grok-box-008` (see
 docs/AGENT.md → "Rename a box").
 
 Before the first `boxup once`, create the Tailscale auth key as **reusable +
@@ -91,28 +91,28 @@ node), update repo (`[update] repo`). See
 
 ## Fleet operations (laptop)
 
-`boxup` runs on a box; [`fleetctl`](fleetctl) runs on the operator's laptop and
+`boxup` runs on a box; [`fleet2`](fleet2) runs on the operator's laptop and
 drives all the boxes at once over the tailnet (needs `tailscale`, `ssh`,
 `sshpass` — `sudo dnf install sshpass` / `sudo apt install sshpass`). It
 discovers every `grok-box-NNN` peer; it never touches other machines.
 
 > **fleet2 (bun + TypeScript brain, phase 1).** The VPS-side brain is moving to
 > bun + TypeScript. `fleet2` adds fleet **inventory** and batch **upgrade**
-> (canary/verify/abort) alongside the bash `fleetctl`. See
+> (canary/verify/abort) alongside the bash `fleet2`. See
 > [`fleet/README.md`](fleet/README.md) and
 > [`docs/FLEET-BRAIN.md`](docs/FLEET-BRAIN.md) §"Upgrades and inventory (fleet2)".
 
 ```bash
-./fleetctl list                 # name, tailscale IP, online — all grok-box-NNN peers
-./fleetctl status               # boxup status line per online box + sha/drift (read-only)
-./fleetctl check                # quiet health gate; exit 1 + prints only problems
-./fleetctl rollout grok-box-003 # deploy current git HEAD to explicit boxes
-./fleetctl rollout --all        # deploy to the whole fleet (canary first, then batch)
-./fleetctl ssh grok-box-003 [cmd] # ssh wrapper
+./fleet2 list                 # name, tailscale IP, online — all grok-box-NNN peers
+./fleet2 status               # boxup status line per online box + sha/drift (read-only)
+./fleet2 check                # quiet health gate; exit 1 + prints only problems
+./fleet2 rollout grok-box-003 # deploy current git HEAD to explicit boxes
+./fleet2 rollout --all        # deploy to the whole fleet (canary first, then batch)
+./fleet2 ssh grok-box-003 [cmd] # ssh wrapper
 ```
 
 `rollout` requires a target: one or more explicit `grok-box-NNN`, or `--all` for
-the whole fleet. A bare `fleetctl rollout` is a usage error (it will not guess).
+the whole fleet. A bare `fleet2 rollout` is a usage error (it will not guess).
 `--all` deploys to a canary first (default `grok-box-005`, override with
 `--canary <box>`), verifies it with `boxup check`, and only then rolls the rest
 at 2-concurrency. The first box that fails verification trips an **abort**: no
@@ -122,30 +122,27 @@ no auto-rollback — on abort the exact redeploy command is printed. An
 unreachable canary aborts (pick another with `--canary`); unreachable
 non-canary boxes are skipped, never failures. `--dirty` allows a dirty tree.
 
-`fleetctl status` appends `sha=<sha> drift=yes|no` per box (comparing the box's
+`fleet2 status` appends `sha=<sha> drift=yes|no` per box (comparing the box's
 installed git sha to the laptop's HEAD) and logs a summary when the fleet is
 mixed-version; a box running an older boxup renders `sha=unknown drift=unknown`
 (informational, never a failure).
 
-`fleetctl check` delegates to `boxup check` on each box and trusts its exit
+`fleet2 check` delegates to `boxup check` on each box and trusts its exit
 code; a box running an older boxup (no `check` subcommand) falls back to the
 laptop-side `boxup status` parse so it is never wrongly reported as failing.
 
-Password precedence: `FLEET_SSH_PASSWORD` > `~/.config/fleetctl/config.toml`
+Password precedence: `FLEET_SSH_PASSWORD` > `~/.config/fleet2/config.toml`
 `[ssh].password` > `12345678` (never stored in git). `FLEET_BOXES="grok-box-1
 grok-box-2"` bypasses discovery for a fixed list.
 
-Run `check` on a schedule with a systemd **user** timer (every 10 min, desktop
-notification on failure):
+The laptop **user** timer is retired (since 5.4.0): the VPS `fleet-reconcile.timer`
+does the scheduled health checks and alerts now. `fleet2 install-timer` prints a
+retirement notice (rc 2). If you set up the old timer on a laptop, tear it down
+once:
 
 ```bash
-./fleetctl install-timer        # enables fleetctl-check.timer (check --notify)
-./fleetctl remove-timer         # tears it down
+./fleet2 remove-timer         # removes the retired fleetctl-check.{timer,service}
 ```
-
-Note: the timer's notifications use `notify-send`, which needs a graphical
-session — outside one (e.g. over plain ssh) nothing pops up, but failures are
-still logged to the systemd user journal.
 
 ## House rules
 

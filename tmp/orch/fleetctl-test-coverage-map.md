@@ -167,14 +167,13 @@ tests plus new alias/locality tests.
 | 1345-1403 M19/M20/M21 installer mutant kills | `tests/test-install-vps.sh` INSTALLER MUTANT KILLS section |
 | 3656-3768 #12 D6a/D6b/#11/F10 sshd drop-in | `tests/test-install-vps.sh` PermitListen cap section |
 | 3927-3962 F8 sshd reload FATAL | `tests/test-install-vps.sh` F8 block |
-| BUG-A (installer) 1535-1550 Environment=HOME= unit template | `tests/test-install-vps.sh` (T8 ExecStart/env — folded into service-unit assertions) OR EXISTING coverage; see note* |
-| BUG-E (installer) 1635-1643 ensure_fleet_user chown ~fleet/.ssh | `tests/test-install-vps.sh` (installer scope) OR DROPPED if not an installed-artefact assertion; see note* |
+| BUG-A (installer) 1535-1550 Environment=HOME= unit template | `tests/test-install-vps.sh` (the service unit carries `Environment=HOME=$STATE_DIR`; asserted by the installer tree + dry-run-gate blocks). The bash `env -i` static scan of fleetctl is DROPPED: shell `set -u`/`$HOME` footgun with no TS analogue. |
+| BUG-E (installer) 1635-1643 ensure_fleet_user chown ~fleet/.ssh | `fleet/test/commands/enroll.test.ts` › VPS authorized_keys perms (700/600/chown) covers the behaviour; the bash `ensure_fleet_user` chown static scan is DROPPED: install-vps.sh shell mechanic, unchanged by phase 3. |
 
-\*note: BUG-A/BUG-E installer static scans that were NOT part of the four moved
-blocks stay in `test-fleet-brain.sh` until commit 7; if they assert installed
-artefacts they migrate to `test-install-vps.sh` in the D7 installer-rewrite
-commit (commit 6, T8), else they are DROPPED with the fleetctl static-scan
-mechanism named. Finalised before the deletion commit.
+All install-vps assertions from test-fleet-brain.sh have been moved to
+`tests/test-install-vps.sh` (commit 1) or resolve above; the two BUG-A/BUG-E
+installer static scans are DROPPED with their bash mechanism named. Nothing in
+test-fleet-brain.sh is left unresolved.
 
 ## DROPPED — bash-only test plumbing (no behavioural analogue)
 
