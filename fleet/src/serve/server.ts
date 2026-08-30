@@ -286,15 +286,52 @@ export interface ServeDeps {
   cfg: ParsedConfig;
   rollout?: RolloutConfig;
   runner?: Runner;
-  /** injectable serve() (tests never bind a real socket). */
+  /** injectable serve() (tests never bind a real socket). Returns the server
+   *  handle whose stop() is called on graceful shutdown. */
   serve?: (opts: { hostname: string; port: number; fetch: (req: Request) => Promise<Response> }) => { stop: () => void };
+  /**
+   * Injectable shutdown seam. Production registers SIGTERM/SIGINT handlers and
+   * resolves when one fires; a test resolves it directly to drive a graceful
+   * stop without real signals. Returns a promise that resolves on shutdown +
+   * an `unregister()` to drop the handlers. When omitted, the default wires
+   * process signals.
+   */
+  onShutdown?: () => { done: Promise<void>; unregister: () => void };
+}
+
+/** Default shutdown seam: resolve on the FIRST SIGTERM/SIGINT/SIGHUP. */
+function processShutdown(): { done: Promise<void>; unregister: () => void } {
+  const handlers: Array<[NodeJS.Signals, () => void]> = [];
+  const done = new Promise<void>((resolve) => {
+    let fired = false;
+    const onSig = () => {
+      if (fired) return;
+      fired = true;
+      resolve();
+    };
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+      process.on(sig, onSig);
+      handlers.push([sig, onSig]);
+    }
+  });
+  return {
+    done,
+    unregister: () => {
+      for (const [sig, h] of handlers) process.off(sig, h);
+    },
+  };
 }
 
 /**
  * `fleet2 serve` entry (already past the locality guard in cli.ts). Resolves the
  * bind (rc 6 when absent), loads tokens (rc 6 on a bad file / missing ffi),
- * installs the log tee, and starts Bun.serve. Returns the process rc; on a
- * clean start it never returns (the server runs) unless `serve` is injected.
+ * installs the log tee, and starts Bun.serve. THE RETURNED PROMISE STAYS PENDING
+ * FOR THE SERVER'S LIFETIME — it resolves ONLY on a shutdown signal
+ * (SIGTERM/SIGINT/SIGHUP), after `server.stop()`, with rc 0. This is the fix for
+ * the r1 gate blocker: cli.ts does `process.exit(rc)` after main() resolves, so
+ * if cmdServe resolved right after Bun.serve the process (and the socket) would
+ * die immediately. Early-refusal paths (bad args / bind / ffi / tokens) still
+ * resolve promptly with their rc.
  */
 export async function cmdServe(rest: string[], deps: ServeDeps): Promise<number> {
   const parsed = parseServeArgs(rest);
@@ -337,9 +374,23 @@ export async function cmdServe(rest: string[], deps: ServeDeps): Promise<number>
   const port = parsed.port ?? DEFAULT_PORT;
   const fetchFn = makeFetch(ctx);
   const serveFn = deps.serve ?? ((o) => Bun.serve(o) as unknown as { stop: () => void });
-  serveFn({ hostname: bind, port, fetch: fetchFn });
+  const server = serveFn({ hostname: bind, port, fetch: fetchFn });
   log(`serve: listening on ${bind}:${port} (${ctx.tokens.count()} token(s))`);
-  // In production the process stays alive on the event loop; a test injects
-  // `serve` and gets control back to assert.
+
+  // Stay alive for the server's lifetime: block on the shutdown seam, then stop
+  // the server gracefully and resolve rc 0. Without this the CLI's
+  // `process.exit(rc)` would kill Bun.serve the instant we returned (r1 blocker).
+  const shutdown = (deps.onShutdown ?? processShutdown)();
+  try {
+    await shutdown.done;
+  } finally {
+    shutdown.unregister();
+    try {
+      server.stop();
+    } catch {
+      /* best-effort graceful stop */
+    }
+  }
+  log("serve: shutting down (signal) — server stopped");
   return 0;
 }
