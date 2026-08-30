@@ -39,3 +39,8 @@ Thumbs.db
 /probes/
 /assets/
 /tmp/
+
+# fleet2 (bun+TS brain) build output — the compiled binary never ships in the
+# tree; `git archive` must not carry it to boxes (blueprint S11).
+fleet/dist/
+fleet/node_modules/

@@ -1,0 +1,68 @@
+{
+  "devices": [
+    {
+      "addresses": ["100.64.0.1"],
+      "id": "1111111111111111",
+      "nodeId": "nSELFREDACTED1",
+      "user": "fleet@example.com",
+      "name": "grok-box-008.tailXXXX.ts.net",
+      "hostname": "grok-box-008",
+      "clientVersion": "1.80.0",
+      "os": "linux",
+      "created": "2026-06-01T00:00:00Z",
+      "lastSeen": "2026-08-30T00:40:00Z",
+      "online": true,
+      "keyExpiryDisabled": false,
+      "expires": "2026-09-01T00:00:00Z",
+      "tags": ["tag:box"]
+    },
+    {
+      "addresses": ["100.64.0.2"],
+      "id": "2222222222222222",
+      "nodeId": "nSELFREDACTED2",
+      "user": "fleet@example.com",
+      "name": "grok-box-009.tailXXXX.ts.net",
+      "hostname": "grok-box-009",
+      "clientVersion": "1.80.0",
+      "os": "linux",
+      "created": "2026-06-01T00:00:00Z",
+      "lastSeen": "2026-08-29T10:00:00Z",
+      "online": false,
+      "keyExpiryDisabled": false,
+      "expires": "2026-09-01T00:00:00Z",
+      "tags": ["tag:box"]
+    },
+    {
+      "addresses": ["100.64.0.11"],
+      "id": "3333333333333333",
+      "nodeId": "nSELFREDACTED3",
+      "user": "fleet@example.com",
+      "name": "grok-box-011.tailXXXX.ts.net",
+      "hostname": "grok-box-011-1",
+      "clientVersion": "1.79.0",
+      "os": "linux",
+      "created": "2026-05-01T00:00:00Z",
+      "lastSeen": "2026-08-20T00:00:00Z",
+      "online": false,
+      "keyExpiryDisabled": false,
+      "expires": "2026-09-01T00:00:00Z",
+      "tags": ["tag:box"]
+    },
+    {
+      "addresses": ["100.64.0.12"],
+      "id": "4444444444444444",
+      "nodeId": "nSELFREDACTED4",
+      "user": "fleet@example.com",
+      "name": "grok-box-011.tailXXXX.ts.net",
+      "hostname": "grok-box-011",
+      "clientVersion": "1.80.0",
+      "os": "linux",
+      "created": "2026-08-15T00:00:00Z",
+      "lastSeen": "2026-08-30T00:39:00Z",
+      "online": true,
+      "keyExpiryDisabled": false,
+      "expires": "2026-09-01T00:00:00Z",
+      "tags": ["tag:box"]
+    }
+  ]
+}

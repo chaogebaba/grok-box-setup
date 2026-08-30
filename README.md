@@ -96,6 +96,12 @@ drives all the boxes at once over the tailnet (needs `tailscale`, `ssh`,
 `sshpass` — `sudo dnf install sshpass` / `sudo apt install sshpass`). It
 discovers every `grok-box-NNN` peer; it never touches other machines.
 
+> **fleet2 (bun + TypeScript brain, phase 1).** The VPS-side brain is moving to
+> bun + TypeScript. `fleet2` adds fleet **inventory** and batch **upgrade**
+> (canary/verify/abort) alongside the bash `fleetctl`. See
+> [`fleet/README.md`](fleet/README.md) and
+> [`docs/FLEET-BRAIN.md`](docs/FLEET-BRAIN.md) §"Upgrades and inventory (fleet2)".
+
 ```bash
 ./fleetctl list                 # name, tailscale IP, online — all grok-box-NNN peers
 ./fleetctl status               # boxup status line per online box + sha/drift (read-only)
