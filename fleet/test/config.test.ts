@@ -1,7 +1,7 @@
 // T7 — config precedence (D5, S5, S6) and TOML strictness.
 
 import { test, expect, describe } from "bun:test";
-import { parseConfig, resolveRollout, ConfigError } from "../src/config.ts";
+import { parseConfig, resolveRollout, configCanary, ConfigError } from "../src/config.ts";
 import { setLogSink } from "../src/log.ts";
 
 describe("T7 config precedence", () => {
@@ -92,5 +92,22 @@ describe("T7 config precedence", () => {
     } finally {
       setLogSink(prev);
     }
+  });
+
+  test("phase-2 P1: rollout.auto resolves (default false, true when set)", () => {
+    expect(resolveRollout(parseConfig("", "/x"), {}).auto).toBe(false);
+    expect(resolveRollout(parseConfig(`[rollout]\nauto = true\n`, "/x"), {}).auto).toBe(true);
+    expect(resolveRollout(parseConfig(`[rollout]\nauto = false\n`, "/x"), {}).auto).toBe(false);
+  });
+
+  test("phase-2 P1/F2: configCanary = [fleet-brain].canary_box, NO default", () => {
+    expect(configCanary(parseConfig("", "/x"))).toBeUndefined();
+    expect(configCanary(parseConfig(`[fleet-brain]\ncanary_box = "grok-box-002"\n`, "/x"))).toBe(
+      "grok-box-002",
+    );
+    // distinct from rollout.canary which DOES default to grok-box-008
+    const cfg = parseConfig("", "/x");
+    expect(configCanary(cfg)).toBeUndefined();
+    expect(resolveRollout(cfg, {}).canary).toBe("grok-box-008");
   });
 });

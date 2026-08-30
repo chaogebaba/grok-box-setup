@@ -30,6 +30,7 @@ export function testRollout(over: Partial<RolloutConfig> = {}): RolloutConfig {
     // small values so verify loops don't take real time; sleep is stubbed anyway
     verifyTries: 3,
     verifyInterval: 0,
+    auto: false,
     ...over,
   };
 }
