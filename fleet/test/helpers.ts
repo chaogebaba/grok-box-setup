@@ -16,6 +16,8 @@ export function testEnv(over: Partial<Env> = {}): Env {
     FLEET_API_TOKEN_FILE: undefined,
     FLEET_ROLLOUT_SRC: undefined,
     FLEET_TARGET_REF: undefined,
+    FLEET_TS_API: "https://api.tailscale.com/api/v2",
+    FLEET_TS_TAILNET: "-",
     ...over,
   };
 }

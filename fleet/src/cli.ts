@@ -15,9 +15,9 @@ import {
   runInventory,
   renderTable,
   fsReadExpires,
-  noApi,
   type DevicesApi,
 } from "./inventory.ts";
+import { tailscaleDevicesApi } from "./tailscale.ts";
 import {
   runUpgradePass,
   takeLockAndReexec,
@@ -116,7 +116,7 @@ async function main(argv: string[]): Promise<number> {
 
     const enrolled = await readEnrolled(env.FLEET_STATE);
     const boxes = explicit.length > 0 ? explicit : resolveMembership(env.FLEET_BOXES, enrolled);
-    const api: DevicesApi = noApi; // phase 1: on-demand, no live API wiring yet
+    const api: DevicesApi = tailscaleDevicesApi(env, cfg);
     const res = await runInventory(boxes, {
       runner,
       env,

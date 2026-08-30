@@ -23,6 +23,10 @@ export interface Env {
   FLEET_ROLLOUT_SRC: string | undefined;
   /** git ref override for the upgrade target. */
   FLEET_TARGET_REF: string | undefined;
+  /** Tailscale API base (fleetctl:780). */
+  FLEET_TS_API: string;
+  /** Tailscale tailnet selector; "-" = the token's default tailnet (fleetctl:781). */
+  FLEET_TS_TAILNET: string;
 }
 
 function get(source: Record<string, string | undefined>, key: string): string | undefined {
@@ -56,5 +60,7 @@ export function resolveEnv(source: Record<string, string | undefined> = process.
     FLEET_API_TOKEN_FILE: get(source, "FLEET_API_TOKEN_FILE"),
     FLEET_ROLLOUT_SRC: get(source, "FLEET_ROLLOUT_SRC"),
     FLEET_TARGET_REF: get(source, "FLEET_TARGET_REF"),
+    FLEET_TS_API: get(source, "FLEET_TS_API") ?? "https://api.tailscale.com/api/v2",
+    FLEET_TS_TAILNET: get(source, "FLEET_TS_TAILNET") ?? "-",
   };
 }

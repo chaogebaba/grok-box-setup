@@ -121,7 +121,6 @@ describe("runInventory", () => {
       fs,
       api: { async probe() { return undefined; } } as DevicesApi,
       readExpires: async () => undefined,
-      resolveTargetFn: undefined as never,
       // inject target via a stub resolve by pre-writing? runInventory calls
       // resolveTarget internally; here git will fail → target null. Assert '?'
     });
@@ -132,6 +131,33 @@ describe("runInventory", () => {
     const parsed = JSON.parse(written!) as Inventory;
     expect(parsed.boxes["grok-box-008"]!.api).toBeNull();
     void target;
+  });
+
+  test("API lastSeen threads into inventory.json for a probed box", async () => {
+    const r = new FakeRunner(
+      sshResponder({
+        ssListens: [20008],
+        onCheck: () => ({ code: 0, stdout: "check=OK " + FULL_STATUS_LINE }),
+      }),
+    );
+    const { fs, store } = memFs();
+    const api: DevicesApi = {
+      async probe() {
+        return new Map([["grok-box-008", { online: true, lastSeen: "2026-08-30T00:40:00Z" }]]);
+      },
+    };
+    const res = await runInventory(["grok-box-008"], {
+      runner: r,
+      env: testEnv(),
+      rollout: testRollout(),
+      fs,
+      api,
+      readExpires: async () => undefined,
+    });
+    expect(res.rows[0]!.api).toBe("online");
+    expect(res.rows[0]!.lastSeen).toBe("2026-08-30T00:40:00Z");
+    const parsed = JSON.parse(store.get("/var/lib/grok-fleet/inventory.json")!) as Inventory;
+    expect(parsed.boxes["grok-box-008"]!.lastSeen).toBe("2026-08-30T00:40:00Z");
   });
 });
 

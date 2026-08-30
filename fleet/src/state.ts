@@ -6,6 +6,8 @@
 
 export interface BoxEntry {
   api: string | null;
+  /** ISO8601 lastSeen from the Tailscale API, or null (F7: null when API `?`). */
+  lastSeen?: string | null;
   tunnel: string | null;
   check: string | null;
   version: string | null;

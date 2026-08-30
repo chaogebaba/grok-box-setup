@@ -26,8 +26,8 @@ const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
 
 export interface DevicesApi {
-  /** Return per-box {online} or undefined when the API is unavailable. */
-  probe(boxes: string[]): Promise<Map<string, { online: boolean }> | undefined>;
+  /** Return per-box {online, lastSeen} or undefined when the API is unavailable. */
+  probe(boxes: string[]): Promise<Map<string, { online: boolean; lastSeen: string | null }> | undefined>;
 }
 
 /** A DevicesApi that always reports "unavailable" (phase-1 default/tests). */
@@ -40,6 +40,8 @@ export const noApi: DevicesApi = {
 export interface ProbeResult {
   box: string;
   api: "online" | "offline" | "?";
+  /** ISO8601 lastSeen from the API, or null (also null when API unavailable). */
+  lastSeen: string | null;
   tunnel: "up" | "down";
   check: "OK" | "FAIL" | "-";
   version: string; // "-" not probed, "?" unknown, else dotted
@@ -54,17 +56,19 @@ export async function probeBox(
   runner: Runner,
   env: Env,
   box: string,
-  api: Map<string, { online: boolean }> | undefined,
+  api: Map<string, { online: boolean; lastSeen: string | null }> | undefined,
   expires: string | undefined,
 ): Promise<ProbeResult> {
-  const apiState: ProbeResult["api"] =
-    api === undefined ? "?" : api.get(box)?.online ? "online" : "offline";
+  const entry = api?.get(box);
+  const apiState: ProbeResult["api"] = api === undefined ? "?" : entry?.online ? "online" : "offline";
+  const lastSeen: string | null = entry?.lastSeen ?? null;
 
   const up = await tunnelUp(runner, box);
   if (!up) {
     return {
       box,
       api: apiState,
+      lastSeen,
       tunnel: "down",
       check: "-",
       version: "-",
@@ -86,6 +90,7 @@ export async function probeBox(
     return {
       box,
       api: apiState,
+      lastSeen,
       tunnel: "up",
       check: "OK",
       version: checkRes.status.version,
@@ -107,6 +112,7 @@ export async function probeBox(
   return {
     box,
     api: apiState,
+    lastSeen,
     tunnel: "up",
     check: "FAIL",
     version: st.version,
@@ -208,6 +214,7 @@ export async function runInventory(boxes: string[], deps: InventoryDeps): Promis
   for (const r of rows) {
     boxesObj[r.box] = {
       api: r.api === "?" ? null : r.api,
+      lastSeen: r.lastSeen,
       tunnel: r.tunnel,
       check: r.check === "-" ? null : r.check,
       version: r.version === "-" || r.version === "?" ? null : r.version,
