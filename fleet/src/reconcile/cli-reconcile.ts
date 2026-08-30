@@ -19,6 +19,8 @@ import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
 import { ReconcileState, nodeStateFs } from "./state.ts";
 import { runReconcile } from "./run.ts";
+import type { ReconcileDeps } from "./run.ts";
+import { appendSnapshot } from "../history/write.ts";
 import { resolveTarget } from "../stage.ts";
 import { fsTelegramSource, fetchPoster, notify as notifyFn } from "../notify.ts";
 import { nodeFs } from "../state.ts";
@@ -68,6 +70,92 @@ function managedSourceFor(env: Env): { present: boolean; fleetToml: () => string
 }
 
 /**
+ * assembleTickDeps (R2-A5) — build the full ReconcileDeps for one tick from the
+ * env/config/rollout, EXACTLY as the CHILD side of cliReconcile does. Extracted
+ * so the /v1/reconcile job handler (TUI-D3) runs `runReconcile(assembleTickDeps(
+ * ...))` DIRECTLY — never `cliReconcile` (whose flock re-exec would silently
+ * skip) — with NO parallel dep assembly. Behavior-preserving: the CHILD branch
+ * of cliReconcile now delegates here.
+ *
+ * Async because it reads the API token once (F13). `apply`/`nowSec` are the
+ * per-call knobs the caller supplies.
+ */
+export async function assembleTickDeps(
+  env: Env,
+  cfg: ParsedConfig,
+  rollout: RolloutConfig,
+  opts: { apply: boolean; nowSec?: number; runner?: BunRunner } = { apply: false },
+): Promise<ReconcileDeps> {
+  const runner = opts.runner ?? new BunRunner();
+  const state = new ReconcileState(env.FLEET_STATE, nodeStateFs);
+  const ctx = new RunContext();
+
+  // Tailscale client — token read once (F13). Missing token ⇒ READ-ONLY run.
+  const tokenFile = resolveTokenFile(env, cfg);
+  let token: string | undefined;
+  try {
+    token = await fetchTransport.readToken(tokenFile);
+  } catch {
+    token = undefined;
+  }
+  const keys =
+    token !== undefined
+      ? new TailscaleKeys(fetchTransport, env.FLEET_TS_API, env.FLEET_TS_TAILNET, token, ctx)
+      : missingTokenKeys(ctx);
+
+  // Target boxes.
+  const enrolled = readIfExists(`${env.FLEET_STATE}/enrolled.tsv`);
+  const targetBoxes = resolveMembership(env.FLEET_BOXES, enrolled);
+
+  // Best-effort target sha (F8).
+  let targetSha: string | undefined;
+  let targetVersion: string | undefined;
+  try {
+    const t = await resolveTarget(runner, rollout.src, rollout.target);
+    targetSha = t.sha;
+    targetVersion = t.version;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`reconcile: rollout target unresolved (${msg}) — drift unknown this tick`);
+  }
+
+  const managed = managedSourceFor(env);
+  const notify = (level: "info" | "warn", msg: string) =>
+    notifyFn(level, msg, { telegramEnvPath: env.FLEET_TELEGRAM_ENV, source: fsTelegramSource, poster: fetchPoster });
+
+  const upgradeDeps: UpgradeDeps = {
+    runner,
+    env,
+    rollout,
+    fs: nodeFs,
+    notifyDeps: { telegramEnvPath: env.FLEET_TELEGRAM_ENV, source: fsTelegramSource, poster: fetchPoster },
+  };
+
+  return {
+    runner,
+    env,
+    rollout,
+    state,
+    keys,
+    ctx,
+    notify,
+    targetBoxes,
+    configCanary: configCanary(cfg),
+    managedSource: managed,
+    managedFilesPresent: managed.present,
+    upgradeDeps,
+    targetSha,
+    targetVersion,
+    apply: opts.apply,
+    nowSec: opts.nowSec,
+    // TUI-D4: production tick appends a snapshot line under FLEET_STATE/history.
+    history: (line) => {
+      appendSnapshot(env.FLEET_STATE, line);
+    },
+  };
+}
+
+/**
  * Run `fleet2 reconcile`. Takes the lock unconditionally; lock-held ⇒ rc 0.
  * On the CHILD side (FLEET2_LOCKED) it runs the tick directly.
  */
@@ -98,69 +186,11 @@ export async function cliReconcile(deps: ReconcileCliDeps): Promise<number> {
   }
 
   // --- CHILD side (locked): assemble deps + run the tick. ---
-  const runner = new BunRunner();
-  const state = new ReconcileState(deps.env.FLEET_STATE, nodeStateFs);
-  const ctx = new RunContext();
-
-  // Tailscale client — token read once (F13). Missing token ⇒ READ-ONLY run.
-  const tokenFile = resolveTokenFile(deps.env, deps.cfg);
-  let token: string | undefined;
-  try {
-    token = await fetchTransport.readToken(tokenFile);
-  } catch {
-    token = undefined;
-  }
-  const keys =
-    token !== undefined
-      ? new TailscaleKeys(fetchTransport, deps.env.FLEET_TS_API, deps.env.FLEET_TS_TAILNET, token, ctx)
-      : missingTokenKeys(ctx);
-
-  // Target boxes.
-  const enrolled = readIfExists(`${deps.env.FLEET_STATE}/enrolled.tsv`);
-  const targetBoxes = resolveMembership(deps.env.FLEET_BOXES, enrolled);
-
-  // Best-effort target sha (F8).
-  let targetSha: string | undefined;
-  let targetVersion: string | undefined;
-  try {
-    const t = await resolveTarget(runner, deps.rollout.src, deps.rollout.target);
-    targetSha = t.sha;
-    targetVersion = t.version;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    log(`reconcile: rollout target unresolved (${msg}) — drift unknown this tick`);
-  }
-
-  const managed = managedSourceFor(deps.env);
-  const notify = (level: "info" | "warn", msg: string) =>
-    notifyFn(level, msg, { telegramEnvPath: deps.env.FLEET_TELEGRAM_ENV, source: fsTelegramSource, poster: fetchPoster });
-
-  const upgradeDeps: UpgradeDeps = {
-    runner,
-    env: deps.env,
-    rollout: deps.rollout,
-    fs: nodeFs,
-    notifyDeps: { telegramEnvPath: deps.env.FLEET_TELEGRAM_ENV, source: fsTelegramSource, poster: fetchPoster },
-  };
-
-  const res = await runReconcile({
-    runner,
-    env: deps.env,
-    rollout: deps.rollout,
-    state,
-    keys,
-    ctx,
-    notify,
-    targetBoxes,
-    configCanary: configCanary(deps.cfg),
-    managedSource: managed,
-    managedFilesPresent: managed.present,
-    upgradeDeps,
-    targetSha,
-    targetVersion,
+  const deps2 = await assembleTickDeps(deps.env, deps.cfg, deps.rollout, {
     apply: deps.apply,
     nowSec: deps.nowSec,
   });
+  const res = await runReconcile(deps2);
   return res.rc;
 }
 

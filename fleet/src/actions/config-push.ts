@@ -48,6 +48,16 @@ export interface PushDeps {
 
 export interface PushResult {
   rc: number;
+  /**
+   * The box's CURRENT managed.toml sha (`cur=` token), when the remote script
+   * ran and emitted a status line; otherwise undefined. Added for TUI-D4 so the
+   * config pass can derive the snapshot's per-box `config` field
+   * ("in-sync"|"drift") without a second probe. Behavior-preserving (TUI-D1):
+   * every existing caller reads only `.rc`.
+   */
+  cur?: string;
+  /** The WANT sha (the rendered managed.toml sha) for this box, when computed. */
+  want?: string;
 }
 
 /** push_managed <box> [--dry-run]. */
@@ -95,14 +105,14 @@ export async function pushManaged(box: string, dry: boolean, deps: PushDeps): Pr
     const cls = classify(r);
     if (r.code === 255 || cls === "transport") {
       log(`config: ${box} unreachable over tunnel (ssh rc=255) — no change applied`);
-      return { rc: 6 };
+      return { rc: 6, want: wantSha };
     }
     if (r.code !== 3 && !status) {
       log(`config: ${box} remote script FAILED (rc=${r.code}, no status line) — no change applied`);
-      return { rc: 5 };
+      return { rc: 5, want: wantSha };
     }
     log(`config: ${box} push FAILED (rc=${r.code}) — no change applied`);
-    return { rc: r.code ?? 5 };
+    return { rc: r.code ?? 5, want: wantSha };
   }
 
   const tok = parseStatusTokens(out);
@@ -120,14 +130,14 @@ export async function pushManaged(box: string, dry: boolean, deps: PushDeps): Pr
   if (dry) {
     if (cur === wantSha) log(`config: ${box} in sync${ann}`);
     else log(`config: ${box} WOULD push (${cur || "none"}->${wantSha})${ann}`);
-    return { rc: 0 };
+    return { rc: 0, cur, want: wantSha };
   }
 
   if (nowSha !== wantSha) {
     log(`config: ${box} push read-back MISMATCH (got ${nowSha || "none"}, want ${wantSha})`);
-    return { rc: 5 };
+    return { rc: 5, cur, want: wantSha };
   }
   if (cur === wantSha) log(`config: ${box} in sync${ann}`);
   else log(`config: ${box} pushed (${cur || "none"}->${wantSha})${ann}`);
-  return { rc: 0 };
+  return { rc: 0, cur, want: wantSha };
 }
