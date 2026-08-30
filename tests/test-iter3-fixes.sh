@@ -217,6 +217,46 @@ else
   bad  "H6 re-auth attempted up with no hostname: [$argv_nohost]"
 fi
 
+# #9 — Exercise the real fallback sources rather than stubbing the resolved
+# values: hostname comes from the frozen file and tags from live debug prefs.
+reauth_live_mentions_test() {
+  local capture inner; capture="$(mktemp)"; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"; HOSTNAME_FILE="\$(mktemp)"; echo grok-box-008 > "\$HOSTNAME_FILE"
+cap_bin="\$(mktemp)"
+cat > "\$cap_bin" <<CAP
+#!/bin/sh
+printf '%s\n' "\\\$@" > "$capture"
+CAP
+chmod +x "\$cap_bin"
+log(){ :; }
+tailscale_bin(){ echo "\$cap_bin"; }
+prefs_hostname(){ echo ""; }
+ts(){
+  case "\$1 \${2:-}" in
+    "debug prefs") echo '{"AdvertiseTags":["tag:grok-box","tag:ops"]}' ;;
+    *) echo '{}' ;;
+  esac
+}
+id(){ return 1; }
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+for f in read_box_name current_advertise_tags run_reauth_up; do eval "\$(extract_fn "\$f")"; done
+run_reauth_up "test live mentions" >/dev/null
+rm -f "\$cap_bin" "\$HOSTNAME_FILE"
+INNER
+  timeout 15 bash "$inner"
+  /usr/bin/tr '\n' ' ' < "$capture"
+  rm -f "$capture" "$inner"
+}
+live_mentions="$(reauth_live_mentions_test)"
+case "$live_mentions" in
+  *--hostname=grok-box-008*--advertise-tags=tag:grok-box,tag:ops*)
+    pass "#9 re-auth mentions frozen hostname and live current tags"
+    ;;
+  *) bad "#9 re-auth did not mention fallback hostname/current tags: [$live_mentions]" ;;
+esac
+
 # ---------------------------------------------------------------------------
 # H5/E3 — the attempt-limiter must record an attempt even when `tailscale up`
 # FAILS (rc≠0). This drives the REAL ensure_login (NeedsLogin + populated
