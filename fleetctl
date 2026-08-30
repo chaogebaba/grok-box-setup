@@ -1507,7 +1507,10 @@ chmod 600 "$cf"
 # --- mint-key ----------------------------------------------------------------
 # fleetctl mint-key <box>: mint a per-box tag-scoped key and seed it ATOMICALLY
 # over the tunnel (S1). Verify via `boxup status` over the tunnel BEFORE
-# recording success; a failure leaves the OLD key intact.
+# recording success. On any seed/verify failure the just-minted key is revoked
+# and the mint-window guard is NOT advanced; the on-box state is not guaranteed —
+# a pre-`mv` failure leaves the OLD key, but a post-`mv` failure may leave the
+# revoked NEW key, so recovery is the next rejoin/expiry trigger (F4b/S2).
 mint_payload() {
   # The EXACT capabilities shape the frozen wall (H11) mandates.
   # P1-6: expirySeconds is HARD-CLAMPED to the 90-day Tailscale maximum. Neither
@@ -1544,7 +1547,8 @@ mint_create() {
 }
 
 # seed_key_over_tunnel <box> <key> <expires-iso>: the S1 atomic verified seed.
-# Runs entirely on the box over its tunnel:
+# Runs entirely on the box over its tunnel, AS ROOT (D1/F1 — secrets/ is
+# root:700):
 #   write .ts-authkey.tmp (600) -> sha256 verify -> mv into place ->
 #   write .expires from the API `expires`. The key is passed on stdin, NEVER
 #   argv, so it never appears in the box's ps/logs.
@@ -1557,19 +1561,24 @@ mint_create() {
 # run, escalate after >3 runs — cmd_mint_key).
 seed_key_over_tunnel() {
   local box="$1" key="$2" expires="$3" want_sha
-  want_sha="$(printf '%s\n' "$key" | sha256sum | awk '{print $1}')"
-  # Stream the key over stdin to a remote heredoc consumer.
-  printf '%s\n' "$key" | tunnel_ssh "$box" "
-    set -e
-    umask 077
-    cat > '$BOX_AUTHKEY_TMP'
-    got=\$(sha256sum '$BOX_AUTHKEY_TMP' | awk '{print \$1}')
-    if [ \"\$got\" != '$want_sha' ]; then echo \"SEED_SHA_MISMATCH:\$got\" >&2; rm -f '$BOX_AUTHKEY_TMP'; exit 3; fi
-    mv -f '$BOX_AUTHKEY_TMP' '$BOX_AUTHKEY'
-    chmod 600 '$BOX_AUTHKEY'
-    printf '%s\n' '$expires' > '$BOX_AUTHKEY_EXPIRES'
-    chmod 600 '$BOX_AUTHKEY_EXPIRES'
-  " >/dev/null 2>&1 || return 1
+  want_sha="$(printf '%s\n' "$key" | sha256sum | cut -d" " -f1)"
+  # D1/F1/S1: install the key AS ROOT over the tunnel. The key travels on STDIN
+  # (never argv/log); the remote script (seed_remote_script) is a fixed,
+  # apostrophe-free literal run under `sudo env NAME=... sh -c '<script>'`, so
+  # argv carries only the paths, the ISO date and the sha256 of the key — never
+  # the key. fleetctl has no `set -e`, so we check the rc EXPLICITLY (S1): a
+  # swallowed seed rc must never fall through to the verify. Remote stderr is
+  # captured (F5) and its first line (truncated to 200 chars, S5) logged on
+  # failure — the remote script never echoes the key.
+  local remote errf
+  remote="$(seed_remote_script)"
+  errf="$(mktemp)"
+  if ! printf '%s\n' "$key" | tunnel_ssh "$box" "sudo env SEED_TMP='$BOX_AUTHKEY_TMP' SEED_DST='$BOX_AUTHKEY' SEED_EXP_FILE='$BOX_AUTHKEY_EXPIRES' SEED_EXP='$expires' SEED_SHA='$want_sha' sh -c '$remote'" 2>"$errf" >/dev/null; then
+    log "mint-key: seed stderr: $(head -n1 "$errf" 2>/dev/null | cut -c1-200)"
+    rm -f "$errf"
+    return 1
+  fi
+  rm -f "$errf"
   # Verify via `boxup status` over the tunnel BEFORE recording success.
   local st
   st="$(tunnel_ssh "$box" "sudo $BOX_ROOT/boxup status" 2>/dev/null)" || return 1
@@ -1583,7 +1592,9 @@ seed_key_over_tunnel() {
   # sidecar landed), which pins the verify to THIS mint, not a stale line.
   seed_status_converged "$st" || return 1
   local seen_exp
-  seen_exp="$(tunnel_ssh "$box" "cat '$BOX_AUTHKEY_EXPIRES' 2>/dev/null" 2>/dev/null | tr -d '[:space:]')"
+  # D2: secrets/* is root:700, so the read-back MUST go through sudo (it is
+  # EACCES for the box user, same as the write). `boxup status` is already sudo.
+  seen_exp="$(tunnel_ssh "$box" "sudo cat '$BOX_AUTHKEY_EXPIRES'" 2>/dev/null | tr -d '[:space:]')"
   [ "$seen_exp" = "$expires" ]
 }
 
@@ -1608,6 +1619,31 @@ seed_status_converged() {
     esac
   done
   return 0
+}
+
+# revoke_minted_key <box> <keyid> <why> <suffix> (D3/F4c/S2): the SINGLE revoke
+# path used by BOTH cmd_mint_key failure arms (seed-failure and persist-failure).
+# A minted key that we cannot both seed AND record is an unrecorded live key on
+# the tailnet — the worse failure — so it MUST be revoked. <why> names the arm
+# and <suffix> carries the arm-specific tail (S2's recovery-trigger text for the
+# seed arm; the invariant note for the persist arm). Logs the reason (NEVER the
+# key value), DELETEs via the API, and:
+#   * 2xx or 404 => log revoked (HTTP code); the key is gone / already gone.
+#   * any other  => log `could NOT revoke … (HTTP …) — manual revoke required`
+#                   and latch RECONCILE_READONLY=1 so no later row mutates.
+# The caller returns 1 either way. Revokes even if the seed died anywhere in the
+# atomic write (the API key exists from the create onward) — INCLUDING after the
+# remote `mv`, in which case the now-revoked new key may be the one on the box.
+revoke_minted_key() {
+  local box="$1" keyid="$2" why="$3" suffix="$4"
+  log "mint-key: $why $box — REVOKING the just-minted key id=$keyid$suffix"
+  ts_api DELETE "/tailnet/$TS_TAILNET/keys/$keyid" >/dev/null
+  if ts_ok || [ "$TS_API_CODE" = 404 ]; then
+    log "mint-key: revoked the just-minted key id=$keyid (HTTP $TS_API_CODE)"
+  else
+    log "mint-key: could NOT revoke key id=$keyid (HTTP $TS_API_CODE) — manual revoke required"
+    RECONCILE_READONLY=1
+  fi
 }
 
 cmd_mint_key() {
@@ -1650,25 +1686,27 @@ cmd_mint_key() {
   case "$expdate" in ????-??-??) : ;; *) expdate="$(date -u -d "+90 days" +%Y-%m-%d 2>/dev/null || echo "$expdate")" ;; esac
 
   if ! seed_key_over_tunnel "$box" "$key" "$expdate"; then
-    log "mint-key: atomic seed/verify FAILED on $box — old key left intact (retry next run)"
+    # F4/S2: revoke UNCONDITIONALLY on any seed/verify failure — a minted-but-not-
+    # recorded key is an unrecorded live key on the tailnet (the worse failure).
+    # We do NOT advance the mint-window guard or record any meta. If the failure
+    # happened AFTER the remote `mv`, the box may hold the now-revoked NEW key and
+    # thus be left WITHOUT a valid authkey; recovery is the next state-loss/rejoin
+    # (row a) or a known-expiry rotation (row c), with the >3-consecutive-failure
+    # escalation (docs:117) as the operator backstop — never a claim that the OLD
+    # key is necessarily still installed.
+    revoke_minted_key "$box" "$keyid" "seed/verify FAILED on" "; re-mint on next rejoin/expiry trigger"
     return 1
   fi
   # P1-3 PERSISTENCE INVARIANT: the minted {id,expires} MUST be durably recorded
   # before we call the mint a success. If persistence fails, the mint FAILS and
   # we REVOKE the just-minted key (we cannot rely on a later rotation finding its
-  # id, so an unrecorded key must not be left live). The box keeps its OLD key
-  # (the seed already happened, but a re-seed next run restores coherence, and
-  # the OLD key is still valid — we did not advance the mint-window guard).
+  # id, so an unrecorded key must not be left live). The verified seed already
+  # ran, so the box now holds the NEW key that we are about to revoke — it is
+  # thus left WITHOUT a valid authkey; we do NOT advance the mint-window guard,
+  # and recovery is the next state-loss/rejoin or known-expiry rotation.
   mkdir -p "$FLEET_STATE" 2>/dev/null || true
   if ! record_key_meta "$box" "$keyid" "$expires"; then
-    log "mint-key: FAILED to persist key meta for $box — REVOKING the just-minted key id=$keyid (invariant: unrecorded key must not stay live)"
-    ts_api DELETE "/tailnet/$TS_TAILNET/keys/$keyid" >/dev/null
-    if ts_ok || [ "$TS_API_CODE" = 404 ]; then
-      log "mint-key: revoked unrecorded key id=$keyid (HTTP $TS_API_CODE)"
-    else
-      log "mint-key: could not revoke unrecorded key id=$keyid (HTTP $TS_API_CODE) — it will lapse at expiry"
-      RECONCILE_READONLY=1
-    fi
+    revoke_minted_key "$box" "$keyid" "FAILED to persist key meta for" "; re-mint on next rejoin/expiry trigger"
     return 1
   fi
   # Record the mint window + expiry AFTER verified seed + persisted meta (never
@@ -2059,6 +2097,42 @@ fi
 now=\$(sha256sum "\$mf" 2>/dev/null | cut -d" " -f1); [ -n "\$now" ] || now=none
 echo "sha=\$now cur=\$cur support=\$support enabled=\$enabled"
 REMOTE
+}
+
+# seed_remote_script: emit the POSIX-sh remote script that installs the minted
+# per-box auth key AS ROOT over the tunnel (D1/F1). Shaped IDENTICALLY to
+# managed_remote_script (:2021): a QUOTED heredoc emitting the script text
+# verbatim so nothing is interpolated at emit time — the script reads ONLY the
+# env vars SEED_TMP, SEED_DST, SEED_EXP_FILE, SEED_EXP, SEED_SHA, which the call
+# site passes through `sudo env NAME=... sh -c '<script>'`.
+#
+# QUOTE-SAFETY (F1, carried over from managed_remote_script :1984-1993): the
+# whole emitted script sits inside a single-quoted `sh -c '<script>'` argument,
+# so a single literal apostrophe anywhere would terminate that outer quote and
+# break the remote command on every real box. The remedy is structural: the
+# emitted body carries ZERO comment lines (all prose lives HERE, above the
+# heredoc), no apostrophe, and no backtick. The sha is taken via `cut` (no awk
+# apostrophes). A char-scan unit test asserts the real output carries none of
+# those chars; the authoritative guard is the wrap_test that pushes through a
+# real `sudo env … sh -c '<script>'` boundary.
+#
+# Remote script shape (reads env only; the key arrives on STDIN, never argv):
+#   cat > SEED_TMP    spool the key from stdin into the 077 tmp
+#   sha check         got != SEED_SHA => rm tmp, SEED_SHA_MISMATCH, exit 3
+#   mv + chmod        install the verified key 600 at SEED_DST
+#   .expires          write SEED_EXP 600 at SEED_EXP_FILE
+seed_remote_script() {
+  cat <<'EOF'
+set -e
+umask 077
+cat > "$SEED_TMP"
+got=$(sha256sum "$SEED_TMP" | cut -d" " -f1)
+if [ "$got" != "$SEED_SHA" ]; then rm -f "$SEED_TMP"; echo SEED_SHA_MISMATCH >&2; exit 3; fi
+mv -f "$SEED_TMP" "$SEED_DST"
+chmod 600 "$SEED_DST"
+printf "%s\n" "$SEED_EXP" > "$SEED_EXP_FILE"
+chmod 600 "$SEED_EXP_FILE"
+EOF
 }
 
 # push_managed <box> [--dry-run]: render + validate + push the managed.toml over
@@ -2851,10 +2925,14 @@ reconcile_rotate() {
   local box="$1" old_id
   # Capture the OLD key id BEFORE minting (mint overwrites the meta file).
   old_id="$(key_meta_id "$box" 2>/dev/null || true)"
-  # Mint + atomically seed + verify the new key. On failure the OLD key is left
-  # intact (cmd_mint_key guarantees this) and we do NOT revoke anything.
+  # Mint + atomically seed + verify the new key. On failure cmd_mint_key has
+  # already REVOKED the just-minted NEW key (F4), so no dangling API key is left;
+  # we revoke NOTHING here (the OLD key id is untouched at the API). We do NOT
+  # claim the OLD key is still installed on the box: if the seed failed AFTER the
+  # remote `mv`, the box now holds the now-revoked NEW key and is left without a
+  # valid authkey — recovery is the next state-loss/rejoin or known-expiry trigger.
   if ! cmd_mint_key "$box"; then
-    log "reconcile: rotate $box — mint/seed FAILED, old key intact, NOT revoking"
+    log "reconcile: rotate $box — mint/seed FAILED; new key already revoked by mint-key, NOT rotating; box may need re-mint on next rejoin/expiry trigger"
     return 1
   fi
   # New key verified seeded. Now revoke the OLD key (task b).
