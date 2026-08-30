@@ -2377,11 +2377,14 @@ reconcile_config_pass() {
   # transport-skip path — one visible info line, counted in skipped=, no notify,
   # no .cfgfail change, then fall through to the non-canary loop (an unhealthy
   # canary must not silently freeze fleet convergence). The tunnel-DOWN case
-  # keeps its existing handling (the whole guard is false => no canary push,
-  # skip uncounted, exactly as before).
+  # (#14) now ALSO logs + counts a skip (previously a silent `:` no-op that left
+  # no journal line and an uncounted skip), then falls through — no push, no
+  # .cfgfail change, no notify; observability only.
   local _canary_cf; _canary_cf="$(reconcile_checkfail_count "$canary")"
   if ! tunnel_up "$canary"; then
-    :   # tunnel down for the canary: unchanged — no push, fall through
+    # #14: tunnel down for the canary — no push, fall through, but log + count it.
+    log "config: canary $canary tunnel down — canary check skipped this tick, continuing without canary protection"
+    n_skip=$((n_skip + 1))
   elif [ "$_canary_cf" -gt 3 ] 2>/dev/null; then
     log "config: canary $canary skipped — checkfail=$_canary_cf (>3), continuing without canary protection"
     n_skip=$((n_skip + 1))
