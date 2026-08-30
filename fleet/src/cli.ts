@@ -164,11 +164,9 @@ async function main(argv: string[]): Promise<number> {
       return cmdServe(rest, { env, cfg, rollout, runner });
     }
     case "tui": {
-      // Laptop-runnable (lane B). The TUI implementation ships in lane B; in
-      // this lane-A binary it refuses cleanly rather than pretending to run.
-      // Lane B replaces this arm with `cmdTui` from ./tui/main.ts.
-      stderr("fleet2 tui: the admin panel (lane B) is not built in this binary yet\n");
-      return RC.REFUSED;
+      // Laptop-runnable (lane B) — no locality guard.
+      const { cmdTui } = await import("./tui/main.ts");
+      return cmdTui(rest, { env });
     }
   }
 
