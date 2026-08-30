@@ -472,6 +472,47 @@ path, no second implementation.
 - **One-time migration for EXISTING brains (add `vps` under `[fleet-brain]`).** A fresh `vps/install-vps.sh` seeds the `[fleet-brain].vps` (+`vps_port`) template keys, but a brain installed **before** the D1 change has a `config.toml` without them (the installer never overwrites an operator's config). Because enroll now REFUSES without a resolved address, each existing brain needs a **one-time** operator step: either add `vps = "<this-brain's-address>"` (and optionally `vps_port = <N>`) under `[fleet-brain]` in `/opt/grok-fleet/config.toml`, **or** export `FLEET_VPS_ADDR` (and `FLEET_VPS_PORT`) in the reconcile unit's environment. Until one of these is done, `fleetctl enroll` on that brain refuses with a clear message pointing here.
 - **`~fleet/.ssh/authorized_keys` MUST be owned by the fleet user (dir `700`, file `600`, both `$FLEET_VPS_USER:$FLEET_VPS_USER`)** — sshd `StrictModes` privsep reads it AS `fleet`; a root-owned file yields "Could not open user 'fleet' authorized keys … Permission denied" and every tunnel fails `publickey`. `fleetctl enroll` now chowns it on every write (BUG-E).
 
+## Upgrades and inventory (fleet2, phase 1)
+
+`fleet2` is the fleet brain rewritten in **bun + TypeScript** (blueprint `blueprints/fleet-ts-phase1.md`). Phase 1 ships a standalone compiled binary that (a) **inventories** the fleet and (b) **upgrades boxes in batch** to a desired git ref, reusing the exact deploy sequence of bash `tunnel_deploy_one`. It runs on the VPS **alongside** bash `fleetctl` (which still owns reconcile/mint/config until phase 2) and coexists safely via the shared `reconcile.lock`.
+
+### Commands
+
+- `fleet2 version` — prints `fleet2 <version> (<git sha>) (bun <ver>)`.
+- `fleet2 inventory [--json] [box…]` — one row per enrolled box: `NAME API TUNNEL CHECK VERSION SHA TARGET DRIFT AUTHKEY`. `TUNNEL` is the VPS-side `ss -tln` probe; a tunnel-down box shows `-` for CHECK/VERSION/SHA/DRIFT; API unavailable shows `?`. Persists `$FLEET_STATE/inventory.json` atomically (0600) — the first machine-readable fleet inventory. Always exits 0; `inventory` never fails on an unresolvable target (TARGET/DRIFT render `?`).
+- `fleet2 upgrade [--to REF] [--all | box…] [--apply] [--canary BOX] [--json]` — **dry-run by default**: prints the plan (`box  running v/sha  target v/sha  action`) and exits 0 without staging. `--apply` stages the tree once and deploys **serially**: canary first, then the rest in enrolled order. Tunnel-down non-canary ⇒ skip; in-sync ⇒ skip; **canary unreachable or verified-failure ⇒ ABORT** (zero others touched). Rollback is the same command with `--to <previous sha>` — no special path.
+
+### Config keys
+
+`fleet2` reads `$FLEET_CONFIG` (see the FLEET_CONFIG note below) with `Bun.TOML.parse`. Existing `[fleet-brain]` keys keep the same env-over-config precedence. New table **`[rollout]`**:
+
+- `src` — the git checkout the brain archives from (default `/opt/grok-fleet/src`; falls back to `[fleet-brain].rollout_src` / `FLEET_ROLLOUT_SRC`). Create it once: `git clone https://github.com/chaogebaba/grok-box-setup.git /opt/grok-fleet/src`.
+- `target` — the git ref to converge to (tag, branch, or sha; default `main`). Override per-run with `--to`.
+- `canary` — the first box deployed and verified (default `[fleet-brain].canary_box` else `grok-box-008`); `--canary BOX` overrides for one run.
+- `verify_interval` / `verify_tries` — the verify poll cadence (default `15` s × `8`).
+
+Unknown `[rollout]` keys log one info line and are ignored.
+
+### Verify criterion
+
+After the install command returns, fleet2 polls `/var/log/boxup-install.log` (which it truncated itself at the start of the same remote command) for this run's `DONE (rc=N)` line — `rc≠0` or no marker within `verify_tries` ⇒ verified FAILURE. It then requires `boxup check` rc 0 **and** the box's sha == target on **two consecutive** polls. Because fleet2 always passes a real `BOX_SETUP_GIT_SHA` (plus `BOX_SETUP_ONCE=1`), install.sh takes its designed detached migration path (unlike bash's `unknown` stamp, which never converges).
+
+### Exit codes
+
+`0` ok · `1` verified failure / abort · `2` usage · `3` target/staging error · `6` refused (not on the VPS / missing box key / `reconcile.lock` held / `flock` missing).
+
+### FLEET_CONFIG default (stated deviation)
+
+fleet2 defaults `FLEET_CONFIG` to **`/opt/grok-fleet/config.toml`** (the systemd unit's value, `vps/install-vps.sh`), NOT bash `fleetctl`'s `~/.config/fleetctl/config.toml`. This is a deliberate deviation (blueprint S5) so a hand-run `fleet2` and the unit read the same config.
+
+### Coexistence via reconcile.lock
+
+`fleet2 upgrade --apply` runs its whole pass under bash `fleetctl`'s `$FLEET_STATE/reconcile.lock` (non-blocking, via `flock -n`), so a reconcile tick and a fleet2 upgrade never mutate boxes at once — if the lock is held, fleet2 refuses (rc 6). `inventory` and dry-runs take no lock. The bash reconcile row-d rollout remains **unwired** (`FLEET_TARGET_SHA` is env-only) and is superseded by fleet2 in phase 2.
+
+### Build & deploy
+
+- `make ts-test` — the bun test suite (box-free). `make ts-build` — the compiled `fleet/dist/fleet2` (gitignored; never shipped to boxes). `make ts-deploy` — scp + atomic `mv` to `/opt/grok-fleet/fleet2`, keeping the previous binary as `fleet2.prev` (rollback = `mv fleet2.prev fleet2`).
+
 ## Prior art / reference URLs
 
 (Consolidated; also inline above.)
