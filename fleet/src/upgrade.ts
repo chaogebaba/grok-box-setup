@@ -8,7 +8,7 @@
 // install command (G1/H1) → verify (F1: wait for DONE marker rc, then require
 // check rc 0 AND sha==target on TWO consecutive polls). Exactly ONE fleet pass.
 
-import type { Runner, RunResult } from "./runner.ts";
+import type { Runner } from "./runner.ts";
 import type { Env } from "./env.ts";
 import type { RolloutConfig } from "./config.ts";
 import type { FsSeam, Inventory, BoxEntry } from "./state.ts";
@@ -28,6 +28,7 @@ import { parseCheck } from "./status.ts";
 import { resolveTarget, stageTree, nodeStageFs, type StageFs } from "./stage.ts";
 import { probeBox, type ProbeResult } from "./inventory.ts";
 import { isCompiled } from "./build-flags.ts";
+import { spawnReexec, type Spawner } from "./reexec.ts";
 import { log } from "./log.ts";
 import { notify, type NotifyDeps } from "./notify.ts";
 
@@ -87,6 +88,8 @@ export interface UpgradeDeps {
   notifyDeps: NotifyDeps;
   /** Provided so tests can inject a Target without a real git repo. */
   resolveTargetFn?: (runner: Runner, src: string, ref: string) => Promise<Target>;
+  /** Spawner for the flock re-exec (fix 3); default inherits stdio (F2). */
+  spawner?: Spawner;
 }
 
 // --------------------------------------------------------------------------
@@ -117,9 +120,11 @@ export interface LockResult {
 }
 
 /**
- * Take the reconcile.lock via a flock re-exec (F2/G3). Returns the child's rc.
- * flock returns 6 when held ⇒ refused. flock ENOENT/127 ⇒ refused (rc 6, G3),
- * NEVER proceeds unlocked.
+ * Take the reconcile.lock via a flock re-exec (F2/G3), spawning the child with
+ * INHERITED stdio so its plan/per-box/summary/notify output reaches the operator
+ * and the journal (gate-r1 fix 3 — the child is NOT run through the piping
+ * Runner). Returns the child's rc. flock returns 6 when held ⇒ refused. flock
+ * ENOENT/127 ⇒ refused (rc 6, G3), NEVER proceeds unlocked.
  */
 export async function takeLockAndReexec(
   deps: UpgradeDeps,
@@ -131,14 +136,11 @@ export async function takeLockAndReexec(
   if (debugExec) {
     process.stderr.write(`exec: ${JSON.stringify(child)}\n`);
   }
-  let r: RunResult;
-  try {
-    r = await deps.runner.run(child, {
-      timeoutMs: 0, // no fleet2 deadline — the child owns the whole pass
-      env: { FLEET2_LOCKED: "1" },
-    });
-  } catch {
-    // spawn failed to launch (ENOENT) — flock not on PATH.
+  // Spawn OUTSIDE the Runner seam with inherited stdio (F2). The child owns the
+  // whole locked pass; there is no fleet2 deadline on it.
+  const r = await spawnReexec(child, { FLEET2_LOCKED: "1" }, deps.spawner);
+  if (!r.launched) {
+    // ENOENT — flock not on PATH.
     log("upgrade: refused — util-linux flock not found on PATH (needed for reconcile.lock)");
     return { rc: RC.REFUSED, ran: false };
   }

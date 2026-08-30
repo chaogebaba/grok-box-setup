@@ -13,6 +13,7 @@ import {
   type UpgradeDeps,
 } from "../src/upgrade.ts";
 import { CHECK_COMMAND, POLL_COMMAND, renderInstallCommand } from "../src/remote.ts";
+import type { Spawner, ReexecOptions, ReexecResult } from "../src/reexec.ts";
 import { FakeRunner, result, isSs, isScp } from "./fake-runner.ts";
 import { testEnv, testRollout } from "./helpers.ts";
 import type { FsSeam, Inventory } from "../src/state.ts";
@@ -383,33 +384,62 @@ describe("T11/T11b lock re-exec (F2/G3/H2)", () => {
     ]);
   });
 
-  test("T11: --apply first runner call is the flock re-exec; held (rc 6) → zero further calls", async () => {
-    const r = new FakeRunner(() => result({ code: 6 })); // flock: lock held
-    const lr = await takeLockAndReexec(baseDeps(r), ["bun", "cli.ts", "upgrade", "--all", "--apply"], false);
+  // A fake spawner recording the argv + stdio options handed to the flock child.
+  function fakeSpawner(res: ReexecResult) {
+    const calls: Array<{ argv: string[]; opts: ReexecOptions }> = [];
+    const spawner: Spawner = async (argv, opts) => {
+      calls.push({ argv, opts });
+      return res;
+    };
+    return { spawner, calls };
+  }
+
+  test("T11: --apply spawns the flock re-exec with INHERITED stdio (fix 3); held (rc 6) → refused, no pass", async () => {
+    const r = new FakeRunner();
+    const { spawner, calls } = fakeSpawner({ code: 6, launched: true }); // lock held
+    const lr = await takeLockAndReexec(baseDeps(r, { spawner }), ["bun", "cli.ts", "upgrade", "--all", "--apply"], false);
     expect(lr.rc).toBe(RC.REFUSED);
     expect(lr.ran).toBe(false);
-    // exactly one runner call — the flock re-exec — and it IS flock
-    expect(r.calls.length).toBe(1);
-    expect(r.calls[0]!.argv[0]).toBe("flock");
-    expect(r.calls[0]!.argv.slice(0, 5)).toEqual(["flock", "-n", "-E", "6", "/var/lib/grok-fleet/reconcile.lock"]);
+    // exactly one spawn — the flock re-exec — and it did NOT go through the Runner
+    expect(r.calls.length).toBe(0);
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.argv[0]).toBe("flock");
+    expect(calls[0]!.argv.slice(0, 5)).toEqual(["flock", "-n", "-E", "6", "/var/lib/grok-fleet/reconcile.lock"]);
+    // fix 3: stdio is inherited so the child's output reaches the operator/journal
+    expect(calls[0]!.opts.stdin).toBe("inherit");
+    expect(calls[0]!.opts.stdout).toBe("inherit");
+    expect(calls[0]!.opts.stderr).toBe("inherit");
+    // the child is told it is the locked incarnation
+    expect(calls[0]!.opts.env["FLEET2_LOCKED"]).toBe("1");
   });
 
-  test("T11b/m18: flock ENOENT (rc 127) → refused rc 6, never unlocked", async () => {
-    const r = new FakeRunner(() => result({ code: 127 }));
-    const lr = await takeLockAndReexec(baseDeps(r), ["bun", "cli.ts", "upgrade", "--apply"], false);
+  test("T11b/m18: flock ENOENT (launched=false) → refused rc 6, never unlocked", async () => {
+    const r = new FakeRunner();
+    const { spawner } = fakeSpawner({ code: null, launched: false });
+    const lr = await takeLockAndReexec(baseDeps(r, { spawner }), ["bun", "cli.ts", "upgrade", "--apply"], false);
+    expect(lr.rc).toBe(RC.REFUSED);
+    expect(lr.ran).toBe(false);
+  });
+
+  test("m18 variant: flock rc 127 (on PATH but exec fails) → refused rc 6", async () => {
+    const r = new FakeRunner();
+    const { spawner } = fakeSpawner({ code: 127, launched: true });
+    const lr = await takeLockAndReexec(baseDeps(r, { spawner }), ["bun", "cli.ts", "upgrade", "--apply"], false);
     expect(lr.rc).toBe(RC.REFUSED);
     expect(lr.ran).toBe(false);
   });
 
   test("lock acquired → child rc is returned", async () => {
-    const r = new FakeRunner(() => result({ code: 0 }));
-    const lr = await takeLockAndReexec(baseDeps(r), ["bun", "cli.ts", "upgrade", "--apply"], false);
+    const r = new FakeRunner();
+    const { spawner } = fakeSpawner({ code: 0, launched: true });
+    const lr = await takeLockAndReexec(baseDeps(r, { spawner }), ["bun", "cli.ts", "upgrade", "--apply"], false);
     expect(lr.rc).toBe(RC.OK);
     expect(lr.ran).toBe(true);
   });
 
   test("H2 --debug-exec: prints `exec: <argv>` equal to the computed child argv", async () => {
-    const r = new FakeRunner(() => result({ code: 0 }));
+    const r = new FakeRunner();
+    const { spawner } = fakeSpawner({ code: 0, launched: true });
     const argv = ["/usr/bin/bun", "src/cli.ts", "upgrade", "--all", "--apply", "--debug-exec"];
     // capture stderr
     const orig = process.stderr.write.bind(process.stderr);
@@ -419,7 +449,7 @@ describe("T11/T11b lock re-exec (F2/G3/H2)", () => {
       return true;
     };
     try {
-      await takeLockAndReexec(baseDeps(r), argv, true);
+      await takeLockAndReexec(baseDeps(r, { spawner }), argv, true);
     } finally {
       (process.stderr as unknown as { write: typeof orig }).write = orig;
     }
