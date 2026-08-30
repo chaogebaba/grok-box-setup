@@ -172,9 +172,14 @@ describe("T5 upgrade order + skip + dry-run", () => {
         "grok-box-011": { sha: "old" },
       }),
     );
-    const res = await runUpgradePass(baseDeps(r), args({ apply: true }));
+    // canary 008 is NOT first in the input order — it must be pulled to front,
+    // and the deploys must be SERIAL in that order (m6: parallel/reorder breaks
+    // this exact-sequence assertion).
+    const res = await runUpgradePass(
+      baseDeps(r),
+      args({ apply: true, boxes: ["grok-box-009", "grok-box-008", "grok-box-011"], canary: "grok-box-008" }),
+    );
     expect(res.rc).toBe(RC.OK);
-    // The scp calls record deploy order; canary 008 must be first.
     const scpBoxes = r.calls.filter((c) => isScp(c.argv)).map((c) => boxOf(c.argv));
     expect(scpBoxes[0]).toBe("grok-box-008");
     expect(scpBoxes).toEqual(["grok-box-008", "grok-box-009", "grok-box-011"]);
@@ -260,8 +265,32 @@ describe("T5 upgrade order + skip + dry-run", () => {
 
 describe("T6/T13 verify loop", () => {
   test("m2/m13: two consecutive passes required; single pass is NOT enough", async () => {
-    // check: pass, fail, pass, pass → first single pass must not satisfy; the
-    // final two consecutive passes do.
+    // A single passing poll followed by a failure must NOT verify — the mutant
+    // that returns on the FIRST passing poll (m13 / drops the two-pass rule m2)
+    // would wrongly succeed here. verifyTries=2 so there is no later recovery.
+    let n = 0;
+    const seq = [true, false]; // pass then fail, then exhausted
+    const r = new FakeRunner((argv) => {
+      const cmd = argv[argv.length - 1] ?? "";
+      if (cmd === POLL_COMMAND) return result({ stdout: "install: DONE (rc=0)\n" });
+      if (cmd === CHECK_COMMAND) {
+        const ok = seq[n++] ?? false;
+        return ok
+          ? result({ code: 0, stdout: "check=OK v=5.3.0/abc1234 tunnel=up" })
+          : result({ code: 1, stdout: "check=FAIL reason=x" });
+      }
+      return result({ code: 1 });
+    });
+    const v = await verifyBox(
+      baseDeps(r, { rollout: testRollout({ verifyTries: 2 }) }),
+      "grok-box-008",
+      "abc1234",
+    );
+    expect(v.ok).toBe(false);
+  });
+
+  test("two consecutive passes DO verify (happy path)", async () => {
+    // pass, fail, pass, pass → the final two consecutive passes verify.
     let n = 0;
     const seq = [true, false, true, true];
     const r = new FakeRunner((argv) => {
