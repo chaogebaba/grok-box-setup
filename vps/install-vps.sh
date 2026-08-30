@@ -5,13 +5,13 @@
 # set, on a shared host we do NOT own the policy of. Scope is deliberately tiny
 # and auditable:
 #
-#   /opt/grok-fleet        fleetctl (from THIS repo) + config.toml template
+#   /opt/grok-fleet        fleet2 (built from THIS repo) + config.toml template
 #   fleet user             shell-less, key-only, password-locked; its
-#                          authorized_keys is managed by `fleetctl enroll`
+#                          authorized_keys is managed by `fleet2 enroll`
 #   /etc/grok-fleet        600 secrets dir (API token, box-access key)
 #   /var/lib/grok-fleet    mutable state (device cache, per-box expiry, locks)
 #   fleet-reconcile.timer  systemd timer, OnUnitActiveSec=5min
-#   fleet-reconcile.service oneshot: fleetctl reconcile (DRY-RUN until apply=true)
+#   fleet-reconcile.service oneshot: fleet2 reconcile (DRY-RUN until apply=true)
 #
 # Usage (on the VPS, as root):
 #   sudo bash vps/install-vps.sh              # install / upgrade (idempotent)
@@ -32,6 +32,9 @@ PREFIX="${PREFIX:-}"
 FLEET_USER="${FLEET_USER:-fleet}"
 
 OPT_DIR="$PREFIX/opt/grok-fleet"
+# The REAL (non-PREFIX) opt dir — the symlink TARGET must resolve on the live
+# system regardless of a PREFIX= scratch install (F4).
+OPT_DIR_REAL="/opt/grok-fleet"
 ETC_DIR="$PREFIX/etc/grok-fleet"
 STATE_DIR="$PREFIX/var/lib/grok-fleet"
 SYSTEMD_DIR="$PREFIX/etc/systemd/system"
@@ -73,6 +76,14 @@ uninstall() {
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
   rm -rf "$OPT_DIR"
+  # F4: remove the PATH symlink ONLY when it resolves to our target (never a
+  # foreign symlink, never a regular file). PREFIX-rooted so a scratch uninstall
+  # only ever touches the scratch link.
+  local link="$PREFIX/usr/local/bin/fleet2"
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$OPT_DIR_REAL/fleet2" ]; then
+    rm -f "$link"
+    log "removed fleet2 symlink $link"
+  fi
   # Secrets + state: remove the dirs WE created. (An operator who wants to keep
   # the API token should back it up before uninstalling.)
   rm -rf "$ETC_DIR" "$STATE_DIR"
@@ -117,7 +128,7 @@ ensure_dirs() {
 
 ensure_fleet_user() {
   # Only on a real install (no meaningful useradd under a PREFIX). Shell-less,
-  # password-locked, key-only. authorized_keys is managed by `fleetctl enroll`.
+  # password-locked, key-only. authorized_keys is managed by `fleet2 enroll`.
   [ -z "$PREFIX" ] || return 0
   command -v useradd >/dev/null 2>&1 || { log "note: useradd missing — skipping fleet user"; return 0; }
   if ! id "$FLEET_USER" >/dev/null 2>&1; then
@@ -138,12 +149,69 @@ ensure_fleet_user() {
   chown -R "$FLEET_USER":"$FLEET_USER" "$home/.ssh" 2>/dev/null || true
 }
 
-install_fleetctl() {
-  # Copy fleetctl from THIS repo. Atomic write (temp + rename in the same dir).
-  local tmp; tmp="$(mktemp "$OPT_DIR/.fleetctl.XXXXXX")"
-  install -m 0755 "$REPO_ROOT/fleetctl" "$tmp"
-  mv -f "$tmp" "$OPT_DIR/fleetctl"
-  log "installed fleetctl -> $OPT_DIR/fleetctl"
+install_fleet2() {
+  # D7: install the compiled fleet2 binary (bun+TS) as THE brain engine. The
+  # retired bash fleetctl is NOT shipped from the repo (it was `git rm`'d in
+  # phase 3) — instead we PRESERVE any incumbent $OPT_DIR/fleetctl IN PLACE
+  # (M6/Q4): move it to $OPT_DIR/fleetctl.retired-c303696 at mode 0644 (non-
+  # executable) as the documented one-release manual fallback. A fresh install
+  # (no incumbent) has no retired copy and that is correct.
+  if [ -e "$OPT_DIR/fleetctl" ] && [ ! -e "$OPT_DIR/fleetctl.retired-c303696" ]; then
+    mv -f "$OPT_DIR/fleetctl" "$OPT_DIR/fleetctl.retired-c303696"
+    chmod 0644 "$OPT_DIR/fleetctl.retired-c303696" 2>/dev/null || true
+    log "retired incumbent bash fleetctl -> $OPT_DIR/fleetctl.retired-c303696 (0644, manual fallback until 5.5.0)"
+  fi
+
+  # Q3: bun is a BUILD dependency on the VPS. The PREFLIGHT check already
+  # refused rc 1 if it is absent; here we build the binary from the checkout.
+  ( cd "$REPO_ROOT" && make ts-build ) || { log "install_fleet2: make ts-build FAILED"; return 1; }
+  local built="$REPO_ROOT/fleet/dist/fleet2"
+  [ -x "$built" ] || { log "install_fleet2: build produced no $built"; return 1; }
+
+  # Keep the previous fleet2 as fleet2.prev (rollback of fleet2 itself) — but
+  # ONLY when the freshly built binary DIFFERS from the installed one, so a
+  # re-run with no change stays byte-identical (idempotent, T8).
+  if [ -e "$OPT_DIR/fleet2" ] && ! cmp -s "$built" "$OPT_DIR/fleet2"; then
+    cp -f "$OPT_DIR/fleet2" "$OPT_DIR/fleet2.prev" 2>/dev/null || true
+  fi
+
+  # Atomic install (temp + rename in the same dir).
+  local tmp; tmp="$(mktemp "$OPT_DIR/.fleet2.XXXXXX")"
+  install -m 0755 "$built" "$tmp"
+  # Q3: the fresh binary must pass `version` before it goes live; else restore
+  # fleet2.prev and refuse rc 1.
+  if ! "$tmp" version >/dev/null 2>&1; then
+    rm -f "$tmp"
+    if [ -e "$OPT_DIR/fleet2.prev" ]; then
+      cp -f "$OPT_DIR/fleet2.prev" "$OPT_DIR/fleet2" 2>/dev/null || true
+      log "install_fleet2: fresh binary failed 'version' — restored fleet2.prev"
+    fi
+    return 1
+  fi
+  mv -f "$tmp" "$OPT_DIR/fleet2"
+  log "installed fleet2 -> $OPT_DIR/fleet2"
+
+  # F4: a PREFIX-rooted PATH symlink /usr/local/bin/fleet2 -> $OPT_DIR/fleet2
+  # (new; bash had no PATH entry). mkdir -p + ln -sfn so a re-run is idempotent.
+  # The symlink TARGET is the REAL (non-PREFIX) path so it resolves on the live
+  # system; under a PREFIX= scratch tree it only ever creates the scratch link.
+  local bindir="$PREFIX/usr/local/bin"
+  mkdir -p "$bindir" 2>/dev/null || true
+  ln -sfn "$OPT_DIR_REAL/fleet2" "$bindir/fleet2" 2>/dev/null || true
+  log "linked $bindir/fleet2 -> $OPT_DIR_REAL/fleet2"
+
+  # D7: a phase-2 cutover drop-in (fleet-reconcile.service.d/fleet2.conf) is now
+  # obsolete — the base unit ExecStart runs fleet2 directly. Remove it +
+  # daemon-reload so no stale ExecStart override survives.
+  local dropin="$SYSTEMD_DIR/fleet-reconcile.service.d/fleet2.conf"
+  if [ -e "$dropin" ]; then
+    rm -f "$dropin"
+    rmdir "$SYSTEMD_DIR/fleet-reconcile.service.d" 2>/dev/null || true
+    log "removed obsolete cutover drop-in $dropin"
+    if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
 install_config_template() {
@@ -163,12 +231,12 @@ install_config_template() {
 # token is NOT inlined here — it lives in a 600 file referenced by path.
 
 [fleet-brain]
-# Path to the write-scoped Tailscale API token (mode 600). Read by fleetctl,
+# Path to the write-scoped Tailscale API token (mode 600). Read by fleet2,
 # never passed on argv or logged.
 api_token_file = "/etc/grok-fleet/api-token"
 
 # The VPS address the BOXES dial out to for the reverse-SSH tunnel. This is
-# what \`fleetctl enroll grok-box-N\` writes into each box's own config.toml
+# what \`fleet2 enroll grok-box-N\` writes into each box's own config.toml
 # [fleet].vps (docs/FLEET-BRAIN.md §ops). REQUIRED for enroll: it resolves
 # FLEET_VPS_ADDR env > [fleet-brain].vps > REFUSE (no baked default). Set it to
 # THIS brain's reachable address (the one the boxes can open a tunnel to).
@@ -199,7 +267,7 @@ Wants=network-online.target
 Type=oneshot
 # HOME is set to the fleet state tree (STATE_DIR=/var/lib/grok-fleet), NOT /root:
 # breaks-if-undone — systemd does NOT export HOME for a system service, and
-# fleetctl's top-level $HOME expansions abort under set -u when HOME is unset
+# fleet2's top-level $HOME expansions abort under set -u when HOME is unset
 # ("HOME: unbound variable" → every timer run status=1/FAILURE before reconcile
 # ever runs). /var/lib/grok-fleet keeps the brain's whole footprint inside the
 # one declared state tree (decision wall: "Footprint: one tree + one unit set");
@@ -209,7 +277,7 @@ Environment=FLEET_CONFIG=$OPT_DIR/config.toml
 Environment=FLEET_ETC=$ETC_DIR
 Environment=FLEET_STATE=$STATE_DIR
 # Dry-run by default; the wrapper adds --apply iff config apply=true.
-ExecStart=/bin/bash -c 'apply=""; grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" "$OPT_DIR/config.toml" && apply="--apply"; exec $OPT_DIR/fleetctl reconcile \$apply'
+ExecStart=/bin/bash -c 'apply=""; grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" "$OPT_DIR/config.toml" && apply="--apply"; exec $OPT_DIR/fleet2 reconcile \$apply'
 EOF
 
   install -m 0644 /dev/stdin "$SYSTEMD_DIR/$TIMER" <<EOF
@@ -242,7 +310,7 @@ EOF
 #   AllowTcpForwarding remote  — reverse (-R) forwards only; NO local (-L)
 #   PermitOpen none            — cannot open local-forward destinations
 #   PermitListen any           — reverse-listen cap is per-key (authorized_keys
-#     permitlisten="127.0.0.1:2000N", fleetctl); no fixed 8-box list here. The
+#     permitlisten="127.0.0.1:2000N", fleet2); no fixed 8-box list here. The
 #     explicit `any` in THIS Match block deliberately overrides any main-section
 #     PermitListen for the fleet user ONLY, so the per-key option alone decides
 #     which 127.0.0.1:2000N a box may listen on (#12; docs/FLEET-BRAIN.md §2).
@@ -316,19 +384,27 @@ case "${1:-}" in
 esac
 
 log "installing to '${PREFIX:-/}' from repo $REPO_ROOT"
+# Q3 PREFLIGHT (before ANY mutation): fleet2 is built from bun on the VPS. Refuse
+# rc 1 with the install hint if bun is absent. Skipped under a PREFIX= test tree
+# only when FLEET_SKIP_BUN_PREFLIGHT=1 (the installer suite builds no binary).
+if [ "${FLEET_SKIP_BUN_PREFLIGHT:-0}" != 1 ] && ! command -v bun >/dev/null 2>&1; then
+  log "install-vps.sh: REFUSING — bun not found on PATH (fleet2 is built from bun on the VPS)."
+  log "install-vps.sh: install it with:  curl -fsSL https://bun.sh/install | bash"
+  exit 1
+fi
 ensure_dirs
 ensure_fleet_user
-install_fleetctl
+install_fleet2 || exit 1
 install_config_template
 install_units
 install_sshd_dropin || exit 1   # F8 (#12): drop-in validate/reload failure is FATAL
 log "install complete. Next:"
 log "  1) put the write-scoped Tailscale API token at $ETC_DIR/api-token (chmod 600)"
 log "  2) generate the box-access key: ssh-keygen -t ed25519 -f $ETC_DIR/box_access_ed25519 -N ''"
-log "  3) fleetctl enroll grok-box-N for each box (over the tailnet)"
-log "  4) verify with: $OPT_DIR/fleetctl reconcile   (dry-run)"
+log "  3) fleet2 enroll grok-box-N for each box (over the tailnet)"
+log "  4) verify with: $OPT_DIR/fleet2 reconcile   (dry-run)"
 log "  5) flip apply=true in $OPT_DIR/config.toml when ready to mutate"
-# Optional Telegram alert sink: fleetctl notify() always writes to the
+# Optional Telegram alert sink: fleet2 notify() always writes to the
 # journal/stderr and additionally POSTs to the Telegram Bot API iff
 # $ETC_DIR/telegram.env (mode 600, TELEGRAM_BOT_TOKEN= + TELEGRAM_CHAT_ID=)
 # exists — see etc/telegram.env.example. The installer deliberately does NOT

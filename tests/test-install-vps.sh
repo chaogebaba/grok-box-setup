@@ -56,7 +56,7 @@ installer_idem_test() {
 }
 [ "$(installer_idem_test)" = IDENTICAL ] && pass "installer: run twice => byte-identical tree (idempotent)" || bad "installer not idempotent: [$(installer_idem_test)]"
 
-# The installed tree has exactly the four expected files and NOTHING else.
+# The installed tree has exactly the expected files and NOTHING else.
 installer_tree_test() {
   local pfx; pfx="$(mktemp -d)"
   PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
@@ -66,14 +66,66 @@ installer_tree_test() {
 tree="$(installer_tree_test)"
 # etc/grok-fleet is a dir (no file) — normalize by removing the trailing dir slash entry if present.
 tree_norm="$(printf '%s' "$tree" | sed 's#etc/grok-fleet/|##')"
-# The sanctioned footprint: fleetctl + config.toml + service + timer + the ONE
-# sshd drop-in (B-3). Nothing else.
-expected_norm="etc/ssh/sshd_config.d/50-grok-fleet.conf|etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/config.toml|opt/grok-fleet/fleetctl|"
+# The sanctioned footprint (D7): fleet2 + config.toml + service + timer + the ONE
+# sshd drop-in (B-3). The usr/local/bin/fleet2 symlink is a symlink (not -type f)
+# and is asserted separately below. A FRESH install has no retired bash binary.
+expected_norm="etc/ssh/sshd_config.d/50-grok-fleet.conf|etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/fleet2|opt/grok-fleet/config.toml|"
+# The build also emits fleet2.prev on a re-run; the tree test uses a fresh pfx so
+# only the first-install files are present. Sort-order: find|sort places
+# opt/grok-fleet/fleet2 before .../config.toml? No — 'c' < 'f', so config first.
+expected_norm="etc/ssh/sshd_config.d/50-grok-fleet.conf|etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/config.toml|opt/grok-fleet/fleet2|"
 if [ "$tree_norm" = "$expected_norm" ]; then
-  pass "installer: installs exactly fleetctl + config.toml + service + timer + one sshd drop-in"
+  pass "installer: installs exactly fleet2 + config.toml + service + timer + one sshd drop-in (D7)"
 else
   bad "installer tree unexpected: [$tree_norm] want [$expected_norm]"
 fi
+
+# T8 (F4): a PREFIX= install creates only <pfx>/usr/local/bin/fleet2 as a symlink
+# pointing at the REAL /opt/grok-fleet/fleet2 (never the real /usr/local/bin).
+installer_symlink_test() {
+  local pfx; pfx="$(mktemp -d)"
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  local link="$pfx/usr/local/bin/fleet2"
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "/opt/grok-fleet/fleet2" ]; then echo "OK"; else echo "MISSING:[$link -> $(readlink "$link" 2>/dev/null)]"; fi
+  rm -rf "$pfx"
+}
+[ "$(installer_symlink_test)" = OK ] && pass "installer (F4): PREFIX symlink usr/local/bin/fleet2 -> /opt/grok-fleet/fleet2" || bad "installer symlink wrong: [$(installer_symlink_test)]"
+
+# T8 (D7): a FRESH install has NO retired bash binary; installing OVER an
+# incumbent $OPT_DIR/fleetctl retires it to fleetctl.retired-c303696 mode 0644.
+installer_fresh_no_retired_test() {
+  local pfx; pfx="$(mktemp -d)"
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  if [ -e "$pfx/opt/grok-fleet/fleetctl.retired-c303696" ]; then echo "HAS-RETIRED"; else echo "NONE"; fi
+  rm -rf "$pfx"
+}
+[ "$(installer_fresh_no_retired_test)" = NONE ] && pass "installer (M6): fresh install has NO retired bash binary" || bad "installer fresh had a retired copy: [$(installer_fresh_no_retired_test)]"
+
+installer_retire_incumbent_test() {
+  local pfx; pfx="$(mktemp -d)"
+  mkdir -p "$pfx/opt/grok-fleet"
+  printf '#!/bin/bash\necho old\n' > "$pfx/opt/grok-fleet/fleetctl"; chmod 0755 "$pfx/opt/grok-fleet/fleetctl"
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  local r="$pfx/opt/grok-fleet/fleetctl.retired-c303696"
+  if [ -e "$r" ] && [ "$(stat -c '%a' "$r")" = 644 ] && [ ! -e "$pfx/opt/grok-fleet/fleetctl" ]; then echo "RETIRED-0644"; else echo "WRONG:[$(ls -la "$pfx/opt/grok-fleet/" 2>&1 | tr '\n' ';')]"; fi
+  rm -rf "$pfx"
+}
+[ "$(installer_retire_incumbent_test)" = RETIRED-0644 ] && pass "installer (M6/Q4): install over an incumbent retires bash fleetctl to .retired-c303696 mode 0644" || bad "installer retire-incumbent wrong: [$(installer_retire_incumbent_test)]"
+
+# T8 (Q3): bun-missing PREFLIGHT refuses rc 1 with the install hint, before any
+# mutation. Shadow PATH so `command -v bun` fails; assert rc 1 + the hint.
+installer_bun_missing_test() {
+  local pfx; pfx="$(mktemp -d)"; local bindir; bindir="$(mktemp -d)"
+  # A PATH with only the coreutils the installer needs, minus bun.
+  for b in bash sh env mktemp install mv cp rm mkdir chmod chown ln grep sed awk cat printf find sort getent id touch stat readlink rmdir dirname cut make; do
+    src="$(command -v "$b" 2>/dev/null)"; [ -n "$src" ] && ln -sf "$src" "$bindir/$b" 2>/dev/null || true
+  done
+  local out rc
+  out="$(PREFIX="$pfx" PATH="$bindir" bash "$VPS_INSTALL" 2>&1)"; rc=$?
+  rm -rf "$pfx" "$bindir"
+  if [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'bun not found on PATH' && printf '%s' "$out" | grep -q 'bun.sh/install'; then echo "REFUSED-1"; else echo "WRONG:rc=$rc"; fi
+}
+[ "$(installer_bun_missing_test)" = REFUSED-1 ] && pass "installer (Q3): bun-missing PREFLIGHT refuses rc 1 with the install hint" || bad "installer bun-missing wrong: [$(installer_bun_missing_test)]"
 
 # The reconcile service is DRY-RUN by default (no bare --apply baked in; the
 # wrapper only adds it when config apply=true).
@@ -152,28 +204,25 @@ m21_test() {
   # Force the config's apply value.
   sed -i "s/^apply = .*/apply = $applyval/" "$cfg"
   # Extract the ExecStart command line and run its inner `bash -c '...'` with a
-  # fleetctl stub that just echoes its args, capturing whether --apply is added.
+  # fleet2 stub that just echoes its args, capturing whether --apply is added.
   local execline
   execline="$(grep -E '^ExecStart=' "$pfx/etc/systemd/system/fleet-reconcile.service" | sed 's/^ExecStart=//')"
-  # Replace the real fleetctl path invocation with an echo shim by shadowing PATH:
-  # simplest is to run the inner bash -c payload directly with a fake fleetctl.
   local payload
   payload="$(printf '%s' "$execline" | sed -E "s#^/bin/bash -c '##; s#'\$##")"
-  # Provide a fleetctl shim on PATH.
-  local bindir="$pfx/bin"; mkdir -p "$bindir"
-  # The payload calls $OPT_DIR/fleetctl reconcile $apply; shadow that exact path.
-  cat > "$pfx/opt/grok-fleet/fleetctl" <<'SHIM'
+  # The payload calls $OPT_DIR/fleet2 reconcile $apply; shadow that exact path
+  # with an echo shim (overwriting the real built binary for this test only).
+  cat > "$pfx/opt/grok-fleet/fleet2" <<'SHIM'
 #!/bin/bash
-echo "FLEETCTL-ARGS:$*"
+echo "FLEET2-ARGS:$*"
 SHIM
-  chmod +x "$pfx/opt/grok-fleet/fleetctl"
+  chmod +x "$pfx/opt/grok-fleet/fleet2"
   bash -c "$payload" 2>/dev/null
   rm -rf "$pfx"
 }
-case "$(m21_test true)" in *"FLEETCTL-ARGS:reconcile --apply"*) pass "M21: config apply=true => wrapper runs reconcile --apply" ;; *) bad "M21: apply=true did not add --apply: [$(m21_test true)]" ;; esac
+case "$(m21_test true)" in *"FLEET2-ARGS:reconcile --apply"*) pass "M21: config apply=true => wrapper runs reconcile --apply" ;; *) bad "M21: apply=true did not add --apply: [$(m21_test true)]" ;; esac
 case "$(m21_test false)" in
   *"--apply"*) bad "M21: config apply=false WRONGLY added --apply (gate inverted): [$(m21_test false)]" ;;
-  *"FLEETCTL-ARGS:reconcile"*) pass "M21: config apply=false => wrapper runs reconcile (no --apply)" ;;
+  *"FLEET2-ARGS:reconcile"*) pass "M21: config apply=false => wrapper runs reconcile (no --apply)" ;;
   *) bad "M21: apply=false wrapper wrong: [$(m21_test false)]" ;;
 esac
 
