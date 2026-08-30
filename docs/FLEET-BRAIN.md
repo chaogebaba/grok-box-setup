@@ -518,6 +518,36 @@ fleet2 defaults `FLEET_CONFIG` to **`/opt/grok-fleet/config.toml`** (the systemd
 
 - `make ts-test` — the bun test suite (box-free). `make ts-build` — the compiled `fleet/dist/fleet2` (gitignored; never shipped to boxes). `make ts-deploy` — scp + atomic `mv` to `/opt/grok-fleet/fleet2`, keeping the previous binary as `fleet2.prev` (rollback = `mv fleet2.prev fleet2`).
 
+## fleet2 reconcile (phase 2)
+
+Phase 2 ports the **whole reconcile tick** to `fleet2 reconcile` (blueprint `blueprints/fleet-ts-phase2.md`). It is a faithful port of bash `cmd_reconcile`: device fetch + READ-ONLY latch, per-box decide/execute (mint, rotate, delete-then-rename, rollout, throttled alerts), the config-truth pass, the identity pass, notify, state files, and the exit-code map. Phase-1 modules (Runner, tunnel, DevicesApi, the upgrade engine, the flock re-exec) are reused. Both binaries coexist until phase 3: bash `fleetctl` for operator commands, `fleet2` for the tick.
+
+### Commands
+- `fleet2 reconcile [--apply | --dry-run]` — dry-run by default (M01). Takes the reconcile lock UNCONDITIONALLY (dry-run also writes `<box>.checkfail`/`<box>.cfgfail`); a held lock ⇒ rc 0 (a skipped tick is success), distinct from `upgrade`'s rc 6. Unknown arg ⇒ rc 2 (before the lock).
+
+### State-file compatibility
+`fleet2` reads and writes every `$FLEET_STATE` file byte-identically to bash (`enrolled.tsv`, `keys/<N>.json`, `<box>.expires`, `<box>.checkfail`/`.seedfail`/`.cfgfail`/`.asleep`/`.incoherent`, `api.fails`/`.backoff_min`/`.next_retry`), so bash and fleet2 can be swapped either direction mid-soak with no migration. Counters use the same read/normalise idiom (strip whitespace, non-numeric ⇒ 0; a healthy `.checkfail` is a literal `0`, gated on count not presence).
+
+**Written on a dry-run tick by BOTH engines** (a `--dry-run`/`apply=false` reconcile does NOT leave `$FLEET_STATE` untouched — this is bash parity, not a fleet2 mutation): `<box>.checkfail` (reset/bump on every tunnel-up box), `<box>.cfgfail` (config-pass), `<box>.asleep` and `<box>.incoherent` (row-e alert throttles — `reconcile_alert_asleep`/`reconcile_alert_incoherent` run BEFORE the mutation gate, fleetctl main:2842/2848), and the `api.*` counters (on an API failure/backoff). Only the API/tunnel MUTATIONS (mint/rotate/dedup key + device writes) are suppressed in dry-run. A cross-engine dry-run parity diff must therefore expect these files to change under both engines.
+
+### Cutover / soak / apply-flip / cutback
+Same unit, timer, env, and lock ⇒ bash and fleet2 never run concurrently.
+- `make ts-cutover SOAK=1` — install the SOAK drop-in (`ExecStart=/opt/grok-fleet/fleet2 reconcile --dry-run`, config ignored). This is the ONLY path into the timer during the gate/soak.
+- `make ts-cutover` (wrapper form) — REFUSES unless the soak marker `/var/lib/grok-fleet/fleet2.soak-ok` exists; only `ts-apply-flip` writes that marker.
+- `make ts-apply-flip [SOAK_SINCE=-24h] [FORCE=1]` — a **binding** check: over the trailing window it requires ≥ ⌈0.69 × (window/300)⌉ `reconcile: done (DRY-RUN)` lines (199 at 24 h) and zero non-zero `ExecMainStatus`/`Result=exit-code` runs; on pass it writes the marker (an attestation) and installs the runtime **wrapper** drop-in (`--apply` evaluated at runtime from `config.toml`'s `apply = true`). `SOAK_SINCE` may only lengthen the window (≥ 24 h). `FORCE=1` overrides the check and records `forced=1 …` INTO the marker so a skipped soak stays visible.
+- `make ts-cutback` — remove the drop-in, daemon-reload (back to bash `fleetctl`).
+Each target daemon-reloads and prints the resulting `systemctl cat` ExecStart. The wrapper ExecStart is byte-identical to `vps/install-vps.sh:212` with the binary swapped, and keeps `$apply` a BARE `$apply` (a `${apply}` would be expanded by systemd to empty and `--apply` lost).
+
+### Stated deviations (phase 2)
+- **D4/F5 API backoff ENFORCED** — bash writes `api.next_retry` (5/10/20-min backoff) but never consults it (dead code, main:2767-2774). fleet2 skips the devices GET while the marker is in the future (read-only run, no `api.fails` bump); a marker more than 20 min ahead is treated as corrupt and ignored.
+- **D5/F1-F2 dynamic canary** — if `[fleet-brain].canary_box` is set the config-pass canary is fixed (bash semantics); if absent it is DYNAMIC (the lowest-index enrolled box with a tunnel up), logged on a separate `config: canary policy=<fixed|dynamic>` line after the verbatim pass-start line. The rollout canary keeps phase-1's resolution unchanged.
+- **D10/F8 auto-rollout gated** — row d drift now WIRES the phase-1 upgrade engine, gated behind `[rollout] auto` (default `false` ⇒ `WOULD rollout` lines only; `true` ⇒ the engine runs once per tick, a user-granted flip). Unresolvable `[rollout].src` degrades to drift-unknown, never rc 3.
+- **D7 in-process fetch header** — the Tailscale token is passed via an in-process `fetch` `Authorization` header (never argv/env/a spawned curl), a strictly smaller exposure than bash's curl `--config` file.
+- **D12/F4 lock rc** — `reconcile` returns rc 0 when the lock is held (bash), while `upgrade --apply` keeps rc 6 (phase 1); both kept per subcommand.
+- **D3/F10-S2 rotate threshold** — row c compares whole days against `floor(FLEET_ROTATE_BEFORE_SECS/86400)`; with the 604800 default this is bash's literal `< 7` exactly.
+- **F6 notify 0600** — inherited from phase 1: Telegram delivery is refused unless `telegram.env` is mode 0600 (bash checks content only); fail-closed on a world-readable token is kept.
+- **H2 WOULD prefix** — the WOULD line's `read-only ` prefix is reproduced UNCONDITIONALLY (bash bug at main:2872 preserved byte-for-byte so the cross-engine diff and the journal corpus stay identical; the fix is a phase-3 item once bash retires).
+
 ## Prior art / reference URLs
 
 (Consolidated; also inline above.)

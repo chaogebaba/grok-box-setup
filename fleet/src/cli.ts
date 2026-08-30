@@ -26,6 +26,7 @@ import {
   type UpgradeDeps,
 } from "./upgrade.ts";
 import { fsTelegramSource, fetchPoster } from "./notify.ts";
+import { cliReconcile } from "./reconcile/cli-reconcile.ts";
 import { buildGitSha } from "./build-flags.ts";
 import { log } from "./log.ts";
 
@@ -39,6 +40,7 @@ function usage(): string {
     "  fleet2 version",
     "  fleet2 inventory [--json] [box…]",
     "  fleet2 upgrade [--to REF] [--all | box…] [--apply] [--canary BOX] [--json]",
+    "  fleet2 reconcile [--apply | --dry-run]",
     "",
     "exit codes: 0 ok, 1 failure/abort, 2 usage, 3 target/staging, 6 refused",
   ].join("\n");
@@ -235,6 +237,33 @@ async function main(argv: string[]): Promise<number> {
       process.stdout.write(res.summary + "\n");
     }
     return res.rc;
+  }
+
+  if (cmd === "reconcile") {
+    const rest = args.slice(1);
+    let apply = false;
+    let debugExec = false;
+    for (const a of rest) {
+      if (a === "--apply") apply = true;
+      else if (a === "--dry-run") apply = false;
+      else if (a === "--debug-exec") debugExec = true;
+      else if (a === "--help" || a === "-h") {
+        process.stdout.write(usage() + "\n");
+        return RC.OK;
+      } else {
+        // unknown arg ⇒ rc 2 BEFORE the lock (main:2527-2534)
+        log(`reconcile: unknown arg '${a}'`);
+        return RC.USAGE;
+      }
+    }
+    return cliReconcile({
+      env,
+      cfg,
+      rollout,
+      apply,
+      debugExec,
+      argv,
+    });
   }
 
   log(`unknown command '${cmd}'`);

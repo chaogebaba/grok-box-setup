@@ -26,6 +26,18 @@ export interface RolloutConfig {
   verifyTries: number;
   /** verify poll interval seconds (default 15). */
   verifyInterval: number;
+  /** phase-2 D10/F8: gate auto-rollout in row d (default false). */
+  auto: boolean;
+}
+
+/**
+ * The CONFIG-pass canary (phase-2 F1/F2): `[fleet-brain].canary_box` with NO
+ * default. Distinct from `RolloutConfig.canary` (which defaults to grok-box-008
+ * for the rollout engine). Undefined ⇒ the config pass uses the DYNAMIC policy
+ * (lowest-index enrolled box whose tunnel is up).
+ */
+export function configCanary(cfg: ParsedConfig): string | undefined {
+  return asStr(cfg.fleetBrain["canary_box"]);
 }
 
 type Table = Record<string, unknown>;
@@ -43,6 +55,15 @@ function asPosInt(v: unknown, fallback: number): number {
   if (typeof v === "string" && /^[0-9]+$/.test(v)) {
     const n = Number.parseInt(v, 10);
     if (n > 0) return n;
+  }
+  return fallback;
+}
+
+function asBool(v: unknown, fallback: boolean): boolean {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") {
+    if (v === "true") return true;
+    if (v === "false") return false;
   }
   return fallback;
 }
@@ -119,7 +140,8 @@ export function resolveRollout(cfg: ParsedConfig, env: RolloutEnv): RolloutConfi
     asStr(cfg.rollout["canary"]) ?? asStr(cfg.fleetBrain["canary_box"]) ?? "grok-box-008";
   const verifyTries = asPosInt(cfg.rollout["verify_tries"], 8);
   const verifyInterval = asPosInt(cfg.rollout["verify_interval"], 15);
-  return { src, target, canary, verifyTries, verifyInterval };
+  const auto = asBool(cfg.rollout["auto"], false);
+  return { src, target, canary, verifyTries, verifyInterval, auto };
 }
 
 /** Read + parse the config file from disk. Absence is not an error. */
