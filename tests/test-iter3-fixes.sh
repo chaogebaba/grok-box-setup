@@ -89,6 +89,41 @@ else
   bad  "H1 flock --close: child leaked the lock fd (result=[$res])"
 fi
 
+# #7 — FUNCTIONAL: spawned daemons close the historical fd 8 directly. Keep
+# this separate from the structural flock-close test above: it catches a
+# regression in spawn_detached even though new converge bodies hide the fd.
+daemon_fd8_close_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn spawn_detached)"
+tmp="\$(mktemp -d)"; lock="\$tmp/converge.lock"; marker="\$tmp/pid"
+(
+  exec 8>"\$lock"
+  flock 8
+  spawn_detached "" sh -c "echo \\\$\\\$ > '\$marker'; exec sleep 5"
+)
+sleep 0.4
+child="\$(cat "\$marker" 2>/dev/null || true)"
+if [ -n "\$child" ] && kill -0 "\$child" 2>/dev/null && flock -n "\$lock" true; then
+  result=closed
+else
+  result=leaked
+fi
+[ -n "\$child" ] && kill "\$child" 2>/dev/null || true
+rm -rf "\$tmp"
+echo "\$result"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+if [ "$(daemon_fd8_close_test)" = closed ]; then
+  pass "#7 spawned daemon closes inherited converge-lock fd 8"
+else
+  bad  "#7 spawned daemon retained inherited converge-lock fd 8"
+fi
+
 # ---------------------------------------------------------------------------
 # H9 — LINT: setsid/nohup/disown must appear ONLY inside spawn_detached. Any
 # other occurrence (outside comments) re-introduces the #7 spawn-leak risk.
@@ -182,6 +217,46 @@ else
   bad  "H6 re-auth attempted up with no hostname: [$argv_nohost]"
 fi
 
+# #9 — Exercise the real fallback sources rather than stubbing the resolved
+# values: hostname comes from the frozen file and tags from live debug prefs.
+reauth_live_mentions_test() {
+  local capture inner; capture="$(mktemp)"; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"; HOSTNAME_FILE="\$(mktemp)"; echo grok-box-008 > "\$HOSTNAME_FILE"
+cap_bin="\$(mktemp)"
+cat > "\$cap_bin" <<CAP
+#!/bin/sh
+printf '%s\n' "\\\$@" > "$capture"
+CAP
+chmod +x "\$cap_bin"
+log(){ :; }
+tailscale_bin(){ echo "\$cap_bin"; }
+prefs_hostname(){ echo ""; }
+ts(){
+  case "\$1 \${2:-}" in
+    "debug prefs") echo '{"AdvertiseTags":["tag:grok-box","tag:ops"]}' ;;
+    *) echo '{}' ;;
+  esac
+}
+id(){ return 1; }
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+for f in read_box_name current_advertise_tags run_reauth_up; do eval "\$(extract_fn "\$f")"; done
+run_reauth_up "test live mentions" >/dev/null
+rm -f "\$cap_bin" "\$HOSTNAME_FILE"
+INNER
+  timeout 15 bash "$inner"
+  /usr/bin/tr '\n' ' ' < "$capture"
+  rm -f "$capture" "$inner"
+}
+live_mentions="$(reauth_live_mentions_test)"
+case "$live_mentions" in
+  *--hostname=grok-box-008*--advertise-tags=tag:grok-box,tag:ops*)
+    pass "#9 re-auth mentions frozen hostname and live current tags"
+    ;;
+  *) bad "#9 re-auth did not mention fallback hostname/current tags: [$live_mentions]" ;;
+esac
+
 # ---------------------------------------------------------------------------
 # H5/E3 — the attempt-limiter must record an attempt even when `tailscale up`
 # FAILS (rc≠0). This drives the REAL ensure_login (NeedsLogin + populated
@@ -226,6 +301,38 @@ if [ "$(h5_test)" = recorded ]; then
   pass "H5/E3 ensure_login records the re-auth attempt even when up FAILS (rc≠0)"
 else
   bad  "H5/E3 attempt NOT recorded on failing up — limiter is defeatable by a rc≠0 up"
+fi
+
+# #8 — A persistent Running-but-offline node is recycled elsewhere in the
+# tick. The restart's fresh NeedsLogin state must enter ensure_login before any
+# preference refresh; otherwise a server-deleted identity remains a no-op.
+deleted_node_reauth_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+RUN_DIR="\$(mktemp -d)"; STATE_DIR="\$RUN_DIR/state"
+trace="\$RUN_DIR/trace"; fakepid=\$\$
+log(){ :; }
+pgrep(){ echo "\$fakepid"; }
+tr(){ echo "tailscaled --statedir=\$STATE_DIR"; }
+kill(){ case "\$1" in -0) return 1 ;; *) return 0 ;; esac; }
+start_tailscaled(){ echo start >> "\$trace"; }
+wait_for_backend(){ echo wait >> "\$trace"; echo NeedsLogin; }
+ensure_login(){ echo login >> "\$trace"; }
+refresh_exitnode(){ echo refresh >> "\$trace"; }
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn recycle_tailscaled)"
+recycle_tailscaled "persistent offline"
+/usr/bin/tr '\n' ' ' < "\$trace"
+rm -rf "\$RUN_DIR"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+if [ "$(deleted_node_reauth_test)" = "start wait login refresh " ]; then
+  pass "#8 recycle reads fresh NeedsLogin and re-auths before prefs refresh"
+else
+  bad  "#8 recycle did not enter re-auth before prefs refresh"
 fi
 
 # ---------------------------------------------------------------------------
