@@ -28,6 +28,23 @@ describe("T3 enrolled.tsv parsing", () => {
     const tsv = ["weird-name\t9\t", "grok-box-008\t20008"].join("\n");
     expect(parseEnrolled(tsv)).toEqual(["grok-box-008", "weird-name"]);
   });
+
+  test("phase-2 I2/P4: equal-index tie broken by NAME ASCENDING (003 before 3)", () => {
+    // grok-box-3 and grok-box-003 both parse to index 3; GNU coreutils yields
+    // name-ascending within the tie, so grok-box-003 sorts before grok-box-3.
+    const tsv = [
+      "grok-box-3\t20003",
+      "grok-box-004\t20004",
+      "grok-box-003\t20003",
+      "grok-box-002\t20002",
+    ].join("\n");
+    expect(parseEnrolled(tsv)).toEqual([
+      "grok-box-002",
+      "grok-box-003",
+      "grok-box-3",
+      "grok-box-004",
+    ]);
+  });
 });
 
 describe("membership override", () => {

@@ -43,8 +43,7 @@ export function isValidBoxName(name: string): boolean {
  */
 export function parseEnrolled(content: string): string[] {
   const seen = new Set<string>();
-  const rows: Array<{ idx: number; name: string; seq: number }> = [];
-  let seq = 0;
+  const rows: Array<{ idx: number; name: string }> = [];
   for (const rawLine of content.split("\n")) {
     const line = rawLine.trim();
     if (line === "") continue;
@@ -54,10 +53,13 @@ export function parseEnrolled(content: string): string[] {
     if (seen.has(name)) continue; // dedup by name
     seen.add(name);
     const idx = boxIndex(name) ?? UNPARSEABLE_INDEX;
-    rows.push({ idx, name, seq: seq++ });
+    rows.push({ idx, name });
   }
-  // Stable numeric sort by index, ties broken by original order.
-  rows.sort((a, b) => (a.idx !== b.idx ? a.idx - b.idx : a.seq - b.seq));
+  // Numeric sort by index; ties (e.g. grok-box-3 + grok-box-003 both index 3)
+  // broken by NAME ASCENDING to match GNU coreutils `sort -u -k2,2 | sort -n
+  // -k1,1` (phase-2 I2/P4). String ascending puts grok-box-003 before
+  // grok-box-3 ('0' < '3'). Stable across equal (idx,name) pairs.
+  rows.sort((a, b) => (a.idx !== b.idx ? a.idx - b.idx : a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return rows.map((r) => r.name);
 }
 
