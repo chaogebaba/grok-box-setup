@@ -80,8 +80,9 @@ else
   bad "installer tree unexpected: [$tree_norm] want [$expected_norm]"
 fi
 
-# T8 (F4): a PREFIX= install creates only <pfx>/usr/local/bin/fleet2 as a symlink
-# pointing at the REAL /opt/grok-fleet/fleet2 (never the real /usr/local/bin).
+# T8 (F4, m17): a PREFIX= install creates only <pfx>/usr/local/bin/fleet2 as a
+# symlink pointing at the REAL /opt/grok-fleet/fleet2 (never the real
+# /usr/local/bin). m17 (symlink not PREFIX-rooted) ⇒ the scratch link is absent ⇒ killed.
 installer_symlink_test() {
   local pfx; pfx="$(mktemp -d)"
   PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
