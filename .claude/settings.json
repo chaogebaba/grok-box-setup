@@ -27,15 +27,6 @@
             "timeout": 10
           }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/supervisor-only.sh\" \"$CLAUDE_PROJECT_DIR/.claude/hooks/ws-arming-check.sh\"",
-            "timeout": 5
-          }
-        ]
       }
     ],
     "Stop": [
