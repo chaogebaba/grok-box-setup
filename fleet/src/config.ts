@@ -47,7 +47,17 @@ function asPosInt(v: unknown, fallback: number): number {
   return fallback;
 }
 
-const KNOWN_ROLLOUT_KEYS = new Set(["src", "target", "canary", "verify_tries", "verify_interval"]);
+// `auto` is reserved for phase-2 (P1/P3 auto-rollout) — phase 1 IGNORES it
+// entirely (no behaviour change for upgrade), it is listed here only so a config
+// that pre-declares it does not emit a spurious "unknown key" info line.
+const KNOWN_ROLLOUT_KEYS = new Set([
+  "src",
+  "target",
+  "canary",
+  "verify_tries",
+  "verify_interval",
+  "auto",
+]);
 
 export interface ParsedConfig {
   fleetBrain: Table;

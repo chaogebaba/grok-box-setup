@@ -2,6 +2,7 @@
 
 import { test, expect, describe } from "bun:test";
 import { parseConfig, resolveRollout, ConfigError } from "../src/config.ts";
+import { setLogSink } from "../src/log.ts";
 
 describe("T7 config precedence", () => {
   test("env > [rollout] > [fleet-brain].rollout_src > default", () => {
@@ -76,5 +77,20 @@ describe("T7 config precedence", () => {
     const cfg = parseConfig(`[rollout]\nbogus = "x"\ntarget = "main"\n`, "/x");
     expect(cfg.present).toBe(true);
     expect(resolveRollout(cfg, {}).target).toBe("main");
+  });
+
+  test("phase-2 prep: [rollout].auto is a KNOWN key (no unknown-key log, ignored)", () => {
+    const logs: string[] = [];
+    const prev = setLogSink((l) => logs.push(l));
+    try {
+      const cfg = parseConfig(`[rollout]\nauto = true\ntarget = "main"\n`, "/x");
+      expect(cfg.present).toBe(true);
+      // no "unknown key" line for `auto`
+      expect(logs.some((l) => l.includes("[rollout].auto"))).toBe(false);
+      // and it does not affect upgrade resolution in phase 1
+      expect(resolveRollout(cfg, {}).target).toBe("main");
+    } finally {
+      setLogSink(prev);
+    }
   });
 });
