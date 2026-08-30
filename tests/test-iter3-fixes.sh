@@ -89,6 +89,41 @@ else
   bad  "H1 flock --close: child leaked the lock fd (result=[$res])"
 fi
 
+# #7 — FUNCTIONAL: spawned daemons close the historical fd 8 directly. Keep
+# this separate from the structural flock-close test above: it catches a
+# regression in spawn_detached even though new converge bodies hide the fd.
+daemon_fd8_close_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn spawn_detached)"
+tmp="\$(mktemp -d)"; lock="\$tmp/converge.lock"; marker="\$tmp/pid"
+(
+  exec 8>"\$lock"
+  flock 8
+  spawn_detached "" sh -c "echo \\\$\\\$ > '\$marker'; exec sleep 5"
+)
+sleep 0.4
+child="\$(cat "\$marker" 2>/dev/null || true)"
+if [ -n "\$child" ] && kill -0 "\$child" 2>/dev/null && flock -n "\$lock" true; then
+  result=closed
+else
+  result=leaked
+fi
+[ -n "\$child" ] && kill "\$child" 2>/dev/null || true
+rm -rf "\$tmp"
+echo "\$result"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+if [ "$(daemon_fd8_close_test)" = closed ]; then
+  pass "#7 spawned daemon closes inherited converge-lock fd 8"
+else
+  bad  "#7 spawned daemon retained inherited converge-lock fd 8"
+fi
+
 # ---------------------------------------------------------------------------
 # H9 — LINT: setsid/nohup/disown must appear ONLY inside spawn_detached. Any
 # other occurrence (outside comments) re-introduces the #7 spawn-leak risk.
