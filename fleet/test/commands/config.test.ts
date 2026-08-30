@@ -63,6 +63,59 @@ describe("T4 diff (F12)", () => {
     return `cur=${cur} want=${want} support=${support} enabled=${enabled}\n---FILE---\n${onbox}`;
   }
 
+  // A runner that runs the REAL diff(1) on the temp files runDiff wrote (so the
+  // trailing-newline handling is actually exercised), and returns the fixture
+  // for the tunnel dry-run. Used by the F2 live-parity tests.
+  function realDiffRunner(dryFixture: string): FakeRunner {
+    return new FakeRunner((argv) => {
+      if (argv[0] === "/usr/bin/diff") {
+        const r = Bun.spawnSync(argv);
+        return result({ code: r.exitCode ?? 0, stdout: r.stdout.toString(), stderr: r.stderr.toString() });
+      }
+      return result({ code: 0, stdout: dryFixture }); // the tunnel dry-run
+    });
+  }
+
+  test("F2: remote ---FILE--- body ALREADY ends in \\n ⇒ byte-EMPTY diff (bash parity)", async () => {
+    // The LIVE remote `boxup config-get` body ends in a newline. Feed a fixture
+    // whose on-box body == the rendered text AND ends in \n; with the r1 fix the
+    // diff must be byte-empty (bash outputs nothing). The pre-fix code appended a
+    // second \n and produced a spurious trailing-blank-line diff.
+    const text = renderManaged(FLEET_TOML, undefined); // ends in exactly one \n
+    const dry = await dryRunOutput("grok-box-8", text, {}); // on-box body ends in \n
+    let out = "";
+    const rc = await cmdConfig(["diff", "grok-box-8"], {
+      runner: realDiffRunner(dry),
+      env,
+      source,
+      enrolled,
+      whichDiff,
+      write: (s) => (out += s),
+    });
+    expect(rc).toBe(0);
+    expect(out).toBe(""); // byte-empty, matching bash's empty stdout
+  });
+
+  test("F2: remote body ends in \\n but content DIFFERS ⇒ real diff still shown (no false-negative)", async () => {
+    const text = renderManaged(FLEET_TOML, undefined);
+    // on-box body differs (an extra key) AND ends in \n.
+    const onbox = text.replace(/\n$/, "") + '\nextra = "1"\n';
+    const dry = await dryRunOutput("grok-box-8", onbox, { cur: "differentsha" });
+    let out = "";
+    const rc = await cmdConfig(["diff", "grok-box-8"], {
+      runner: realDiffRunner(dry),
+      env,
+      source,
+      enrolled,
+      whichDiff,
+      write: (s) => (out += s),
+    });
+    expect(rc).toBe(1); // drift
+    expect(out).toContain('extra = "1"'); // the genuine difference IS shown
+    // and NOT a spurious lone trailing-blank-line hunk
+    expect(out).not.toMatch(/@@ [^\n]*@@\n(?:[ +-]\S.*\n)* \S+\n-\n$/);
+  });
+
   test("in sync (cur==want, enabled true, support yes) ⇒ rc 0", async () => {
     const text = renderManaged(FLEET_TOML, undefined);
     const dry = await dryRunOutput("grok-box-8", text.replace(/\n$/, ""), {});

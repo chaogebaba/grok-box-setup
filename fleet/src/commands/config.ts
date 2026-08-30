@@ -144,11 +144,17 @@ export async function cmdConfig(args: string[], deps: ConfigDeps): Promise<numbe
     else if (tok.startsWith("enabled=")) enabled = tok.slice(8);
   }
 
-  // Unified diff on-box (current) vs rendered (desired). F12: operands are
-  // onbox+"\n" and text (already ends in one \n). diff rc IGNORED (|| true).
+  // Unified diff on-box (current) vs rendered (desired). F2/F12 (r1 gate fix):
+  // bash captures both operands via `$(...)` — which STRIPS all trailing
+  // newlines — then re-adds exactly ONE via `printf '%s\n'`. So each operand is
+  // normalised to EXACTLY one trailing newline regardless of how many the raw
+  // body carried. fleet2's old `onboxBody + "\n"` double-newlined a remote body
+  // that already ended in `\n`, emitting a spurious trailing blank line on every
+  // real box. Normalise both operands the bash way: drop trailing \n, add one.
+  const oneTrailingNl = (s: string): string => s.replace(/\n+$/, "") + "\n";
   const diffOut = await runDiff(deps.runner, diffPath, {
-    onbox: onboxBody + "\n",
-    rendered: text,
+    onbox: oneTrailingNl(onboxBody),
+    rendered: oneTrailingNl(text),
     box,
   });
   if (diffOut !== "") write(diffOut);
