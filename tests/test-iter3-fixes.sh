@@ -263,6 +263,38 @@ else
   bad  "H5/E3 attempt NOT recorded on failing up — limiter is defeatable by a rc≠0 up"
 fi
 
+# #8 — A persistent Running-but-offline node is recycled elsewhere in the
+# tick. The restart's fresh NeedsLogin state must enter ensure_login before any
+# preference refresh; otherwise a server-deleted identity remains a no-op.
+deleted_node_reauth_test() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$BOXUP"
+RUN_DIR="\$(mktemp -d)"; STATE_DIR="\$RUN_DIR/state"
+trace="\$RUN_DIR/trace"; fakepid=\$\$
+log(){ :; }
+pgrep(){ echo "\$fakepid"; }
+tr(){ echo "tailscaled --statedir=\$STATE_DIR"; }
+kill(){ case "\$1" in -0) return 1 ;; *) return 0 ;; esac; }
+start_tailscaled(){ echo start >> "\$trace"; }
+wait_for_backend(){ echo wait >> "\$trace"; echo NeedsLogin; }
+ensure_login(){ echo login >> "\$trace"; }
+refresh_exitnode(){ echo refresh >> "\$trace"; }
+extract_fn(){ awk -v fn="\$1" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$BOXUP"; }
+eval "\$(extract_fn recycle_tailscaled)"
+recycle_tailscaled "persistent offline"
+/usr/bin/tr '\n' ' ' < "\$trace"
+rm -rf "\$RUN_DIR"
+INNER
+  timeout 15 bash "$inner"; rm -f "$inner"
+}
+if [ "$(deleted_node_reauth_test)" = "start wait login refresh " ]; then
+  pass "#8 recycle reads fresh NeedsLogin and re-auths before prefs refresh"
+else
+  bad  "#8 recycle did not enter re-auth before prefs refresh"
+fi
+
 # ---------------------------------------------------------------------------
 # H11 — auth-key expiry classification. Exercise the real authkey_expiry_state
 # helper with a controlled .expires file.
