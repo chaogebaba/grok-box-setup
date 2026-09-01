@@ -32,6 +32,9 @@ export interface TuiState {
   boxes: SnapshotBox[];
   snapshotTs: string | null;
   apply: boolean | null;
+  /** "snapshot" ⇒ the live config read failed and this value may be stale; the
+   *  header suffixes it with `?` so nobody acts on a stale apply reading. */
+  applySource: "config" | "snapshot";
   canary: string | null;
   scope: Scope;
   /** tick age seconds derived from snapshotTs vs now (null unknown). */
@@ -116,7 +119,10 @@ export function counts(boxes: SnapshotBox[]): { total: number; healthy: number; 
 // --- header ------------------------------------------------------------------
 export function renderHeader(state: TuiState, size: Size): string {
   const c = counts(state.boxes);
-  const applyStr = state.apply === null ? "apply=?" : state.apply ? "apply=ON" : "apply=off";
+  const applyStr =
+    state.apply === null
+      ? "apply=?"
+      : `apply=${state.apply ? "ON" : "off"}${state.applySource === "config" ? "" : "?"}`;
   const tick = state.tickAgeS === null ? "tick=?" : `tick=${fmtAge(state.tickAgeS)}`;
   const linkStr = state.link.up
     ? sgr(state, C.green, "link=up")

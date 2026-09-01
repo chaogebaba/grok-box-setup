@@ -41,6 +41,9 @@ async function ctxFor(state: string, enrolled: string[]) {
   const c = await fakeContext({ enrolled });
   // point the context at the real tmp state (fakeContext used a nonexistent one).
   (c as { env: { FLEET_STATE: string } }).env.FLEET_STATE = state;
+  // and at a config path that does NOT exist, so these merge cases stay about
+  // the snapshot/marker merge and never depend on a real /opt/grok-fleet.
+  (c as { env: { FLEET_CONFIG: string } }).env.FLEET_CONFIG = join(state, "no-such-config.toml");
   return c;
 }
 
@@ -93,7 +96,10 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
     const body = await (await fetch(getReq("/v1/fleet", "ADMINSECRET"))).json();
     expect(body.boxes[0].checkfail).toBe(false);
     expect(body.boxes[0].config).toBeNull();
+    // R2: `apply` is read LIVE; ctxFor points FLEET_CONFIG at nothing, so the
+    // snapshot value stands and the response SAYS so (see fleet-apply-live).
     expect(body.apply).toBe(true);
+    expect(body.apply_source).toBe("snapshot");
   });
 
   test("GET /v1/health tick_age_s derives from the newest snapshot ts", async () => {

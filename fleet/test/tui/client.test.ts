@@ -32,6 +32,20 @@ describe("GET /v1/fleet", () => {
       expect(r.value.boxes[0]!.name).toBe("grok-box-1");
     }
   });
+  test("R2: apply_source is carried through, and a server that omits it is treated as stale-capable", async () => {
+    const bodyWith = (extra: string) =>
+      `{"snapshot_ts":"t","apply":true${extra},"canary":null,"scope":"admin","boxes":[]}`;
+    const live = makeApiClient("http://h", "TOK", fakeFetch(() => ({ status: 200, body: bodyWith(',"apply_source":"config"') })).fetch);
+    const r1 = await live.fleet();
+    expect(r1.ok && r1.value.apply_source).toBe("config");
+    const fell = makeApiClient("http://h", "TOK", fakeFetch(() => ({ status: 200, body: bodyWith(',"apply_source":"snapshot"') })).fetch);
+    const r2 = await fell.fleet();
+    expect(r2.ok && r2.value.apply_source).toBe("snapshot");
+    // an older serve has no such field: never claim the value is live.
+    const old = makeApiClient("http://h", "TOK", fakeFetch(() => ({ status: 200, body: bodyWith("") })).fetch);
+    const r3 = await old.fleet();
+    expect(r3.ok && r3.value.apply_source).toBe("snapshot");
+  });
   test("sends the bearer token", async () => {
     const { fetch, calls } = fakeFetch(() => ({ status: 200, body: JSON.stringify({ boxes: [] }) }));
     await makeApiClient("http://h", "SEKRIT", fetch).fleet();

@@ -60,6 +60,47 @@ function mergeBox(env: ServerContext["env"], sb: SnapshotBox): SnapshotBox {
   return { ...sb, checkfail: m.checkfail, asleep: m.asleep, expiry_days: m.expiry_days ?? sb.expiry_days };
 }
 
+/**
+ * R2: read `apply` LIVE from $FLEET_CONFIG on every request.
+ *
+ * The snapshot's `apply` records what the LAST TICK did. A stale snapshot
+ * therefore reports a stale answer: a 34h-old line said `apply=off` while
+ * production had been applying for a day — a reading an operator could act on.
+ * `apply` is a config fact, not a tick observation, so read the config itself.
+ *
+ * This mirrors the reconcile drop-in's own test EXACTLY, which is what actually
+ * decides whether the timer passes `--apply`:
+ *   grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" config.toml
+ * so `apply` is true when it is true EITHER at top level OR in [fleet-brain]
+ * (the installer's template puts it in [fleet-brain]; a hand-edited top-level
+ * key still makes the unit apply, and we must not report otherwise).
+ *
+ * Cheap: one local file read, NO ssh and NO reconcile. On ANY failure (missing
+ * file, unreadable, unparseable TOML) it does NOT throw — it falls back to the
+ * snapshot value and reports `apply_source: "snapshot"` so the client can tell
+ * the reading may be stale.
+ */
+export function readLiveApply(
+  env: ServerContext["env"],
+  snapshotApply: boolean | null,
+): { apply: boolean | null; apply_source: "config" | "snapshot" } {
+  const fallback = { apply: snapshotApply, apply_source: "snapshot" as const };
+  try {
+    if (!existsSync(env.FLEET_CONFIG)) return fallback;
+    const raw = Bun.TOML.parse(readFileSync(env.FLEET_CONFIG, "utf8")) as Record<string, unknown>;
+    const fb = raw["fleet-brain"];
+    const scoped = fb !== null && typeof fb === "object" && !Array.isArray(fb)
+      ? (fb as Record<string, unknown>)["apply"]
+      : undefined;
+    // absent in both ⇒ the unit's grep finds nothing ⇒ dry-run. That IS the
+    // live answer, not a read failure.
+    const isTrue = (v: unknown) => v === true || v === "true";
+    return { apply: isTrue(scoped) || isTrue(raw["apply"]), apply_source: "config" };
+  } catch {
+    return fallback;
+  }
+}
+
 /** ISO8601Z now. */
 function nowIso(ctx: ServerContext): string {
   return (ctx.now ? ctx.now() : new Date()).toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -84,9 +125,13 @@ export function handleHealth(ctx: ServerContext): Response {
 export function handleFleet(ctx: ServerContext, auth: RequestAuth): Response {
   const latest = readLatest(ctx.env.FLEET_STATE, { today: nowIso(ctx).slice(0, 10) });
   const boxes = (latest?.boxes ?? []).map((b) => mergeBox(ctx.env, b));
+  // `apply` is read LIVE from the config; every OTHER field still comes from the
+  // snapshot (and tick_age_s / staleness are unchanged).
+  const live = readLiveApply(ctx.env, latest?.apply ?? null);
   return jsonOk({
     snapshot_ts: latest?.ts ?? null,
-    apply: latest?.apply ?? null,
+    apply: live.apply,
+    apply_source: live.apply_source,
     canary: latest?.canary ?? null,
     scope: auth.scope, // R3-A1: TUI dims action keys for a readonly token
     boxes,

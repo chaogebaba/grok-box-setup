@@ -28,6 +28,7 @@ export function state(over: Partial<TuiState> = {}): TuiState {
     boxes: [box("grok-box-1")],
     snapshotTs: "2026-05-01T00:00:00Z",
     apply: false,
+    applySource: "config",
     canary: null,
     scope: "admin",
     tickAgeS: 10,

@@ -15,6 +15,9 @@ export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 export interface FleetView {
   snapshot_ts: string | null;
   apply: boolean | null;
+  /** where `apply` came from: "config" = read live this request; "snapshot" =
+   *  the config read failed and the (possibly stale) snapshot value stands. */
+  apply_source: "config" | "snapshot";
   canary: string | null;
   scope: Scope;
   boxes: SnapshotBox[];
@@ -123,6 +126,8 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
         return {
           snapshot_ts: o.snapshot_ts ?? null,
           apply: o.apply ?? null,
+          // an older server omits the field; assume the stale-capable source.
+          apply_source: o.apply_source === "config" ? "config" : "snapshot",
           canary: o.canary ?? null,
           scope: (o.scope as Scope) ?? "readonly",
           boxes: o.boxes as SnapshotBox[],

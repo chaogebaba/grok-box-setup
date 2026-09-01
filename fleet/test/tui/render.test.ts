@@ -5,6 +5,7 @@
 import { test, expect, describe } from "bun:test";
 import {
   renderFrame,
+  renderHeader,
   renderTable,
   renderDetail,
   renderBanner,
@@ -14,6 +15,26 @@ import {
   counts,
 } from "../../src/tui/render.ts";
 import { box, state, SIZE_80x24, SIZE_120x40 } from "./helpers.ts";
+
+// R2: the header's apply reading must say when it could be STALE. `apply` is
+// read live from the config per request; when that read fails the serve falls
+// back to the (possibly 34h-old) snapshot value and marks it, and the header
+// must show that rather than presenting a stale value as fact.
+describe("header apply reading (R2 live-vs-fallback)", () => {
+  const applyOf = (s: string) => s.split(/\s+/).find((w) => w.startsWith("apply="));
+  test("a LIVE reading is unqualified", () => {
+    expect(applyOf(renderHeader(state({ apply: true, applySource: "config" }), SIZE_120x40))).toBe("apply=ON");
+    expect(applyOf(renderHeader(state({ apply: false, applySource: "config" }), SIZE_120x40))).toBe("apply=off");
+  });
+  test("a value that FELL BACK to the snapshot is suffixed with ?", () => {
+    expect(applyOf(renderHeader(state({ apply: true, applySource: "snapshot" }), SIZE_120x40))).toBe("apply=ON?");
+    expect(applyOf(renderHeader(state({ apply: false, applySource: "snapshot" }), SIZE_120x40))).toBe("apply=off?");
+  });
+  test("an unknown apply stays apply=? regardless of source", () => {
+    expect(applyOf(renderHeader(state({ apply: null, applySource: "config" }), SIZE_120x40))).toBe("apply=?");
+    expect(applyOf(renderHeader(state({ apply: null, applySource: "snapshot" }), SIZE_120x40))).toBe("apply=?");
+  });
+});
 
 describe("box glyphs (all states)", () => {
   const s = state({ noColor: true });
