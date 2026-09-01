@@ -71,7 +71,7 @@ FLEET2_RELEASE_ENV="${FLEET2_RELEASE-}"
 FLEET2_SHA256_ENV="${FLEET2_SHA256-}"
 # `make ts-release-build` rewrites EXACTLY these two lines (fleet/scripts/
 # release-build.sh); keep them at column 0 in `NAME=value` form.
-FLEET2_RELEASE=v5.5.0
+FLEET2_RELEASE=v5.6.0
 # Placeholder until the first `make ts-release-build` writes the real digest.
 # Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
 FLEET2_SHA256=8a66a5fedd0dc47cd57634c32d267958cc07de404a8a1df3eee0e3a81b9040d4
@@ -415,6 +415,27 @@ EOF
   log "seeded $cfg (apply=false — reconcile is dry-run until you flip it)"
 }
 
+install_box_passwd() {
+  # P2 (zero-touch join): adoption drives a box over the TAILNET as box@<box>
+  # before that box is enrolled, so the engine needs the box ssh password. It
+  # lives in its own 600 file owned by the fleet user; fleet2 reads it at tick
+  # start and never caches it across ticks.
+  #
+  # Written ONLY when BOX_PASSWD is in the environment, and the value is NEVER
+  # logged. Without it discover fails closed (skipped:no-box-password) rather
+  # than falling back to fleet2's baked default, so an EXISTING fleet must
+  # re-run this installer with BOX_PASSWD before adoption does anything.
+  local f="$ETC_DIR/box_passwd"
+  if [ -z "${BOX_PASSWD-}" ]; then
+    log "note: BOX_PASSWD not set — left $f untouched (zero-touch adoption stays inert until it exists)"
+    return 0
+  fi
+  ( umask 077; printf '%s\n' "$BOX_PASSWD" > "$f" )
+  chmod 600 "$f" 2>/dev/null || true
+  chown "$FLEET_USER":"$FLEET_USER" "$f" 2>/dev/null || true
+  log "wrote $f (mode 600, owner $FLEET_USER) — box ssh password for zero-touch adoption"
+}
+
 install_units() {
   # The oneshot reconcile service reads apply= from the config: dry-run unless
   # apply=true. We express that with an ExecStart wrapper that appends --apply
@@ -598,13 +619,14 @@ ensure_dirs
 ensure_fleet_user
 install_fleet2 || exit 1
 install_config_template
+install_box_passwd
 install_units
 install_fleet_api
 install_sshd_dropin || exit 1   # F8 (#12): drop-in validate/reload failure is FATAL
 log "install complete. Next:"
 log "  1) put the write-scoped Tailscale API token at $ETC_DIR/api-token (chmod 600)"
 log "  2) generate the box-access key: ssh-keygen -t ed25519 -f $ETC_DIR/box_access_ed25519 -N ''"
-log "  3) fleet2 enroll grok-box-N for each box (over the tailnet)"
+log "  3) fleet2 enroll grok-box-N for each box (over the tailnet) — or re-run this installer with BOX_PASSWD=... set and let zero-touch join adopt them (docs/FLEET-BRAIN.md §zero-touch join)"
 log "  4) verify with: $OPT_DIR/fleet2 reconcile   (dry-run)"
 log "  5) flip apply=true in $OPT_DIR/config.toml when ready to mutate"
 # Optional Telegram alert sink: fleet2 notify() always writes to the
