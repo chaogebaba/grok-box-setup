@@ -43,9 +43,17 @@ export function resolveSshPassword(
   return DEFAULT_SSH_PASSWORD;
 }
 
-/** Build the ssh argv (box@<box> + opts + optional command). No password here. */
-export function sshCmdArgv(box: string, command: string | undefined): string[] {
-  const argv = ["sshpass", "-e", "ssh", ...SSH_OPTS, `${BOX_USER}@${box}`];
+/**
+ * Build the ssh argv (box@<box> + opts + optional command). No password here.
+ *
+ * `extraOpts` is spliced in BEFORE `SSH_OPTS`, never after: ssh resolves each
+ * option to the FIRST value it obtains, so an `-o ConnectTimeout=20` appended
+ * after SSH_OPTS' `ConnectTimeout=6` would be silently ignored. The discover
+ * transport (D2) relies on this ordering to raise its connect timeout WITHOUT
+ * changing SSH_OPTS, which `fleet2 ssh` and enroll share.
+ */
+export function sshCmdArgv(box: string, command: string | undefined, extraOpts: string[] = []): string[] {
+  const argv = ["sshpass", "-e", "ssh", ...extraOpts, ...SSH_OPTS, `${BOX_USER}@${box}`];
   if (command !== undefined) argv.push(command);
   return argv;
 }

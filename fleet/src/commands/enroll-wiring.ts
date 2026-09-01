@@ -6,7 +6,8 @@
 import type { Runner } from "../runner.ts";
 import type { Env } from "../env.ts";
 import { type ParsedConfig } from "../config.ts";
-import { resolveSshPassword, sshCmdArgv } from "./ssh.ts";
+import { resolveSshPassword } from "./ssh.ts";
+import { boxSsh as boxSshTransport } from "./box-transport.ts";
 import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { portFor } from "../boxes.ts";
 import type { EnrollSideEffects } from "./enroll.ts";
@@ -15,21 +16,71 @@ import { WRITE_BOX_CONFIG_REMOTE } from "./enroll.ts";
 const SSH_TIMEOUT_MS = 20_000;
 const API_TIMEOUT_MS = 30_000;
 
+/**
+ * Per-invocation transport knobs (P2/D2/D3, zero-touch join).
+ *
+ * `fleet2 enroll` on the CLI passes none of these and keeps its historical
+ * behaviour. A DISCOVER-initiated enrol passes all three:
+ *
+ *  - `password` — P2 threading. The resolved discover password is handed IN and
+ *    every ssh this wiring makes uses THAT value. The wiring's own
+ *    `resolveSshPassword` fallback (which ends in the baked DEFAULT_SSH_PASSWORD)
+ *    is deliberately NOT reachable on the discover path: adoption must fail
+ *    closed rather than try a baked credential against an unknown box.
+ *  - `connectTimeoutS` — D2's DISCOVER_CONNECT_TIMEOUT_S, an explicit
+ *    `-o ConnectTimeout=` for discover calls only. SSH_OPTS is unchanged.
+ *  - `tunnelWaitBudget` — D3's tunnel wait 0: the adoption is RECORDED and tick
+ *    N+1 proves the tunnel through the normal decision table.
+ */
+export interface EnrollWiringOpts {
+  password?: string;
+  connectTimeoutS?: number;
+  tunnelWaitBudget?: string;
+}
+
 function boxSsh(
   runner: Runner,
   cfg: ParsedConfig,
+  opts: EnrollWiringOpts,
   box: string,
   remoteCommand: string,
   stdin?: string,
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  const pw = resolveSshPassword(cfg);
-  return runner
-    .run(sshCmdArgv(box, remoteCommand), { timeoutMs: SSH_TIMEOUT_MS, env: { SSHPASS: pw }, stdin })
-    .then((r) => ({ code: r.code, stdout: r.stdout, stderr: r.stderr }));
+  // P2: an explicitly threaded password wins and the baked-default resolver is
+  // never consulted.
+  const pw = opts.password ?? resolveSshPassword(cfg);
+  return boxSshTransport(runner, box, remoteCommand, {
+    password: pw,
+    connectTimeoutS: opts.connectTimeoutS,
+    timeoutMs: SSH_TIMEOUT_MS,
+    stdin,
+  });
+}
+
+/**
+ * True when an EXISTING authorized_keys line is superseded by `line` (D5).
+ *
+ * Superseded means: the same `permitlisten="127.0.0.1:<port>"` restriction, OR
+ * the same key material. Both classes are dropped before the new line is
+ * appended, which is what makes a re-adopt after a rotated box pubkey leave
+ * exactly one line for the port.
+ */
+export function supersededAuthorizedKeysLine(existing: string, line: string): boolean {
+  const key = line.split(/\s+/)[2] ?? "";
+  if (key !== "" && existing.includes(key)) return true;
+  const m = /permitlisten="([^"]+)"/.exec(line);
+  const permit = m?.[1];
+  if (permit !== undefined && existing.includes(`permitlisten="${permit}"`)) return true;
+  return false;
 }
 
 /** Build the production EnrollSideEffects for `fleet2 enroll`. */
-export function makeEnrollSideEffects(env: Env, cfg: ParsedConfig, runner: Runner): EnrollSideEffects {
+export function makeEnrollSideEffects(
+  env: Env,
+  cfg: ParsedConfig,
+  runner: Runner,
+  wiringOpts: EnrollWiringOpts = {},
+): EnrollSideEffects {
   const vpsUser = process.env.FLEET_VPS_USER ?? process.env.FLEET_USER ?? "fleet";
   const vpsAuthkeys = process.env.FLEET_VPS_AUTHKEYS ?? `/home/${vpsUser}/.ssh/authorized_keys`;
   const etcAkDir = process.env.FLEET_ETC_AK_DIR ?? `${env.FLEET_ETC}/authorized-keys.d`;
@@ -102,7 +153,7 @@ export function makeEnrollSideEffects(env: Env, cfg: ParsedConfig, runner: Runne
       return lastApiCode;
     },
     async readBoxPubkey(box) {
-      const r = await boxSsh(runner, cfg, box, `sudo cat '/workspace/box-setup/secrets/tunnel_ed25519.pub'`);
+      const r = await boxSsh(runner, cfg, wiringOpts, box, `sudo cat '/workspace/box-setup/secrets/tunnel_ed25519.pub'`);
       if (r.code !== 0) return undefined;
       const first = r.stdout.split("\n").find((l) => l.trim() !== "");
       return first?.trim();
@@ -121,9 +172,16 @@ export function makeEnrollSideEffects(env: Env, cfg: ParsedConfig, runner: Runne
         const { dirname } = require("node:path") as typeof import("node:path");
         const akdir = dirname(vpsAuthkeys);
         mkdirSync(akdir, { recursive: true });
-        const key = line.split(/\s+/)[2] ?? "";
         const prior = existsSync(vpsAuthkeys) ? readFileSync(vpsAuthkeys, "utf8") : "";
-        const kept = prior.split("\n").filter((l) => l !== "" && !l.includes(key));
+        // D5 idempotency CHANGE: dedup by permitlisten PORT **or** key material,
+        // not key material alone. A box that regenerated tunnel_ed25519 used to
+        // leave its stale line behind with the same
+        // permitlisten="127.0.0.1:<port>", so the port kept a key the box no
+        // longer holds. Dropping both classes makes a re-adopt after a rotated
+        // pubkey converge to exactly ONE line for that port.
+        const kept = prior
+          .split("\n")
+          .filter((l) => l !== "" && !supersededAuthorizedKeysLine(l, line));
         writeFileSync(vpsAuthkeys, [...kept, line].join("\n") + "\n");
         // BUG-E perms: dir 700, file 600, chown fleet (best-effort).
         chmodSync(akdir, 0o700);
@@ -150,7 +208,11 @@ export function makeEnrollSideEffects(env: Env, cfg: ParsedConfig, runner: Runne
         const key = line.split(/\s+/)[2] ?? "";
         const idx = `${env.FLEET_ETC}/authorized-keys.map`;
         const prior = existsSync(idx) ? readFileSync(idx, "utf8") : "";
-        const kept = prior.split("\n").filter((l) => l !== "" && !l.startsWith(`${box}\t`));
+        // D5: ONE entry per PORT as well as per box, so the map cannot keep a
+        // stale key for a port whose authorized_keys line was just replaced.
+        const kept = prior
+          .split("\n")
+          .filter((l) => l !== "" && !l.startsWith(`${box}\t`) && (l.split("\t")[1] ?? "") !== String(port));
         writeFileSync(idx, [...kept, `${box}\t${port}\t${key}`].join("\n") + "\n");
         chmodSync(idx, 0o600);
         return true;
@@ -182,12 +244,12 @@ export function makeEnrollSideEffects(env: Env, cfg: ParsedConfig, runner: Runne
         'mv -f "$tmp" ~/.ssh/authorized_keys',
         "chmod 600 ~/.ssh/authorized_keys",
       ].join("\n");
-      const r = await boxSsh(runner, cfg, box, remote);
+      const r = await boxSsh(runner, cfg, wiringOpts, box, remote);
       return r.code === 0;
     },
     async writeBoxConfig(box, vps, idx, port) {
       const cmd = `sudo sh -s -- '${vps}' '${idx}' '/workspace/box-setup/config.toml' '${port}'`;
-      const r = await boxSsh(runner, cfg, box, cmd, WRITE_BOX_CONFIG_REMOTE);
+      const r = await boxSsh(runner, cfg, wiringOpts, box, cmd, WRITE_BOX_CONFIG_REMOTE);
       if (r.code === 4) return 4;
       if (r.code !== 0) return 1;
       return 0;
@@ -213,7 +275,9 @@ export function makeEnrollSideEffects(env: Env, cfg: ParsedConfig, runner: Runne
       });
     },
     tunnelWaitBudget() {
-      return process.env.ENROLL_TUNNEL_WAIT ?? "90";
+      // D3: a discover-initiated enrol passes "0" — the enrolment is RECORDED
+      // and tick N+1 proves the tunnel through the decision table.
+      return wiringOpts.tunnelWaitBudget ?? process.env.ENROLL_TUNNEL_WAIT ?? "90";
     },
     async sleep5() {
       await new Promise((r) => setTimeout(r, 5000));
