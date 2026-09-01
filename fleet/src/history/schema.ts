@@ -30,6 +30,17 @@ export interface SnapshotBox {
   expiry_days: number | null;
 }
 
+/**
+ * Zero-touch join observability (D7). OPTIONAL: a tick that ran no discovery
+ * omits it entirely, and every reader tolerates its absence — no `v` bump.
+ */
+export interface SnapshotDiscover {
+  candidates: number;
+  adopted: number;
+  repaired: number;
+  skipped: Array<{ name: string; reason: string }>;
+}
+
 /** One reconcile-tick snapshot line (the daily jsonl record). */
 export interface SnapshotLine {
   v: 1;
@@ -41,4 +52,7 @@ export interface SnapshotLine {
    *  null when no managed files / no reachable box. NOT the rollout canary. */
   canary: string | null;
   boxes: SnapshotBox[];
+  /** what the tick's discover pass saw and did (5.6.0); absent on older lines
+   *  and on ticks with discovery disabled. */
+  discover?: SnapshotDiscover;
 }

@@ -63,6 +63,7 @@ export function applyFleet(state: TuiState, view: FleetView, nowMs: number): Tui
     applySource: view.apply_source,
     canary: view.canary,
     scope: view.scope,
+    discover: view.discover,
     link: { up: true },
     nowMs,
   };
@@ -230,6 +231,7 @@ export function initialState(nowMs: number, noColor: boolean): TuiState {
     applySource: "snapshot",
     canary: null,
     scope: "readonly",
+    discover: null,
     tickAgeS: null,
     link: { up: false, sinceMs: nowMs },
     nowMs,

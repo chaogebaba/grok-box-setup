@@ -60,6 +60,15 @@ export function historyFile(fleetState: string, day: string): string {
 export function serializeLine(line: SnapshotLine): string {
   const full = JSON.stringify(line) + "\n";
   if (Buffer.byteLength(full, "utf8") <= MAX_LINE_BYTES) return full;
+  // D7 overflow ORDER: drop `discover` FIRST, then fall back to the boxes stub.
+  // `boxes` is the fleet view the TUI and every reader depend on; `discover` is
+  // a per-tick extra whose skip list is the part that can grow without bound.
+  // Sacrificing boxes for discover would trade the signal for the ornament.
+  if (line.discover !== undefined) {
+    const { discover: _dropped, ...rest } = line;
+    const withoutDiscover = JSON.stringify(rest) + "\n";
+    if (Buffer.byteLength(withoutDiscover, "utf8") <= MAX_LINE_BYTES) return withoutDiscover;
+  }
   const stub = JSON.stringify({
     v: line.v,
     ts: line.ts,

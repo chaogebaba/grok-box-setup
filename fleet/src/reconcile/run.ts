@@ -39,6 +39,7 @@ import type { UpgradeDeps } from "../upgrade.ts";
 import { log } from "../log.ts";
 import { splitVersion } from "../status.ts";
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
+import { DiscoverRun, type DiscoverDeps, type DiscoverSummary } from "./discover.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
@@ -76,6 +77,15 @@ export interface ReconcileDeps {
    * R2-A4); the writer itself must never throw (best-effort — see write.ts).
    */
   history?: (line: SnapshotLine) => void;
+  /**
+   * Zero-touch join (5.6.0). Present ⇒ the tick discovers, adopts and repairs;
+   * omitted ⇒ no discovery at all, which is what keeps the existing box-free
+   * runReconcile tests hermetic AND what D6(e) requires when FLEET_BOXES is set
+   * (an explicit membership seam must not be second-guessed by discovery).
+   */
+  discover?: DiscoverDeps;
+  /** monotonic clock (ms) for the discover budget; injected for tests. */
+  nowMsFn?: () => number;
 }
 
 export interface ReconcileResult {
@@ -99,6 +109,12 @@ function devicesValid(body: string): boolean {
 export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult> {
   const mode = deps.apply ? "APPLY" : "DRY-RUN"; // H1: UPPERCASE
   log(`reconcile: start (${mode})`);
+
+  // D5: one tick ordinal per run, bumped BEFORE anything reads it, so
+  // `repair_pending_runs` freshness ("the immediately preceding tick" / "the
+  // current tick") is a total order with no holes — early-return ticks bump it
+  // too.
+  const tick = deps.state.bumpTick();
 
   // --- devices GET with D4/F5 backoff ---
   let devs = "";
@@ -143,12 +159,31 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
     }
   }
 
+  // --- discovery: ADOPT (D1 placement) ---
+  // Before the membership loop AND before the empty-membership early return: a
+  // brand-new VPS with an empty enrolled.tsv must still adopt. Constructed here
+  // and not earlier because ctx.readonly is only final after the devices GET.
+  const drun =
+    deps.discover === undefined
+      ? undefined
+      : new DiscoverRun(deps.discover, {
+          state: deps.state,
+          tick,
+          readonly: deps.ctx.readonly,
+          apply: deps.apply,
+          membership: deps.targetBoxes,
+          nowSec: nowS,
+          nowMs: deps.nowMsFn ?? (() => Date.now()),
+        });
+  await drun?.adoptPass();
+
   // --- target boxes ---
   if (deps.targetBoxes.length === 0) {
     log("reconcile: no enrolled boxes");
+    drun?.finish();
     // R2-A4: an early-return tick still appends a snapshot (empty boxes) so the
     // tick_age freshness signal / STALE banner works even for an empty fleet.
-    writeSnapshot(deps, [], null);
+    writeSnapshot(deps, [], null, drun?.summary);
     return { rc: 0 };
   }
 
@@ -157,9 +192,15 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   const drifted: DriftedBox[] = [];
   const snapshots: SnapshotBox[] = [];
   for (const box of deps.targetBoxes) {
-    const r = await reconcileOne(box, devs, deps, drifted, snapshots);
+    const r = await reconcileOne(box, devs, deps, drifted, snapshots, tick);
     if (r === 1) rc = 1;
   }
+
+  // --- discovery: REPAIR (D1 placement) ---
+  // After the loop, because its trigger is THIS tick's row-e outcome, which the
+  // loop has just stamped into `repair_pending_runs`.
+  await drun?.repairPass();
+  drun?.finish();
 
   // --- rollout once (F8), BEFORE the config pass ---
   await runRolloutOnce(drifted, {
@@ -191,7 +232,7 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   for (const sb of snapshots) {
     sb.config = deps.managedFilesPresent ? (cpRes.perBox.get(sb.name) ?? null) : null;
   }
-  writeSnapshot(deps, snapshots, deps.managedFilesPresent ? (cpRes.canary ?? null) : null);
+  writeSnapshot(deps, snapshots, deps.managedFilesPresent ? (cpRes.canary ?? null) : null, drun?.summary);
 
   log(`reconcile: done (${mode})`);
   return { rc };
@@ -202,7 +243,12 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
  * path of runReconcile so an early-return tick still appends (R2-A4). The
  * `history` writer is injected; omitted ⇒ no-op.
  */
-function writeSnapshot(deps: ReconcileDeps, boxes: SnapshotBox[], canary: string | null): void {
+function writeSnapshot(
+  deps: ReconcileDeps,
+  boxes: SnapshotBox[],
+  canary: string | null,
+  discover?: DiscoverSummary,
+): void {
   if (deps.history === undefined) return;
   const line: SnapshotLine = {
     v: 1,
@@ -210,6 +256,9 @@ function writeSnapshot(deps: ReconcileDeps, boxes: SnapshotBox[], canary: string
     apply: deps.apply,
     canary,
     boxes,
+    // D7: OPTIONAL and absent when the tick ran no discovery — no `v` bump, and
+    // every reader tolerates its absence.
+    ...(discover === undefined ? {} : { discover }),
   };
   try {
     deps.history(line);
@@ -226,6 +275,7 @@ async function reconcileOne(
   deps: ReconcileDeps,
   drifted: DriftedBox[],
   snapshots: SnapshotBox[],
+  tick: number,
 ): Promise<0 | 1> {
   if (boxIndex(box) === undefined) return 1; // box_index fail ⇒ rc 1
   let rcOne: 0 | 1 = 0;
@@ -314,6 +364,18 @@ async function reconcileOne(
     drift,
     checkfailRuns,
   });
+
+  // D5 hysteresis marker, written HERE — at the row-e evaluation, inside the
+  // loop — so `repair` (which runs after the loop) sees a CURRENT-tick stamp and
+  // `adopt` (which ran before it) could only have seen the preceding tick's. The
+  // marker is DISTINCT from `<box>.incoherent`, whose reset semantics differ.
+  // Reset to 0 on ANY tick where the condition does not hold, which the row-e
+  // test covers by construction: tunnel up, box asleep, an API outage or a
+  // read-only run (online "unknown") and a box absent from the API all fail to
+  // emit the token.
+  const incoherent = actions.includes("alert-incident:incoherent-both-dead");
+  if (incoherent) deps.state.bumpRepairPending(box, tick);
+  else deps.state.resetRepairPending(box, tick);
 
   for (const a of actions) {
     if (a === "noop") continue;

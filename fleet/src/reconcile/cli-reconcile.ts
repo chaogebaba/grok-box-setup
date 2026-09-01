@@ -19,6 +19,7 @@ import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
 import { ReconcileState, nodeStateFs } from "./state.ts";
 import { runReconcile } from "./run.ts";
+import { makeDiscoverDeps } from "./discover-wiring.ts";
 import type { ReconcileDeps } from "./run.ts";
 import { appendSnapshot } from "../history/write.ts";
 import { resolveTarget } from "../stage.ts";
@@ -107,6 +108,14 @@ export async function assembleTickDeps(
   const enrolled = readIfExists(`${env.FLEET_STATE}/enrolled.tsv`);
   const targetBoxes = resolveMembership(env.FLEET_BOXES, enrolled);
 
+  // Zero-touch join (D1/P1/D6e). The token was read ONCE above; discover is
+  // told the RESULT rather than reading it again. D6(e): an explicit
+  // FLEET_BOXES membership seam disables discovery entirely.
+  const discoverEnabled = env.FLEET_BOXES === undefined || env.FLEET_BOXES.trim() === "";
+  const discover = discoverEnabled
+    ? makeDiscoverDeps({ env, cfg, runner, apiToken: token !== undefined })
+    : undefined;
+
   // Best-effort target sha (F8).
   let targetSha: string | undefined;
   let targetVersion: string | undefined;
@@ -148,6 +157,7 @@ export async function assembleTickDeps(
     targetVersion,
     apply: opts.apply,
     nowSec: opts.nowSec,
+    discover,
     // TUI-D4: production tick appends a snapshot line under FLEET_STATE/history.
     history: (line) => {
       appendSnapshot(env.FLEET_STATE, line);

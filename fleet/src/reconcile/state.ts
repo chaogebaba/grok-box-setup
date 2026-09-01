@@ -223,7 +223,87 @@ export class ReconcileState {
     return /^[0-9]+$/.test(s) ? Number.parseInt(s, 10) : undefined;
   }
 
+  // --- tick sequence (zero-touch join D5) ---------------------------------
+  //
+  // `repair_pending_runs` freshness is ORDINAL — "written by the immediately
+  // preceding tick" / "written by the CURRENT tick" — so it needs a tick
+  // ordinal, not a wall clock. `tick.seq` is a plain counter bumped ONCE at the
+  // start of every runReconcile (including early-return ticks, so the ordering
+  // never has a hole). Same idiom as every other counter here: an absent or
+  // non-numeric file reads 0, so a fresh brain starts at tick 1.
+  bumpTick(): number {
+    return this.bumpCounter("tick.seq");
+  }
+  /** The current tick ordinal (0 before the first bump). */
+  currentTick(): number {
+    return this.readCounter("tick.seq");
+  }
+
+  // --- repair_pending_runs (zero-touch join D5) ----------------------------
+  //
+  // `<box>.repair_pending_runs` = "<runs> <tick>\n". DISTINCT from
+  // `<box>.incoherent`, whose reset semantics differ (incoherent is rm -f'd by
+  // any non-alert action and drives alertIncoherent's n>=2 notify throttle).
+  // This marker counts CONSECUTIVE ticks in which row e's incoherent condition
+  // held, and carries the STAMP of the tick that wrote it so each consumer can
+  // apply its own freshness rule:
+  //   adopt  (before the loop) yields only to a marker stamped tick-1;
+  //   repair (after the loop) fires only on a marker stamped tick, runs >= 2.
+  // A marker older than the preceding tick is ignored by both, which is also
+  // why a de-enrolled box needs no explicit clearing.
+  readRepairPending(box: string): { runs: number; tick: number } | undefined {
+    const raw = this.fs.read(this.p(`${box}.repair_pending_runs`));
+    if (raw === undefined) return undefined;
+    const parts = raw.trim().split(/\s+/);
+    if (!/^[0-9]+$/.test(parts[0] ?? "") || !/^[0-9]+$/.test(parts[1] ?? "")) return undefined;
+    return { runs: Number.parseInt(parts[0]!, 10), tick: Number.parseInt(parts[1]!, 10) };
+  }
+  /** Bump the consecutive-incoherent count and stamp it with `tick`. */
+  bumpRepairPending(box: string, tick: number): number {
+    const prev = this.readRepairPending(box);
+    const runs = (prev?.runs ?? 0) + 1;
+    this.fs.write(this.p(`${box}.repair_pending_runs`), `${runs} ${tick}\n`);
+    return runs;
+  }
+  /** RESET TO 0 on any tick in which the incoherent condition does not hold. */
+  resetRepairPending(box: string, tick: number): void {
+    this.fs.write(this.p(`${box}.repair_pending_runs`), `0 ${tick}\n`);
+  }
+
+  // --- discover.json (zero-touch join D4 backoff ledger) -------------------
+  /** Read the per-box failure ledger; a missing/corrupt file reads as empty. */
+  readDiscoverLedger(): DiscoverRecord[] {
+    const raw = this.fs.read(this.p("discover.json"));
+    if (raw === undefined) return [];
+    try {
+      const v = JSON.parse(raw) as { boxes?: unknown };
+      if (!Array.isArray(v.boxes)) return [];
+      return (v.boxes as DiscoverRecord[]).filter(
+        (r) => r !== null && typeof r === "object" && typeof r.name === "string" && r.name !== "",
+      );
+    } catch {
+      return [];
+    }
+  }
+  /** Write the ledger (best-effort, like every other state write). */
+  writeDiscoverLedger(records: DiscoverRecord[]): void {
+    this.fs.write(this.p("discover.json"), JSON.stringify({ v: 1, boxes: records }) + "\n");
+  }
+
   mkdirState(): void {
     this.fs.mkdirp(this.fleetState);
   }
+}
+
+/**
+ * One box's discover failure record (D4). `last_attempt` is epoch seconds for a
+ * human reading the file; `last_tick` is the tick ordinal the backoff schedule
+ * actually counts in.
+ */
+export interface DiscoverRecord {
+  name: string;
+  last_attempt: number;
+  failures: number;
+  reason: string;
+  last_tick: number;
 }

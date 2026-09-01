@@ -75,14 +75,24 @@ export function supersededAuthorizedKeysLine(existing: string, line: string): bo
 }
 
 /** Build the production EnrollSideEffects for `fleet2 enroll`. */
+export function fleetVpsUser(): string {
+  return process.env.FLEET_VPS_USER ?? process.env.FLEET_USER ?? "fleet";
+}
+
+/** The fleet user's authorized_keys path — the file enroll writes and the D5
+ *  repair content check reads. */
+export function vpsAuthorizedKeysPath(): string {
+  return process.env.FLEET_VPS_AUTHKEYS ?? `/home/${fleetVpsUser()}/.ssh/authorized_keys`;
+}
+
 export function makeEnrollSideEffects(
   env: Env,
   cfg: ParsedConfig,
   runner: Runner,
   wiringOpts: EnrollWiringOpts = {},
 ): EnrollSideEffects {
-  const vpsUser = process.env.FLEET_VPS_USER ?? process.env.FLEET_USER ?? "fleet";
-  const vpsAuthkeys = process.env.FLEET_VPS_AUTHKEYS ?? `/home/${vpsUser}/.ssh/authorized_keys`;
+  const vpsUser = fleetVpsUser();
+  const vpsAuthkeys = vpsAuthorizedKeysPath();
   const etcAkDir = process.env.FLEET_ETC_AK_DIR ?? `${env.FLEET_ETC}/authorized-keys.d`;
   let lastApiCode = 0;
 
