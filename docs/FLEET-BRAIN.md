@@ -749,6 +749,122 @@ Intentional behaviour changes (the ONLY ones; everything else is byte parity):
   PATH symlink is added; `--dirty` is accepted for compatibility but the dirty-tree
   refusal is not ported (fleet2 deploys the resolved ref, never the working tree).
 
+## Zero-touch join (discover + adopt + repair — 5.6.0)
+
+Before 5.6.0 membership was a static `enrolled.tsv`: a box that was on the
+tailnet with sshd up but not enrolled was invisible to the tick, and an operator
+had to run `fleet2 enroll <box>` on the VPS by hand. After an image swap the box
+came back under the same identity (because `/workspace` persists) but nothing
+repaired a lost VPS-side artefact or a lost `[fleet]` block. Since 5.6.0 the
+engine does both itself, inside the ordinary reconcile tick.
+
+### Candidate rule
+
+A tailnet peer is a candidate for adoption iff **all** of:
+
+- its name matches `^grok-box-[0-9]{3}$` (a legacy 1–2 digit name is reported as
+  `skipped:needs-rename` and never adopted — rename it first);
+- the tailnet says it is online;
+- it is NOT already in the resolved membership;
+- its box index collides with no enrolled box's index (`skipped:index-collision`,
+  logged at ERROR).
+
+**Tags are not gated.** A box approved by URL arrives UNTAGGED with an EMPTY
+hostname file — both normal — and tagging happens after adoption through the
+existing mint/retag path.
+
+### Preconditions (all fail CLOSED)
+
+- **P1 — Tailscale API token.** Preflighted once per tick. Absent or unreadable
+  ⇒ every candidate is `skipped:no-api-token`, with no ssh and no backoff record.
+- **P2 — box ssh password.** Precedence: `FLEET_SSH_PASSWORD` env >
+  `$FLEET_ETC/box_passwd` (mode 600, owned by the fleet user) > `[ssh].password`
+  in the brain config > **refuse**. fleet2's baked default password does NOT
+  count for adoption: trying a baked credential against a box the engine has
+  never met is exactly what must fail closed. An EXISTING fleet must therefore
+  re-run `vps/install-vps.sh` with `BOX_PASSWD=...` set before adoption does
+  anything; without the file every candidate is `skipped:no-box-password`.
+- **P3 — reachability implies boxup.** A box's sshd IS boxup's sshd, so anything
+  reachable on the tailnet already has boxup. Discover therefore has NO install
+  or tarball path; `boxup version` is read as advisory and a box whose boxup is
+  missing or unparsable is `skipped:boxup-missing` for an operator. Rollout and
+  upgrade remain the delivery path.
+
+### Rails
+
+- **Index collision** — never adopt over an enrolled box's port.
+- **Name mismatch** — a NON-EMPTY `/workspace/box-setup/hostname` that disagrees
+  with the tailscale name ⇒ `skipped:name-mismatch`. An absent or empty file is
+  `install.sh`'s default and carries no opinion.
+- **Cap** — at most ONE mutation per tick, shared between adopt and repair.
+  Repair outranks adopt: adopt yields the slot whenever a repair may be due and
+  logs `discover: adopt deferred (repair pending on <box>)`.
+- **Budget** — 60 s of cumulative discover work per tick, split 30 s for
+  adopt-side probes and 30 s RESERVED for repair-side content checks, so a slow
+  or unhealthy fleet cannot starve repair. The accumulator is paused while the
+  membership loop runs. Past its share a side stops STARTING new work.
+- **Read-only latch** — a tick that reports itself read-only (e.g. after a
+  Tailscale API failure) adopts nothing, repairs nothing, writes no backoff
+  record, and logs `discover: skipped (readonly latch)`.
+- **Backoff** — per-box failures are recorded in `$FLEET_STATE/discover.json`
+  with a 1, 2, 4 … tick backoff capped at 12 ticks; success clears the record.
+  A record untouched for 288 ticks (~24 h) is pruned and the file holds at most
+  64 records, so an indefinitely offline box cannot accrue state forever.
+- **`FLEET_BOXES`** — when the explicit membership seam is set, discovery is
+  disabled entirely.
+
+### Adoption
+
+Adoption is the ordinary `fleet2 enroll` orchestration run IN PROCESS behind the
+same side-effect seam, over the TAILNET (`sshpass -e ssh box@<box>`, an explicit
+`ConnectTimeout=20`), with the tunnel wait set to **0**: the enrolment is
+RECORDED and tick N+1 proves the tunnel through the normal decision table. No
+auth-key handling of any kind happens here — per-box tag-scoped keys are seeded
+by decision-table row a AFTER the tunnel is up, which is the blast-radius
+doctrine above, and discover must not invert it.
+
+The mutation has named abort points in the real enrol order — `acl` (30 s),
+`read-pubkey` (20 s), `install-vps-key` (local), `install-box-key` (20 s),
+`write-box-config` (20 s), `record-enrolled` (local). A timeout at any remote
+point aborts as `skipped:timeout-<point>` with a backoff record. Partial state
+is real and stated: a timeout at `write-box-config` leaves a VPS
+`authorized_keys` line and an `/etc` mapping with no `enrolled.tsv` entry, i.e.
+a restricted permitlisten-scoped line for a port nobody dials. The retry
+converges because the VPS line is now deduped by PORT as well as key material.
+
+### Repair (the survival property)
+
+A box IN membership whose tunnel is down while the tailnet says it is live is
+the condition decision-table row e already computes. Repair fires only after
+that condition has held for **two consecutive ticks**, counted in a marker
+distinct from the incoherent alert counter, written inside the membership loop
+at the row-e evaluation and carrying the stamp of the tick that wrote it. Adopt,
+which runs before the loop, yields only to a marker from the immediately
+preceding tick; repair, which runs after it, fires only on a current-tick marker.
+A marker older than the preceding tick is ignored by both, so a de-enrolled box
+needs no explicit clearing. Repair does NOT suppress the row-e alert.
+
+The checks are CONTENT checks, not presence checks. The box's CURRENT tunnel
+pubkey is read, and the fleet user's `authorized_keys` must carry exactly one
+line for that port with exactly that key material, the `authorized-keys.map`
+entry must match, and the box's `[fleet]` block must name this VPS and the right
+`box_index`. Any mismatch reruns the adoption path with the fresh pubkey.
+
+### Observability
+
+Each tick's snapshot line carries an OPTIONAL `discover` object
+(`{candidates, adopted, repaired, skipped}`); readers tolerate its absence and
+there is no schema version bump. When a line would exceed the 2 KB cap
+`discover` is dropped FIRST — `boxes` is never sacrificed for it. `GET /v1/fleet`
+exposes the same object, and the TUI renders one summary row.
+
+### Out of scope
+
+A box with no `/workspace` (truly bare, no tailscale) is unreachable by anything;
+survival relies on `/workspace` persistence, and losing it needs the human URL
+dance once. No auth changes (the box password stays). No boxup delivery from
+discover. No tag gating. Nothing new is added to the Tailscale API surface.
+
 ## Prior art / reference URLs
 
 (Consolidated; also inline above.)
