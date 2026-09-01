@@ -175,9 +175,9 @@ describe("T9/T9b backoff (D4/F5)", () => {
   });
 });
 
-describe("H2: WOULD line 'read-only ' prefix is UNCONDITIONAL", () => {
-  test("dry-run mint-worthy box ⇒ 'WOULD mint (read-only dry-run/no-apply)'", async () => {
-    // devices say 008 offline; tunnel up ⇒ row a mint. Dry-run ⇒ WOULD.
+describe("T7 D4: WOULD 'read-only ' prefix is CONDITIONAL on the latch (F3, m9)", () => {
+  test("healthy dry-run mint-worthy box ⇒ 'WOULD mint (dry-run/no-apply)' (NO read-only)", async () => {
+    // devices say 008 offline; tunnel up ⇒ row a mint. Dry-run, NOT latched.
     const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: false, lastSeen: "2000-01-01T00:00:00Z" }] });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
@@ -189,7 +189,56 @@ describe("H2: WOULD line 'read-only ' prefix is UNCONDITIONAL", () => {
     await runReconcile(deps);
     const would = logs.find((l) => l.includes("grok-box-008 WOULD mint"));
     expect(would).toBeDefined();
-    expect(would!).toContain("(read-only dry-run/no-apply)"); // H2 unconditional
+    expect(would!).toContain("(dry-run/no-apply)");
+    expect(would!).not.toContain("read-only "); // D4/F3: healthy dry-run has NO prefix
+  });
+
+  test("latched run (pre-latched ctx, apply) ⇒ 'WOULD mint (read-only dry-run/no-apply)'", async () => {
+    // 008 offline + tunnel up ⇒ row a mint; apply mode but ctx PRE-LATCHED
+    // (an earlier box's API failure). The gate WOULD-logs WITH the prefix.
+    const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: false, lastSeen: "2000-01-01T00:00:00Z" }] });
+    const { keys, ctx } = fakeKeys(() => ({ code: 200, body: devs }));
+    ctx.latch(); // pre-latched ⇒ ctx.readonly true
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
+      return result({ code: 1 });
+    });
+    const deps = baseDeps({ keys, ctx, runner, apply: true, targetBoxes: ["grok-box-008"], nowSec: Date.parse("2099-01-01T00:00:00Z") / 1000 });
+    await runReconcile(deps);
+    const would = logs.find((l) => l.includes("grok-box-008 WOULD mint"));
+    expect(would).toBeDefined();
+    expect(would!).toContain("(read-only dry-run/no-apply)"); // latched ⇒ prefix present
+  });
+
+  test("m16: a real config-pass WOULD push line (dry-run) carries NO 'read-only ' prefix", async () => {
+    // Drive an ACTUAL config pass: dry-run, managed files present, a box whose
+    // on-box managed sha DIFFERS from the render ⇒ pushManaged(dry) logs
+    // `config: <box> WOULD push (<cur>-><want>)`. m16 (add the read-only prefix
+    // to the config-pass WOULD line) is killed here — bash's config WOULD line
+    // never carried a prefix.
+    const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: true, lastSeen: "2999-01-01T00:00:00Z" }] });
+    const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
+      // the config-pass dry-run remote: report a DIFFERENT cur sha ⇒ WOULD push.
+      return result({ code: 0, stdout: "cur=OTHERSHA want=IGNORED support=yes enabled=true" });
+    });
+    const src: ManagedSource = { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined };
+    const deps = baseDeps({
+      keys,
+      runner,
+      apply: false, // DRY-RUN ⇒ pushManaged(dry=true) ⇒ WOULD push
+      targetBoxes: ["grok-box-008"],
+      managedSource: src,
+      managedFilesPresent: true,
+      nowSec: Date.parse("2999-01-01T00:00:00Z") / 1000,
+    });
+    await runReconcile(deps);
+    const would = logs.find((l) => l.includes("grok-box-008 WOULD push"));
+    expect(would).toBeDefined(); // the config-pass WOULD line was actually emitted
+    expect(would!).not.toContain("read-only "); // m16 kill: no prefix on it
   });
 });
 

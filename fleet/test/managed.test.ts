@@ -15,6 +15,19 @@ import { configPass, type ConfigPassDeps } from "../src/actions/config-pass.ts";
 import { ReconcileState, type StateFs } from "../src/reconcile/state.ts";
 import { FakeRunner, result, isSs } from "./fake-runner.ts";
 import { testEnv } from "./helpers.ts";
+import { setLogSink } from "../src/log.ts";
+
+/** Capture log lines emitted during `fn`. */
+async function withLogs(fn: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const prev = setLogSink((l) => lines.push(l));
+  try {
+    await fn();
+  } finally {
+    setLogSink(prev);
+  }
+  return lines;
+}
 
 // ---- render_test / render_present_test (tests:2321-2430) ----
 describe("T11 render_managed (tests:2321-2430)", () => {
@@ -285,6 +298,44 @@ describe("T11 config pass canary routing (F1/F2)", () => {
     });
     expect(r.policy).toBe("fixed");
     expect(r.canary).toBe("grok-box-002");
+  });
+
+  test("F3 parity: fixed policy emits NO 'config: canary policy=' line (bash parity)", async () => {
+    const { fs } = memState();
+    const lines = await withLogs(async () => {
+      await configPass({
+        runner: passRunner([20002]),
+        env: testEnv(),
+        source: { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined },
+        state: new ReconcileState("/s", fs),
+        notify: () => {},
+        targetBoxes: ["grok-box-002"],
+        configCanary: "grok-box-002", // fixed policy
+        managedFilesPresent: true,
+        apply: false,
+      });
+    });
+    // bash emits the pass-start line but NEVER a `config: canary policy=` line.
+    expect(lines.some((l) => l.includes("config: pass start (dry-run)"))).toBe(true);
+    expect(lines.some((l) => l.includes("config: canary policy="))).toBe(false);
+  });
+
+  test("F3: dynamic policy KEEPS the 'config: canary policy=dynamic' line (fleet2-only mode)", async () => {
+    const { fs } = memState();
+    const lines = await withLogs(async () => {
+      await configPass({
+        runner: passRunner([20004]),
+        env: testEnv(),
+        source: { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined },
+        state: new ReconcileState("/s", fs),
+        notify: () => {},
+        targetBoxes: ["grok-box-004"],
+        configCanary: undefined, // dynamic policy
+        managedFilesPresent: true,
+        apply: false,
+      });
+    });
+    expect(lines.some((l) => l.includes("config: canary policy=dynamic"))).toBe(true);
   });
 
   test("no reachable box ⇒ no canary, one skip, non-canary loop still runs", async () => {

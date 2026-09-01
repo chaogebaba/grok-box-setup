@@ -44,3 +44,9 @@ Thumbs.db
 # tree; `git archive` must not carry it to boxes (blueprint S11).
 fleet/dist/
 fleet/node_modules/
+
+# Local CAO orchestration hooks — session/seat wiring for the agent harness that
+# drives this repo, NOT project code. They are live on the operator's machine and
+# must keep working, so they stay on disk and out of the tree (untracked in
+# fleet2 phase 3 r2, blocker 4).
+.claude/

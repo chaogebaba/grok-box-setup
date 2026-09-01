@@ -77,7 +77,11 @@ export async function configPass(deps: ConfigPassDeps): Promise<ConfigPassResult
   // Pass-start line — bash verbatim in BOTH policies (F1). `<canary>` is the
   // resolved box, or "none" when dynamic found no reachable box.
   log(`config: pass start (${mode}) — canary-first over tunnels (canary=${canary ?? "none"})`);
-  log(`config: canary policy=${policy}`); // F1 separate line
+  // F3 (r1 gate parity): bash emits NO `config: canary policy=` line. Suppress it
+  // in fixed-policy mode (the bash-equivalent mode where `[fleet-brain].canary_box`
+  // is set) for byte-identical logs. Keep it ONLY for dynamic-canary mode, which
+  // bash never had, so operators can still see the dynamic selection.
+  if (policy === "dynamic") log(`config: canary policy=${policy}`);
 
   const push = (box: string): Promise<{ rc: number }> => pushManaged(box, !deps.apply, pushDeps);
 

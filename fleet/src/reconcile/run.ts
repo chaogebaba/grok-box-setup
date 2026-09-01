@@ -276,14 +276,16 @@ async function reconcileOne(
       continue;
     }
 
-    // Mutation gate (main:2871-2874). H2: `readonly` in bash is ALWAYS "0"/"1"
-    // (never null), so `${readonly:+read-only }` ALWAYS substitutes — the WOULD
-    // line reads `(read-only dry-run/no-apply)` UNCONDITIONALLY even on a healthy
-    // dry-run. Phase 2 reproduces this bash bug byte-for-byte (main:2872; see
-    // blueprint H2). Do NOT make the prefix conditional on the latch — that is a
-    // PHASE-3 fix once bash retires.
+    // Mutation gate (main:2871-2874). D4/F3 fix (phase 3): the `read-only `
+    // prefix is CONDITIONAL on the run-wide latch (ctx.readonly), NOT on
+    // dry-run. A healthy dry-run (no latch) prints `(dry-run/no-apply)`; a
+    // latched run (e.g. a fake-401 API failure) prints
+    // `(read-only dry-run/no-apply)`. This is the ONE line the fix touches
+    // (main:2872 / run.ts:286) — the config-pass and rollout WOULD lines carry
+    // no prefix and MUST NOT gain one (F3). Kills m9 (unconditional again).
     if (deps.ctx.readonly || !deps.apply) {
-      log(`reconcile: ${box} WOULD ${a} (read-only dry-run/no-apply)`);
+      const prefix = deps.ctx.readonly ? "read-only " : "";
+      log(`reconcile: ${box} WOULD ${a} (${prefix}dry-run/no-apply)`);
       continue;
     }
 

@@ -38,7 +38,13 @@ required=$(( (69 * expected + 99) / 100 ))
 done_count=0
 fail_runs=""
 if command -v journalctl >/dev/null 2>&1; then
-  done_count="$(journalctl -u fleet-reconcile --since "$since" 2>/dev/null | grep -c 'reconcile: done (DRY-RUN)' || echo 0)"
+  # R2-B1: `grep -c` PRINTS 0 and EXITS 1 on an empty journal, so a trailing
+  # `|| echo 0` appended a SECOND zero and done_count became the two-line string
+  # "0\n0" — which then landed verbatim in the FORCE=1 marker as
+  # `observed=0\n0 required=199`. Capture the count and reset on failure instead,
+  # then hard-clamp to digits so the marker is always ONE clean line.
+  done_count="$(journalctl -u fleet-reconcile --since "$since" 2>/dev/null | grep -c 'reconcile: done (DRY-RUN)')" || done_count=0
+  case "$done_count" in ''|*[!0-9]*) done_count=0 ;; esac
   # any non-zero ExecMainStatus / Result=exit-code in the window
   fail_runs="$(journalctl -u fleet-reconcile --since "$since" 2>/dev/null \
     | grep -E 'Result=exit-code|ExecMainStatus=[1-9]' | awk '{print $1"T"$2"Z"}' | paste -sd, - || true)"
