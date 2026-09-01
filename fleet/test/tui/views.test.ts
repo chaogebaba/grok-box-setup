@@ -4,19 +4,24 @@
 
 import { test, expect, describe } from "bun:test";
 import {
-  renderDetail,
-  renderFooter,
-  renderFrame,
-  renderView,
+  detailLines,
+  footerLines,
+  viewLines,
   viewContent,
   viewChromeRows,
   viewRowsAvailable,
   viewportWindow,
   historyRows,
   HISTORY_MAX_ROWS,
-  type TuiState,
-  type ViewState,
-} from "../../src/tui/render.ts";
+  type Size,
+} from "../../src/tui/model.ts";
+import type { TuiState, ViewState } from "../../src/tui/state.ts";
+import { frameOf } from "./ink-harness.ts";
+
+/** The model's rows as plain text (the old painters returned strings). */
+const renderDetail = (s: TuiState, _size: Size): string[] => detailLines(s).map((l) => l.text);
+const renderFooter = (s: TuiState, size: Size): string[] => footerLines(s, size);
+const renderView = (s: TuiState, size: Size): string[] => viewLines(s, size).map((l) => l.text);
 import type { SnapshotLine } from "../../src/history/schema.ts";
 import type { BoxDetail } from "../../src/tui/api-client.ts";
 import { box, state, SIZE_120x40 } from "./helpers.ts";
@@ -183,10 +188,10 @@ describe("D5b viewport", () => {
     expect(viewChromeRows(base, SIZE_140x40)).toBe(5);
   });
 
-  test("SNAPSHOT at 24 rows × 100 cols: the window fits and the FOOTER IS LAST", () => {
+  test("SNAPSHOT at 24 rows × 100 cols: the window fits and the FOOTER IS LAST", async () => {
     const content = Array.from({ length: 200 }, (_, i) => `diff line ${i}`);
     const s = state({ view: { kind: "diff", box: "grok-box-1", offset: 0, loading: false, lines: content } });
-    const frame = renderFrame(s, SIZE_100x24).split("\n");
+    const frame = (await frameOf(s, SIZE_100x24)).split("\n");
     // the frame occupies EXACTLY the terminal: chrome + the painted window.
     expect(frame.length).toBe(24);
     expect(frame[frame.length - 1]).toContain("P push"); // footer still last
@@ -198,10 +203,10 @@ describe("D5b viewport", () => {
   });
 
   // the ledger's D5b mutant: render ALL rows instead of the window.
-  test("a 200-row view never paints more rows than the terminal has", () => {
+  test("a 200-row view never paints more rows than the terminal has", async () => {
     const content = Array.from({ length: 200 }, (_, i) => `L${i}`);
     const s = state({ view: { kind: "diff", box: "grok-box-1", offset: 0, loading: false, lines: content } });
-    expect(renderFrame(s, SIZE_100x24).split("\n").length).toBeLessThanOrEqual(24);
+    expect((await frameOf(s, SIZE_100x24)).split("\n").length).toBeLessThanOrEqual(24);
   });
 
   test("scrolled to the end, the window clamps and the last row is the last row", () => {
@@ -212,12 +217,12 @@ describe("D5b viewport", () => {
     expect(rows[0]).toContain("of 50");
   });
 
-  test("a resize shrinks the window and the offset RE-clamps to the new end", () => {
+  test("a resize shrinks the window and the offset RE-clamps to the new end", async () => {
     const content = Array.from({ length: 50 }, (_, i) => `L${i}`);
     // an offset past the end at BOTH sizes, so both frames must clamp it.
     const s = state({ view: { kind: "diff", box: "grok-box-1", offset: 48, loading: false, lines: content } });
-    const tall = renderFrame(s, { cols: 100, rows: 40 }).split("\n");
-    const short = renderFrame(s, { cols: 100, rows: 12 }).split("\n");
+    const tall = (await frameOf(s, { cols: 100, rows: 40 })).split("\n");
+    const short = (await frameOf(s, { cols: 100, rows: 12 })).split("\n");
     expect(tall.length).toBe(40);
     expect(short.length).toBe(12);
     // the last content row is L49 at BOTH sizes: the offset never runs off.
@@ -255,13 +260,13 @@ describe("D3 journal view", () => {
     expect(rows.join("\n")).toContain("unit started");
   });
   // the ledger's "drop the 403 handling" mutant.
-  test("a readonly token's 403 is words in the frame, not a crash", () => {
+  test("a readonly token's 403 is words in the frame, not a crash", async () => {
     const s = state({
       scope: "readonly",
       view: { kind: "journal", box: "grok-box-1", offset: 0, loading: false, error: "journal: admin token required" },
     });
     expect(viewContent(s)).toEqual(["journal: admin token required"]);
-    expect(renderFrame(s, SIZE_120x40)).toContain("journal: admin token required");
+    expect(await frameOf(s, SIZE_120x40)).toContain("journal: admin token required");
   });
 });
 
@@ -310,31 +315,31 @@ describe("D4 history view", () => {
 // --- the view frame vs. the table + banners ----------------------------------
 describe("an open view replaces the table, under the banners", () => {
   const view: ViewState = { kind: "diff", box: "grok-box-1", offset: 0, loading: false, lines: ["--- a"] };
-  test("the box table and the ZTJ discover row are BOTH suppressed", () => {
+  test("the box table and the ZTJ discover row are BOTH suppressed", async () => {
     const s = state({
       boxes: [box("grok-box-1"), box("grok-box-2")],
       discover: { candidates: 2, adopted: 1, repaired: 0, skipped: [] },
       view,
     });
-    const frame = renderFrame(s, SIZE_120x40);
+    const frame = await frameOf(s, SIZE_120x40);
     expect(frame).toContain("── diff grok-box-1");
     expect(frame).not.toContain("TUNNEL"); // the table header is gone
     expect(frame).not.toContain("discover:"); // and so is the discover row
     expect(frame).not.toContain("grok-box-2");
   });
-  test("LINK DOWN still renders ABOVE the view (existing precedence)", () => {
+  test("LINK DOWN still renders ABOVE the view (existing precedence)", async () => {
     const s = state({ view, link: { up: false, sinceMs: Date.parse("2026-05-01T00:00:00Z") }, nowMs: Date.parse("2026-05-01T00:00:45Z") });
-    const frame = renderFrame(s, SIZE_120x40).split("\n");
+    const frame = (await frameOf(s, SIZE_120x40)).split("\n");
     expect(frame[0]).toContain("fleet2"); // header
     expect(frame[1]).toContain("LINK DOWN 45s"); // banner, still first
     expect(frame.join("\n")).toContain("── diff grok-box-1");
   });
-  test("STALE still renders above the view too", () => {
+  test("STALE still renders above the view too", async () => {
     const s = state({ view, tickAgeS: 16 * 60, link: { up: true } });
-    expect(renderFrame(s, SIZE_120x40).split("\n")[1]).toContain("STALE");
+    expect((await frameOf(s, SIZE_120x40)).split("\n")[1]).toContain("STALE");
   });
-  test("the header keeps ticking while a view is open (Acceptance 3)", () => {
+  test("the header keeps ticking while a view is open (Acceptance 3)", async () => {
     const s = state({ view, tickAgeS: 42 });
-    expect(renderFrame(s, SIZE_120x40).split("\n")[0]).toContain("tick=42s");
+    expect((await frameOf(s, SIZE_120x40)).split("\n")[0]).toContain("tick=42s");
   });
 });

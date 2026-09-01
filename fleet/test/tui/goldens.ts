@@ -11,7 +11,8 @@
 // whitespace is stripped.
 
 import type { SnapshotBox, SnapshotLine } from "../../src/history/schema.ts";
-import type { TuiState, Size } from "../../src/tui/render.ts";
+import type { TuiState } from "../../src/tui/state.ts";
+import type { Size } from "../../src/tui/model.ts";
 import { box, state } from "./helpers.ts";
 
 /**

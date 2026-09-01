@@ -1,5 +1,5 @@
 // keyloop.test.ts — the PURE key reducer (handleKey), A15 selection recovery,
-// filter, modals, scope-gating, and splitKeys. TTY-free (fake stdin ⇒ strings).
+// filter, modals and scope-gating. TTY-free: these call the reducer directly.
 
 import { test, expect, describe } from "bun:test";
 import {
@@ -7,14 +7,13 @@ import {
   recoverSelection,
   applyFleet,
   applyLinkDown,
-  splitKeys,
   initialState,
   detailEffectFor,
   selectedBoxName,
   applyViewResult,
   viewError,
   shouldPoll,
-} from "../../src/tui/main.ts";
+} from "../../src/tui/state.ts";
 import type { FleetView } from "../../src/tui/api-client.ts";
 import { box, state } from "./helpers.ts";
 
@@ -174,13 +173,8 @@ describe("modal confirm flow", () => {
   });
 });
 
-describe("splitKeys", () => {
-  test("splits arrows as 3-char sequences and chars individually", () => {
-    expect(splitKeys("\x1b[Bj\x1b[A")).toEqual(["\x1b[B", "j", "\x1b[A"]);
-    expect(splitKeys("abc")).toEqual(["a", "b", "c"]);
-    expect(splitKeys("\x1b")).toEqual(["\x1b"]); // lone Esc
-  });
-});
+// (`splitKeys` is gone: Ink parses the keypress and `keys.ts` maps it — see
+// keys.test.ts, which pins the whole table.)
 
 describe("initialState", () => {
   test("starts link-down (connecting) with an empty fleet", () => {
@@ -193,7 +187,7 @@ describe("initialState", () => {
 
 // --- 5.7.0: D/J/H views, the B4 detail trigger, the D6 suppression -----------
 
-import type { ViewState } from "../../src/tui/render.ts";
+import type { ViewState } from "../../src/tui/state.ts";
 
 const TWO = [box("grok-box-1"), box("grok-box-2")];
 
