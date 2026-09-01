@@ -694,6 +694,58 @@ Tailscale pair). Poll `GET /v1/fleet` every 5 s; API unreachable ⇒ last-good d
 greyed + red `LINK DOWN <age>`, keep retrying, never exit; snapshot older than
 15 min ⇒ yellow `STALE <age>`.
 
+### Per-box detail + the diff/journal/history views (5.7.0)
+
+`GET /v1/boxes/:name` (readonly, no ssh) reports five OPTIONAL fields alongside
+its existing `box` and `markers`, all read from state the reconcile tick already
+writes:
+
+| field | source | absent as |
+| --- | --- | --- |
+| `checkfail_count` | `<box>.checkfail` | `null` |
+| `asleep_since` / `asleep_last` | `<box>.asleep` | `null` |
+| `expires_at` | `<box>.expires` (`YYYY-MM-DD`) | `null` |
+| `api_backoff` | `api.fails` + `api.next_retry` | `null` |
+
+They sit at the TOP level rather than inside `markers`, whose `checkfail` is the
+BOOLEAN that `checkfail_count` is the number behind. The failure count is read
+through `ReconcileState.apiFails()`, a read-only accessor: the other public path
+to that number, `recordApiFailure`, bumps the counter and writes a next-retry
+stamp, so a read path calling it would push the engine into a backoff it never
+actually entered. A `GET` leaves the three `api.*` files byte-identical.
+
+Every field is optional on the wire and the TUI client's shape validator keys on
+`name` alone, so a 5.6.0 engine's answer still validates; the pane renders the
+missing facts as `—` rather than dropping the link.
+
+The TUI shows them as labelled rows in the detail pane, and ONLY when the stored
+facts carry the currently selected box's name — during an in-flight selection
+change the rows read `—`, never the previous box's numbers under the new box's
+header. The pane's data is loaded by one combined box+history fetch that fires
+whenever the SELECTED BOX NAME CHANGES, including the first poll's selection
+(which no keypress announces) and any selection recovery that lands elsewhere.
+
+Three read-only full-frame views open over the box table:
+
+| key | view | scope | notes |
+| --- | --- | --- | --- |
+| `D` | `GET /v1/boxes/:name/diff` | readonly | an empty diff renders `in sync` |
+| `J` | `GET /v1/boxes/:name/journal?lines=80` | admin | a readonly token's 403 renders `journal: admin token required` |
+| `H` | the already-loaded 24 h history | — | no request; newest first, newest 288 rows |
+
+Inside a view, `j`/`k` and the arrows scroll, `r` refetches, and `Esc` or `q`
+closes it (`q` quits only from the table). Each view captures its box name and
+content AT OPEN, so the 5 s fleet poll that keeps running underneath never swaps
+rows under the operator, and `r` targets the CAPTURED box rather than whatever
+the selection has become. While a view is open the detail fetch is suppressed
+entirely; closing it onto a different box fires exactly one fetch. The
+`LINK DOWN` / `STALE` banners keep their precedence and render above any view.
+
+Views paint through a viewport sized from `rows` minus the frame's own chrome
+(header, banner, spacers, title, message line, and the footer, which is TWO
+lines below 120 columns), so the footer is always the last line on screen and a
+long diff never scrolls it away. The box table's own layout is unchanged.
+
 ## Retired: bash `fleetctl` (last at c303696)
 
 Since 5.4.0 (phase 3) the brain engine is **fleet2** (bun+TS); the bash
