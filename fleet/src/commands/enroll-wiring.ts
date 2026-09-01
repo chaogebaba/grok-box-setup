@@ -9,7 +9,8 @@ import { type ParsedConfig } from "../config.ts";
 import { resolveSshPassword } from "./ssh.ts";
 import { boxSsh as boxSshTransport } from "./box-transport.ts";
 import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
-import { portFor } from "../boxes.ts";
+import { tunnelUp } from "../tunnel.ts";
+import { knownHostsFile, forgetHostKeys } from "../hostkey.ts";
 import type { EnrollSideEffects } from "./enroll.ts";
 import { WRITE_BOX_CONFIG_REMOTE } from "./enroll.ts";
 
@@ -42,6 +43,7 @@ function boxSsh(
   runner: Runner,
   cfg: ParsedConfig,
   opts: EnrollWiringOpts,
+  env: Env,
   box: string,
   remoteCommand: string,
   stdin?: string,
@@ -54,6 +56,9 @@ function boxSsh(
     connectTimeoutS: opts.connectTimeoutS,
     timeoutMs: SSH_TIMEOUT_MS,
     stdin,
+    // D11(a): the tailnet path is fleet-driven, so it reads the engine's own
+    // known_hosts, never /root/.ssh/known_hosts.
+    knownHosts: knownHostsFile(env),
   });
 }
 
@@ -163,18 +168,19 @@ export function makeEnrollSideEffects(
       return lastApiCode;
     },
     async readBoxPubkey(box) {
-      const r = await boxSsh(runner, cfg, wiringOpts, box, `sudo cat '/workspace/box-setup/secrets/tunnel_ed25519.pub'`);
+      const r = await boxSsh(runner, cfg, wiringOpts, env, box, `sudo cat '/workspace/box-setup/secrets/tunnel_ed25519.pub'`);
       if (r.code !== 0) return undefined;
       const first = r.stdout.split("\n").find((l) => l.trim() !== "");
       return first?.trim();
     },
     async tunnelUp(box) {
-      const port = portFor(box);
-      if (port === undefined) return false;
-      const r = await runner.run(["ss", "-tln"], { timeoutMs: 5000 });
-      if (r.code !== 0) return false;
-      const needle = `127.0.0.1:${port}`;
-      return r.stdout.split("\n").some((l) => l.trim().split(/\s+/).includes(needle));
+      // D11(c): this wiring used to keep a PRIVATE copy of the listener probe,
+      // which knew nothing about who owns the listener. One parser now — the
+      // enrol's pre-listener warning and the tick agree by construction.
+      return tunnelUp(runner, box);
+    },
+    async forgetHostKeys(box, port) {
+      await forgetHostKeys(runner, { file: knownHostsFile(env), box, port, why: "enrol" });
     },
     async installVpsAuthorizedKey(line) {
       try {
@@ -254,12 +260,12 @@ export function makeEnrollSideEffects(
         'mv -f "$tmp" ~/.ssh/authorized_keys',
         "chmod 600 ~/.ssh/authorized_keys",
       ].join("\n");
-      const r = await boxSsh(runner, cfg, wiringOpts, box, remote);
+      const r = await boxSsh(runner, cfg, wiringOpts, env, box, remote);
       return r.code === 0;
     },
     async writeBoxConfig(box, vps, idx, port) {
       const cmd = `sudo sh -s -- '${vps}' '${idx}' '/workspace/box-setup/config.toml' '${port}'`;
-      const r = await boxSsh(runner, cfg, wiringOpts, box, cmd, WRITE_BOX_CONFIG_REMOTE);
+      const r = await boxSsh(runner, cfg, wiringOpts, env, box, cmd, WRITE_BOX_CONFIG_REMOTE);
       if (r.code === 4) return 4;
       if (r.code !== 0) return 1;
       return 0;

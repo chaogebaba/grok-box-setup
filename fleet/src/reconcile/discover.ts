@@ -73,6 +73,12 @@ export interface ProbeOutcome {
   hostname: string;
   /** parsed `boxup version`, or undefined when missing/unparsable (P3). */
   boxup: string | undefined;
+  /**
+   * D11(c): the probe hit OpenSSH's REMOTE HOST IDENTIFICATION HAS CHANGED
+   * banner on the TAILNET spec — a reused NAME, not a reused port. Only ever
+   * true together with `reachable: false`.
+   */
+  hostkeyMismatch?: boolean;
 }
 
 /** What the repair content checks found (D5). */
@@ -107,6 +113,12 @@ export interface DiscoverDeps {
   adopt(box: string): Promise<AdoptOutcome>;
   /** the D5 content checks. */
   inspect(box: string): Promise<RepairFindings>;
+  /**
+   * D11(b): forget a box's known_hosts pins at an identity-binding moment.
+   * "tailnet" is the candidate re-probe (an unenrolled box has no tunnel of
+   * ours); "both" is the repair, which is about the tunnel spec.
+   */
+  forgetHostKeys(box: string, scope: "both" | "tailnet"): Promise<void>;
 }
 
 /** Per-tick facts the caller supplies. */
@@ -445,7 +457,18 @@ export class DiscoverRun {
         log(`discover: adopt budget spent (${this.budget.spent().adopt}ms) — ${name} and any remaining candidates deferred`);
         return;
       }
-      const p = await this.budget.spend("adopt", () => this.deps.probe(name));
+      let p = await this.budget.spend("adopt", () => this.deps.probe(name));
+      // D11(c) candidate re-probe. A CANDIDATE is not in membership, so a banner
+      // on its tailnet name is a reused NAME — a retired record, or a box that
+      // lost /workspace. D2 already concedes tailnet membership plus the
+      // password as the identity boundary for an unenrolled box, and accept-new
+      // pins whatever it sees on first contact, so forgetting the tailnet pin
+      // and probing ONCE more is the same trust decision made twice. One added
+      // remote call, on the candidate path only, inside the adopt share.
+      if (!p.reachable && p.hostkeyMismatch === true) {
+        await this.deps.forgetHostKeys(name, "tailnet");
+        p = await this.budget.spend("adopt", () => this.deps.probe(name));
+      }
       if (!p.reachable) {
         this.recordFailure(name, "unreachable");
         this.skip(name, "unreachable");
@@ -514,6 +537,20 @@ export class DiscoverRun {
       if (!this.budget.canStart("repair", DISCOVER_PROBE_CEILING_MS)) {
         log(`discover: repair budget spent (${this.budget.spent().repair}ms) — ${box} deferred`);
         return;
+      }
+      // D11(b)(ii): a box carrying the mismatch marker gets its pins forgotten
+      // BEFORE the content checks — otherwise the tailnet reads hit the banner
+      // and the repair could never fire. For a mismatch the forget IS the cure:
+      // the artefacts are coherent and `adopt` rewrites byte-identical content,
+      // but the repair still consumes this tick's single mutation slot.
+      //
+      // The marker being CLEAR is load-bearing too (the flapping case): a box
+      // whose counter reached 2 across alternating mismatch and row-e ticks
+      // must NOT be forgotten here. `inspect` then finds a rotated box coherent
+      // and the repair is a deliberate NO-OP that spends no slot; the cure
+      // lands on the next mismatch tick.
+      if (this.tick.state.readHostkeyMismatch(box)) {
+        await this.deps.forgetHostKeys(box, "both");
       }
       const f = await this.budget.spend("repair", () => this.deps.inspect(box));
       if (!f.ok) {

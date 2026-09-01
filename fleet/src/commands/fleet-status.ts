@@ -14,6 +14,7 @@
 import type { Runner } from "../runner.ts";
 import type { Env } from "../env.ts";
 import { tunnelUp, tunnelSsh } from "../tunnel.ts";
+import { knownHostsFile } from "../hostkey.ts";
 import { parseEnrolled } from "../boxes.ts";
 import { parseDevices } from "../tailscale.ts";
 import { splitVersion } from "../status.ts";
@@ -102,10 +103,12 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
     if (up) {
       const chk = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, CHECK_COMMAND, {
         timeoutMs: CHECK_TIMEOUT_MS,
+        knownHosts: knownHostsFile(deps.env),
       });
       check = chk.code === 0 ? "OK" : "FAIL";
       const st = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, STATUS_COMMAND, {
         timeoutMs: STATUS_TIMEOUT_MS,
+        knownHosts: knownHostsFile(deps.env),
       });
       const line = st.code === 0 ? st.stdout : "";
       const v = line.trim().split(/\s+/).find((t) => t.startsWith("v="));

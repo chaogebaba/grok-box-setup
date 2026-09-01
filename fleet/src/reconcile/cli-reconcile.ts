@@ -113,7 +113,7 @@ export async function assembleTickDeps(
   // FLEET_BOXES membership seam disables discovery entirely.
   const discoverEnabled = env.FLEET_BOXES === undefined || env.FLEET_BOXES.trim() === "";
   const discover = discoverEnabled
-    ? makeDiscoverDeps({ env, cfg, runner, apiToken: token !== undefined })
+    ? makeDiscoverDeps({ env, cfg, runner, apiToken: token !== undefined, state })
     : undefined;
 
   // Best-effort target sha (F8).

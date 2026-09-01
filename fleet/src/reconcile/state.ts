@@ -270,6 +270,28 @@ export class ReconcileState {
     this.fs.write(this.p(`${box}.repair_pending_runs`), `0 ${tick}\n`);
   }
 
+  // --- hostkey_mismatch (zero-touch join D11c) -----------------------------
+  //
+  // `<box>.hostkey_mismatch` is a ONE-TICK memory of an OBSERVATION: the box's
+  // tunnel results this tick contained OpenSSH's REMOTE HOST IDENTIFICATION HAS
+  // CHANGED banner. It is DISTINCT from `<box>.incoherent` and from
+  // `<box>.repair_pending_runs` (which it feeds): it carries no count and no
+  // stamp because it is rewritten from scratch at the same one site every tick
+  // — set on a mismatch tick, cleared on ANY tick whose tunnel results contain
+  // no mismatch, tunnel-down ticks (which make no tunnel call at all) included.
+  //
+  // Two consumers read it within the same tick: the tunnel-write gate in the
+  // action loop, and the config pass.
+  readHostkeyMismatch(box: string): boolean {
+    return this.fs.read(this.p(`${box}.hostkey_mismatch`)) !== undefined;
+  }
+  setHostkeyMismatch(box: string): void {
+    this.fs.write(this.p(`${box}.hostkey_mismatch`), "1\n");
+  }
+  clearHostkeyMismatch(box: string): void {
+    this.fs.remove(this.p(`${box}.hostkey_mismatch`));
+  }
+
   // --- discover.json (zero-touch join D4 backoff ledger) -------------------
   /** Read the per-box failure ledger; a missing/corrupt file reads as empty. */
   readDiscoverLedger(): DiscoverRecord[] {

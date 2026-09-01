@@ -9,6 +9,8 @@ import type { Runner } from "../runner.ts";
 import type { Env } from "../env.ts";
 import type { ParsedConfig } from "../config.ts";
 import { boxIndex, portFor } from "../boxes.ts";
+import { forgetHostKeys, isHostKeyMismatch, knownHostsFile } from "../hostkey.ts";
+import type { ReconcileState } from "./state.ts";
 import { discover as listTailnet } from "../commands/list.ts";
 import { boxSsh } from "../commands/box-transport.ts";
 import { cmdEnroll, type EnrollSideEffects } from "../commands/enroll.ts";
@@ -159,6 +161,12 @@ export interface DiscoverWiringOpts {
   readFile?: (path: string) => string | undefined;
   /** monotonic clock for the mutation's abort points. */
   clock?: () => number;
+  /**
+   * D11(c): the tick's ReconcileState. `inspect` reads `hostkey_mismatch` from
+   * it so a mismatched box short-circuits to the repair branch instead of
+   * spending two remote reads on checks whose verdict is already known.
+   */
+  state?: ReconcileState;
 }
 
 /** Build the production DiscoverDeps for one tick. */
@@ -180,6 +188,9 @@ export function makeDiscoverDeps(opts: DiscoverWiringOpts): DiscoverDeps {
     password: pw,
     connectTimeoutS: DISCOVER_CONNECT_TIMEOUT_S,
     timeoutMs: DISCOVER_PROBE_CEILING_MS,
+    // D11(a): the discover transport is fleet-driven, so it reads the engine's
+    // own known_hosts too.
+    knownHosts: knownHostsFile(opts.env),
   });
 
   /** Side effects for a discover-initiated enrol: threaded password, discover
@@ -203,7 +214,14 @@ export function makeDiscoverDeps(opts: DiscoverWiringOpts): DiscoverDeps {
       const pw = password;
       if (pw === undefined) return { reachable: false, hostname: "", boxup: undefined };
       const alive = await boxSsh(opts.runner, box, "true", sshOpts(pw));
-      if (alive.code !== 0) return { reachable: false, hostname: "", boxup: undefined };
+      if (alive.code !== 0) {
+        return {
+          reachable: false,
+          hostname: "",
+          boxup: undefined,
+          hostkeyMismatch: isHostKeyMismatch({ code: alive.code, stderr: alive.stderr }),
+        };
+      }
       const read = await boxSsh(opts.runner, box, PROBE_READ, sshOpts(pw));
       if (read.code !== 0) return { reachable: true, hostname: "", boxup: undefined };
       const parsed = parseProbeRead(read.stdout);
@@ -219,7 +237,24 @@ export function makeDiscoverDeps(opts: DiscoverWiringOpts): DiscoverDeps {
       return point === undefined ? { rc } : { rc, timeoutPoint: point };
     },
 
+    async forgetHostKeys(box, scope): Promise<void> {
+      await forgetHostKeys(opts.runner, {
+        file: knownHostsFile(opts.env),
+        box,
+        port: portFor(box),
+        scope,
+        why: scope === "tailnet" ? "probe" : "repair",
+      });
+    },
+
     async inspect(box): Promise<RepairFindings> {
+      // D11(c): while the marker is set the verdict is already known — the
+      // artefacts are coherent and the pin was the whole problem. Returning
+      // ok:true takes the REPAIR branch rather than the unreachable/backoff
+      // branch, and spends no remote call.
+      if (opts.state?.readHostkeyMismatch(box) === true) {
+        return { ok: true, coherent: false, reason: "hostkey-mismatch" };
+      }
       const pw = password;
       if (pw === undefined) return { ok: false, coherent: false, reason: "no-box-password" };
       const port = portFor(box);

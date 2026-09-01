@@ -24,6 +24,7 @@ import { RunContext, TailscaleKeys } from "../reconcile/tailscale-keys.ts";
 import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { readJournal } from "./journal.ts";
 import { tunnelUp, tunnelSsh } from "../tunnel.ts";
+import { knownHostsFile } from "../hostkey.ts";
 import { CHECK_COMMAND } from "../remote.ts";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -220,6 +221,7 @@ export async function handleCheck(ctx: ServerContext, box: string, auth: Request
     if (!up) return 1;
     const chk = await tunnelSsh(ctx.runner, box, ctx.env.FLEET_BOX_KEY, CHECK_COMMAND, {
       timeoutMs: CHECK_TIMEOUT_MS,
+      knownHosts: knownHostsFile(ctx.env),
     });
     return chk.code === 0 ? 0 : 1;
   });

@@ -155,6 +155,13 @@ export interface EnrollSideEffects {
   readBoxPubkey(box: string): Promise<string | undefined>;
   /** tunnel_up(box) — VPS-side listener probe. */
   tunnelUp(box: string): Promise<boolean>;
+  /**
+   * D11(b)(i): forget this box's known_hosts pins at THIS identity-binding
+   * moment, so an enrol (manual, adopt or repair) always binds from a clean
+   * pin. Local processes only; never fatal; the tunnel spec is fail-closed
+   * behind the listener ownership check inside forgetHostKeys.
+   */
+  forgetHostKeys(box: string, port: number): Promise<void>;
   /** install the VPS authorized_keys line (BUG-E perms). */
   installVpsAuthorizedKey(line: string): Promise<boolean>;
   /** /etc mapping copy (non-fatal). */
@@ -262,6 +269,12 @@ export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<
       log(`enroll: cannot evaluate sshd permitlisten policy (sshd -T failed) — continuing`);
     }
   }
+
+  // D11(b)(i): the forget goes HERE — after the rc-6 locality guard and the
+  // rc-5 permitlisten guard, which the design requires to run "before any side
+  // effect", and a forget IS a side effect on the engine's own file; and before
+  // the `acl` abort point, so every remote step below meets a clean pin.
+  await se.forgetHostKeys(box, port);
 
   // (0) VPS address precheck (D1) — skipped under --no-box-config.
   let vps = "";

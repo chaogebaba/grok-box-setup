@@ -18,7 +18,8 @@
 
 import type { Runner } from "../runner.ts";
 import type { Env } from "../env.ts";
-import { tunnelSsh } from "../tunnel.ts";
+import { tunnelSsh, tunnelUp } from "../tunnel.ts";
+import { knownHostsFile } from "../hostkey.ts";
 import { parseEnrolled } from "../boxes.ts";
 import { renderManaged } from "../managed/render.ts";
 import { validateManaged } from "../managed/validate.ts";
@@ -119,11 +120,21 @@ export async function cmdConfig(args: string[], deps: ConfigDeps): Promise<numbe
     return 2;
   }
 
+  // D11(c): the ONE tunnel caller that used to dial without asking whether the
+  // listener is ours. A squatter on a member port must read as `tunnel: down` on
+  // every path, CLI included — otherwise this human-invoked diff would hand a
+  // foreign listener the rendered managed config on stdin.
+  if (!(await tunnelUp(deps.runner, box))) {
+    process.stderr.write(`fleet2 config diff: ${box} tunnel down\n`);
+    return 2;
+  }
+
   const wantSha = await textSha256(text);
   const remote = managedRemoteScript(wantSha, 1);
   const dry = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, wrapSudoShC(remote), {
     stdin: text,
     timeoutMs: DRYRUN_TIMEOUT_MS,
+    knownHosts: knownHostsFile(deps.env),
   });
   if (dry.code !== 0) {
     process.stderr.write(`fleet2 config diff: ${box} unreachable/failed (rc=${dry.code ?? "killed"})\n`);

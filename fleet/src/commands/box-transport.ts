@@ -16,6 +16,7 @@
 
 import type { Runner } from "../runner.ts";
 import { sshCmdArgv } from "./ssh.ts";
+import { KNOWN_HOSTS_OPTS } from "../hostkey.ts";
 
 /** Default fleet2 deadline for a box ssh call (enroll's SSH_TIMEOUT_MS). */
 export const BOX_SSH_TIMEOUT_MS = 20_000;
@@ -29,6 +30,13 @@ export interface BoxSshOpts {
   timeoutMs?: number;
   /** bytes for the remote command's stdin. */
   stdin?: string;
+  /**
+   * D11(a): the engine's own known_hosts file (knownHostsFile(env)). REQUIRED —
+   * this is the tailnet path used by enroll, the discover probes and the repair
+   * inspect, i.e. every fleet-driven `<box>` contact. The interactive
+   * `fleet2 ssh` does NOT come through here and keeps ssh's defaults.
+   */
+  knownHosts: string;
 }
 
 export interface BoxSshResult {
@@ -44,7 +52,14 @@ export async function boxSsh(
   remoteCommand: string,
   opts: BoxSshOpts,
 ): Promise<BoxSshResult> {
-  const extra = opts.connectTimeoutS === undefined ? [] : ["-o", `ConnectTimeout=${opts.connectTimeoutS}`];
+  // Both go through `extraOpts`, which is spliced BEFORE SSH_OPTS — ssh takes
+  // the FIRST value it obtains for an option, so this ordering is what lets the
+  // known-hosts options and the discover connect timeout win without changing
+  // SSH_OPTS (which `fleet2 ssh` shares).
+  const extra = [
+    ...KNOWN_HOSTS_OPTS(opts.knownHosts),
+    ...(opts.connectTimeoutS === undefined ? [] : ["-o", `ConnectTimeout=${opts.connectTimeoutS}`]),
+  ];
   const r = await runner.run(sshCmdArgv(box, remoteCommand, extra), {
     timeoutMs: opts.timeoutMs ?? BOX_SSH_TIMEOUT_MS,
     env: { SSHPASS: opts.password },

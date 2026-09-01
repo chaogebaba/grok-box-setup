@@ -19,10 +19,11 @@ import type { Runner } from "../runner.ts";
 import type { Env } from "../env.ts";
 import type { RolloutConfig } from "../config.ts";
 import type { NotifyLevel } from "../notify.ts";
-import { tunnelUp, tunnelSsh } from "../tunnel.ts";
+import { tunnelUp, tunnelSsh, makeWarnOnce, type TunnelDeps } from "../tunnel.ts";
+import { isHostKeyMismatch, knownHostsFile } from "../hostkey.ts";
+import { boxIndex, portFor } from "../boxes.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../remote.ts";
 import { parseCheck, parseStatusLine } from "../status.ts";
-import { boxIndex } from "../boxes.ts";
 import { ReconcileState } from "./state.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
 import { decide } from "./decide.ts";
@@ -46,6 +47,21 @@ const STATUS_TIMEOUT_MS = 20_000;
 const BOX_ROOT = "/workspace/box-setup";
 const STALE_SECS = 600;
 const BACKOFF_CAP_SECS = 1200; // 20-min cap (main:2750-2754); beyond ⇒ implausible (F5)
+
+/**
+ * D11(c): every decision-table action that WRITES over a box's tunnel. The gate
+ * is a property of the TUNNEL, not a list of action names that happens to be
+ * complete today — row a seeds a key, row c rotates (the same mint code), row d
+ * scps a tarball and row b renames over it. Read-only calls (check, status) are
+ * deliberately absent: they run BEFORE this point and their result is what makes
+ * the observation in the first place.
+ */
+export const TUNNEL_WRITING_ACTIONS = new Set(["mint", "rotate", "rollout", "delete-then-rename"]);
+
+/** The log label each of those uses (the seed path logs as `mint-key`). */
+export function actionLabel(a: string): string {
+  return a === "mint" ? "mint-key" : a;
+}
 
 export interface ReconcileDeps {
   runner: Runner;
@@ -191,8 +207,13 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   let rc: 0 | 1 = 0;
   const drifted: DriftedBox[] = [];
   const snapshots: SnapshotBox[] = [];
+  // D11(c)/r12 note 2: `tunnelUp` may report an unverifiable listener owner
+  // many times in one tick (once per box in the loop, again per box in the
+  // config pass). tunnel.ts holds no module state, so the dedup lives HERE, for
+  // exactly the scope of one tick.
+  const tunnelDeps: TunnelDeps = { warnOnce: makeWarnOnce() };
   for (const box of deps.targetBoxes) {
-    const r = await reconcileOne(box, devs, deps, drifted, snapshots, tick);
+    const r = await reconcileOne(box, devs, deps, drifted, snapshots, tick, tunnelDeps);
     if (r === 1) rc = 1;
   }
 
@@ -276,6 +297,7 @@ async function reconcileOne(
   drifted: DriftedBox[],
   snapshots: SnapshotBox[],
   tick: number,
+  tunnelDeps: TunnelDeps = {},
 ): Promise<0 | 1> {
   if (boxIndex(box) === undefined) return 1; // box_index fail ⇒ rc 1
   let rcOne: 0 | 1 = 0;
@@ -290,16 +312,22 @@ async function reconcileOne(
   const lastseenFresh = devs.trim() !== "" ? f.fresh : ("unknown" as const);
 
   // Tunnel + check inputs.
-  const tunnel = (await tunnelUp(deps.runner, box)) ? "up" : "down";
+  const tunnel = (await tunnelUp(deps.runner, box, tunnelDeps)) ? "up" : "down";
   let checkfail: "yes" | "no" = "no";
   let checkfailRuns = 0;
   let checkSha = "unknown";
   let checkVersion = "unknown"; // TUI-D4: the human version (splitVersion.version)
   let checkHealthy = false; // TUI-D4: true iff `boxup check` returned OK
+  // D11(c): did ANY of this tick's tunnel calls meet the banner? A tunnel-down
+  // tick makes no call at all and therefore reads false, which is what clears
+  // the marker below.
+  let hostkeyMismatch = false;
   if (tunnel === "up") {
     const chk = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, CHECK_COMMAND, {
       timeoutMs: CHECK_TIMEOUT_MS,
+      knownHosts: knownHostsFile(deps.env),
     });
+    if (isHostKeyMismatch(chk)) hostkeyMismatch = true;
     const parsed = parseCheck(chk.code, chk.stdout + (chk.stderr ? "\n" + chk.stderr : ""));
     if (!parsed.ok) {
       checkfail = "yes";
@@ -307,7 +335,9 @@ async function reconcileOne(
       // F8 drift probe on unhealthy: second boxup status to still compute drift.
       const st = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, STATUS_COMMAND, {
         timeoutMs: STATUS_TIMEOUT_MS,
+        knownHosts: knownHostsFile(deps.env),
       });
+      if (isHostKeyMismatch(st)) hostkeyMismatch = true;
       const sl = parseStatusLine(st.stdout);
       checkSha = sl.sha;
       checkVersion = sl.version;
@@ -373,9 +403,30 @@ async function reconcileOne(
   // test covers by construction: tunnel up, box asleep, an API outage or a
   // read-only run (online "unknown") and a box absent from the API all fail to
   // emit the token.
-  const incoherent = actions.includes("alert-incident:incoherent-both-dead");
-  if (incoherent) deps.state.bumpRepairPending(box, tick);
+  //
+  // D11(c) folds the host-key observation in at the SAME site: the marker is
+  // written (or cleared) from this tick's tunnel results, and the D5 predicate
+  // becomes `rowE || hostkeyMismatch`. The two are disjoint in practice — a
+  // mismatch tick reads tunnel = up, which row e cannot — so EITHER alone bumps
+  // the counter, and alternation between them still accumulates.
+  if (hostkeyMismatch) deps.state.setHostkeyMismatch(box);
+  else deps.state.clearHostkeyMismatch(box);
+
+  const rowE = actions.includes("alert-incident:incoherent-both-dead");
+  const incoherent = rowE || hostkeyMismatch;
+  let repairRuns = 0;
+  if (incoherent) repairRuns = deps.state.bumpRepairPending(box, tick);
   else deps.state.resetRepairPending(box, tick);
+
+  if (hostkeyMismatch) {
+    // The journal line IS the operator's signal for these ticks: row e does not
+    // emit while the tunnel reads up, so no alert fires during the two mismatch
+    // ticks. If the heal never completes, `checkfail` accumulates and row N-1
+    // (`reachable-cannot-converge`) alerts past three runs anyway.
+    log(
+      `hostkey: ${box} host key changed on [127.0.0.1]:${portFor(box) ?? "?"} — refusing until repair re-binds (n=${repairRuns})`,
+    );
+  }
 
   for (const a of actions) {
     if (a === "noop") continue;
@@ -397,6 +448,16 @@ async function reconcileOne(
     // non-alert observation clears row-e timers.
     deps.state.resetAsleep(box);
     deps.state.resetIncoherent(box);
+
+    // D11(c) tunnel-write gate. While the marker is set, EVERY action that
+    // writes over this box's tunnel is deferred — including row d, which is
+    // gated ABOVE the `drifted.push` below rather than at the execute call, or
+    // the rollout pass would scp into the banner after the loop. So a rotation
+    // can never cause the mint-seed-fail-revoke of empirical r2, on any row.
+    if (hostkeyMismatch && TUNNEL_WRITING_ACTIONS.has(a)) {
+      log(`${actionLabel(a)}: ${box} deferred — host key mismatch`);
+      continue;
+    }
 
     // row d: record the drift, the actual pass runs once after the loop (F8).
     if (a === "rollout") {
@@ -462,6 +523,7 @@ async function execute(box: string, action: string, deps: ReconcileDeps): Promis
       // boxup once (result ignored, main:2905).
       await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, `sudo ${BOX_ROOT}/boxup once`, {
         timeoutMs: STATUS_TIMEOUT_MS,
+        knownHosts: knownHostsFile(deps.env),
       }).catch(() => {});
       return true;
     }
