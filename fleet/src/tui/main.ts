@@ -105,6 +105,20 @@ export function applyViewResult(
   };
 }
 
+/**
+ * D6: whether the 5s `GET /v1/fleet` poll runs on this tick. It ALWAYS does —
+ * an open view does not pause it, so the header's tick age keeps moving and a
+ * fleet that goes stale under a long diff read still says so (Acceptance 3).
+ *
+ * This exists as a named predicate rather than as a bare `setInterval` body so
+ * the rule is pinned by a test: pausing the poll behind a view would have to
+ * change THIS, and the test says it must not.
+ */
+export function shouldPoll(state: TuiState): boolean {
+  void state;
+  return true;
+}
+
 /** Recompute tickAgeS + link/stale from the current view + clock. */
 export function deriveFreshness(state: TuiState): TuiState {
   let tickAgeS: number | null = null;
@@ -532,8 +546,9 @@ export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
   await syncDetail(); // the startup-selected box loads without a keypress (r2).
   const timer = setInterval(() => {
     void (async () => {
+      if (!shouldPoll(state)) return;
       await poll();
-      await syncDetail();
+      await syncDetail(); // suppressed by detailEffectFor while a view is open.
     })();
   }, POLL_INTERVAL_MS);
 
