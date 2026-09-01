@@ -70,7 +70,7 @@ while IFS='|' read -r label lport lkey; do
   case "\$lkey" in real) lkey="\$TUNNEL_KEY" ;; esac
   # NB: the trailing \`; :\` matters — bash exec-optimizes a lone simple command
   # under -c, which would replace the process image and DISCARD this argv.
-  bash -c 'sleep 30; :' _ -N -T -o ExitOnForwardFailure=yes \\
+  bash -c 'sleep 300; :' _ -N -T -o ExitOnForwardFailure=yes \\
       -i "\$lkey" -R "127.0.0.1:\$lport:localhost:22" -p 22 fleet@vps \\
       </dev/null >/dev/null 2>&1 &
   p=\$!
@@ -80,6 +80,12 @@ while IFS='|' read -r label lport lkey; do
 done <<'PROCS'
 $procs
 PROCS
+# A fixture that never started (fork failure on a loaded machine) would look
+# exactly like a supervisor that killed it, so fail LOUDLY and distinctly here
+# instead of letting the assertions below report a false negative.
+for p in \$pids; do
+  command kill -0 "\$p" 2>/dev/null || { echo "SPAWNFAIL:\$p"; exit 9; }
+done
 [ -n "$initpid" ] && echo "$initpid" > "\$TUNNEL_PID"
 
 # --- stubs -----------------------------------------------------------------
@@ -143,6 +149,9 @@ label_pid() {
   return 1
 }
 field() { printf '%s' "$1" | sed -n "s/.*\\b$2=\\([^ ]*\\).*/\\1/p"; }
+# guard: the harness prints SPAWNFAIL:<pid> and exits 9 when a fixture process
+# failed to start. That is an infrastructure fault, never a code verdict.
+spawnok() { case "$1" in *SPAWNFAIL*) bad "harness could not start its fixture processes: [$1]"; return 1 ;; esac; return 0; }
 
 # ---------------------------------------------------------------------------
 # (a) one stray with our exact argv and NO pidfile => ADOPTED. The pidfile must
@@ -151,6 +160,7 @@ field() { printf '%s' "$1" | sed -n "s/.*\\b$2=\\([^ ]*\\).*/\\1/p"; }
 # the adopt branch, or dropping the fail.tunnel reset, flips this.
 # ---------------------------------------------------------------------------
 outa="$(run_supervise 'stray|20005|real' 4 '')"
+spawnok "$outa" || exit 1
 a1="$(printf '%s\n' "$outa" | sed -n 1p)"
 alab="$(printf '%s\n' "$outa" | sed -n 2p)"
 stray="$(label_pid "$alab" stray)"
@@ -168,6 +178,7 @@ fi
 # ---------------------------------------------------------------------------
 outb="$(run_supervise 'old|20005|real
 new|20005|real' 3 '')"
+spawnok "$outb" || exit 1
 b1="$(printf '%s\n' "$outb" | sed -n 1p)"
 blab="$(printf '%s\n' "$outb" | sed -n 2p)"
 bsig="$(printf '%s\n' "$outb" | sed -n 3p)"; bsig="${bsig#signalled:}"
@@ -191,6 +202,7 @@ fi
 # ---------------------------------------------------------------------------
 outc="$(run_supervise 'wrongkey|20005|/tmp/some-other-key
 wrongport|20009|real' '' '')"
+spawnok "$outc" || exit 1
 c1="$(printf '%s\n' "$outc" | sed -n 1p)"
 clab="$(printf '%s\n' "$outc" | sed -n 2p)"
 csig="$(printf '%s\n' "$outc" | sed -n 3p)"; csig="${csig#signalled:}"
@@ -210,6 +222,7 @@ fi
 # increments (2 -> 3) and last-tunnel is stamped for the backoff window.
 # ---------------------------------------------------------------------------
 outd="$(run_supervise '' 2 '')"
+spawnok "$outd" || exit 1
 d1="$(printf '%s\n' "$outd" | sed -n 1p)"
 if [ "$(field "$d1" spawned)" = yes ] && [ "$(field "$d1" fail)" = 3 ] \
    && [ "$(field "$d1" stamp)" = yes ] && [ "$(field "$d1" adopted)" = no ]; then
@@ -225,6 +238,7 @@ fi
 # TERM the live tunnel once per tick.
 # ---------------------------------------------------------------------------
 oute="$(run_supervise 'mine|20005|real' 0 '')"
+spawnok "$oute" || exit 1
 e1="$(printf '%s\n' "$oute" | sed -n 1p)"
 esig="$(printf '%s\n' "$oute" | sed -n 3p)"; esig="${esig#signalled:}"
 if [ "$(field "$e1" spawned)" = no ] && [ "$(field "$e1" fail)" = 0 ] \
