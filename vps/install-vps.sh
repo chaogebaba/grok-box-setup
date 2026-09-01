@@ -71,7 +71,7 @@ FLEET2_RELEASE_ENV="${FLEET2_RELEASE-}"
 FLEET2_SHA256_ENV="${FLEET2_SHA256-}"
 # `make ts-release-build` rewrites EXACTLY these two lines (fleet/scripts/
 # release-build.sh); keep them at column 0 in `NAME=value` form.
-FLEET2_RELEASE=v5.4.0
+FLEET2_RELEASE=v5.5.0
 # Placeholder until the first `make ts-release-build` writes the real digest.
 # Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
 FLEET2_SHA256=0000000000000000000000000000000000000000000000000000000000000000
