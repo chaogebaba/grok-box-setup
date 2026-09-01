@@ -382,5 +382,109 @@ else
   bad "make/git not available — cannot execute the ts-release-build / ts-release-publish recipes"
 fi
 
+
+# --- 6. the TUI pty smoke (blueprint fleet-tui-ink D4) ------------------------
+# The TUI is an Ink app now, and everything that used to be hand-rolled — raw
+# mode, the alternate screen, the cursor, restore on exit — is a library's job.
+# A frame test cannot see any of that: `bun test` runs TTY-free, where Ink turns
+# the alt screen off entirely. So the binary is driven under a REAL pty here.
+#
+# `script` is not installed on every machine this repo is developed on, so
+# tests/lib/pty-smoke.py forks its own pty (python3's `pty.fork`).
+#
+# The environment is DELIBERATELY sterile: a fresh HOME and XDG_CONFIG_HOME so
+# nothing of the developer's ~/.config/grok-fleet leaks in, and an admin URL
+# pointing at a closed port so the smoke can never reach the production API.
+tui_pty_smoke() {
+  local R T out raw
+  R="$ROOT"
+  T="$(mktemp -d)"
+  mkdir -p "$T/home" "$T/xdg"
+  raw="$T/raw"
+
+  # --- 6a. the happy path: paint, then quit ----------------------------------
+  out="$(cd "$R" && env -i \
+      PATH="/usr/bin:/bin" \
+      TERM=xterm-256color \
+      HOME="$T/home" \
+      XDG_CONFIG_HOME="$T/xdg" \
+      FLEET2_ADMIN_URL="http://127.0.0.1:1" \
+      FLEET2_ADMIN_TOKEN=x \
+      python3 tests/lib/pty-smoke.py 5 q "$raw" -- "$R/fleet/dist/fleet2" tui)"
+  # shellcheck disable=SC2086  # the KEY=VALUE lines are meant to be split
+  eval "$out"
+
+  [ "${SAW_HEADER:-0}" = 1 ] \
+    && pass "D4 pty: the TUI paints its header within the timeout" \
+    || bad "D4 pty: no header line painted [$out]"
+  [ "${SAW_LINKDOWN:-0}" = 1 ] \
+    && pass "D4 pty: the LINK DOWN banner is painted (the closed port, not the production API)" \
+    || bad "D4 pty: no LINK DOWN banner [$out]"
+  [ "${RC:-x}" = 0 ] \
+    && pass "D4 pty: 'q' quits with rc 0" \
+    || bad "D4 pty: quitting did not exit 0 (RC=${RC:-?}; -999 means it never exited) [$out]"
+
+  # Ink's unmount order: enter the alt screen, then leave it, then show the
+  # cursor. A restore that never happens leaves the operator's terminal in the
+  # alt screen with no cursor, which is exactly what term.ts existed to prevent.
+  if [ "${ALT_ON:--1}" -ge 0 ]; then
+    pass "D4 pty: the alternate screen is ENTERED (1049h)"
+  else
+    bad "D4 pty: no 1049h in the pty bytes — alternateScreen is not in force"
+  fi
+  if [ "${ALT_OFF:--1}" -gt "${ALT_ON:--1}" ]; then
+    pass "D4 pty: the alternate screen is LEFT after it was entered (1049l after 1049h)"
+  else
+    bad "D4 pty: no 1049l after the 1049h (ALT_ON=${ALT_ON:-?} ALT_OFF=${ALT_OFF:-?})"
+  fi
+  if [ "${CURSOR_ON:--1}" -gt "${ALT_OFF:--1}" ]; then
+    pass "D4 pty: the cursor is shown AFTER the alt screen is left (25h after 1049l)"
+  else
+    bad "D4 pty: no 25h after the 1049l (ALT_OFF=${ALT_OFF:-?} CURSOR_ON=${CURSOR_ON:-?})"
+  fi
+
+  # Nothing of the operator's config was read, and nothing was written into the
+  # sterile HOME: the smoke ran entirely off the two env variables.
+  if [ -d "$T/home/.config/grok-fleet" ] || [ -d "$T/xdg/grok-fleet" ]; then
+    bad "D4 pty: the smoke created a grok-fleet config dir in its sterile HOME/XDG"
+  else
+    pass "D4 pty: no grok-fleet config was read or written (sterile HOME + XDG_CONFIG_HOME)"
+  fi
+
+  # --- 6b. the crash path ----------------------------------------------------
+  # The compiled TUI cannot be told to throw, so the crash barrier is driven
+  # over the SAME render-options factory and the SAME installCrashBarrier the
+  # entry point uses. The point of the barrier is ordering: the teardown bytes
+  # must reach the terminal BEFORE the process exits, and the process must
+  # still exit rather than hang waiting on a stream callback that never fires.
+  if command -v bun >/dev/null 2>&1; then
+    unset RC ALT_ON ALT_OFF CURSOR_ON
+    out="$(cd "$R/fleet" && python3 "$R/tests/lib/pty-smoke.py" 8 "" "$T/raw-crash" -- bun run test/tui/crash-fixture.ts)"
+    # shellcheck disable=SC2086
+    eval "$out"
+    [ "${RC:-x}" != 0 ] && [ "${RC:-x}" != "-999" ] \
+      && pass "D4 pty crash: an uncaught exception ENDS the process (rc ${RC:-?})" \
+      || bad "D4 pty crash: the process did not end non-zero on an uncaught exception (RC=${RC:-?}) [$out]"
+    if [ "${ALT_OFF:--1}" -gt "${ALT_ON:--1}" ] && [ "${CURSOR_ON:--1}" -gt "${ALT_OFF:--1}" ]; then
+      pass "D4 pty crash: the alt screen is left and the cursor restored BEFORE the exit"
+    else
+      bad "D4 pty crash: the teardown bytes did not arrive before the exit (ALT_ON=${ALT_ON:-?} ALT_OFF=${ALT_OFF:-?} CURSOR_ON=${CURSOR_ON:-?})"
+    fi
+  else
+    echo "SKIP: bun not installed; the crash-barrier pty case needs it"
+  fi
+
+  rm -rf "$T"
+}
+if [ ! -x "$ROOT/fleet/dist/fleet2" ]; then
+  # `make test` must keep working on a machine with no bun (see the header), and
+  # that machine cannot have built the binary either.
+  echo "SKIP: fleet/dist/fleet2 is not built; run 'make ts-build' for the TUI pty smoke"
+elif ! command -v python3 >/dev/null 2>&1; then
+  echo "SKIP: python3 not installed; the TUI pty smoke needs it to fork a pty"
+else
+  tui_pty_smoke
+fi
+
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$fail"
