@@ -140,17 +140,43 @@ installer_dryrun_test() {
 }
 [ "$(installer_dryrun_test)" = GATED ] && pass "installer: reconcile service is dry-run until config apply=true (--apply gated)" || bad "installer service not dry-run-gated: [$(installer_dryrun_test)]"
 
-# --uninstall removes exactly what it installed (nothing under grok-fleet left).
+# --uninstall removes exactly what it installed (nothing under grok-fleet left)
+# EXCEPT the state dir, which R2-B3 requires it to leave alone — see the sentinel
+# case below. Units, /opt tree, secrets dir and symlink must all be gone.
 installer_uninstall_test() {
   local pfx; pfx="$(mktemp -d)"
   PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   PREFIX="$pfx" bash "$VPS_INSTALL" --uninstall >/dev/null 2>&1
   local left
-  left="$( find "$pfx" -path '*grok-fleet*' -o -name 'fleet-reconcile*' 2>/dev/null | wc -l | tr -d ' ' )"
+  left="$( find "$pfx" \( -path '*grok-fleet*' -o -name 'fleet-reconcile*' \) \
+             -not -path "$pfx/var/lib/grok-fleet" -not -path "$pfx/var/lib/grok-fleet/*" \
+             2>/dev/null | wc -l | tr -d ' ' )"
   echo "$left"
   rm -rf "$pfx"
 }
-[ "$(installer_uninstall_test)" = 0 ] && pass "installer: --uninstall removes exactly what it installed" || bad "installer --uninstall left files: [$(installer_uninstall_test)]"
+[ "$(installer_uninstall_test)" = 0 ] && pass "installer: --uninstall removes exactly what it installed (state excepted)" || bad "installer --uninstall left files: [$(installer_uninstall_test)]"
+
+# R2-B3: --uninstall MUST LEAVE STATE. The gate seeded a sentinel under a PREFIX
+# state dir and `--uninstall` deleted it, taking the device cache / key-expiry
+# ledger with it. State outlives an install; only units, binaries, symlinks and
+# secrets are ours to remove.
+installer_uninstall_state_test() {
+  local pfx; pfx="$(mktemp -d)"
+  local sentinel="$pfx/var/lib/grok-fleet/preexisting-state-sentinel"
+  mkdir -p "$pfx/var/lib/grok-fleet"
+  printf 'do-not-delete\n' > "$sentinel"
+  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  PREFIX="$pfx" bash "$VPS_INSTALL" --uninstall >/dev/null 2>&1
+  local out=""
+  if [ -f "$sentinel" ] && [ "$(cat "$sentinel")" = "do-not-delete" ]; then out="survived"; else out="REMOVED"; fi
+  # and the things uninstall IS responsible for are still gone
+  [ -e "$pfx/opt/grok-fleet" ] && out="$out+opt-left"
+  [ -e "$pfx/etc/grok-fleet" ] && out="$out+secrets-left"
+  [ -e "$pfx/etc/systemd/system/fleet-reconcile.service" ] && out="$out+unit-left"
+  echo "$out"
+  rm -rf "$pfx"
+}
+[ "$(installer_uninstall_state_test)" = survived ] && pass "installer: --uninstall leaves pre-existing state intact (R2-B3)" || bad "installer --uninstall did not leave state: [$(installer_uninstall_state_test)]"
 
 # The installer must NOT MUTATE sshd/xray/hysteria/wg0 (scope guard). We scan
 # for a mutating command (systemctl/rm/mv/install/sed -i/redirect) on the SAME

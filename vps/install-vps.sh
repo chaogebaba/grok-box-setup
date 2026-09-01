@@ -16,6 +16,7 @@
 # Usage (on the VPS, as root):
 #   sudo bash vps/install-vps.sh              # install / upgrade (idempotent)
 #   sudo bash vps/install-vps.sh --uninstall  # remove EXACTLY what we installed
+#                                             # (never /var/lib/grok-fleet state)
 #
 # NON-GOALS / HARD GUARANTEES:
 #   * NEVER touches global sshd_config, xray, hysteria, WireGuard wg0, cron, or
@@ -84,9 +85,18 @@ uninstall() {
     rm -f "$link"
     log "removed fleet2 symlink $link"
   fi
-  # Secrets + state: remove the dirs WE created. (An operator who wants to keep
-  # the API token should back it up before uninstalling.)
-  rm -rf "$ETC_DIR" "$STATE_DIR"
+  # Secrets: remove the dir WE created. (An operator who wants to keep the API
+  # token should back it up before uninstalling.)
+  rm -rf "$ETC_DIR"
+  # R2-B3: STATE IS NEVER REMOVED. $STATE_DIR holds the device cache, the
+  # per-box key-expiry ledger and the reconcile locks — operator data that
+  # outlives any one install, and that a PREFIX= scratch uninstall was observed
+  # to delete out from under a pre-existing tree. Uninstall removes units,
+  # binaries, symlinks and secrets; it leaves /var/lib/grok-fleet and everything
+  # in it alone. An operator who really wants it gone removes it by hand.
+  if [ -d "$STATE_DIR" ]; then
+    log "left state dir $STATE_DIR intact (remove it by hand if you really want it gone)"
+  fi
   # B-3: remove the sshd drop-in we installed, then re-validate + reload so the
   # daemon returns to its pre-install policy. NEVER touch the main config.
   if [ -e "$SSHD_DROPIN" ]; then

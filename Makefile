@@ -54,11 +54,24 @@ DROPIN_DIR = /etc/systemd/system/fleet-reconcile.service.d
 DROPIN = $(DROPIN_DIR)/fleet2.conf
 SOAK_MARKER = /var/lib/grok-fleet/fleet2.soak-ok
 CONFIG = /opt/grok-fleet/config.toml
+# systemctl is a variable ONLY so the shell test-suite can drive the real
+# recipes against a scratch DROPIN_DIR on a machine with no systemd
+# (SYSTEMCTL=true). Production leaves it at `systemctl`.
+SYSTEMCTL ?= systemctl
 # T2 hazard: $$apply must stay a BARE $apply inside the single-quoted bash -c —
 # $${apply} would be expanded by systemd against the unit env to empty and
 # --apply lost silently. (Makefile $$ ⇒ a literal $ in the recipe.)
 WRAPPER_EXEC = ExecStart=/bin/bash -c 'apply=""; grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" $(CONFIG) && apply="--apply"; exec $(FLEET2_REMOTE) reconcile $$apply'
 SOAK_EXEC = ExecStart=$(FLEET2_REMOTE) reconcile --dry-run
+# R2-B1 (production defect): WRAPPER_EXEC must reach the drop-in file with a
+# LITERAL $apply. Interpolating it into a recipe as "$(WRAPPER_EXEC)" does NOT
+# work: make expands $$apply to a bare $apply in the recipe TEXT, and then the
+# SHELL expands that $apply — inside double quotes — to the empty string. The
+# installed drop-in then ends at `reconcile ` and --apply is lost forever, while
+# `make -n` and any recipe-text assertion still show a healthy bare $apply.
+# Exporting instead hands the fully expanded value to the child through the
+# ENVIRONMENT, which the shell never re-expands; recipes use "$$WRAPPER_EXEC".
+export WRAPPER_EXEC
 
 # ts-cutover: install the WRAPPER drop-in (runtime apply-evaluated). REFUSES
 # (G3/I1) unless the soak marker exists — the wrapper form is only ever installed
@@ -73,11 +86,11 @@ else
 		echo "ts-cutover: REFUSED — no soak marker ($(SOAK_MARKER)); run 'make ts-cutover SOAK=1' for the gate, then 'make ts-apply-flip' after a clean 24h soak" >&2; \
 		exit 1; \
 	fi
-	@printf '%s\n' '[Service]' 'ExecStart=' "$(WRAPPER_EXEC)" > $(DROPIN)
+	@printf '%s\n' '[Service]' 'ExecStart=' "$$WRAPPER_EXEC" > $(DROPIN)
 	@echo "ts-cutover: installed WRAPPER drop-in (runtime apply-evaluated)"
 endif
-	systemctl daemon-reload
-	systemctl cat fleet-reconcile.service | grep -A1 '^ExecStart'
+	$(SYSTEMCTL) daemon-reload
+	@$(SYSTEMCTL) cat fleet-reconcile.service 2>/dev/null | grep -A1 '^ExecStart' || cat $(DROPIN)
 
 # ts-apply-flip: verify a trailing SOAK window (I1 binding; H4/I3), write the
 # marker, and swap the soak drop-in for the wrapper form. SOAK_SINCE may only
@@ -86,9 +99,9 @@ endif
 # non-zero ExecMainStatus / Result=exit-code in the window.
 SOAK_SINCE ?= -24h
 ts-apply-flip:
-	@bash fleet/scripts/apply-flip.sh "$(SOAK_SINCE)" "$(FORCE)" "$(SOAK_MARKER)" "$(DROPIN)" "$(DROPIN_DIR)" "$(WRAPPER_EXEC)"
-	systemctl daemon-reload
-	systemctl cat fleet-reconcile.service | grep -A1 '^ExecStart'
+	@bash fleet/scripts/apply-flip.sh "$(SOAK_SINCE)" "$(FORCE)" "$(SOAK_MARKER)" "$(DROPIN)" "$(DROPIN_DIR)" "$$WRAPPER_EXEC"
+	$(SYSTEMCTL) daemon-reload
+	@$(SYSTEMCTL) cat fleet-reconcile.service 2>/dev/null | grep -A1 '^ExecStart' || cat $(DROPIN)
 
 # ts-cutback: PHASE-3 ROLLBACK. The pre-phase-3 semantic ("rm the drop-in and
 # daemon-reload, back to bash fleetctl") is DEAD: D7 retired bash fleetctl and
@@ -107,5 +120,5 @@ ts-cutback:
 	@mkdir -p $(DROPIN_DIR)
 	@printf '%s\n' '[Service]' 'ExecStart=' '$(SOAK_EXEC)' > $(DROPIN)
 	@echo "ts-cutback: restored $(FLEET2_REMOTE) from .prev and forced the SOAK (dry-run) drop-in"
-	systemctl daemon-reload
-	systemctl cat fleet-reconcile.service | grep -A1 '^ExecStart'
+	$(SYSTEMCTL) daemon-reload
+	@$(SYSTEMCTL) cat fleet-reconcile.service 2>/dev/null | grep -A1 '^ExecStart' || cat $(DROPIN)
