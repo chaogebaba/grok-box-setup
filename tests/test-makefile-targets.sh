@@ -231,5 +231,156 @@ else
   bad "make not available — cannot execute the ts-apply-flip / ts-cutover recipes"
 fi
 
+# =============================================================================
+# 6. RELEASE TOOLING — ts-release-build / ts-release-publish
+#    (blueprint fleet2-release-install D12/D15, acceptance #14/#15/#19)
+# =============================================================================
+# Everything below runs the REAL recipes inside a THROWAWAY GIT REPO under
+# mktemp -d. Nothing touches this checkout, and NOTHING IS EVER PUBLISHED:
+# ts-release-publish is driven with CONFIRM unset at every call site, and its
+# CONFIRM gate is the last check before the only `git tag` / `git push` /
+# `gh release create` in the script. That is deliberate — D12 split publish out
+# of build precisely so no gate's happy path can create a permanent public
+# release. The publish HAPPY PATH is therefore never exercised here; what is
+# exercised is that every refusal fires, and that after the D15 step-2 commit
+# the run gets PAST all of them and stops only at the CONFIRM gate.
+#
+# The bun compile is stubbed via FLEET2_BUILD_CMD (a documented seam in
+# release-build.sh) so this file stays bash-only and fast, per its header.
+release_tests() {
+  local T; T="$(mktemp -d)" || { bad "mktemp -d failed — cannot run the release tests"; return; }
+  local R="$T/repo"
+  mkdir -p "$R/vps" "$R/fleet/src" "$R/fleet/scripts"
+  cp "$ROOT/Makefile" "$R/Makefile"
+  cp "$ROOT/.gitignore" "$R/.gitignore"
+  cp "$ROOT/vps/install-vps.sh" "$R/vps/install-vps.sh"
+  cp "$ROOT/fleet/src/cli.ts" "$R/fleet/src/cli.ts"
+  cp "$ROOT/fleet/scripts/release-build.sh" "$R/fleet/scripts/release-build.sh"
+  cp "$ROOT/fleet/scripts/release-publish.sh" "$R/fleet/scripts/release-publish.sh"
+  # A stand-in for `make ts-build`: writes a deterministic fleet/dist/fleet2.
+  cat > "$T/fakebuild.sh" <<'FAKE'
+#!/bin/bash
+mkdir -p fleet/dist
+printf '#!/bin/bash\necho "fleet2 fake"\n' > fleet/dist/fleet2
+chmod 0755 fleet/dist/fleet2
+FAKE
+  chmod 0755 "$T/fakebuild.sh"
+
+  ( cd "$R" \
+    && git init -q \
+    && git checkout -q -b main 2>/dev/null \
+    && git add -A \
+    && git -c user.email=t@example.invalid -c user.name=test commit -qm init ) \
+    || { bad "could not build the scratch release repo"; rm -rf "$T"; return; }
+
+  # rel <target> [VAR=val ...]: run the real recipe in the scratch repo.
+  # CONFIRM is NEVER set to 1 anywhere in this function.
+  rel() {
+    local target="$1"; shift
+    ( cd "$R" && env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS \
+        FLEET2_BUILD_CMD="bash $T/fakebuild.sh" \
+        make --no-print-directory "$target" "$@" 2>&1 )
+  }
+  scratch_commit() {
+    ( cd "$R" && git add -A \
+      && git -c user.email=t@example.invalid -c user.name=test commit -qm "$1" ) >/dev/null 2>&1
+  }
+  installer_pin() { sed -nE "s/^$1=(.*)\$/\1/p" "$R/vps/install-vps.sh" | head -1; }
+
+  # --- #19a: ts-release-build refuses when ANOTHER tracked file is dirty ------
+  printf '\n# scratch edit\n' >> "$R/fleet/src/cli.ts"
+  local out
+  out="$(rel ts-release-build)"
+  case "$out" in
+    *'REFUSED'*'fleet/src/cli.ts'*'is dirty'*)
+      pass "#19: ts-release-build REFUSES when a tracked file other than the two pin constants is dirty" ;;
+    *) bad "#19: ts-release-build did not refuse on an unrelated dirty file: [$out]" ;;
+  esac
+  ( cd "$R" && git checkout -q -- fleet/src/cli.ts )
+
+  # --- #14: FLEET2_RELEASE != v$PKG_VERSION => refusal -----------------------
+  ( cd "$R" && sed -i 's/^FLEET2_RELEASE=.*/FLEET2_RELEASE=v0.0.1/' vps/install-vps.sh )
+  scratch_commit "mismatched pin tag"
+  out="$(rel ts-release-build)"
+  case "$out" in
+    *'REFUSED'*'FLEET2_RELEASE=v0.0.1'*'PKG_VERSION='*)
+      pass "#14: ts-release-build REFUSES when FLEET2_RELEASE != v\$PKG_VERSION" ;;
+    *) bad "#14: ts-release-build did not refuse on a tag/PKG_VERSION mismatch: [$out]" ;;
+  esac
+  ( cd "$R" && git revert -q --no-edit HEAD 2>/dev/null \
+    || git -c user.email=t@example.invalid -c user.name=test reset -q --hard HEAD~1 )
+
+  # --- build HAPPY PATH (local, network-free) --------------------------------
+  out="$(rel ts-release-build)"
+  local dist="$R/fleet/dist/fleet2-linux-x64"
+  if [ -f "$dist" ] && [ -f "$dist.sha256" ]; then
+    pass "ts-release-build emits fleet/dist/fleet2-linux-x64 + its .sha256"
+  else
+    bad "ts-release-build produced no artifact/.sha256: [$out]"
+  fi
+  local digest; digest="$(sha256sum "$dist" 2>/dev/null | cut -d' ' -f1)"
+  if [ -n "$digest" ] && [ "$(installer_pin FLEET2_SHA256)" = "$digest" ]; then
+    pass "ts-release-build rewrites FLEET2_SHA256 in the installer to the artifact's digest (the pin travels with the release)"
+  else
+    bad "ts-release-build left FLEET2_SHA256=[$(installer_pin FLEET2_SHA256)], artifact digest [$digest]"
+  fi
+  local dirty; dirty="$( cd "$R" && git diff --name-only HEAD | tr '\n' '|' )"
+  if [ "$dirty" = "vps/install-vps.sh|" ]; then
+    pass "ts-release-build leaves ONLY vps/install-vps.sh dirty (D15 step 1)"
+  else
+    bad "ts-release-build left an unexpected dirty set: [$dirty]"
+  fi
+
+  # --- #19b: publish REFUSES on the dirty tree step 1 just left --------------
+  out="$(rel ts-release-publish)"
+  case "$out" in
+    *'REFUSED'*'working tree is dirty'*)
+      pass "#19: ts-release-publish REFUSES on the dirty tree left by ts-release-build (before the commit)" ;;
+    *) bad "#19: ts-release-publish did not refuse on the step-1 dirty tree: [$out]" ;;
+  esac
+
+  # --- #15: after the commit, a MISMATCHED artifact is still refused ---------
+  scratch_commit "release: bump the fleet2 pin"
+  printf 'tamper\n' >> "$dist"
+  out="$(rel ts-release-publish)"
+  case "$out" in
+    *'REFUSED'*'artifact digest != the committed FLEET2_SHA256'*)
+      pass "#15: ts-release-publish REFUSES when the artifact digest != the committed FLEET2_SHA256" ;;
+    *) bad "#15: ts-release-publish did not refuse a digest mismatch: [$out]" ;;
+  esac
+
+  # --- #19c: with the commit made and the artifact matching, every refusal is
+  # PASSED and the run stops only at the CONFIRM gate, having printed the plan.
+  # This is as far as any test may go: the next statement in the script is the
+  # `git tag` / `git push` / `gh release create` that publishes for real.
+  rel ts-release-build >/dev/null
+  scratch_commit "release: restore the matching pin" 2>/dev/null || true
+  out="$(rel ts-release-publish)"
+  case "$out" in
+    *'PLAN'*'CONFIRM=1 not set'*)
+      pass "#19: after the D15 step-2 commit, ts-release-publish clears dirty/main/tag/digest and stops at the CONFIRM gate" ;;
+    *) bad "#19: ts-release-publish did not reach the CONFIRM gate after the commit: [$out]" ;;
+  esac
+  case "$out" in
+    *'no .sha256 asset is published'*)
+      pass "D4: the publish plan states that no same-origin .sha256 asset is published" ;;
+    *) bad "D4: the publish plan does not mention the absent .sha256 asset: [$out]" ;;
+  esac
+
+  # --- nothing was published -------------------------------------------------
+  if [ -z "$( cd "$R" && git tag -l )" ]; then
+    pass "release tests created NO git tag (the publish happy path is never exercised — D12)"
+  else
+    bad "release tests created a git tag in the scratch repo: [$( cd "$R" && git tag -l | tr '\n' ' ')]"
+  fi
+
+  rm -rf "$T"
+}
+if command -v make >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+  release_tests
+else
+  bad "make/git not available — cannot execute the ts-release-build / ts-release-publish recipes"
+fi
+
 if [ "$fail" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$fail"

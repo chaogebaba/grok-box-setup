@@ -518,6 +518,34 @@ fleet2 defaults `FLEET_CONFIG` to **`/opt/grok-fleet/config.toml`** (the systemd
 
 - `make ts-test` — the bun test suite (box-free). `make ts-build` — the compiled `fleet/dist/fleet2` (gitignored; never shipped to boxes). `make ts-deploy` — scp + atomic `mv` to `/opt/grok-fleet/fleet2`, keeping the previous binary as `fleet2.prev` (rollback = `mv fleet2.prev fleet2`).
 
+### Release + install
+
+Hosts do **not** build fleet2. They used to (`vps/install-vps.sh` ran `make ts-build` on the target), which meant provisioning needed bun **and** make **and** a full checkout — and the r2 gate died on the live VPS with `make: command not found`. The installer now downloads one pinned release asset with `curl`. Net host requirement: **curl + sha256sum**.
+
+**Cutting a release — three operator steps, in this order** (build is split from publish so no gate can create a public release as a side effect):
+
+```bash
+make ts-release-build              # local, network-free: builds fleet/dist/fleet2-linux-x64,
+                                   # computes the digest, and rewrites FLEET2_RELEASE +
+                                   # FLEET2_SHA256 in vps/install-vps.sh
+git commit -am 'release: bump the fleet2 pin'    # a normal commit on main
+make ts-release-publish CONFIRM=1  # tags THAT commit and uploads the asset
+```
+
+The tag is created by step 3 at the commit produced by step 2, so the tag always names a commit whose installer pin matches the published bytes. `make ts-release-build` refuses if any tracked file **other than** those two constants is dirty, and refuses if `FLEET2_RELEASE` is not `v$PKG_VERSION` (`fleet/src/cli.ts`), so a version bump cannot silently leave the pin naming an older tag. `make ts-release-publish` refuses on a dirty tree, off `main`, an existing tag, a missing `CONFIRM=1`, **or** an artifact whose digest differs from the committed `FLEET2_SHA256` — the published bytes and the pin can never disagree. It prints exactly what it will do before doing it, and it is the only outward-facing target here: no gate ever runs its happy path.
+
+**How a host installs.** `sudo bash vps/install-vps.sh` from a checkout. Its **preflight** — before `ensure_dirs`, before `ensure_fleet_user`, before anything on the host is touched — fetches `https://github.com/chaogebaba/grok-box-setup/releases/download/<FLEET2_RELEASE>/fleet2-linux-x64` and verifies it against the in-repo `FLEET2_SHA256`. A failed fetch or a failed verify exits rc 1 leaving the host **byte-identical** to before the run: no dirs created, no `fleet` user created, the incumbent engine untouched. No `gh`, no token, no credentials: the repo and the release are public. The incumbent bash `fleetctl` is retired **only after** the verified replacement is live and has passed its `version` smoke test (see the rollback note below).
+
+**Pin / rollback.** The pin is the **sha256, not the tag**. A git tag is mutable (`git tag -f && git push -f --tags`) and so is a release asset (`gh release upload --clobber`), so the tag pins a *name*, not bytes; `FLEET2_RELEASE` is only the fetch address and `FLEET2_SHA256` is the identity. Both are overridable by env, but only **together** — one alone is a refusal, because a rollback legitimately needs both and one alone means fetching bytes nobody pinned:
+
+```bash
+sudo FLEET2_RELEASE=v5.4.0 FLEET2_SHA256=<hex> bash vps/install-vps.sh
+```
+
+**Air-gapped / GitHub-unreachable.** `FLEET2_BINARY=/path/to/fleet2` short-circuits the download and installs those bytes (still smoke-tested with `version`). Checksum verification is skipped — the operator supplied the bytes deliberately — and the installer logs that it did.
+
+**What the checksum does and does not defend against.** It *is* an integrity check against truncated downloads, disk-full writes, a captive portal or proxy answering 200-with-HTML, and a mis-uploaded asset — and, because the digest lives in the repo the operator is already executing, an authenticity control anchored to *that checkout*. It is **NOT** protection against anyone who can write to the release: a compromised GitHub account or token, a malicious collaborator, or GitHub itself. Such an adversary replaces the asset — and any same-origin `.sha256` beside it — in one `gh release upload --clobber`. That is exactly why **no `.sha256` asset is published or consulted**: it would read as supply-chain coverage while adding zero. Do not read this section as supply-chain coverage. No flag skips verification on the download path.
+
 ## fleet2 reconcile (phase 2)
 
 Phase 2 ports the **whole reconcile tick** to `fleet2 reconcile` (blueprint `blueprints/fleet-ts-phase2.md`). It is a faithful port of bash `cmd_reconcile`: device fetch + READ-ONLY latch, per-box decide/execute (mint, rotate, delete-then-rename, rollout, throttled alerts), the config-truth pass, the identity pass, notify, state files, and the exit-code map. Phase-1 modules (Runner, tunnel, DevicesApi, the upgrade engine, the flock re-exec) are reused. Both binaries coexist until phase 3: bash `fleet2` for operator commands, `fleet2` for the tick.
@@ -572,10 +600,20 @@ Since 5.4.0 (phase 3) the brain engine is **fleet2** (bun+TS); the bash
   non-executable, at `$OPT_DIR/fleetctl.retired-c303696` (mode 0644) for ONE
   release (deleted in 5.5.0). To run it manually as an emergency fallback:
   `sudo install -m 0755 /opt/grok-fleet/fleetctl.retired-c303696 /opt/grok-fleet/fleetctl && /opt/grok-fleet/fleetctl reconcile`.
-- **Installer (D7).** `vps/install-vps.sh` builds fleet2 from the checkout
-  (`make ts-build`, requires `bun` on the VPS), installs it to
-  `/opt/grok-fleet/fleet2`, and adds a PATH symlink `/usr/local/bin/fleet2`.
-  `--uninstall` removes the symlink (only when it resolves to our target).
+- **Installer (D7).** `vps/install-vps.sh` fetches the pinned fleet2 release
+  asset and verifies it against the in-repo `FLEET2_SHA256` (§"Release +
+  install"; it used to build from the checkout with `make ts-build`, requiring
+  bun on the VPS), installs it to `/opt/grok-fleet/fleet2`, and adds a PATH
+  symlink `/usr/local/bin/fleet2`. `--uninstall` removes the symlink (only when
+  it resolves to our target).
+- **Retirement ORDERING (the r2 incident).** The retirement above happens only
+  **after** `mv -f` has put a verified, smoke-tested fleet2 live. It used to run
+  first, at the top of `install_fleet2()`, and `install_fleet2 || exit 1`
+  disables `set -e` for the whole function body — so an ENOSPC on the 80 MB
+  copy, a `noexec` mount or a wrong-arch binary did not abort: control reached
+  the `version` smoke test, it failed, and the rollback restores `fleet2.prev`
+  ONLY, never `fleetctl`. Production was left with its engine renamed to a
+  non-executable 0644 file and no replacement. Do not move this block back.
 - **Rollback.** FAST — restore the retired bash binary + its ExecStart and
   `systemctl daemon-reload && systemctl restart fleet-reconcile.timer`. FULL —
   `git checkout c303696 && sudo bash vps/install-vps.sh` (after the phase-3 merge

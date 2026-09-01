@@ -1,11 +1,14 @@
-.PHONY: lint test ts-test ts-build ts-deploy ts-cutover ts-apply-flip ts-cutback
+.PHONY: lint test ts-test ts-build ts-deploy ts-cutover ts-apply-flip ts-cutback \
+        ts-release-build ts-release-publish
 
 lint:
 	bash -n boxup
 	bash -n install.sh
 	bash -n box-bootstrap.sh
 	bash -n vps/install-vps.sh
-	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh || echo "shellcheck not installed; skipped"
+	bash -n fleet/scripts/release-build.sh
+	bash -n fleet/scripts/release-publish.sh
+	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-publish.sh || echo "shellcheck not installed; skipped"
 
 test:
 	bash tests/test-iter3-fixes.sh
@@ -28,6 +31,30 @@ ts-build:
 		--target=bun-linux-x64 --define IS_COMPILED=true \
 		--define FLEET2_GIT_SHA="\"$$(git rev-parse --short HEAD)\"" \
 		--outfile dist/fleet2
+
+# --- release (blueprint fleet2-release-install D12/D15) -----------------------
+# Hosts no longer BUILD fleet2 (they needed bun + make + a checkout, and the r2
+# gate died on `make: command not found`); vps/install-vps.sh downloads a pinned
+# release asset instead. These two targets are how that asset comes to exist.
+#
+# D12 SPLITS build from publish so a gate's happy-path run cannot create a
+# permanent public release as a side effect. D15 is the operator sequence:
+#   1. make ts-release-build                 (local, network-free; rewrites the
+#                                             two pin constants in the installer)
+#   2. git commit that pin bump              (a normal commit on main)
+#   3. make ts-release-publish CONFIRM=1     (tags THAT commit, uploads the asset)
+# The tag is created in step 3 at the commit from step 2, so the tag always names
+# a commit whose installer pin matches the published bytes.
+FLEET2_ASSET        = fleet2-linux-x64
+FLEET2_DIST         = fleet/dist/$(FLEET2_ASSET)
+FLEET2_REPO        ?= chaogebaba/grok-box-setup
+FLEET2_INSTALLER    = vps/install-vps.sh
+
+ts-release-build:
+	@bash fleet/scripts/release-build.sh "$(FLEET2_INSTALLER)" "$(FLEET2_DIST)"
+
+ts-release-publish:
+	@bash fleet/scripts/release-publish.sh "$(FLEET2_INSTALLER)" "$(FLEET2_DIST)" "$(FLEET2_REPO)" "$(CONFIRM)"
 
 # Atomic deploy (D10/S9): scp to a temp name, keep the previous binary as
 # fleet2.prev, chmod, then `mv -f` over the live path, and smoke `version`.

@@ -15,6 +15,13 @@
 #              until config apply=true; the scope guard (never mutates sshd/xray/
 #              hysteria/wg0); the reconcile timer cadence (M20) and the ExecStart
 #              --apply wrapper gate (M21); sshd is reloaded never restarted (M19).
+#   release path (blueprint fleet2-release-install) the fetch+verify PREFLIGHT
+#              (curl/sha256sum refusals, the FLEET2_RELEASE+FLEET2_SHA256 pin
+#              pairing), the D10 `file://` fixture origin (good body / corrupt
+#              body / 404 / a 200 carrying an HTML error page), the D2 promise
+#              that a failed acquisition leaves the tree BYTE-IDENTICAL, and the
+#              D13 ordering fix: the incumbent fleetctl is retired only AFTER a
+#              verified replacement is live.
 #   sshd drop-in  the rendered 50-grok-fleet.conf carries `PermitListen any` (no
 #              literal per-port list), PermitOpen none, the Match User fleet block
 #              with ClientAlive{Interval,CountMax}; upgrade replaces a hand-widened
@@ -42,14 +49,51 @@ extract_from() {
 }
 
 # =============================================================================
+# THE FLEET2_BINARY STUB (blueprint fleet2-release-install D7) — READ THIS
+# BEFORE EDITING ANY CALL SITE BELOW.
+# =============================================================================
+# Since D1 the installer FETCHES an ~80 MB release asset with curl instead of
+# building it on the host. This file drives `bash "$VPS_INSTALL"` at ~14 sites;
+# without a stub each one would perform a real download (~1 GB per `make test`)
+# in a suite that advertises "local, box-free, VPS-free coverage". So every call
+# site passes FLEET2_BINARY="$STUB": an executable that exits 0 on `version`,
+# which is exactly what install_fleet2's smoke test runs.
+#
+# *** THE TWO DELIBERATE EXCEPTIONS (D14) ***
+# installer_curl_missing_test and installer_sha256sum_missing_test do NOT set
+# FLEET2_BINARY, and MUST NOT. FLEET2_BINARY short-circuits the whole preflight,
+# so setting it there would mean the curl/sha256sum refusal can never fire —
+# both cases would become permanently-green no-ops asserting nothing. They are
+# safe without it because the preflight refuses on the MISSING TOOL before any
+# fetch is attempted, so no download happens even with the fetch path live.
+# Each of the two grants the OTHER tool on PATH, for the same reason: granting
+# both would leave nothing missing, and the refusal could never fire.
+# Do NOT "fix" those two by adding FLEET2_BINARY.
+#
+# The fixture tests further down use FLEET2_BASE_URL (D10) with a `file://`
+# origin instead, because they exercise the fetch/verify code FLEET2_BINARY
+# deliberately skips.
+STUB_DIR="$(mktemp -d)"
+trap 'rm -rf "$STUB_DIR"' EXIT
+STUB="$STUB_DIR/fleet2-stub"
+cat > "$STUB" <<'STUBEOF'
+#!/bin/bash
+# Stand-in for the release binary: the installer only ever runs `version`.
+[ "${1:-}" = version ] && echo "fleet2 stub (test)"
+exit 0
+STUBEOF
+chmod 0755 "$STUB"
+STUB_SHA="$(sha256sum "$STUB" | cut -d' ' -f1)"
+
+# =============================================================================
 # INSTALLER — vps/install-vps.sh idempotency + --uninstall (fake root PREFIX).
 # =============================================================================
 installer_idem_test() {
   local pfx; pfx="$(mktemp -d)"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1 || { echo "INSTALL1-FAIL"; rm -rf "$pfx"; return; }
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1 || { echo "INSTALL1-FAIL"; rm -rf "$pfx"; return; }
   local a b
   a="$( (cd "$pfx" && find . -type f -exec sha256sum {} \; | sort) )"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1 || { echo "INSTALL2-FAIL"; rm -rf "$pfx"; return; }
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1 || { echo "INSTALL2-FAIL"; rm -rf "$pfx"; return; }
   b="$( (cd "$pfx" && find . -type f -exec sha256sum {} \; | sort) )"
   if [ "$a" = "$b" ]; then echo "IDENTICAL"; else echo "DIFFERED"; fi
   rm -rf "$pfx"
@@ -59,7 +103,7 @@ installer_idem_test() {
 # The installed tree has exactly the expected files and NOTHING else.
 installer_tree_test() {
   local pfx; pfx="$(mktemp -d)"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   ( cd "$pfx" && find . -type f | sort | sed "s#^\./##" ) | tr '\n' '|'
   rm -rf "$pfx"
 }
@@ -85,7 +129,7 @@ fi
 # /usr/local/bin). m17 (symlink not PREFIX-rooted) ⇒ the scratch link is absent ⇒ killed.
 installer_symlink_test() {
   local pfx; pfx="$(mktemp -d)"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   local link="$pfx/usr/local/bin/fleet2"
   if [ -L "$link" ] && [ "$(readlink "$link")" = "/opt/grok-fleet/fleet2" ]; then echo "OK"; else echo "MISSING:[$link -> $(readlink "$link" 2>/dev/null)]"; fi
   rm -rf "$pfx"
@@ -96,7 +140,7 @@ installer_symlink_test() {
 # incumbent $OPT_DIR/fleetctl retires it to fleetctl.retired-c303696 mode 0644.
 installer_fresh_no_retired_test() {
   local pfx; pfx="$(mktemp -d)"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   if [ -e "$pfx/opt/grok-fleet/fleetctl.retired-c303696" ]; then echo "HAS-RETIRED"; else echo "NONE"; fi
   rm -rf "$pfx"
 }
@@ -106,33 +150,62 @@ installer_retire_incumbent_test() {
   local pfx; pfx="$(mktemp -d)"
   mkdir -p "$pfx/opt/grok-fleet"
   printf '#!/bin/bash\necho old\n' > "$pfx/opt/grok-fleet/fleetctl"; chmod 0755 "$pfx/opt/grok-fleet/fleetctl"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   local r="$pfx/opt/grok-fleet/fleetctl.retired-c303696"
   if [ -e "$r" ] && [ "$(stat -c '%a' "$r")" = 644 ] && [ ! -e "$pfx/opt/grok-fleet/fleetctl" ]; then echo "RETIRED-0644"; else echo "WRONG:[$(ls -la "$pfx/opt/grok-fleet/" 2>&1 | tr '\n' ';')]"; fi
   rm -rf "$pfx"
 }
 [ "$(installer_retire_incumbent_test)" = RETIRED-0644 ] && pass "installer (M6/Q4): install over an incumbent retires bash fleetctl to .retired-c303696 mode 0644" || bad "installer retire-incumbent wrong: [$(installer_retire_incumbent_test)]"
 
-# T8 (Q3): bun-missing PREFLIGHT refuses rc 1 with the install hint, before any
-# mutation. Shadow PATH so `command -v bun` fails; assert rc 1 + the hint.
-installer_bun_missing_test() {
+# D6/D14 (replaces the retired installer_bun_missing_test, which asserted the
+# `bun not found on PATH` refusal D6 deletes): the PREFLIGHT refuses rc 1 with an
+# install hint when a tool the FETCH path needs is absent — before any mutation.
+# `make` and `bun` are gone from the allowlist: since D1 the host builds nothing.
+#
+# D14: this takes TWO cases, each granting the OTHER tool. Granting both would
+# leave nothing missing, the preflight would pass, and the refusal could never
+# fire — a permanently-green no-op. NEITHER case sets FLEET2_BINARY (see the
+# stub header at the top of this file): FLEET2_BINARY short-circuits the whole
+# preflight and would make both cases vacuous. They cause no download because
+# the preflight refuses on the missing tool BEFORE any fetch is attempted.
+installer_tool_missing_test() {
+  local grant="$1"                       # the ONE of curl/sha256sum we DO grant
   local pfx; pfx="$(mktemp -d)"; local bindir; bindir="$(mktemp -d)"
-  # A PATH with only the coreutils the installer needs, minus bun.
-  for b in bash sh env mktemp install mv cp rm mkdir chmod chown ln grep sed awk cat printf find sort getent id touch stat readlink rmdir dirname cut make; do
+  local b src
+  for b in bash sh env mktemp install mv cp rm mkdir chmod chown ln grep sed awk cat printf find sort getent id touch stat readlink rmdir dirname cut "$grant"; do
     src="$(command -v "$b" 2>/dev/null)"; [ -n "$src" ] && ln -sf "$src" "$bindir/$b" 2>/dev/null || true
   done
   local out rc
   out="$(PREFIX="$pfx" PATH="$bindir" bash "$VPS_INSTALL" 2>&1)"; rc=$?
+  # Nothing may have been created under the PREFIX either (D2): the refusal is
+  # in the preflight, so ensure_dirs never ran.
+  local created; created="$(find "$pfx" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
   rm -rf "$pfx" "$bindir"
-  if [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'bun not found on PATH' && printf '%s' "$out" | grep -q 'bun.sh/install'; then echo "REFUSED-1"; else echo "WRONG:rc=$rc"; fi
+  printf 'rc=%s created=%s|%s\n' "$rc" "$created" "$out"
 }
-[ "$(installer_bun_missing_test)" = REFUSED-1 ] && pass "installer (Q3): bun-missing PREFLIGHT refuses rc 1 with the install hint" || bad "installer bun-missing wrong: [$(installer_bun_missing_test)]"
+# The two D14 cases, under the names the blueprint gives them. Each grants the
+# OTHER tool; neither sets FLEET2_BINARY.
+installer_curl_missing_test()      { installer_tool_missing_test sha256sum; }
+installer_sha256sum_missing_test() { installer_tool_missing_test curl; }
+
+curl_missing="$(installer_curl_missing_test)"
+case "$curl_missing" in
+  rc=1\ created=0\|*'curl not found on PATH'*'apt-get install -y curl'*)
+    pass "installer (D6/D14): curl-missing PREFLIGHT refuses rc 1 with the install hint, nothing created" ;;
+  *) bad "installer curl-missing wrong: [$curl_missing]" ;;
+esac
+sha_missing="$(installer_sha256sum_missing_test)"
+case "$sha_missing" in
+  rc=1\ created=0\|*'sha256sum not found on PATH'*'apt-get install -y coreutils'*)
+    pass "installer (D6/D14): sha256sum-missing PREFLIGHT refuses rc 1 with the install hint, nothing created" ;;
+  *) bad "installer sha256sum-missing wrong: [$sha_missing]" ;;
+esac
 
 # The reconcile service is DRY-RUN by default (no bare --apply baked in; the
 # wrapper only adds it when config apply=true).
 installer_dryrun_test() {
   local pfx; pfx="$(mktemp -d)"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   local svc="$pfx/etc/systemd/system/fleet-reconcile.service"
   # apply must be GATED on the config grep, never unconditional.
   if grep -q 'apply="--apply"' "$svc" && grep -q 'grep -Eq' "$svc"; then echo "GATED"; else echo "UNGATED"; fi
@@ -145,7 +218,7 @@ installer_dryrun_test() {
 # case below. Units, /opt tree, secrets dir and symlink must all be gone.
 installer_uninstall_test() {
   local pfx; pfx="$(mktemp -d)"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   PREFIX="$pfx" bash "$VPS_INSTALL" --uninstall >/dev/null 2>&1
   local left
   left="$( find "$pfx" \( -path '*grok-fleet*' -o -name 'fleet-reconcile*' \) \
@@ -165,7 +238,7 @@ installer_uninstall_state_test() {
   local sentinel="$pfx/var/lib/grok-fleet/preexisting-state-sentinel"
   mkdir -p "$pfx/var/lib/grok-fleet"
   printf 'do-not-delete\n' > "$sentinel"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   PREFIX="$pfx" bash "$VPS_INSTALL" --uninstall >/dev/null 2>&1
   local out=""
   if [ -f "$sentinel" ] && [ "$(cat "$sentinel")" = "do-not-delete" ]; then out="survived"; else out="REMOVED"; fi
@@ -187,6 +260,240 @@ if [ -z "$mutate_lines" ]; then
   pass "installer: never MUTATES sshd/xray/hysteria/wg0 (scope guarantee holds)"
 else
   bad "installer appears to MUTATE sshd/xray/hysteria/wg0: $mutate_lines"
+fi
+
+echo "-----"
+
+# =============================================================================
+# RELEASE FETCH PATH + ORDERING (blueprint fleet2-release-install D1-D6, D10,
+# D13). Offline: every case below drives a `file://` fixture origin or the
+# FLEET2_BINARY hatch. Nothing here touches the network.
+# =============================================================================
+
+# --- D16 (acceptance #16), THE HEADLINE CASE ---------------------------------
+# The fleetctl retirement must happen AFTER a verified replacement is live, not
+# before. Until D13 the installer renamed the live engine to a NON-EXECUTABLE
+# 0644 file first and only then copied and smoke-tested the replacement — and
+# the rollback restores fleet2.prev ONLY, never fleetctl. That is how production
+# ended up with a renamed engine and no replacement.
+#
+# Vehicle: FLEET2_BINARY= pointing at a stub that exits NON-ZERO on `version`.
+# Truncation cannot be used here — down the fetch path D4's digest check refuses
+# a bad file in the preflight, long before the smoke test. This stub stands in
+# for the real failures the smoke test is there to catch: ENOSPC on the 80 MB
+# copy, a `noexec` mount, a wrong-arch binary.
+installer_retire_ordering_test() {
+  local pfx sd; pfx="$(mktemp -d)"; sd="$(mktemp -d)"
+  mkdir -p "$pfx/opt/grok-fleet"
+  printf '#!/bin/bash\necho old-engine\n' > "$pfx/opt/grok-fleet/fleetctl"
+  chmod 0755 "$pfx/opt/grok-fleet/fleetctl"
+  local badbin="$sd/fleet2-bad"
+  printf '#!/bin/bash\nexit 3\n' > "$badbin"; chmod 0755 "$badbin"
+  local rc r
+  FLEET2_BINARY="$badbin" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1; rc=$?
+  r="rc=$rc"
+  if [ -e "$pfx/opt/grok-fleet/fleetctl" ]; then r="$r fleetctl=present"; else r="$r fleetctl=GONE"; fi
+  if [ -x "$pfx/opt/grok-fleet/fleetctl" ]; then r="$r exec=yes"; else r="$r exec=NO"; fi
+  if [ -e "$pfx/opt/grok-fleet/fleetctl.retired-c303696" ]; then r="$r retired=YES"; else r="$r retired=no"; fi
+  rm -rf "$pfx" "$sd"
+  echo "$r"
+}
+ord="$(installer_retire_ordering_test)"
+if [ "$ord" = "rc=1 fleetctl=present exec=yes retired=no" ]; then
+  pass "installer (D13/#16): a failed 'version' smoke test leaves the incumbent fleetctl present + executable, NOT retired"
+else
+  bad "D13/#16 ORDERING DEFECT: [$ord] want [rc=1 fleetctl=present exec=yes retired=no]"
+fi
+
+# --- D10 fixture origin -------------------------------------------------------
+# FLEET2_BASE_URL is a seam because the security-critical paths are UNTESTABLE
+# against github.com: there is no controllable origin, no way to serve a corrupt
+# body or an HTML error page, and no release exists yet. A `file://` origin
+# drives the identical curl + sha256sum code. FLEET2_BINARY does not substitute
+# here — it SKIPS verification, which is exactly the code under test.
+fixture_origin() {
+  local mode="$1" dir="$2"
+  mkdir -p "$dir/v9.9.9"
+  case "$mode" in
+    good)    cp "$STUB" "$dir/v9.9.9/fleet2-linux-x64" ;;
+    corrupt) head -c 12 "$STUB" > "$dir/v9.9.9/fleet2-linux-x64" ;;
+    html)    printf '<!DOCTYPE html><html><head><title>Not Found</title></head><body>404</body></html>\n' > "$dir/v9.9.9/fleet2-linux-x64" ;;
+    absent)  : ;;   # a 404: no asset at that address at all
+  esac
+}
+
+# snap: the acceptance-#13 host snapshot — every path with its size and mode.
+snap() { ( cd "$1" && find . -printf '%p %s %m\n' 2>/dev/null | sort ); }
+
+# fetch_run <mode>: seed a PREFIX holding a LIVE incumbent fleetctl, snapshot it,
+# run the installer against a <mode> fixture origin, snapshot again.
+# Echoes: rc=<n> why=<...> tree=<SAME|CHANGED> fleetctl=<...> retired=<...> fleet2=<...>
+#
+# `why=` names WHICH refusal fired, and is load-bearing: without it the download
+# refusal is untestable, because the digest check downstream would refuse a
+# never-created file too and rc/tree would look identical. Asserting the reason
+# is what makes each guard individually provable by mutation.
+fetch_run() {
+  local mode="$1"
+  local pfx fx; pfx="$(mktemp -d)"; fx="$(mktemp -d)"
+  mkdir -p "$pfx/opt/grok-fleet"
+  printf '#!/bin/bash\necho old-engine\n' > "$pfx/opt/grok-fleet/fleetctl"
+  chmod 0755 "$pfx/opt/grok-fleet/fleetctl"
+  fixture_origin "$mode" "$fx"
+  local before after out rc r
+  before="$(snap "$pfx")"
+  out="$(PREFIX="$pfx" FLEET2_BASE_URL="file://$fx" FLEET2_RELEASE=v9.9.9 FLEET2_SHA256="$STUB_SHA" \
+    bash "$VPS_INSTALL" 2>&1)"; rc=$?
+  after="$(snap "$pfx")"
+  r="rc=$rc"
+  case "$out" in
+    *'could not download'*) r="$r why=download" ;;
+    *'sha256 MISMATCH'*)    r="$r why=digest" ;;
+    *)                      r="$r why=none" ;;
+  esac
+  if [ "$before" = "$after" ]; then r="$r tree=SAME"; else r="$r tree=CHANGED"; fi
+  if [ -e "$pfx/opt/grok-fleet/fleetctl" ]; then r="$r fleetctl=present"; else r="$r fleetctl=GONE"; fi
+  if [ -e "$pfx/opt/grok-fleet/fleetctl.retired-c303696" ]; then r="$r retired=YES"; else r="$r retired=no"; fi
+  if [ -x "$pfx/opt/grok-fleet/fleet2" ] \
+     && [ "$(sha256sum "$pfx/opt/grok-fleet/fleet2" | cut -d' ' -f1)" = "$STUB_SHA" ] \
+     && "$pfx/opt/grok-fleet/fleet2" version >/dev/null 2>&1; then
+    r="$r fleet2=pinned-and-runs"
+  elif [ -e "$pfx/opt/grok-fleet/fleet2" ]; then r="$r fleet2=WRONG"
+  else r="$r fleet2=absent"; fi
+  rm -rf "$pfx" "$fx"
+  echo "$r"
+}
+
+# #1/#13: a 404 (an unpublished tag, the state `main` is in between the phase-3
+# merge and the first release) exits rc 1 from the PREFLIGHT and leaves the tree
+# BYTE-IDENTICAL. Note the snapshot is the real test: under D2 install_fleet2 is
+# never called at all, so "install_fleet2 returns 1" is not assertable.
+# The "no fleet user was created" clause of #13 is kept for the record but is
+# VACUOUS under PREFIX: ensure_fleet_user returns early when PREFIX is set, so
+# this suite cannot prove it — only a real (PREFIX-less) run could.
+r404="$(fetch_run absent)"
+if [ "$r404" = "rc=1 why=download tree=SAME fleetctl=present retired=no fleet2=absent" ]; then
+  pass "installer (D2/#1): a 404 on the pinned tag exits rc 1 from the preflight, tree byte-identical, fleetctl untouched"
+else
+  bad "#1 404 case wrong: [$r404]"
+fi
+
+# #2/#12: a corrupt (truncated) body — 200, wrong bytes — is refused on the
+# digest, the download is deleted, and the tree is byte-identical.
+rcorrupt="$(fetch_run corrupt)"
+if [ "$rcorrupt" = "rc=1 why=digest tree=SAME fleetctl=present retired=no fleet2=absent" ]; then
+  pass "installer (D4/#2): a corrupt body fails the sha256 check, rc 1, tree byte-identical"
+else
+  bad "#2 corrupt case wrong: [$rcorrupt]"
+fi
+
+# #12: a captive portal / proxy answering 200 with an HTML error page. Same
+# refusal, via the digest — which is the point of verifying at all.
+rhtml="$(fetch_run html)"
+if [ "$rhtml" = "rc=1 why=digest tree=SAME fleetctl=present retired=no fleet2=absent" ]; then
+  pass "installer (D4/#12): a 200 whose body is an HTML error page fails the sha256 check, rc 1, tree byte-identical"
+else
+  bad "#12 html-body case wrong: [$rhtml]"
+fi
+
+# #4/#12/#17: the happy fetch path. The installed file's sha256 equals the pin
+# AND the binary's `version` exits 0 (acceptance #4 is not runnable as written —
+# "version matches the pinned sha256" — so it is implemented as those two).
+# #17: retirement DOES happen on the success path, after the replacement is live.
+rgood="$(fetch_run good)"
+if [ "$rgood" = "rc=0 why=none tree=CHANGED fleetctl=GONE retired=YES fleet2=pinned-and-runs" ]; then
+  pass "installer (D1/#4): a good fetch installs the pinned bytes, 'version' runs, and the incumbent is retired AFTER (#17)"
+else
+  bad "#4 good-fetch case wrong: [$rgood]"
+fi
+
+# #8: the fetch path leaves NO download temp and NO .sha256 in $OPT_DIR — the
+# download lives outside $PREFIX entirely (D2/D7) and is cleaned up by the trap.
+installer_tree_fetch_test() {
+  local pfx fx; pfx="$(mktemp -d)"; fx="$(mktemp -d)"
+  fixture_origin good "$fx"
+  PREFIX="$pfx" FLEET2_BASE_URL="file://$fx" FLEET2_RELEASE=v9.9.9 FLEET2_SHA256="$STUB_SHA" \
+    bash "$VPS_INSTALL" >/dev/null 2>&1
+  ( cd "$pfx" && find . -type f | sort | sed "s#^\./##" ) | tr '\n' '|'
+  rm -rf "$pfx" "$fx"
+}
+tree_fetch="$(installer_tree_fetch_test | sed 's#etc/grok-fleet/|##')"
+if [ "$tree_fetch" = "$expected_norm" ]; then
+  pass "installer (D7/#8): the FETCH path leaves no download temp and no .sha256 in \$OPT_DIR"
+else
+  bad "#8 fetch-path tree unexpected: [$tree_fetch] want [$expected_norm]"
+fi
+
+# #5 (D3): the tag is only an address; the sha256 is the identity. Overriding one
+# without the other means fetching bytes the operator has not pinned ⇒ refusal.
+# No FLEET2_BINARY here on purpose: the pairing check runs first in the preflight,
+# so nothing is fetched and nothing is created.
+installer_pin_pairing_test() {
+  local which="$1" pfx out rc created
+  pfx="$(mktemp -d)"
+  case "$which" in
+    release) out="$(PREFIX="$pfx" FLEET2_RELEASE=v9.9.9 bash "$VPS_INSTALL" 2>&1)"; rc=$? ;;
+    *)       out="$(PREFIX="$pfx" FLEET2_SHA256="$STUB_SHA" bash "$VPS_INSTALL" 2>&1)"; rc=$? ;;
+  esac
+  created="$(find "$pfx" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+  rm -rf "$pfx"
+  printf 'rc=%s created=%s|%s\n' "$rc" "$created" "$out"
+}
+for w in release:FLEET2_RELEASE sha:FLEET2_SHA256; do
+  pp="$(installer_pin_pairing_test "${w%%:*}")"
+  case "$pp" in
+    rc=1\ created=0\|*'must be overridden TOGETHER'*)
+      pass "installer (D3/#5): ${w##*:} set alone ⇒ refusal rc 1, nothing created" ;;
+    *) bad "#5 pin-pairing (${w##*:}) wrong: [$pp]" ;;
+  esac
+done
+
+# #6: THE ACTUAL r2 PRODUCTION FAILURE. The gate died on `make: command not
+# found` while building fleet2 on the VPS. With neither bun NOR make on PATH the
+# install must now succeed — the host requirement went from bun + make + a full
+# checkout to curl + sha256sum.
+installer_no_bun_no_make_test() {
+  local pfx fx bindir b src rc have hasbun hasmake
+  pfx="$(mktemp -d)"; fx="$(mktemp -d)"; bindir="$(mktemp -d)"
+  fixture_origin good "$fx"
+  for b in bash sh env mktemp install mv cp rm mkdir chmod chown ln grep sed awk cat printf find sort getent id touch stat readlink rmdir dirname cut cmp curl sha256sum; do
+    src="$(command -v "$b" 2>/dev/null)"; [ -n "$src" ] && ln -sf "$src" "$bindir/$b" 2>/dev/null || true
+  done
+  PREFIX="$pfx" PATH="$bindir" FLEET2_BASE_URL="file://$fx" FLEET2_RELEASE=v9.9.9 FLEET2_SHA256="$STUB_SHA" \
+    bash "$VPS_INSTALL" >/dev/null 2>&1; rc=$?
+  have=no; [ -x "$pfx/opt/grok-fleet/fleet2" ] && have=yes
+  hasbun=yes; PATH="$bindir" command -v bun >/dev/null 2>&1 || hasbun=no
+  hasmake=yes; PATH="$bindir" command -v make >/dev/null 2>&1 || hasmake=no
+  rm -rf "$pfx" "$fx" "$bindir"
+  echo "rc=$rc fleet2=$have bun=$hasbun make=$hasmake"
+}
+nbm="$(installer_no_bun_no_make_test)"
+if [ "$nbm" = "rc=0 fleet2=yes bun=no make=no" ]; then
+  pass "installer (D1/#6): install succeeds with NEITHER bun NOR make on PATH (the r2 production failure)"
+else
+  bad "#6 no-bun-no-make wrong: [$nbm] want [rc=0 fleet2=yes bun=no make=no]"
+fi
+
+# D7: exactly ONE real-network test, SKIPPED BY DEFAULT. Every case above is
+# offline; this is the only one that touches github.com, and it needs a
+# published release. Enable it with FLEET2_TEST_REAL_FETCH=1.
+if [ "${FLEET2_TEST_REAL_FETCH:-0}" = 1 ]; then
+  real_fetch_test() {
+    local pfx rc; pfx="$(mktemp -d)"
+    # No FLEET2_BASE_URL, no FLEET2_RELEASE/FLEET2_SHA256 overrides: this uses
+    # the COMMITTED pin against the real release origin.
+    PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1; rc=$?
+    local r="rc=$rc"
+    if [ -x "$pfx/opt/grok-fleet/fleet2" ] && "$pfx/opt/grok-fleet/fleet2" version >/dev/null 2>&1; then
+      r="$r fleet2=runs"
+    else r="$r fleet2=BAD"; fi
+    rm -rf "$pfx"
+    echo "$r"
+  }
+  rf="$(real_fetch_test)"
+  [ "$rf" = "rc=0 fleet2=runs" ] && pass "installer (#4): REAL fetch of the committed pin installs and runs" || bad "#4 real fetch wrong: [$rf]"
+else
+  pass "installer (D7): the real-fetch test is SKIPPED by default (FLEET2_TEST_REAL_FETCH=1 to run it) — the suite downloads nothing"
 fi
 
 echo "-----"
@@ -215,7 +522,7 @@ fi
 # the INSTALLED unit, so a change to 10min is caught.
 m20_test() {
   local pfx; pfx="$(mktemp -d)"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   grep -E '^OnUnitActiveSec=' "$pfx/etc/systemd/system/fleet-reconcile.timer" | tr -d ' '
   rm -rf "$pfx"
 }
@@ -226,7 +533,7 @@ m20_test() {
 # If the grep gate is inverted (M21), apply=false would wrongly add --apply.
 m21_test() {
   local applyval="$1" pfx; pfx="$(mktemp -d)"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   local cfg="$pfx/opt/grok-fleet/config.toml"
   # Force the config's apply value.
   sed -i "s/^apply = .*/apply = $applyval/" "$cfg"
@@ -264,7 +571,7 @@ echo "-----"
 # Match block. Reuses the installer PREFIX harness.
 dropin_render() {
   local pfx; pfx="$(mktemp -d)"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   cat "$pfx/etc/ssh/sshd_config.d/50-grok-fleet.conf"
   rm -rf "$pfx"
 }
@@ -298,7 +605,7 @@ Match User fleet
     PermitOpen none
     PermitListen 127.0.0.1:20001 127.0.0.1:20002 127.0.0.1:20003 127.0.0.1:20004 127.0.0.1:20005 127.0.0.1:20006 127.0.0.1:20007 127.0.0.1:20008 127.0.0.1:20009 127.0.0.1:20010 127.0.0.1:20011
 OLD
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   cat "$pfx/etc/ssh/sshd_config.d/50-grok-fleet.conf"
   rm -rf "$pfx"
 }
@@ -318,7 +625,7 @@ dropin_bak_survives() {
   local pfx; pfx="$(mktemp -d)"; local d="$pfx/etc/ssh/sshd_config.d"
   mkdir -p "$d"
   : > "$d/50-grok-fleet.conf.bak.20260829T153543Z"
-  PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   if [ -e "$d/50-grok-fleet.conf.bak.20260829T153543Z" ]; then echo SURVIVED; else echo GONE; fi
   rm -rf "$pfx"
 }

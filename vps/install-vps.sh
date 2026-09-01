@@ -5,7 +5,8 @@
 # set, on a shared host we do NOT own the policy of. Scope is deliberately tiny
 # and auditable:
 #
-#   /opt/grok-fleet        fleet2 (built from THIS repo) + config.toml template
+#   /opt/grok-fleet        fleet2 (a pinned release asset, fetched + sha256-
+#                          verified by the preflight) + config.toml template
 #   fleet user             shell-less, key-only, password-locked; its
 #                          authorized_keys is managed by `fleet2 enroll`
 #   /etc/grok-fleet        600 secrets dir (API token, box-access key)
@@ -50,6 +51,54 @@ SSHD_DROPIN_DIR="$PREFIX/etc/ssh/${SSHD_CONF_D:-sshd_config.d}"
 SSHD_DROPIN="$SSHD_DROPIN_DIR/50-grok-fleet.conf"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# --- fleet2 release pin (blueprint fleet2-release-install, D1/D3) -------------
+# The host no longer BUILDS fleet2 (it needed bun + make + a full checkout, and
+# the r2 gate died on `make: command not found`). It downloads a pinned release
+# asset with curl instead.
+#
+# D3 — THE PIN IS THE SHA256, NOT THE TAG. A git tag is mutable
+# (`git tag -f && git push -f --tags`) and a release asset is mutable
+# (`gh release upload --clobber`), so the tag pins a NAME, not bytes. The tag is
+# only the fetch ADDRESS; FLEET2_SHA256 is the identity, and it lives HERE, in
+# the repo the operator is already executing.
+#
+# Both are overridable by env FOR ROLLBACK, but only TOGETHER (D3): a rollback
+# legitimately needs both, and one alone means the operator is fetching bytes
+# they have not pinned. Capture what the environment supplied BEFORE the
+# committed pin shadows it, so the preflight can tell the two apart.
+FLEET2_RELEASE_ENV="${FLEET2_RELEASE-}"
+FLEET2_SHA256_ENV="${FLEET2_SHA256-}"
+# `make ts-release-build` rewrites EXACTLY these two lines (fleet/scripts/
+# release-build.sh); keep them at column 0 in `NAME=value` form.
+FLEET2_RELEASE=v5.4.0
+# Placeholder until the first `make ts-release-build` writes the real digest.
+# Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
+FLEET2_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+
+# D10 — the fetch ORIGIN is a seam so the security-critical paths (good fetch,
+# corrupt body, 404, a 200 whose body is an HTML error page) can be tested
+# against a local fixture instead of github.com, which is not controllable.
+FLEET2_BASE_URL="${FLEET2_BASE_URL:-https://github.com/chaogebaba/grok-box-setup/releases/download}"
+FLEET2_ASSET="${FLEET2_ASSET:-fleet2-linux-x64}"
+
+# D5 — operator escape hatch: install THESE bytes and skip the download entirely
+# (dev loop, air-gapped provisioning, GitHub unreachable). Checksum verification
+# is skipped, and the installer LOGS that it was.
+FLEET2_BINARY="${FLEET2_BINARY:-}"
+
+# Peak disk during an install is ~320 MB (fetch temp + $OPT_DIR temp + fleet2 +
+# fleet2.prev) and the brain VPS has ~961 MB with a possibly-tmpfs default
+# TMPDIR, so the download goes on an EXPLICITLY named real-disk path, never
+# $TMPDIR. It is deliberately NOT under $PREFIX: a failed preflight must leave
+# the install tree BYTE-IDENTICAL (D2), and creating $PREFIX/var/... for a
+# scratch file would break exactly that. Removed on every exit path (trap).
+FLEET2_FETCH_ROOT="${FLEET2_FETCH_ROOT:-/var/tmp}"
+
+# Set by the preflight; consumed by install_fleet2 (D1 REBIND). Always bound so
+# `set -u` cannot trip on it.
+FLEET2_VERIFIED_BINARY=""
+FLEET2_FETCH_DIR=""
 
 log() { echo "install-vps: $*"; }
 
@@ -159,24 +208,103 @@ ensure_fleet_user() {
   chown -R "$FLEET_USER":"$FLEET_USER" "$home/.ssh" 2>/dev/null || true
 }
 
-install_fleet2() {
-  # D7: install the compiled fleet2 binary (bun+TS) as THE brain engine. The
-  # retired bash fleetctl is NOT shipped from the repo (it was `git rm`'d in
-  # phase 3) — instead we PRESERVE any incumbent $OPT_DIR/fleetctl IN PLACE
-  # (M6/Q4): move it to $OPT_DIR/fleetctl.retired-c303696 at mode 0644 (non-
-  # executable) as the documented one-release manual fallback. A fresh install
-  # (no incumbent) has no retired copy and that is correct.
-  if [ -e "$OPT_DIR/fleetctl" ] && [ ! -e "$OPT_DIR/fleetctl.retired-c303696" ]; then
-    mv -f "$OPT_DIR/fleetctl" "$OPT_DIR/fleetctl.retired-c303696"
-    chmod 0644 "$OPT_DIR/fleetctl.retired-c303696" 2>/dev/null || true
-    log "retired incumbent bash fleetctl -> $OPT_DIR/fleetctl.retired-c303696 (0644, manual fallback until 5.5.0)"
+# --- fleet2 acquisition PREFLIGHT (D2 — ORDERING IS THE SAFETY PROPERTY) ------
+# This runs BEFORE ensure_dirs, BEFORE ensure_fleet_user and before
+# install_fleet2 is called at all. Converting the build into a NETWORK FETCH
+# widens every failure window (DNS, GitHub 5xx, a proxy, a 404 on an unpublished
+# tag, disk full), so the bytes are acquired AND verified while NOTHING on the
+# host has been touched. A failed fetch or a failed verify leaves the host
+# byte-identical to before the run. Hoisting only to the top of install_fleet2()
+# would be insufficient: ensure_dirs/ensure_fleet_user have already run by then,
+# and a failed fetch would strand a half-provisioned host.
+fleet2_fetch_cleanup() {
+  if [ -n "$FLEET2_FETCH_DIR" ] && [ -d "$FLEET2_FETCH_DIR" ]; then
+    rm -rf "$FLEET2_FETCH_DIR"
+  fi
+}
+
+fleet2_preflight() {
+  # D3: the pin is a PAIR. Overriding one without the other is a refusal.
+  if [ -n "$FLEET2_RELEASE_ENV" ] && [ -z "$FLEET2_SHA256_ENV" ]; then
+    log "install-vps.sh: REFUSING — FLEET2_RELEASE and FLEET2_SHA256 must be overridden TOGETHER (the tag is only an address; the sha256 is the identity)."
+    return 1
+  fi
+  if [ -n "$FLEET2_SHA256_ENV" ] && [ -z "$FLEET2_RELEASE_ENV" ]; then
+    log "install-vps.sh: REFUSING — FLEET2_RELEASE and FLEET2_SHA256 must be overridden TOGETHER (the tag is only an address; the sha256 is the identity)."
+    return 1
+  fi
+  if [ -n "$FLEET2_RELEASE_ENV" ]; then FLEET2_RELEASE="$FLEET2_RELEASE_ENV"; fi
+  if [ -n "$FLEET2_SHA256_ENV" ]; then FLEET2_SHA256="$FLEET2_SHA256_ENV"; fi
+
+  # D5: operator-supplied bytes short-circuit the download. Verification is
+  # skipped BY DESIGN (the operator chose these bytes) — and we say so out loud.
+  if [ -n "$FLEET2_BINARY" ]; then
+    if [ ! -f "$FLEET2_BINARY" ]; then
+      log "install-vps.sh: REFUSING — FLEET2_BINARY='$FLEET2_BINARY' is not a file"
+      return 1
+    fi
+    FLEET2_VERIFIED_BINARY="$FLEET2_BINARY"
+    log "using operator-supplied FLEET2_BINARY=$FLEET2_BINARY — checksum verification SKIPPED (D5)"
+    return 0
   fi
 
-  # Q3: bun is a BUILD dependency on the VPS. The PREFLIGHT check already
-  # refused rc 1 if it is absent; here we build the binary from the checkout.
-  ( cd "$REPO_ROOT" && make ts-build ) || { log "install_fleet2: make ts-build FAILED"; return 1; }
-  local built="$REPO_ROOT/fleet/dist/fleet2"
-  [ -x "$built" ] || { log "install_fleet2: build produced no $built"; return 1; }
+  # D6: what the fetch path needs. bun and make are NO LONGER host requirements.
+  if ! command -v curl >/dev/null 2>&1; then
+    log "install-vps.sh: REFUSING — curl not found on PATH (fleet2 is downloaded from a GitHub release)."
+    log "install-vps.sh: install it with:  apt-get install -y curl   (or set FLEET2_BINARY=/path/to/fleet2)"
+    return 1
+  fi
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    log "install-vps.sh: REFUSING — sha256sum not found on PATH (the download is verified against the in-repo FLEET2_SHA256)."
+    log "install-vps.sh: install it with:  apt-get install -y coreutils   (or set FLEET2_BINARY=/path/to/fleet2)"
+    return 1
+  fi
+
+  local url="$FLEET2_BASE_URL/$FLEET2_RELEASE/$FLEET2_ASSET"
+  FLEET2_FETCH_DIR="$(mktemp -d "$FLEET2_FETCH_ROOT/.fleet2-fetch.XXXXXX" 2>/dev/null)" \
+    || FLEET2_FETCH_DIR="$(mktemp -d)" \
+    || { log "install-vps.sh: REFUSING — cannot create a download dir under $FLEET2_FETCH_ROOT"; return 1; }
+  local dl="$FLEET2_FETCH_DIR/$FLEET2_ASSET"
+
+  log "fetching fleet2 $FLEET2_RELEASE from $url"
+  if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 -o "$dl" "$url"; then
+    log "install-vps.sh: REFUSING — could not download $url (nothing on this host was changed)."
+    log "install-vps.sh: for an air-gapped or GitHub-unreachable install, set FLEET2_BINARY=/path/to/fleet2"
+    return 1
+  fi
+
+  # D4: verify against the IN-REPO constant and nothing else. This catches
+  # truncated downloads, disk-full writes, a captive portal or proxy answering
+  # 200-with-HTML, and a mis-uploaded asset; and because the digest lives in the
+  # repo the operator is already executing, it anchors authenticity to THAT
+  # checkout. It does NOT defend against someone who can write to the release
+  # (a compromised GitHub account or token, a malicious collaborator, GitHub
+  # itself) — such an adversary replaces the asset, and a same-origin `.sha256`
+  # alongside it, in one `gh release upload --clobber`. That is why no `.sha256`
+  # asset is published or consulted. No flag may skip this check.
+  local got; got="$(sha256sum "$dl" | cut -d' ' -f1)"
+  if [ "$got" != "$FLEET2_SHA256" ]; then
+    rm -f "$dl"
+    log "install-vps.sh: REFUSING — sha256 MISMATCH for $url"
+    log "install-vps.sh:   expected $FLEET2_SHA256"
+    log "install-vps.sh:   got      $got"
+    log "install-vps.sh: the download was deleted; nothing on this host was changed."
+    return 1
+  fi
+  chmod 0755 "$dl"
+  FLEET2_VERIFIED_BINARY="$dl"
+  log "verified fleet2 $FLEET2_RELEASE (sha256 $FLEET2_SHA256)"
+  return 0
+}
+
+install_fleet2() {
+  # D1 REBIND: the binary was FETCHED AND VERIFIED by fleet2_preflight, before
+  # any mutation. `built` is REBOUND to that verified temp path rather than
+  # deleted — every consumer of it below (the `-x` guard, the `.prev` cmp guard,
+  # the `install`) keeps working byte-for-byte unchanged. Only the ACQUISITION
+  # of `built` changed; the host needs no bun, no make and no checkout for it.
+  local built="$FLEET2_VERIFIED_BINARY"
+  [ -x "$built" ] || { log "install_fleet2: no executable verified binary at '$built'"; return 1; }
 
   # Keep the previous fleet2 as fleet2.prev (rollback of fleet2 itself) — but
   # ONLY when the freshly built binary DIFFERS from the installed one, so a
@@ -200,6 +328,28 @@ install_fleet2() {
   fi
   mv -f "$tmp" "$OPT_DIR/fleet2"
   log "installed fleet2 -> $OPT_DIR/fleet2"
+
+  # D13 — RETIRE THE INCUMBENT ONLY ONCE A VERIFIED REPLACEMENT IS LIVE.
+  # This block used to run FIRST, at the top of install_fleet2(). That is how
+  # production ended up with its engine renamed to a non-executable 0644 file
+  # and no replacement: `install_fleet2 || exit 1` disables `set -e` for the
+  # whole function body, so an ENOSPC on the 80 MB copy, a `noexec` mount or a
+  # wrong-arch binary did NOT abort — control reached the `version` smoke test,
+  # it failed, and the rollback below restores fleet2.prev ONLY; it never
+  # restored fleetctl. Running here, after `mv -f "$tmp" "$OPT_DIR/fleet2"` has
+  # succeeded, every one of those failures returns 1 with the incumbent still
+  # in place, still executable.
+  #
+  # D7: the retired bash fleetctl is NOT shipped from the repo (it was `git
+  # rm`'d in phase 3) — instead we PRESERVE any incumbent $OPT_DIR/fleetctl IN
+  # PLACE (M6/Q4): move it to $OPT_DIR/fleetctl.retired-c303696 at mode 0644
+  # (non-executable) as the documented one-release manual fallback. A fresh
+  # install (no incumbent) has no retired copy and that is correct.
+  if [ -e "$OPT_DIR/fleetctl" ] && [ ! -e "$OPT_DIR/fleetctl.retired-c303696" ]; then
+    mv -f "$OPT_DIR/fleetctl" "$OPT_DIR/fleetctl.retired-c303696"
+    chmod 0644 "$OPT_DIR/fleetctl.retired-c303696" 2>/dev/null || true
+    log "retired incumbent bash fleetctl -> $OPT_DIR/fleetctl.retired-c303696 (0644, manual fallback until 5.5.0)"
+  fi
 
   # F4: a PREFIX-rooted PATH symlink /usr/local/bin/fleet2 -> $OPT_DIR/fleet2
   # (new; bash had no PATH entry). mkdir -p + ln -sfn so a re-run is idempotent.
@@ -394,14 +544,12 @@ case "${1:-}" in
 esac
 
 log "installing to '${PREFIX:-/}' from repo $REPO_ROOT"
-# Q3 PREFLIGHT (before ANY mutation): fleet2 is built from bun on the VPS. Refuse
-# rc 1 with the install hint if bun is absent. Skipped under a PREFIX= test tree
-# only when FLEET_SKIP_BUN_PREFLIGHT=1 (the installer suite builds no binary).
-if [ "${FLEET_SKIP_BUN_PREFLIGHT:-0}" != 1 ] && ! command -v bun >/dev/null 2>&1; then
-  log "install-vps.sh: REFUSING — bun not found on PATH (fleet2 is built from bun on the VPS)."
-  log "install-vps.sh: install it with:  curl -fsSL https://bun.sh/install | bash"
-  exit 1
-fi
+# D2 PREFLIGHT (before ANY mutation): acquire AND verify the fleet2 binary while
+# the host is still untouched — no dirs created, no fleet user created, the
+# incumbent engine still in place. Any failure here exits rc 1 having changed
+# nothing. The download temp is removed on EVERY exit path.
+trap fleet2_fetch_cleanup EXIT
+fleet2_preflight || exit 1
 ensure_dirs
 ensure_fleet_user
 install_fleet2 || exit 1
