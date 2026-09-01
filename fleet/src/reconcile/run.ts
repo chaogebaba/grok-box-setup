@@ -37,6 +37,8 @@ import { configPass, type ConfigPassDeps } from "../actions/config-pass.ts";
 import type { ManagedSource } from "../actions/config-push.ts";
 import type { UpgradeDeps } from "../upgrade.ts";
 import { log } from "../log.ts";
+import { splitVersion } from "../status.ts";
+import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
@@ -65,6 +67,15 @@ export interface ReconcileDeps {
   /** injected clock (seconds) for deterministic tests. */
   nowSec?: number;
   keyExpirySecs?: number;
+  /**
+   * TUI-D4 history hook — append one snapshot line per tick. Injected so the
+   * production tick (assembleTickDeps) writes to `${FLEET_STATE}/history/` and
+   * the box-free tests can assert the line WITHOUT touching disk. Omitted ⇒ no
+   * snapshot is written (the default keeps existing runReconcile tests
+   * hermetic). Runs on EVERY return path (early-return ticks still append,
+   * R2-A4); the writer itself must never throw (best-effort — see write.ts).
+   */
+  history?: (line: SnapshotLine) => void;
 }
 
 export interface ReconcileResult {
@@ -135,14 +146,18 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   // --- target boxes ---
   if (deps.targetBoxes.length === 0) {
     log("reconcile: no enrolled boxes");
+    // R2-A4: an early-return tick still appends a snapshot (empty boxes) so the
+    // tick_age freshness signal / STALE banner works even for an empty fleet.
+    writeSnapshot(deps, [], null);
     return { rc: 0 };
   }
 
   // --- per-box loop (SERIAL) ---
   let rc: 0 | 1 = 0;
   const drifted: DriftedBox[] = [];
+  const snapshots: SnapshotBox[] = [];
   for (const box of deps.targetBoxes) {
-    const r = await reconcileOne(box, devs, deps, drifted);
+    const r = await reconcileOne(box, devs, deps, drifted, snapshots);
     if (r === 1) rc = 1;
   }
 
@@ -166,13 +181,41 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
     managedFilesPresent: deps.managedFilesPresent,
     apply: deps.apply,
   };
-  await configPass(cpDeps);
+  const cpRes = await configPass(cpDeps);
 
   // --- identity pass (log-only) ---
   identityPass({ devs, targetBoxes: deps.targetBoxes });
 
+  // TUI-D4: fold the config-pass verdict into the per-box snapshot + record the
+  // config-pass canary, then append the snapshot line (finally-path).
+  for (const sb of snapshots) {
+    sb.config = deps.managedFilesPresent ? (cpRes.perBox.get(sb.name) ?? null) : null;
+  }
+  writeSnapshot(deps, snapshots, deps.managedFilesPresent ? (cpRes.canary ?? null) : null);
+
   log(`reconcile: done (${mode})`);
   return { rc };
+}
+
+/**
+ * Build + emit the TUI-D4 snapshot line (best-effort). Runs on EVERY return
+ * path of runReconcile so an early-return tick still appends (R2-A4). The
+ * `history` writer is injected; omitted ⇒ no-op.
+ */
+function writeSnapshot(deps: ReconcileDeps, boxes: SnapshotBox[], canary: string | null): void {
+  if (deps.history === undefined) return;
+  const line: SnapshotLine = {
+    v: 1,
+    ts: new Date((deps.nowSec ?? Math.floor(Date.now() / 1000)) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    apply: deps.apply,
+    canary,
+    boxes,
+  };
+  try {
+    deps.history(line);
+  } catch {
+    /* the writer is best-effort; a snapshot failure never fails the tick */
+  }
 }
 
 /** reconcile_one (main:2784-2898). Returns 0 ok / 1 on a decision-execute or
@@ -182,6 +225,7 @@ async function reconcileOne(
   devs: string,
   deps: ReconcileDeps,
   drifted: DriftedBox[],
+  snapshots: SnapshotBox[],
 ): Promise<0 | 1> {
   if (boxIndex(box) === undefined) return 1; // box_index fail ⇒ rc 1
   let rcOne: 0 | 1 = 0;
@@ -200,6 +244,8 @@ async function reconcileOne(
   let checkfail: "yes" | "no" = "no";
   let checkfailRuns = 0;
   let checkSha = "unknown";
+  let checkVersion = "unknown"; // TUI-D4: the human version (splitVersion.version)
+  let checkHealthy = false; // TUI-D4: true iff `boxup check` returned OK
   if (tunnel === "up") {
     const chk = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, CHECK_COMMAND, {
       timeoutMs: CHECK_TIMEOUT_MS,
@@ -212,10 +258,14 @@ async function reconcileOne(
       const st = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, STATUS_COMMAND, {
         timeoutMs: STATUS_TIMEOUT_MS,
       });
-      checkSha = parseStatusLine(st.stdout).sha;
+      const sl = parseStatusLine(st.stdout);
+      checkSha = sl.sha;
+      checkVersion = sl.version;
     } else {
       deps.state.resetCheckfail(box);
+      checkHealthy = true;
       checkSha = parsed.status?.sha ?? "unknown";
+      checkVersion = parsed.status?.version ?? "unknown";
     }
   }
 
@@ -231,6 +281,27 @@ async function reconcileOne(
       drift = checkSha === deps.targetSha ? "no" : "yes";
     }
   }
+
+  // TUI-D4 snapshot mirror for this box. `check`: OK when healthy, FAIL when the
+  // check failed, "-" when the tunnel is down (never probed — fleet-status
+  // semantics). `ver`: the human version (splitVersion), "-" when unknown.
+  // `config` is filled in by the caller after the config pass. `checkfail`/
+  // `asleep` mirror the live markers at this instant (GET /v1/fleet lets the
+  // live markers override). `expiry_days` null when unknown.
+  const check: "OK" | "FAIL" | "-" =
+    tunnel === "down" ? "-" : checkHealthy ? "OK" : "FAIL";
+  const ver = checkVersion !== "unknown" && checkVersion !== "" ? checkVersion : "-";
+  snapshots.push({
+    name: box,
+    tunnel,
+    check,
+    ver,
+    drift,
+    config: null,
+    checkfail: deps.state.checkfailCount(box) > 0,
+    asleep: deps.state.readAsleep(box) !== undefined,
+    expiry_days: expiryDays === "unknown" ? null : expiryDays,
+  });
 
   const actions = decide({
     online,

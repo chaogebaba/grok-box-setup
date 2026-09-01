@@ -113,13 +113,15 @@ tree_norm="$(printf '%s' "$tree" | sed 's#etc/grok-fleet/|##')"
 # The sanctioned footprint (D7): fleet2 + config.toml + service + timer + the ONE
 # sshd drop-in (B-3). The usr/local/bin/fleet2 symlink is a symlink (not -type f)
 # and is asserted separately below. A FRESH install has no retired bash binary.
-expected_norm="etc/ssh/sshd_config.d/50-grok-fleet.conf|etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/fleet2|opt/grok-fleet/config.toml|"
+# TUI-D8 (fleet2 admin panel): install_fleet_api adds fleet-api.service (NOT
+# enabled). Alphabetically fleet-api.service sorts BEFORE fleet-reconcile.service.
+expected_norm="etc/ssh/sshd_config.d/50-grok-fleet.conf|etc/systemd/system/fleet-api.service|etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/fleet2|opt/grok-fleet/config.toml|"
 # The build also emits fleet2.prev on a re-run; the tree test uses a fresh pfx so
 # only the first-install files are present. Sort-order: find|sort places
 # opt/grok-fleet/fleet2 before .../config.toml? No — 'c' < 'f', so config first.
-expected_norm="etc/ssh/sshd_config.d/50-grok-fleet.conf|etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/config.toml|opt/grok-fleet/fleet2|"
+expected_norm="etc/ssh/sshd_config.d/50-grok-fleet.conf|etc/systemd/system/fleet-api.service|etc/systemd/system/fleet-reconcile.service|etc/systemd/system/fleet-reconcile.timer|opt/grok-fleet/config.toml|opt/grok-fleet/fleet2|"
 if [ "$tree_norm" = "$expected_norm" ]; then
-  pass "installer: installs exactly fleet2 + config.toml + service + timer + one sshd drop-in (D7)"
+  pass "installer: installs exactly fleet2 + config.toml + service + timer + fleet-api.service + one sshd drop-in (D7/TUI-D8)"
 else
   bad "installer tree unexpected: [$tree_norm] want [$expected_norm]"
 fi

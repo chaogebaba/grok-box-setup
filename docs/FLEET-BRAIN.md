@@ -579,6 +579,121 @@ Each target daemon-reloads and prints the resulting `systemctl cat` ExecStart. T
   - latched run (e.g. a Tailscale API 401/500 that set the read-only latch): `reconcile: <box> WOULD <action> (read-only dry-run/no-apply)`
   The config-pass (`config: <box> WOULD push …`) and rollout (`reconcile: WOULD rollout …`) WOULD lines carry no prefix and never gain one.
 
+## fleet2 API + TUI (fleet2 admin panel — phase 3.x, 5.5.0)
+
+The admin panel is one binary, two subcommands: `fleet2 serve` (VPS-side
+tailnet-bound token-auth HTTP/JSON API — the single data+action surface; AI
+agents curl it) and `fleet2 tui` (a laptop admin panel that consumes only that
+API and holds zero fleet logic). Built in two sequenced lanes: **lane A** is
+serve + API + history (this section's engine); **lane B** is the TUI. The
+decisions below are namespaced `TUI-D<n>` (the r4 blueprint's decision wall).
+
+### TUI-D1 — thin adapter
+Endpoints call the SAME internal modules as the CLI commands (StateFs, config
+render/diff, check, mint/rotate, rename, reconcile). Behavior-preserving
+extraction only; the existing test suite stays green unmodified. Subprocesses are
+limited to external tools (`journalctl`, `diff(1)`, ssh) — never self-invocation.
+
+### TUI-D2 — bind + auth
+`serve` binds the VPS tailnet IPv4 (`tailscale ip -4`, first line; binary
+absent/empty/error ⇒ refuse to start rc 6; `--bind <ip>` override for tests).
+Port 9891 (`--port <n>` override). Tokens live in
+`${FLEET_ETC}/serve-tokens.toml`, mode **600** enforced (wrong mode/owner/
+missing/malformed at startup ⇒ refuse to start, log why). Format:
+
+```toml
+[tokens.<name>]
+token = "<plaintext>"
+scope = "admin"   # or "readonly"
+```
+
+`<name>` must match `^[a-z0-9-]{1,32}$` (audit-forgery guard). Plaintext is
+acceptable at this trust level (same posture as the Tailscale token file).
+Comparison: SHA-256 both sides, then `crypto.timingSafeEqual` (length-safe —
+never throws on a short/long presented token). The file is re-checked per request
+by an uncached mtime stat; a reload re-enforces mode/owner; a **malformed file on
+reload keeps the last-good token set** and logs a warning — a running server
+never crashes or drops to zero tokens on a bad edit. `401` invalid/missing, `403`
+readonly-on-POST. Error bodies never echo tokens or fleet data.
+
+### TUI-D3 — mutations: in-process held lock + audit
+Mutation endpoints hold `${FLEET_STATE}/reconcile.lock` **in-process** via
+`bun:ffi` `flock(2)`: open an fd on the lock file, loop `flock(fd,
+LOCK_EX|LOCK_NB)` at 250 ms intervals up to **T=30 s**; on timeout close the fd
+and return HTTP **423** `{error:{code:"lock_busy"}}` (an apply tick legitimately
+runs minutes). On success run the op, `close(fd)` in `finally`. No helper child
+exists to orphan — the kernel releases the lock on ANY process death. This is
+compatible with the CLI/timer's util-linux `flock` (same advisory lock, same
+file). An in-process async mutex sits AHEAD of the ffi lock; the mutex wait
+shares the SAME T=30 s budget (one ceiling per request — no unbounded client
+hang). The dlopen chain is `libc.so.6` → `libc.so`; a missing symbol ⇒ serve
+refuses to start with a clear reason. Lock-taking set: `config-push`,
+`rotate-key`, `rename`, `reconcile` (NOT `check`, non-destructive).
+**Re-entrancy rule:** no core may re-acquire `reconcile.lock` while its handler
+holds it — the rename handler injects a lock-held `RenameOps` whose
+`acquireLock()` returns `"ok"` (the request already holds the lock; the external
+`flock -w 90` cannot see the fd-held lock and would self-deadlock 90 s
+otherwise), and the `/v1/reconcile` job calls `runReconcile(assembleTickDeps(…))`
+DIRECTLY, never `cliReconcile`. Every mutation appends
+`<ts> token=<name> action=<x> box=<y> rc=<n>` to `${FLEET_STATE}/audit.log`
+(mode 0600, unbounded) and journald; for the async reconcile job the line is
+written ONCE at job completion with the job id (never at 202-time — no
+missing/double rc). **Operator note: `audit.log` is unbounded — configure
+logrotate** (e.g. a weekly `copytruncate` rule) if the fleet mutates often.
+
+### TUI-D4 — snapshot = history
+The reconcile tick appends one line to
+`${FLEET_STATE}/history/<YYYY-MM-DD>.jsonl` (daily files):
+`{v:1, ts, apply, canary, boxes:[{name,tunnel,check,ver,drift,config,checkfail,asleep,expiry_days}]}`.
+`check` is `"OK"|"FAIL"|"-"` (fleet-status semantics); `ver` is the human version
+from `splitVersion` (not just the sha); `drift` is VERSION drift vs targetSha;
+`config` is `"in-sync"|"drift"|"skip"|null` (sourced by the extended `PushResult`
+`cur`/`want` shas — behavior-preserving); `canary` is the box the config pass
+ACTUALLY used that tick (the config-pass canary, NOT the rollout canary; `null`
+when no managed files). The append runs on a `finally`/every-return path of
+`runReconcile` so an early-return tick (e.g. empty targetBoxes) still logs. Line
+is ≤2 KB, mode 0600; a write failure never fails the tick (warn only).
+`GET /v1/fleet` = the last line of the newest history file + a live state-marker
+merge (file read, NO ssh); live markers (`*.checkfail`, `*.asleep`, `*.expires`)
+override the snapshot's copies, probe-derived fields come from the snapshot.
+`tick_age_s` in `/v1/health` derives from the same line (absent/unwritable ⇒
+`null`, TUI banners STALE/UNKNOWN). Freshness on demand =
+`POST /v1/boxes/:name/check`. Prune: files >92 days at startup AND lazily on the
+first history read of a new day (no rollover timer).
+
+**Expected gap under a long mutation:** a long API mutation holds the lock, so a
+timer reconcile tick that lands during it is **skipped** (rc 6 → the CLI logs
+"skipping this run") and writes no history line — a brief history gap. This is
+expected and is covered by the STALE banner (a snapshot older than 15 min goes
+yellow).
+
+### TUI-D8 — deployment
+`fleet-api.service`: `ExecStart=/opt/grok-fleet/fleet2 serve`,
+`Restart=on-failure`, `RestartSec=5`, `StartLimitIntervalSec=0` (slow tailscaled
+must not park the unit in `failed`), `After=network-online.target
+tailscaled.service`, env EXACTLY as fleet-reconcile INCLUDING `HOME=$STATE_DIR`
+(the refuse-to-start + Restart IS the boot-order retry). Installed by the
+idempotent `install_fleet_api` in `vps/install-vps.sh`; **NOT enabled by
+default** — the empirical gate starts/enables it on PASS.
+
+### HTTP contract (v1)
+All under `/v1/`. `GET /v1/health` is unauthenticated (`{ok,version,tick_age_s}`).
+Status mapping: 200 = operation ran (body `{rc, log:[lines]}` — a nonzero domain
+rc is still HTTP 200; clients read `rc`); 400 bad body / `confirm_mismatch`;
+401/403 auth; 404 unknown route or box not in `enrolled.tsv`; 423 `lock_busy`;
+409 `job_running`; 500 unexpected. Errors: `{error:{code,message}}`. Destructive
+POSTs (`config-push`, `rotate-key`, `rename`, `reconcile`) require body
+`{confirm:"<box-name>"}` (`{confirm:"fleet"}` for reconcile); a mismatch ⇒ 400
+`confirm_mismatch`. Box names are validated (`isValidBoxName`) + enrolled-
+membership-checked (re-read per request) BEFORE reaching any argv.
+
+### TUI-D6/D7 — TUI config + degradation (lane B)
+`~/.config/grok-fleet/tui.toml` (`url`, `token`; mode 600 enforced); env override
+`FLEET2_ADMIN_URL`/`FLEET2_ADMIN_TOKEN` (never `FLEET_API_*`, which is the
+Tailscale pair). Poll `GET /v1/fleet` every 5 s; API unreachable ⇒ last-good data
+greyed + red `LINK DOWN <age>`, keep retrying, never exit; snapshot older than
+15 min ⇒ yellow `STALE <age>`.
+
 ## Retired: bash `fleetctl` (last at c303696)
 
 Since 5.4.0 (phase 3) the brain engine is **fleet2** (bun+TS); the bash
