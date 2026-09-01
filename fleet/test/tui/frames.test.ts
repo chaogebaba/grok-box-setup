@@ -126,6 +126,12 @@ describe("frame goldens", () => {
         for (const b of all.slice(0, win.start)) expect(frame).not.toContain(b.name);
         for (const b of all.slice(win.end)) expect(frame).not.toContain(b.name);
         expect(frame).toContain(`rows ${win.start + 1}–${win.end} of ${all.length}`);
+        // …and against the LITERAL window the golden declares, which no change
+        // to the arithmetic can move.
+        expect(g.window).toBeDefined();
+        expect(frame).toContain(g.window!.indicator);
+        expect(frame).toContain(g.window!.first);
+        expect(frame).toContain(g.window!.last);
         // the chrome is unchanged: the header and the footer come from the fixture.
         expect(lines[0]!.replace(/[ \t]+$/, "")).toBe(fixture(g.name)[0]!);
       }

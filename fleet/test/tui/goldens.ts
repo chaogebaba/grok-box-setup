@@ -38,6 +38,10 @@ export interface Golden {
   size: Size;
   state: TuiState;
   exceptions: GoldenException[];
+  /** For a golden whose fleet overflows the budget: the LITERAL window the
+   *  frame must paint. Spelled out rather than computed, so an off-by-one in
+   *  the window arithmetic cannot quietly move the expectation with it. */
+  window?: { indicator: string; first: string; last: string };
 }
 
 const SIZE = (cols: number, rows: number): Size => ({ cols, rows });
@@ -151,18 +155,24 @@ export const GOLDENS: Golden[] = [
   },
 
   // --- the 30-box fleet in a 12-row terminal, both token scopes --------------
-  ...(["admin", "readonly"] as const).flatMap((scope) =>
+  // The literal windows: admin gets a ONE-line footer at 120 columns and so one
+  // more box row than readonly, whose footer takes two.
+  ...(
     [
-      { suffix: "top", selected: 0 },
-      { suffix: "middle", selected: 15 },
-      { suffix: "bottom", selected: 29 },
-    ].map((s) => ({
-      name: `fleet30-${scope}-120x12-${s.suffix}`,
-      size: SIZE(120, 12),
-      state: state({ boxes: THIRTY, scope, selected: s.selected }),
-      exceptions: ["table-window", "detail-omitted"] as GoldenException[],
-    })),
-  ),
+      { scope: "admin" as const, suffix: "top", selected: 0, indicator: "rows 1–6 of 30", first: "grok-box-001", last: "grok-box-006" },
+      { scope: "admin" as const, suffix: "middle", selected: 15, indicator: "rows 11–16 of 30", first: "grok-box-011", last: "grok-box-016" },
+      { scope: "admin" as const, suffix: "bottom", selected: 29, indicator: "rows 25–30 of 30", first: "grok-box-025", last: "grok-box-030" },
+      { scope: "readonly" as const, suffix: "top", selected: 0, indicator: "rows 1–5 of 30", first: "grok-box-001", last: "grok-box-005" },
+      { scope: "readonly" as const, suffix: "middle", selected: 15, indicator: "rows 12–16 of 30", first: "grok-box-012", last: "grok-box-016" },
+      { scope: "readonly" as const, suffix: "bottom", selected: 29, indicator: "rows 26–30 of 30", first: "grok-box-026", last: "grok-box-030" },
+    ]
+  ).map((s) => ({
+    name: `fleet30-${s.scope}-120x12-${s.suffix}`,
+    size: SIZE(120, 12),
+    state: state({ boxes: THIRTY, scope: s.scope, selected: s.selected }),
+    exceptions: ["table-window", "detail-omitted"] as GoldenException[],
+    window: { indicator: s.indicator, first: s.first, last: s.last },
+  })),
 
   // --- banners ---------------------------------------------------------------
   {

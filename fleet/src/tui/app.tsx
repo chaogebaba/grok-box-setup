@@ -203,12 +203,19 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [w.seq]);
 
-  // --- the 5s fleet poll -----------------------------------------------------
-  // EMPTY deps on purpose: the interval is installed ONCE. Re-installing it on
-  // every state change (which is what putting `state` in the deps does) resets
-  // the timer on every keystroke and the poll never fires under typing.
+  // --- the first read --------------------------------------------------------
+  // Separate from the interval below on purpose: folding it in would mean a
+  // re-installed interval also fires a poll, which would hide the very mutant
+  // the interval's deps are there to prevent.
   useEffect(() => {
-    void poll(); // the first read, without waiting a whole period
+    void poll();
+  }, [poll]);
+
+  // --- the 5s fleet poll -----------------------------------------------------
+  // The deps are the CONSTANT ones on purpose: the interval is installed ONCE.
+  // Adding `state` re-installs it on every keystroke, which resets the timer
+  // before it can fire and the poll silently stops under typing.
+  useEffect(() => {
     const id = setInterval(() => {
       if (!shouldPoll(stateRef.current)) return;
       void poll();
