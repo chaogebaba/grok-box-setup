@@ -4,10 +4,21 @@
 
 import type { Env } from "../env.ts";
 import { Terminal, NotATtyError, type TermIo, nodeTermIo } from "./term.ts";
-import { renderFrame, filteredBoxes, type TuiState, type ModalState, type Size } from "./render.ts";
+import {
+  renderFrame,
+  filteredBoxes,
+  viewContent,
+  viewRowsAvailable,
+  viewportWindow,
+  type TuiState,
+  type ModalState,
+  type Size,
+  type ViewKind,
+} from "./render.ts";
 import { makeApiClient, type ApiClient, type FleetView } from "./api-client.ts";
 import { resolveTuiConfig, TuiConfigError, type ConfigFs, nodeConfigFs } from "./config.ts";
 import { actionForKey, RECONCILE_ACTION, confirmValue, needsTarget, type ActionSpec } from "./actions.ts";
+import type { SnapshotLine } from "../history/schema.ts";
 import { log } from "../log.ts";
 
 const STALE_SECONDS = 15 * 60;
@@ -20,7 +31,79 @@ export type Effect =
   | { type: "quit" }
   | { type: "refresh" }
   | { type: "load-detail"; box: string }
+  /** fetch (or refetch) an open view's content for its CAPTURED box (D2/D3/D4). */
+  | { type: "load-view"; kind: ViewKind; box: string }
   | { type: "run-action"; spec: ActionSpec; box: string; to?: string };
+
+/** The default size used when a caller does not supply one (tests, headless). */
+const DEFAULT_SIZE: Size = { cols: 120, rows: 40 };
+
+/** The selected box's NAME, or undefined when nothing is selected. */
+export function selectedBoxName(state: TuiState): string | undefined {
+  return filteredBoxes(state)[state.selected]?.name;
+}
+
+/**
+ * B4: the detail effect fires whenever the SELECTED BOX NAME CHANGES, including
+ * from none to the first selection. It is driven from the loop rather than from
+ * the key arms, because the name also changes on the first poll that yields a
+ * list (the startup-selected box never loaded — gate r2) and on any
+ * selection-recovery path that lands on a different box.
+ *
+ * D6: while a view is open it is SUPPRESSED ENTIRELY. `loadedBox` is left
+ * untouched by the suppression, so closing a view onto a different selection
+ * fires the effect exactly once.
+ */
+export function detailEffectFor(state: TuiState, loadedBox: string | null): Effect {
+  if (state.view !== undefined) return { type: "none" };
+  const name = selectedBoxName(state);
+  if (name === undefined || name === loadedBox) return { type: "none" };
+  return { type: "load-detail", box: name };
+}
+
+/** D3: the journal window the view asks for. */
+export const JOURNAL_LINES = 80;
+
+/**
+ * The line a failed view fetch renders IN THE VIEW FRAME — never a crash, and
+ * never the LINK DOWN path swallowing the answer. A readonly token hitting the
+ * admin-scoped journal route gets the API's 403 turned into plain words (D3).
+ */
+export function viewError(r: { ok: false; kind: string; message: string }, kind?: ViewKind): string {
+  if (r.kind === "forbidden" && kind === "journal") return "journal: admin token required";
+  if (r.kind === "forbidden") return `${kind ?? "view"}: forbidden`;
+  if (r.kind === "unauthorized") return "unauthorized (check the token)";
+  if (r.kind === "link_down") return "link error";
+  return r.message;
+}
+
+/**
+ * Store a view fetch's outcome — but ONLY when the open view is still the same
+ * kind and the same CAPTURED box. A response that lands after the operator
+ * closed the view, or opened a different one, is dropped rather than painted
+ * under the wrong title (D6).
+ */
+export function applyViewResult(
+  state: TuiState,
+  kind: ViewKind,
+  box: string,
+  payload: { lines?: string[]; history?: SnapshotLine[]; error?: string },
+): TuiState {
+  const v = state.view;
+  if (v === undefined || v.kind !== kind || v.box !== box) return state;
+  return {
+    ...state,
+    view: {
+      ...v,
+      loading: false,
+      error: payload.error,
+      lines: payload.error === undefined && payload.lines !== undefined ? payload.lines : v.lines,
+      history: payload.error === undefined && payload.history !== undefined ? payload.history : v.history,
+      // a refetch starts the reader at the top of the new content.
+      offset: 0,
+    },
+  };
+}
 
 /** Recompute tickAgeS + link/stale from the current view + clock. */
 export function deriveFreshness(state: TuiState): TuiState {
@@ -85,10 +168,16 @@ export function applyLinkDown(state: TuiState, nowMs: number): TuiState {
 
 /** A single key/byte handled against the current state. Returns the next state
  *  and an Effect for the loop to perform. PURE (no I/O). */
-export function handleKey(state: TuiState, key: string): { state: TuiState; effect: Effect } {
+export function handleKey(state: TuiState, key: string, size: Size = DEFAULT_SIZE): { state: TuiState; effect: Effect } {
   // --- modal mode ---
   if (state.modal) {
     return handleModalKey(state, key);
+  }
+  // --- view mode (D2/D3/D4) ---
+  // Checked BEFORE the normal-mode switch, exactly as the modal branch is, so
+  // `q` closes an open view instead of quitting the TUI (gate note 4).
+  if (state.view) {
+    return handleViewKey(state, key, size);
   }
   // --- filter mode ---
   if (state.filtering) {
@@ -118,15 +207,36 @@ export function handleKey(state: TuiState, key: string): { state: TuiState; effe
       return { state: { ...state, filtering: true, filter: "" }, effect: { type: "none" } };
     case "j":
     case "\x1b[B": {
+      // the detail effect is driven by the NAME CHANGE from the loop (B4), not
+      // emitted here: a clamped move at the end of the list changes nothing.
       const selected = Math.min(state.selected + 1, Math.max(0, list.length - 1));
-      const box = list[selected]?.name;
-      return { state: { ...state, selected }, effect: box ? { type: "load-detail", box } : { type: "none" } };
+      return { state: { ...state, selected }, effect: { type: "none" } };
     }
     case "k":
     case "\x1b[A": {
       const selected = Math.max(state.selected - 1, 0);
-      const box = list[selected]?.name;
-      return { state: { ...state, selected }, effect: box ? { type: "load-detail", box } : { type: "none" } };
+      return { state: { ...state, selected }, effect: { type: "none" } };
+    }
+    case "D":
+    case "J":
+    case "H": {
+      // D2/D3/D4. Inert when nothing is selected.
+      const box = list[state.selected]?.name;
+      if (box === undefined) return { state, effect: { type: "none" } };
+      const kind: ViewKind = key === "D" ? "diff" : key === "J" ? "journal" : "history";
+      if (kind === "history") {
+        // D4: renders from the ALREADY-LOADED per-selection history — no second
+        // request and no second endpoint. The captured copy is taken here.
+        const lines = state.detail !== undefined && state.detail.box === box ? state.detail.lines : [];
+        return {
+          state: { ...state, message: undefined, view: { kind, box, offset: 0, loading: false, history: [...lines] } },
+          effect: { type: "none" },
+        };
+      }
+      return {
+        state: { ...state, message: undefined, view: { kind, box, offset: 0, loading: true } },
+        effect: { type: "load-view", kind, box },
+      };
     }
   }
 
@@ -149,6 +259,38 @@ export function handleKey(state: TuiState, key: string): { state: TuiState; effe
     return openActionModal(state, spec, box);
   }
 
+  return { state, effect: { type: "none" } };
+}
+
+/**
+ * Keys inside an open view (D2/D3/D4): `j/k` and the arrows scroll, `Esc`/`q`
+ * close, `r` refetches. `r` is VIEW-SCOPED and targets the CAPTURED box, not the
+ * current selection — the poll may have moved the selection underneath, and the
+ * view's subject is the capture (D4). History's `r` goes to the history client
+ * method for that same captured box.
+ */
+function handleViewKey(state: TuiState, key: string, size: Size): { state: TuiState; effect: Effect } {
+  const v = state.view!;
+  if (key === "\x1b" || key === "q") {
+    // close. The loop then re-evaluates the detail effect: if the selection
+    // moved while the view was open, it fires exactly once (D6).
+    return { state: { ...state, view: undefined }, effect: { type: "none" } };
+  }
+  if (key === "\x03") return { state, effect: { type: "quit" } }; // Ctrl-C still quits
+  if (key === "r") {
+    return {
+      state: { ...state, view: { ...v, loading: true, error: undefined } },
+      effect: { type: "load-view", kind: v.kind, box: v.box },
+    };
+  }
+  const down = key === "j" || key === "\x1b[B";
+  const up = key === "k" || key === "\x1b[A";
+  if (down || up) {
+    const total = viewContent(state).length;
+    const rows = viewRowsAvailable(state, size);
+    const next = viewportWindow(total, v.offset + (down ? 1 : -1), rows).offset;
+    return { state: { ...state, view: { ...v, offset: next } }, effect: { type: "none" } };
+  }
   return { state, effect: { type: "none" } };
 }
 
@@ -296,12 +438,25 @@ export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
     term.paint(renderFrame(state, size()));
   };
 
+  // B4: the box the detail pane's data belongs to. The effect fires on every
+  // CHANGE of the selected name — including the first poll's selection, which
+  // no key arm ever announced (gate r2).
+  let loadedDetailBox: string | null = null;
+
   const poll = async () => {
     const r = await client.fleet();
     if (r.ok) state = applyFleet(state, r.value, now());
     else if (r.kind === "unauthorized" || r.kind === "forbidden") state = { ...applyLinkDown(state, now()), message: r.message };
     else state = applyLinkDown(state, now());
     repaint();
+  };
+
+  /** Fire the detail effect iff the selected name changed and no view is open. */
+  const syncDetail = async () => {
+    const eff = detailEffectFor(state, loadedDetailBox);
+    if (eff.type !== "load-detail") return;
+    loadedDetailBox = eff.box;
+    await runEffect(eff);
   };
 
   const runEffect = async (effect: Effect) => {
@@ -313,9 +468,33 @@ export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
         await poll();
         break;
       case "load-detail": {
-        const h = await client.history(effect.box, 24);
+        // ONE combined effect (B4): the D1 box facts AND the 24h history the
+        // sparkline feeds on. Both are stored WITH the box name they were
+        // fetched for, so the pane can refuse to show them under another box.
+        const [d, h] = await Promise.all([client.box(effect.box), client.history(effect.box, 24)]);
+        if (d.ok) state = { ...state, detailFacts: { box: effect.box, facts: d.value } };
         if (h.ok) state = { ...state, detail: { box: effect.box, lines: h.value } };
-        else if (h.kind === "link_down") state = applyLinkDown(state, now());
+        if ((!d.ok && d.kind === "link_down") || (!h.ok && h.kind === "link_down")) {
+          state = applyLinkDown(state, now());
+        }
+        repaint();
+        break;
+      }
+      case "load-view": {
+        const r =
+          effect.kind === "diff"
+            ? await client.diff(effect.box)
+            : effect.kind === "journal"
+              ? await client.journal(effect.box, JOURNAL_LINES)
+              : undefined;
+        if (effect.kind === "history") {
+          // D4: view-scoped `r` — one request for the CAPTURED box; the shared
+          // `state.detail` is deliberately left alone.
+          const h = await client.history(effect.box, 24);
+          state = applyViewResult(state, effect.kind, effect.box, h.ok ? { lines: undefined, history: h.value } : { error: viewError(h) });
+        } else if (r !== undefined) {
+          state = applyViewResult(state, effect.kind, effect.box, r.ok ? { lines: r.value.log } : { error: viewError(r, effect.kind) });
+        }
         repaint();
         break;
       }
@@ -337,9 +516,12 @@ export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
       // a chunk may carry an escape sequence (arrows) or a single char.
       const keys = splitKeys(data);
       for (const k of keys) {
-        const { state: next, effect } = handleKey(state, k);
+        const { state: next, effect } = handleKey(state, k, size());
         state = next;
         await runEffect(effect);
+        // a move, or a view close onto a different box, changes the selected
+        // name; that CHANGE is what loads the detail (B4/D6).
+        await syncDetail();
       }
       repaint();
     })();
@@ -347,8 +529,12 @@ export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
   const unsubResize = term.onResize(() => repaint());
 
   await poll();
+  await syncDetail(); // the startup-selected box loads without a keypress (r2).
   const timer = setInterval(() => {
-    void poll();
+    void (async () => {
+      await poll();
+      await syncDetail();
+    })();
   }, POLL_INTERVAL_MS);
 
   // wait until the user quits.

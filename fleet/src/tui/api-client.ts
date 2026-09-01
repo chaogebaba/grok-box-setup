@@ -25,6 +25,23 @@ export interface FleetView {
   discover: SnapshotDiscover | null;
 }
 
+/**
+ * The GET /v1/boxes/:name body, as far as the TUI cares (D1, 5.7.0).
+ *
+ * EVERY field except `name` is optional, and the shape validator keys on `name`
+ * ONLY. A 5.6.0 engine omits all five detail facts; that response must still
+ * validate and render as `—`, not trip the malformed-body path into LINK DOWN
+ * (Acceptance 1).
+ */
+export interface BoxDetail {
+  name: string;
+  checkfail_count?: number | null;
+  asleep_since?: string | null;
+  asleep_last?: string | null;
+  expires_at?: string | null;
+  api_backoff?: { fails: number; next_retry: string | null } | null;
+}
+
 /** A discriminated result: ok payload, or a link-down/auth/other failure. */
 export type ClientResult<T> =
   | { ok: true; value: T }
@@ -38,6 +55,10 @@ export interface OpResult {
 
 export interface ApiClient {
   fleet(): Promise<ClientResult<FleetView>>;
+  /** GET /v1/boxes/:name — the D1 detail facts (readonly scope). */
+  box(name: string): Promise<ClientResult<BoxDetail>>;
+  /** GET /v1/boxes/:name/diff — a {rc, log} body, readonly scope (D2). */
+  diff(name: string): Promise<ClientResult<OpResult>>;
   history(box: string, hours: number): Promise<ClientResult<SnapshotLine[]>>;
   journal(box: string, lines: number): Promise<ClientResult<OpResult>>;
   check(box: string): Promise<ClientResult<OpResult>>;
@@ -137,6 +158,30 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
           discover: (o.discover as SnapshotDiscover | undefined) ?? null,
         };
       });
+    },
+    box(name) {
+      return getJson<BoxDetail>(`/v1/boxes/${encodeURIComponent(name)}`, (j) => {
+        const o = j as Partial<BoxDetail>;
+        // key on `name` ONLY: an engine without the D1 fields still validates.
+        if (typeof o.name !== "string" || o.name === "") return undefined;
+        const ab = o.api_backoff;
+        return {
+          name: o.name,
+          checkfail_count: typeof o.checkfail_count === "number" ? o.checkfail_count : null,
+          asleep_since: typeof o.asleep_since === "string" ? o.asleep_since : null,
+          asleep_last: typeof o.asleep_last === "string" ? o.asleep_last : null,
+          expires_at: typeof o.expires_at === "string" ? o.expires_at : null,
+          api_backoff:
+            ab !== null && ab !== undefined && typeof ab.fails === "number"
+              ? { fails: ab.fails, next_retry: typeof ab.next_retry === "string" ? ab.next_retry : null }
+              : null,
+        };
+      });
+    },
+    diff(name) {
+      // D2: the diff body is the SAME {rc, log} shape as journal's — there is
+      // no `name` field in a diff response — so it reuses the GET/op reader.
+      return postOpGet(`/v1/boxes/${encodeURIComponent(name)}/diff`);
     },
     history(box, hours) {
       const q = `/v1/history?box=${encodeURIComponent(box)}&hours=${hours}`;

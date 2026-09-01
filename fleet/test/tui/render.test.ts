@@ -116,11 +116,11 @@ describe("banners", () => {
 describe("footer scope-aware dimming (R3-A1)", () => {
   test("readonly scope marks action keys 'admin token required'", () => {
     const s = state({ scope: "readonly" });
-    expect(renderFooter(s, SIZE_120x40)).toContain("admin token required");
+    expect(renderFooter(s, SIZE_120x40).join("\n")).toContain("admin token required");
   });
   test("admin scope shows the action keys plainly", () => {
     const s = state({ scope: "admin" });
-    const f = renderFooter(s, SIZE_120x40);
+    const f = renderFooter(s, SIZE_120x40).join("\n");
     expect(f).toContain("P push");
     expect(f).not.toContain("admin token required");
   });

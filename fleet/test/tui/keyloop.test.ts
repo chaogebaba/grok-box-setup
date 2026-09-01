@@ -9,19 +9,28 @@ import {
   applyLinkDown,
   splitKeys,
   initialState,
+  detailEffectFor,
+  selectedBoxName,
+  applyViewResult,
+  viewError,
 } from "../../src/tui/main.ts";
 import type { FleetView } from "../../src/tui/api-client.ts";
 import { box, state } from "./helpers.ts";
 
 describe("navigation", () => {
-  test("j/↓ and k/↑ move the selection and emit load-detail", () => {
+  // B4: the key arms move the SELECTION only. The detail effect is derived from
+  // the resulting NAME CHANGE (detailEffectFor), because the name also changes
+  // on the first poll and on selection recovery, neither of which is a keypress.
+  test("j/↓ and k/↑ move the selection; the name change is what loads the detail", () => {
     const s = state({ boxes: [box("grok-box-1"), box("grok-box-2")], selected: 0 });
     const down = handleKey(s, "j");
     expect(down.state.selected).toBe(1);
-    expect(down.effect).toEqual({ type: "load-detail", box: "grok-box-2" });
+    expect(down.effect).toEqual({ type: "none" });
+    expect(detailEffectFor(down.state, "grok-box-1")).toEqual({ type: "load-detail", box: "grok-box-2" });
     const up = handleKey(down.state, "\x1b[A");
     expect(up.state.selected).toBe(0);
-    expect(up.effect).toEqual({ type: "load-detail", box: "grok-box-1" });
+    expect(up.effect).toEqual({ type: "none" });
+    expect(detailEffectFor(up.state, "grok-box-2")).toEqual({ type: "load-detail", box: "grok-box-1" });
   });
   test("selection clamps at the ends", () => {
     const s = state({ boxes: [box("grok-box-1")], selected: 0 });
