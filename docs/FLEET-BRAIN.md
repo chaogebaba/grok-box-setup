@@ -850,6 +850,67 @@ line for that port with exactly that key material, the `authorized-keys.map`
 entry must match, and the box's `[fleet]` block must name this VPS and the right
 `box_index`. Any mismatch reruns the adoption path with the fresh pubkey.
 
+### Host keys — the engine owns its `known_hosts`
+
+fleet2 used to let ssh resolve `~/.ssh/known_hosts` from the passwd entry, so
+both units read `/root/.ssh/known_hosts` — a file the engine neither owns nor can
+reason about. When a port or a name is REUSED across identities (a retired
+record, or a box that lost `/workspace` and with it its persisted sshd host keys)
+OpenSSH answered every tunnel call with `REMOTE HOST IDENTIFICATION HAS CHANGED`
+and rc 255: `StrictHostKeyChecking=accept-new` accepts an UNKNOWN key but refuses
+a CHANGED one, forever. In the field this made the engine mint a key, fail to
+seed it over the banner, and revoke it again, every tick.
+
+Since 5.6.0:
+
+- **One file.** `$FLEET_STATE/known_hosts`, named on the two FLEET-DRIVEN argv
+  builders only — the reverse tunnel (`[127.0.0.1]:<port>`) and the tailnet box
+  ssh (`<box>`) — together with `GlobalKnownHostsFile=/dev/null`,
+  `HashKnownHosts=no` and `CheckHostIP=no`, so no pin can escape the engine's own
+  file, hide from `ssh-keygen -F`, or survive an `ssh-keygen -R <name>`.
+  Interactive `fleet2 ssh <box>` is UNCHANGED: it is human-invoked, often from a
+  laptop where `$FLEET_STATE` does not exist, and keeps the user's own host
+  verification and the visible banner. `known_hosts` is engine bookkeeping in the
+  class of `discover.json`, not part of the mutation surface, and is written on
+  every tick including dry-run.
+- **A banner is an OBSERVATION, never a trigger.** A tunnel call that meets the
+  banner sets a one-tick `hostkey_mismatch` marker for that box, cleared on any
+  later tick whose tunnel results contain no banner. While it is set, EVERY
+  action that WRITES over that box's tunnel is deferred — mint, rotate, rollout,
+  delete-then-rename and the config push each log
+  `<action>: <box> deferred — host key mismatch` — so a rotation can never cause
+  the mint-seed-fail-revoke again. Read-only check and status calls still run,
+  because they are what makes the observation. The marker also feeds the repair
+  hysteresis counter alongside row e.
+- **Pins are forgotten only at identity-binding moments.** An enrol (manual,
+  adopt or repair), a repair, and a candidate's one re-probe. Never on a banner.
+  The tailnet spec is dropped unconditionally; the tunnel spec is FAIL-CLOSED
+  behind an ownership check — `ss -tlnp` must show the local listener absent or
+  held by an accepted sshd (`sshd`, `sshd-session`, or an `sshd:` display form),
+  otherwise the pin is KEPT and the refusal is logged. The cost of a wrong keep
+  is one more unhealthy tick; the cost of a wrong forget is re-pinning a squatter
+  and handing it the next secret.
+- **A foreign listener is DOWN.** `tunnelUp` now reads the owner too: an
+  unaccepted `comm` reads as `tunnel: down` on every engine path AND on
+  `fleet2 config diff`, so a squatter on a member port is never dialled. An
+  unverifiable owner reads up ONLY for a non-root caller (so a non-root
+  `fleet2 fleet-status` does not report the whole fleet as down); as root it
+  reads DOWN, because the exception is bound to its premise.
+- **Healing takes three ticks and no human.** +1 sees the banner and marks it;
+  +2 sees it again, so the counter reaches 2 and repair forgets the pins and
+  re-runs the enrol; +3 re-pins through `accept-new` and the box is healthy.
+
+**Retirement runbook.** Retiring a box record must forget its pins, or the next
+box to take that port or name meets the banner. Remove the `enrolled.tsv` row,
+the `authorized-keys.map` row, the `$FLEET_ETC/authorized-keys.d/<box>.line` and
+the fleet user's `authorized_keys` line as before, and ALSO run both specs
+against the engine's file:
+
+```sh
+ssh-keygen -R "[127.0.0.1]:<port>" -f "$FLEET_STATE/known_hosts"
+ssh-keygen -R "<box>"              -f "$FLEET_STATE/known_hosts"
+```
+
 ### Observability
 
 Each tick's snapshot line carries an OPTIONAL `discover` object
