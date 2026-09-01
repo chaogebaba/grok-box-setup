@@ -722,9 +722,9 @@ if grep -q 'CONVERGE_LOCK="\$RUN_DIR/converge.v2.lock"' "$BOXUP"; then
 else
   bad  "F1(b) converge lock path is not versioned"
 fi
-# VERSION bumped to 5.3.0 (file + BOXUP_VERSION constant agree).
-if [ "$(tr -d '[:space:]' < "$ROOT/VERSION")" = 5.3.0 ] && grep -q '^BOXUP_VERSION=5.3.0' "$BOXUP"; then
-  pass "F1 VERSION bumped to 5.3.0 (file + constant agree)"
+# VERSION bumped to 5.3.1 (file + BOXUP_VERSION constant agree).
+if [ "$(tr -d '[:space:]' < "$ROOT/VERSION")" = 5.3.1 ] && grep -q '^BOXUP_VERSION=5.3.1' "$BOXUP"; then
+  pass "F1 VERSION bumped to 5.3.1 (file + constant agree)"
 else
   bad  "F1 VERSION mismatch: file=$(tr -d '[:space:]' < "$ROOT/VERSION") constant=$(grep '^BOXUP_VERSION=' "$BOXUP")"
 fi

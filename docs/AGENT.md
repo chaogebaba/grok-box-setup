@@ -130,7 +130,7 @@ sudo /workspace/box-setup/boxup check   # exit 0 healthy / 1 unhealthy (never 2)
 healthy, else exit 1 and `check=FAIL reason=<first-failed-predicate>`.
 
 Healthy: `backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1`
-with numeric pids and a small `hb=` age (≤ ~30s), and `v=5.3.0/<sha>`.
+with numeric pids and a small `hb=` age (≤ ~30s), and `v=5.3.1/<sha>`.
 Cross-check from another machine on the tailnet: `tailscale ping grok-box-NNN`
 and `ssh box@grok-box-NNN` (password from config.toml, default `12345678`).
 
@@ -138,6 +138,13 @@ If a persistently failing exit-node refresh has escalated, `status` shows
 `refresh=failing:N` (N = consecutive failures; the retry window backs off
 20s→60s→180s→600s). Force one immediate retry, bypassing the backoff, with the
 env form in section D.
+
+The reverse tunnel contributes two fields, always present:
+`tunnel=unconfigured|up|down` and `tunnelfail=N`. N is the consecutive
+tunnel-spawn failure count behind the respawn backoff ladder
+(0s→0s→15s→30s→60s→120s→300s cap), so `tunnel=down tunnelfail=4` means the
+box is parked for 60s before it retries. A healthy box reads
+`tunnel=up tunnelfail=0`. `check` never fails on `tunnelfail` alone.
 
 ## D. Something is wrong
 
@@ -152,6 +159,7 @@ env form in section D.
 | `check=FAIL reason=...` | that predicate is unhealthy | act on the named predicate (its own row here); most are fixed by `boxup once` |
 | `check=FAIL reason=tags-missing:tag:grok-box` (`status` shows `tags=none`) | the node registered UNTAGGED — it did not get the tag at auth time, so node-key expiry is NOT disabled (issue #10) | `sudo /workspace/box-setup/boxup retag` (re-auths WITH the config tag; needs a tag-capable seeded key — see §A step 1 / §G). NOT fixed by `boxup once` (converge never retags) |
 | `check=FAIL reason=key-expiry-enabled:<YYYY-MM-DD>` (`status` shows `keyexpiry=<date>`) | the node is tagged but node-key expiry is still ENABLED (it was tagged LATER in the console, which does not disable expiry) — it will lapse on that date (issue #10) | `sudo /workspace/box-setup/boxup retag` (re-auth at auth time with the tag disables expiry). NOT fixed by `boxup once` |
+| `tunnelfail:N` climbing with `tunnel=down` in status | the reverse tunnel cannot spawn: the VPS is unreachable, the per-box key is not authorised, or something else holds the VPS port. Since 5.3.1 a stray tunnel with our exact argv is ADOPTED instead of fought, so a climbing count means a real failure | check `/var/log/boxup-tunnel.log`; from the VPS, `ss -ltnp | grep 2000N` shows whether the port is held |
 | `refresh=failing:N` in status | exit-node `tailscale set` has failed N times in a row (backoff 20→60→180→600s) | check `/var/log/boxup-worker.log`; force one immediate retry with `sudo env BOXUP_FORCE_REFRESH=1 /workspace/box-setup/boxup once` |
 | `hb=-` or huge | worker dead | `boxup once` (restarts it) |
 | `authkey=expiring:<date>` in status | seeded auth key expires in < 7 days | mint a new reusable key, write it to `secrets/ts-authkey`, update `secrets/ts-authkey.expires` (see §A) |
