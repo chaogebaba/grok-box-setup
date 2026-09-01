@@ -30,7 +30,7 @@ import { existsSync, readFileSync } from "node:fs";
 const CHECK_TIMEOUT_MS = 20_000;
 
 /** The current version string source (kept in sync with cli.ts PKG_VERSION). */
-export const SERVE_VERSION = "5.6.0";
+export const SERVE_VERSION = "5.7.0";
 
 /** Live per-box marker mirror read from FLEET_STATE (TUI-D4 merge inputs). */
 function liveMarkers(env: ServerContext["env"], box: string): {
@@ -49,6 +49,54 @@ function liveMarkers(env: ServerContext["env"], box: string): {
     checkfail: st.checkfailCount(box) > 0,
     asleep: st.readAsleep(box) !== undefined,
     expiry_days,
+  };
+}
+
+/** epoch seconds → ISO8601Z, or null for a NaN/absent/non-finite input. */
+function isoFromEpochSec(sec: number | undefined): string | null {
+  if (sec === undefined || !Number.isFinite(sec)) return null;
+  const d = new Date(sec * 1000);
+  const t = d.getTime();
+  if (Number.isNaN(t)) return null;
+  return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/**
+ * The 5.7.0 per-box detail facts (D1) — every one of them from an EXISTING
+ * READ-ONLY state reader, none from ssh, none of them a mutation.
+ *
+ * These sit at the TOP LEVEL of the box response rather than inside `markers`
+ * (gate note 8): `markers.checkfail` is a boolean and `checkfail_count` is the
+ * number behind it, and the two next to each other under one key read as a
+ * contradiction.
+ *
+ * `readAsleep` returns NaN fields for a malformed marker file rather than
+ * undefined (gate note 9), so the ISO conversion maps NaN to null and the pane
+ * never renders `Invalid Date`.
+ */
+export interface BoxDetailFacts {
+  checkfail_count: number;
+  asleep_since: string | null;
+  asleep_last: string | null;
+  expires_at: string | null;
+  api_backoff: { fails: number; next_retry: string | null } | null;
+}
+
+export function boxDetailFacts(env: ServerContext["env"], box: string): BoxDetailFacts {
+  const st = new ReconcileState(env.FLEET_STATE, nodeStateFs);
+  const asleep = st.readAsleep(box);
+  // READ-ONLY: apiFails(), never recordApiFailure (B3).
+  const fails = st.apiFails();
+  const nextRetry = st.nextRetry();
+  const expires = st.readExpiresDate(box);
+  return {
+    checkfail_count: st.checkfailCount(box),
+    asleep_since: asleep === undefined ? null : isoFromEpochSec(asleep.since),
+    asleep_last: asleep === undefined ? null : isoFromEpochSec(asleep.last),
+    expires_at: expires !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(expires) ? expires : null,
+    // null when there is no backoff state at all, so a client can tell "no
+    // failures recorded" from "0 failures and a pending retry stamp".
+    api_backoff: fails === 0 && nextRetry === undefined ? null : { fails, next_retry: isoFromEpochSec(nextRetry) },
   };
 }
 
@@ -167,6 +215,9 @@ export function handleBox(ctx: ServerContext, box: string): Response {
     snapshot_ts: latest?.ts ?? null,
     box: merged ?? null,
     markers: m,
+    // D1 (5.7.0): the facts the engine records and the TUI never showed. All
+    // read-only; a client that predates them simply ignores them.
+    ...boxDetailFacts(ctx.env, box),
   });
 }
 
