@@ -30,7 +30,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.3.0
+BOXUP_VERSION=5.3.1
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -1091,6 +1091,64 @@ tunnel_pid() {
   return 1
 }
 
+# tunnel_candidates <port>: print the pid of EVERY live ssh process whose argv
+# is OUR reverse tunnel for this box — an `-R` token followed by exactly
+# `127.0.0.1:<port>:localhost:22` AND an `-i` token followed by exactly
+# $TUNNEL_KEY. Mirrors start_tailscaled's stray sweep: `pgrep -x ssh` for the
+# pid list, then a per-pid NUL-split read of /proc/<pid>/cmdline. Never
+# `pkill -f` (house rule) and never `pgrep -f` substring matching — a substring
+# match would also claim an operator's own ssh, another box's port, or a tunnel
+# built with a different key.
+tunnel_candidates() {
+  local port="$1" pid tok prev hit_r hit_i want_r="127.0.0.1:$1:localhost:22"
+  for pid in $(pgrep -x ssh 2>/dev/null || true); do
+    hit_r=0; hit_i=0; prev=""
+    while IFS= read -r -d '' tok; do
+      case "$prev" in
+        -R) [ "$tok" = "$want_r" ] && hit_r=1 ;;
+        -i) [ "$tok" = "$TUNNEL_KEY" ] && hit_i=1 ;;
+      esac
+      prev="$tok"
+    done < "/proc/$pid/cmdline" 2>/dev/null || true
+    [ "$hit_r" = 1 ] && [ "$hit_i" = 1 ] && printf '%s\n' "$pid"
+  done
+  return 0
+}
+
+# tunnel_starttime <pid>: field 22 of /proc/<pid>/stat (process start time in
+# clock ticks since boot) — the only monotonic "which one is newer" signal that
+# survives pid wraparound. The comm field (field 2) may itself contain spaces
+# and parens, so cut past the LAST `) ` and count from field 3; field 22 is then
+# the 20th positional.
+tunnel_starttime() {
+  local pid="$1" stat rest
+  stat="$(tr '\n' ' ' < "/proc/$pid/stat" 2>/dev/null || true)"
+  [ -n "$stat" ] || return 1
+  rest="${stat##*') '}"
+  # shellcheck disable=SC2086
+  set -- $rest
+  printf '%s' "${20:-0}"
+}
+
+# tunnel_newest <pid>...: the NEWEST pid (highest start time, ties broken by the
+# higher pid). Empty input => rc 1. Newest, not oldest: after a racing respawn
+# the newest process is the one whose forward actually holds the VPS port (the
+# older one lost ExitOnForwardFailure and is on its way out).
+tunnel_newest() {
+  local p t best="" best_t=-1
+  for p in "$@"; do
+    case "$p" in ''|*[!0-9]*) continue ;; esac
+    t="$(tunnel_starttime "$p" || echo 0)"
+    case "$t" in ''|*[!0-9]*) t=0 ;; esac
+    if [ -z "$best" ] || [ "$t" -gt "$best_t" ] ||
+       { [ "$t" -eq "$best_t" ] && [ "$p" -gt "$best" ]; }; then
+      best="$p"; best_t="$t"
+    fi
+  done
+  [ -n "$best" ] || return 1
+  printf '%s' "$best"
+}
+
 # tunnel_backoff_window <fails> -> 15,30,60,120,300 cap (respawn storm brake).
 tunnel_backoff_window() {
   local f="${1:-0}"
@@ -1103,8 +1161,19 @@ tunnel_fail_count() {
   echo "$n"
 }
 
-# supervise_tunnel: the per-tick supervisor. Unconfigured => silent no-op. If a
-# live tunnel exists, nothing to do. Otherwise (re)spawn under a backoff window.
+# supervise_tunnel: the per-tick supervisor. Unconfigured => silent no-op. A
+# stray tunnel (one with our exact argv that is NOT the pidfile pid) is ADOPTED
+# and any duplicate killed BEFORE the spawn decision; only with zero candidates
+# does the (re)spawn path run, under a backoff window.
+#
+# Why adoption (observed on grok-box-005, 2026-09-01): a mid-tick subshell that
+# survived a kill, an operator-started ssh, or a raced tick holds the VPS port.
+# The old code asked only "is the PIDFILE pid alive?", saw "down", spawned a
+# second ssh, `ExitOnForwardFailure=yes` killed it because the port was already
+# held, fail.tunnel climbed, and the backoff ladder parked the box for up to 5
+# minutes per attempt while the VPS was reachable the whole time through the
+# stray. Adoption existed only as a race: the old trailing `pgrep -n -f` could
+# happen to write the stray's pid into the pidfile.
 supervise_tunnel() {
   fleet_configured || return 0        # unconfigured: silent no-op
   local vps port sshport
@@ -1112,6 +1181,39 @@ supervise_tunnel() {
   [ -n "$vps" ] || return 0
   port="$(fleet_port)" || { log "tunnel: no box_index/hostname — cannot derive port" >&2; return 0; }
   sshport="$(config_get fleet port || true)"; [ -n "$sshport" ] || sshport=22
+
+  # D2 — adopt-or-kill, BEFORE any spawn decision. Every process carrying our
+  # exact tunnel argv is a candidate, whether or not it is the pidfile pid. Keep
+  # the newest, TERM the rest by exact pid (KILL sweep after 1s, exactly as
+  # start_tailscaled does), point the pidfile at the survivor and clear the fail
+  # counter — the tunnel IS up, so the backoff ladder must not run.
+  local cands keep extras=0 p prev_pid=""
+  cands="$(tunnel_candidates "$port")"
+  if [ -n "$cands" ]; then
+    # shellcheck disable=SC2086
+    keep="$(tunnel_newest $cands)" || keep=""
+    if [ -n "$keep" ]; then
+      for p in $cands; do
+        [ "$p" = "$keep" ] && continue
+        extras=$((extras + 1))
+        log "tunnel: extra tunnel pid=$p on port $port — stopping"
+        kill -TERM "$p" 2>/dev/null || true
+      done
+      if [ "$extras" -gt 0 ]; then
+        sleep 1
+        for p in $cands; do
+          [ "$p" = "$keep" ] && continue
+          kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+        done
+        log "tunnel: killed $extras extra tunnel(s) on port $port"
+      fi
+      [ -f "$TUNNEL_PID" ] && prev_pid="$(tr -d '[:space:]' < "$TUNNEL_PID" 2>/dev/null || true)"
+      [ "$prev_pid" = "$keep" ] || log "tunnel: adopted stray pid=$keep on port $port"
+      printf '%s\n' "$keep" > "$TUNNEL_PID" 2>/dev/null || true
+      echo 0 > "$RUN_DIR/fail.tunnel" 2>/dev/null || true
+      return 0
+    fi
+  fi
 
   if tunnel_pid >/dev/null 2>&1; then
     echo 0 > "$RUN_DIR/fail.tunnel" 2>/dev/null || true
@@ -1152,10 +1254,15 @@ supervise_tunnel() {
       -i "$TUNNEL_KEY" \
       -R "127.0.0.1:$port:localhost:22" \
       -p "$sshport" "fleet@$vps"
-  # Record the newest ssh pid we can attribute to this tunnel.
+  # Record the newest ssh pid we can attribute to this tunnel. D1: the old
+  # `pgrep -n -f -- "-R 127.0.0.1:$port..."` is GONE — it matched any argv
+  # substring (an operator's ssh, or a `-c` command line merely mentioning the
+  # port) and ignored the key entirely.
   sleep 0.3
-  local pid
-  pid="$(pgrep -n -f -- "-R 127.0.0.1:$port:localhost:22" 2>/dev/null || true)"
+  local newpids pid
+  newpids="$(tunnel_candidates "$port")"
+  # shellcheck disable=SC2086
+  pid="$(tunnel_newest $newpids)" || pid=""
   [ -n "$pid" ] && printf '%s\n' "$pid" > "$TUNNEL_PID" 2>/dev/null || true
 }
 
@@ -2189,7 +2296,11 @@ print_status() {
   esac
   # FLEET-BRAIN §1: the reverse-tunnel state. unconfigured (silent for legacy
   # readers is fine, but the brain reads this field) | up | down.
-  printf ' tunnel=%s' "$(tunnel_state)"
+  # D3: tunnelfail= rides alongside it, ALWAYS (0 when the counter file is
+  # absent) — a box parked on the tunnel backoff ladder was previously invisible
+  # from the status line, which is how the grok-box-005 stray went unnoticed.
+  # `check` stays OK on tunnelfail alone; this is visibility, not a predicate.
+  printf ' tunnel=%s tunnelfail=%s' "$(tunnel_state)" "$(tunnel_fail_count)"
   printf '\n'
 }
 
