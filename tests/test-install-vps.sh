@@ -424,6 +424,65 @@ else
   bad "#8 fetch-path tree unexpected: [$tree_fetch] want [$expected_norm]"
 fi
 
+# --- TWO TEMPS, AND THEY ARE NOT INTERCHANGEABLE -----------------------------
+# The install path has TWO temp files. Do not merge them.
+#
+#   1. the FETCH temp — $FLEET2_FETCH_ROOT/.fleet2-fetch.XXXXXX/<asset>, where
+#      curl writes and the digest is verified. It is created in the PREFLIGHT,
+#      before any mutation, on an EXPLICITLY NAMED real-disk path — never the
+#      default TMPDIR, which is tmpfs on the 961 MB brain VPS and would have to
+#      hold an ~80 MB download.
+#   2. the INSTALL temp — $OPT_DIR/.fleet2.XXXXXX, created by mktemp in the SAME
+#      DIRECTORY as the live target. That same-directory mktemp + `mv -f` is
+#      what makes the install ATOMIC, and is the entire reason it lives in
+#      $OPT_DIR rather than anywhere more convenient.
+#
+# The fetch temp is COPIED into the install temp with `install -m 0755` and is
+# NEVER renamed onto the live path. Pointing the final `mv -f` at the fetch temp
+# would look like a simplification and would be a cross-device rename —
+# $FLEET2_FETCH_ROOT and $OPT_DIR can be on different filesystems — which either
+# fails outright or silently degrades into a non-atomic copy, losing the
+# atomicity this code has today. These assertions exist to catch that edit.
+inst_fn="$(extract_from "$VPS_INSTALL" install_fleet2)"
+if printf '%s\n' "$inst_fn" | grep -Fq 'tmp="$(mktemp "$OPT_DIR/.fleet2.XXXXXX")"'; then
+  pass "installer: the INSTALL temp is still mktemp'd inside \$OPT_DIR (same-dir rename = atomic)"
+else
+  bad "installer: the \$OPT_DIR/.fleet2.XXXXXX install temp is gone — the install is no longer atomic: [$inst_fn]"
+fi
+if printf '%s\n' "$inst_fn" | grep -Fq 'install -m 0755 "$built" "$tmp"'; then
+  pass "installer: the FETCH temp is COPIED into the install temp (install -m 0755), never renamed onto the live path"
+else
+  bad "installer: 'install -m 0755 \"\$built\" \"\$tmp\"' is gone — the two temps have been merged"
+fi
+mv_live="$(printf '%s\n' "$inst_fn" | grep -F 'mv -f' | grep -F '"$OPT_DIR/fleet2"' | grep -v '^ *#')"
+case "$mv_live" in
+  *'mv -f "$tmp" "$OPT_DIR/fleet2"'*)
+    pass "installer: the live \$OPT_DIR/fleet2 is renamed from the INSTALL temp (\$tmp), not the fetch temp" ;;
+  *) bad "installer: the final mv -f does not rename \$tmp onto \$OPT_DIR/fleet2 — cross-device rename risk: [$mv_live]" ;;
+esac
+
+# The fetch temp is ~80 MB and must not accumulate across re-provisions: it is
+# removed on EVERY exit path — the refusal paths (curl failure, bad digest) and
+# the success path alike. FLEET2_FETCH_ROOT points at a scratch dir here so the
+# leftovers are countable.
+fetch_temp_cleanup_test() {
+  local mode="$1"
+  local pfx fx fr; pfx="$(mktemp -d)"; fx="$(mktemp -d)"; fr="$(mktemp -d)"
+  fixture_origin "$mode" "$fx"
+  PREFIX="$pfx" FLEET2_FETCH_ROOT="$fr" FLEET2_BASE_URL="file://$fx" \
+    FLEET2_RELEASE=v9.9.9 FLEET2_SHA256="$STUB_SHA" bash "$VPS_INSTALL" >/dev/null 2>&1
+  find "$fr" -mindepth 1 2>/dev/null | wc -l | tr -d ' '
+  rm -rf "$pfx" "$fx" "$fr"
+}
+for m in good corrupt absent; do
+  left="$(fetch_temp_cleanup_test "$m")"
+  if [ "$left" = 0 ]; then
+    pass "installer (D2/D7): the ~80 MB fetch temp is cleaned up on the '$m' path (nothing left under \$FLEET2_FETCH_ROOT)"
+  else
+    bad "fetch temp LEAKED on the '$m' path: $left entries left under \$FLEET2_FETCH_ROOT"
+  fi
+done
+
 # #5 (D3): the tag is only an address; the sha256 is the identity. Overriding one
 # without the other means fetching bytes the operator has not pinned ⇒ refusal.
 # No FLEET2_BINARY here on purpose: the pairing check runs first in the preflight,
