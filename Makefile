@@ -1,4 +1,4 @@
-.PHONY: lint test ts-test ts-build ts-deploy ts-cutover ts-apply-flip ts-cutback \
+.PHONY: lint test ts-deps ts-test ts-build ts-deploy ts-cutover ts-apply-flip ts-cutback \
         ts-release-build ts-release-publish
 
 lint:
@@ -23,12 +23,20 @@ test:
 VPS ?= root@107.172.132.211
 FLEET2_REMOTE ?= /opt/grok-fleet/fleet2
 
-ts-test:
+# The TUI is an Ink (React) app since fleet-tui-ink D4, so the bun targets need
+# the node_modules tree. `--frozen-lockfile` makes the tracked fleet/bun.lock the
+# authority: a dependency edit that forgot to commit the lock fails here rather
+# than resolving something different on the release machine.
+ts-deps:
+	cd fleet && bun install --frozen-lockfile
+
+ts-test: ts-deps
 	cd fleet && bun test
 
-ts-build:
+ts-build: ts-deps
 	cd fleet && bun build src/cli.ts --compile --minify --sourcemap \
 		--target=bun-linux-x64 --define IS_COMPILED=true \
+		--define process.env.NODE_ENV='"production"' \
 		--define FLEET2_GIT_SHA="\"$$(git rev-parse --short HEAD)\"" \
 		--outfile dist/fleet2
 
