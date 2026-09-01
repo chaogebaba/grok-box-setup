@@ -68,37 +68,51 @@ function mergeBox(env: ServerContext["env"], sb: SnapshotBox): SnapshotBox {
  * production had been applying for a day — a reading an operator could act on.
  * `apply` is a config fact, not a tick observation, so read the config itself.
  *
- * This mirrors the reconcile drop-in's own test EXACTLY, which is what actually
+ * The authority is the reconcile drop-in's OWN test, which is what actually
  * decides whether the timer passes `--apply`:
- *   grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" config.toml
- * so `apply` is true when it is true EITHER at top level OR in [fleet-brain]
- * (the installer's template puts it in [fleet-brain]; a hand-edited top-level
- * key still makes the unit apply, and we must not report otherwise).
  *
- * Cheap: one local file read, NO ssh and NO reconcile. On ANY failure (missing
- * file, unreadable, unparseable TOML) it does NOT throw — it falls back to the
- * snapshot value and reports `apply_source: "snapshot"` so the client can tell
- * the reading may be stale.
+ *   grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" config.toml
+ *
+ * So we run THAT regex over the raw file text rather than parsing TOML and
+ * imitating it. Parity is then exact by construction. A TOML parse could only
+ * ever approximate it and the gap is not academic: `apply = true` under ANY
+ * table — `[rollout]`, or a section someone adds next year — makes the UNIT
+ * apply, while a parse that inspects only the tables it knows about would
+ * report `apply=false` and label it `apply_source: "config"`, i.e. present a
+ * WRONG reading as authoritative. That is the same failure class as the stale
+ * reading this function exists to fix. The grep is line-oriented and
+ * section-blind, and so are we.
+ *
+ * Corollaries, all of them the unit's behaviour and therefore ours:
+ *   - `#apply = true` is not at the start of a line's content ⇒ false;
+ *   - `apply=true` and leading whitespace both match (the regex allows both);
+ *   - `apply = "true"` does NOT match (a quote sits where `true` must be), so
+ *     the unit dry-runs and we report false;
+ *   - malformed TOML is irrelevant — grep does not parse, and neither do we.
+ *
+ * Cheap: one local file read, NO ssh and NO reconcile. On a genuine READ
+ * failure (missing file, EACCES, a directory at the path) it does NOT throw —
+ * it falls back to the snapshot value and reports `apply_source: "snapshot"` so
+ * the client can tell the reading may be stale.
  */
+/** The drop-in's grep, as a regex. `[[:space:]]` minus the line separator. */
+const APPLY_TRUE_RE = /^[ \t\v\f\r]*apply[ \t\v\f\r]*=[ \t\v\f\r]*true/m;
+
 export function readLiveApply(
   env: ServerContext["env"],
   snapshotApply: boolean | null,
 ): { apply: boolean | null; apply_source: "config" | "snapshot" } {
   const fallback = { apply: snapshotApply, apply_source: "snapshot" as const };
+  let text: string;
   try {
     if (!existsSync(env.FLEET_CONFIG)) return fallback;
-    const raw = Bun.TOML.parse(readFileSync(env.FLEET_CONFIG, "utf8")) as Record<string, unknown>;
-    const fb = raw["fleet-brain"];
-    const scoped = fb !== null && typeof fb === "object" && !Array.isArray(fb)
-      ? (fb as Record<string, unknown>)["apply"]
-      : undefined;
-    // absent in both ⇒ the unit's grep finds nothing ⇒ dry-run. That IS the
-    // live answer, not a read failure.
-    const isTrue = (v: unknown) => v === true || v === "true";
-    return { apply: isTrue(scoped) || isTrue(raw["apply"]), apply_source: "config" };
+    text = readFileSync(env.FLEET_CONFIG, "utf8");
   } catch {
     return fallback;
   }
+  // No match ⇒ the unit finds nothing to flip on ⇒ dry-run. That IS the live
+  // answer, not a read failure.
+  return { apply: APPLY_TRUE_RE.test(text), apply_source: "config" };
 }
 
 /** ISO8601Z now. */

@@ -7,9 +7,26 @@
 // read is one local file read: no ssh, no reconcile. Every OTHER field still
 // comes from the snapshot, and tick_age_s / staleness are unchanged.
 //
-// Mutants these kill: read `apply` from the snapshot again; throw (500) when the
-// config is missing/malformed instead of falling back; drop `apply_source` so a
-// fallen-back (possibly stale) value is indistinguishable from a live one.
+// The authority is the reconcile drop-in's own test, which is what decides
+// whether the timer passes --apply:
+//   grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" config.toml
+// so the live read runs THAT regex over the raw text. Parity is exact by
+// construction, not by imitation — a TOML parse that only inspects the tables it
+// knows about reports `apply=false` for `apply = true` under `[rollout]` (or any
+// section added later) while the UNIT applies, i.e. a WRONG reading labelled
+// authoritative. Same failure class as the stale reading, just moved.
+//
+// Every expectation below was checked against real GNU grep with that exact
+// pattern; all 11 probes agreed with the regex:
+//   `apply = true`  TRUE | `[rollout]`+`apply = true` TRUE | `#apply = true` false
+//   `# apply = true` false | `apply=true` TRUE | `   apply   =   true` TRUE
+//   `apply = "true"` false | `apply = True` false | `apply = false` false
+//   `xapply = true` false | `apply = truex` TRUE
+//
+// Mutants these kill: read `apply` from the snapshot again; parse TOML and check
+// only known tables (the section-blindness cases); throw (500) on an unreadable
+// config instead of falling back; drop `apply_source` so a fallen-back (possibly
+// stale) value is indistinguishable from a live one.
 
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
@@ -96,10 +113,55 @@ describe("GET /v1/fleet reads apply LIVE from the config", () => {
     expect(body.apply_source).toBe("config");
   });
 
-  test("a commented-out apply does not count as true", async () => {
-    const { body } = await fleetBody(treeWith(LINE(false), '[fleet-brain]\n#apply = true\n'));
+  test("a commented-out apply does not count as true (both #apply and # apply)", async () => {
+    for (const text of ['[fleet-brain]\n#apply = true\n', '[fleet-brain]\n# apply = true\n']) {
+      const { body } = await fleetBody(treeWith(LINE(false), text));
+      expect(body.apply).toBe(false);
+      expect(body.apply_source).toBe("config");
+    }
+  });
+
+  // --- PARITY with the drop-in's grep (the divergence a TOML parse would open) -
+  test("apply=true under a NON-fleet-brain table counts — the unit applies, so must we", async () => {
+    // A TOML parse that inspects only top level + [fleet-brain] reports false
+    // here while the timer is applying: a WRONG reading sold as authoritative.
+    const { body } = await fleetBody(treeWith(LINE(false), '[rollout]\napply = true\n'));
+    expect(body.apply).toBe(true);
+    expect(body.apply_source).toBe("config");
+  });
+
+  test("a section added LATER counts too (the grep is section-blind)", async () => {
+    const { body } = await fleetBody(
+      treeWith(LINE(false), '[fleet-brain]\nvps = "1.2.3.4"\n\n[some-future-table]\napply = true\n'),
+    );
+    expect(body.apply).toBe(true);
+  });
+
+  test("no spaces (apply=true) and leading whitespace both count", async () => {
+    for (const text of ['apply=true\n', '   apply   =   true\n', '\tapply\t=\ttrue\n']) {
+      const { body } = await fleetBody(treeWith(LINE(false), text));
+      expect(body.apply).toBe(true);
+      expect(body.apply_source).toBe("config");
+    }
+  });
+
+  test('apply = "true" as a TOML STRING is FALSE — matching the unit, not TOML', async () => {
+    // Verified against real grep: a quote sits where `true` must be, so the
+    // pattern does not match and the timer DRY-RUNS. We report what the unit
+    // does, even though a TOML reader would call this a truthy-looking value.
+    const { body } = await fleetBody(treeWith(LINE(true), '[fleet-brain]\napply = "true"\n'));
     expect(body.apply).toBe(false);
     expect(body.apply_source).toBe("config");
+  });
+
+  test("apply = True (capitalised) is FALSE — the pattern is case-sensitive", async () => {
+    const { body } = await fleetBody(treeWith(LINE(true), '[fleet-brain]\napply = True\n'));
+    expect(body.apply).toBe(false);
+  });
+
+  test("a key that merely ENDS in apply does not count", async () => {
+    const { body } = await fleetBody(treeWith(LINE(false), '[fleet-brain]\nxapply = true\n'));
+    expect(body.apply).toBe(false);
   });
 
   test("MISSING config ⇒ 200 with the snapshot value, marked apply_source=snapshot", async () => {
@@ -110,8 +172,26 @@ describe("GET /v1/fleet reads apply LIVE from the config", () => {
     expect(body.apply_source).toBe("snapshot");
   });
 
-  test("MALFORMED config ⇒ falls back, never 500s", async () => {
-    const { status, body } = await fleetBody(treeWith(LINE(true), '[fleet-brain\napply = = true\n'));
+  test("MALFORMED TOML is irrelevant — grep does not parse, and neither do we", async () => {
+    // The unit would apply here (the line matches); a TOML-parsing read would
+    // have thrown and fallen back to a possibly stale snapshot value instead.
+    const { status, body } = await fleetBody(treeWith(LINE(false), '[fleet-brain\napply = true\n'));
+    expect(status).toBe(200);
+    expect(body.apply).toBe(true);
+    expect(body.apply_source).toBe("config");
+  });
+
+  test("UNREADABLE config (a directory at the path) ⇒ falls back, never 500s", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fleet2-applylive-dir-"));
+    dirs.push(root);
+    const state = join(root, "state");
+    const hist = join(state, "history");
+    mkdirSync(hist, { recursive: true });
+    const line = LINE(true);
+    writeFileSync(join(hist, `${line.ts.slice(0, 10)}.jsonl`), JSON.stringify(line) + "\n");
+    const config = join(root, "config.toml");
+    mkdirSync(config); // readFileSync ⇒ EISDIR
+    const { status, body } = await fleetBody({ state, config });
     expect(status).toBe(200);
     expect(body.apply).toBe(true);
     expect(body.apply_source).toBe("snapshot");
