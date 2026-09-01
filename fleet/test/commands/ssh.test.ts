@@ -42,6 +42,20 @@ describe("T-ssh usage + argv", () => {
     ]);
     expect(argv.join(" ")).not.toContain("12345678");
   });
+
+  test("D11(a): the INTERACTIVE forms carry NO known-hosts option (kills mutant l)", () => {
+    // `fleet2 ssh` is human-invoked, often from a laptop where FLEET_STATE does
+    // not exist. It keeps ssh's defaults, the user's own ~/.ssh/known_hosts, no
+    // auto-forget and a visible banner. Both forms.
+    for (const argv of [sshCmdArgv("grok-box-8", "uptime"), sshCmdArgv("grok-box-8", undefined)]) {
+      const joined = argv.join(" ");
+      expect(joined).not.toContain("UserKnownHostsFile");
+      expect(joined).not.toContain("GlobalKnownHostsFile");
+      expect(joined).not.toContain("HashKnownHosts");
+      expect(joined).not.toContain("CheckHostIP");
+      expect(joined).not.toContain("known_hosts");
+    }
+  });
 });
 
 describe("T-ssh password resolution (main:108)", () => {

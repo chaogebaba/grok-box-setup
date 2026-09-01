@@ -144,7 +144,7 @@ describe("T9/T9b backoff (D4/F5)", () => {
     // managed present so we can see the config pass run despite backoff
     const src: ManagedSource = { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined };
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" }); // 008 tunnel up
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" }); // 008 tunnel up
       return result({ code: 0, stdout: "sha=X cur=X support=yes enabled=true" });
     });
     const deps = baseDeps({
@@ -181,7 +181,7 @@ describe("T7 D4: WOULD 'read-only ' prefix is CONDITIONAL on the latch (F3, m9)"
     const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: false, lastSeen: "2000-01-01T00:00:00Z" }] });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       return result({ code: 1 });
     });
@@ -200,7 +200,7 @@ describe("T7 D4: WOULD 'read-only ' prefix is CONDITIONAL on the latch (F3, m9)"
     const { keys, ctx } = fakeKeys(() => ({ code: 200, body: devs }));
     ctx.latch(); // pre-latched ⇒ ctx.readonly true
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       return result({ code: 1 });
     });
@@ -220,7 +220,7 @@ describe("T7 D4: WOULD 'read-only ' prefix is CONDITIONAL on the latch (F3, m9)"
     const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: true, lastSeen: "2999-01-01T00:00:00Z" }] });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       // the config-pass dry-run remote: report a DIFFERENT cur sha ⇒ WOULD push.
       return result({ code: 0, stdout: "cur=OTHERSHA want=IGNORED support=yes enabled=true" });
@@ -268,7 +268,7 @@ describe("T12 rollout gating (D10/F8)", () => {
     const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: true, lastSeen: "2999-01-01T00:00:00Z", tags: ["t"], keyExpiryDisabled: true }] });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/OLDSHA tunnel=up" });
       return result({ code: 1 });
     });
@@ -295,7 +295,7 @@ describe("T13 D6c: config pass failure never changes run rc", () => {
     });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       // config push (sudo sh -c) ⇒ rc 2 no status ⇒ push rc 5
       return result({ code: 2, stdout: "" });
@@ -326,7 +326,7 @@ describe("T2 latch suppresses a mint-worthy box even in apply mode (m2)", () => 
     const { keys, ctx, apiCalls } = fakeKeys(() => ({ code: 200, body: devs }));
     ctx.latch(); // pre-latched
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       return result({ code: 1 });
     });

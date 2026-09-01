@@ -24,6 +24,8 @@ interface Recorder {
   wrote: boolean;
   installedVpsKey: boolean;
   installedBoxKey: boolean;
+  /** D11(b)(i): every forgetHostKeys(box, port) the orchestration made. */
+  forgets: string[];
 }
 
 /** A default-happy EnrollSideEffects; tests override individual members. */
@@ -38,6 +40,7 @@ function happySE(over: Partial<EnrollSideEffects> = {}, rec?: Recorder): EnrollS
     lastApiCode() { return 200; },
     async readBoxPubkey() { return "ssh-ed25519 AAAAC3xyz grok-tunnel"; },
     async tunnelUp() { return false; },
+    async forgetHostKeys(box, port) { rec?.forgets.push(`${box}:${port}`); },
     async installVpsAuthorizedKey() { if (rec) rec.installedVpsKey = true; return true; },
     async recordEtcMapping() { return true; },
     async vpsBoxAccessPubkey() { return "ssh-ed25519 AAAAvpskey vps"; },
@@ -127,6 +130,40 @@ describe("T1 enroll_wait_tunnel (D3/F1/F5)", () => {
 });
 
 describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
+  test("D11(b)(i): the forget runs AFTER the rc-6 and rc-5 guards and BEFORE the ACL", async () => {
+    // The two guards run "before any side effect", and a forget IS a side
+    // effect on the engine's own file — so a refused enrol must spawn nothing.
+    const order: string[] = [];
+    const denied = "permitlisten 127.0.0.1:20009\n";
+
+    const rc6: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
+    expect(await cmdEnroll(["grok-box-8"], happySE({ async vpsUserExists() { return false; } }, rc6))).toBe(6);
+    expect(rc6.forgets).toEqual([]);
+
+    const rc5: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
+    const rc = await cmdEnroll(
+      ["grok-box-8"],
+      happySE({ async haveSshd() { return true; }, async sshdEffective() { return denied; } }, rc5),
+    );
+    expect(rc).toBe(5);
+    expect(rc5.forgets).toEqual([]);
+
+    // A permitted enrol forgets ONCE, for this box and port, before the ACL GET.
+    const ok: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
+    await cmdEnroll(
+      ["grok-box-8"],
+      happySE(
+        {
+          async forgetHostKeys(box, port) { order.push(`forget:${box}:${port}`); ok.forgets.push(`${box}:${port}`); },
+          async aclHasFleetBrainTagowner() { order.push("acl"); return 0; },
+        },
+        ok,
+      ),
+    );
+    expect(ok.forgets).toEqual(["grok-box-8:20008"]);
+    expect(order).toEqual(["forget:grok-box-8:20008", "acl"]);
+  });
+
   test("usage: no box ⇒ rc 2", async () => {
     const cap = captureLog();
     const rc = await cmdEnroll([], happySE());
@@ -144,7 +181,7 @@ describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
   });
 
   test("F4 rc 6 locality (fleet user absent) ⇒ nothing written", async () => {
-    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false };
+    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
     const cap = captureLog();
     const rc = await cmdEnroll(["grok-box-8"], happySE({ async vpsUserExists() { return false; } }, rec));
     cap.restore();
@@ -155,7 +192,7 @@ describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
   });
 
   test("D4 rc 5 permitlisten DENIED ⇒ nothing written", async () => {
-    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false };
+    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
     const cap = captureLog();
     const rc = await cmdEnroll(
       ["grok-box-8"],
@@ -169,7 +206,7 @@ describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
   });
 
   test("m1: box-config failure ⇒ rc 1, enrolled.tsv NOT written", async () => {
-    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false };
+    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
     const cap = captureLog();
     const rc = await cmdEnroll(["grok-box-8"], happySE({ async writeBoxConfig() { return 1; } }, rec));
     cap.restore();
@@ -179,7 +216,7 @@ describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
   });
 
   test("box-config ABSENT (rc 4) ⇒ rc 1 + install-first message, NOT recorded", async () => {
-    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false };
+    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
     const cap = captureLog();
     const rc = await cmdEnroll(["grok-box-8"], happySE({ async writeBoxConfig() { return 4; } }, rec));
     cap.restore();
@@ -189,7 +226,7 @@ describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
   });
 
   test("no VPS address ⇒ 4-line refusal rc 1, nothing written (D1)", async () => {
-    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false };
+    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
     const cap = captureLog();
     const rc = await cmdEnroll(["grok-box-8"], happySE({ fleetVpsAddr() { return undefined; } }, rec));
     cap.restore();
@@ -215,7 +252,7 @@ describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
   });
 
   test("happy path (WAIT=0) ⇒ rc 0, row written with the port", async () => {
-    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false };
+    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
     const rc = await cmdEnroll(["grok-box-8"], happySE({}, rec));
     expect(rc).toBe(0);
     expect(rec.enrolled).toEqual([{ box: "grok-box-8", port: 20008 }]);
@@ -231,7 +268,7 @@ describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
   });
 
   test("D3 rc 4 tunnel timeout ⇒ row STILL written (resumable)", async () => {
-    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false };
+    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
     const cap = captureLog();
     // WAIT=1, tunnel never up ⇒ waitTunnel rc 4, but recordEnrolled ran first.
     const rc = await cmdEnroll(["grok-box-8"], happySE({ tunnelWaitBudget: () => "1", async tunnelUp() { return false; } }, rec));
@@ -241,7 +278,7 @@ describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
   });
 
   test("--no-box-config ⇒ skips box write, rc 0, DONE line", async () => {
-    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false };
+    const rec: Recorder = { enrolled: [], wrote: false, installedVpsKey: false, installedBoxKey: false, forgets: [] };
     const cap = captureLog();
     const rc = await cmdEnroll(["--no-box-config", "grok-box-8"], happySE({}, rec));
     cap.restore();

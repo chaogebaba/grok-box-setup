@@ -69,10 +69,11 @@ interface Calls {
   probes: string[];
   adopts: string[];
   inspects: string[];
+  forgets: Array<{ box: string; scope: "both" | "tailnet" }>;
 }
 
 function stubDeps(over: Partial<DiscoverDeps> = {}): { deps: DiscoverDeps; calls: Calls } {
-  const calls: Calls = { probes: [], adopts: [], inspects: [] };
+  const calls: Calls = { probes: [], adopts: [], inspects: [], forgets: [] };
   const base: DiscoverDeps = {
     apiToken: true,
     boxPassword: "pw",
@@ -90,6 +91,9 @@ function stubDeps(over: Partial<DiscoverDeps> = {}): { deps: DiscoverDeps; calls
     async inspect(box): Promise<RepairFindings> {
       calls.inspects.push(box);
       return { ok: true, coherent: false, reason: "[fleet] block missing" };
+    },
+    async forgetHostKeys(box, scope): Promise<void> {
+      calls.forgets.push({ box, scope });
     },
   };
   return { deps: { ...base, ...over }, calls };
@@ -560,5 +564,108 @@ describe("D6d split budget", () => {
     now += 120_000; // the membership loop takes two minutes
     await run.repairPass();
     expect(calls.inspects).toEqual(["grok-box-008"]); // repair still ran
+  });
+});
+
+// --- D11(c) candidate re-probe + D11(b)(ii) repair forget ---------------------
+
+describe("D11(c) candidate re-probe (a reused NAME)", () => {
+  test("mismatch then success ⇒ ONE tailnet forget and ONE re-probe, then the adopt", async () => {
+    const { state } = memState();
+    let n = 0;
+    const { deps, calls } = stubDeps({
+      async probe(box) {
+        calls.probes.push(box);
+        n++;
+        // the first contact meets the banner; after the pin is forgotten,
+        // accept-new pins whatever the box now presents.
+        return n === 1
+          ? { reachable: false, hostname: "", boxup: undefined, hostkeyMismatch: true }
+          : { reachable: true, hostname: "", boxup: "5.3.0" };
+      },
+    });
+    const run = new DiscoverRun(deps, tickOpts(state));
+    await run.adoptPass();
+    // tailnet spec ONLY: an unenrolled box has no tunnel of ours to reason about
+    expect(calls.forgets).toEqual([{ box: "grok-box-003", scope: "tailnet" }]);
+    expect(calls.probes).toEqual(["grok-box-003", "grok-box-003"]);
+    expect(calls.adopts).toEqual(["grok-box-003"]);
+  });
+
+  test("mismatch TWICE ⇒ skipped:unreachable and NO third probe", async () => {
+    const { state } = memState();
+    const { deps, calls } = stubDeps({
+      async probe(box) {
+        calls.probes.push(box);
+        return { reachable: false, hostname: "", boxup: undefined, hostkeyMismatch: true };
+      },
+    });
+    const run = new DiscoverRun(deps, tickOpts(state));
+    await run.adoptPass();
+    expect(calls.probes).toHaveLength(2);
+    expect(calls.forgets).toHaveLength(1);
+    expect(calls.adopts).toEqual([]);
+    expect(run.summary.skipped).toEqual([{ name: "grok-box-003", reason: "unreachable" }]);
+  });
+
+  test("an ordinary unreachable candidate is NOT re-probed", async () => {
+    const { state } = memState();
+    const { deps, calls } = stubDeps({
+      async probe(box) {
+        calls.probes.push(box);
+        return { reachable: false, hostname: "", boxup: undefined };
+      },
+    });
+    const run = new DiscoverRun(deps, tickOpts(state));
+    await run.adoptPass();
+    expect(calls.probes).toHaveLength(1);
+    expect(calls.forgets).toEqual([]);
+  });
+});
+
+describe("D11(b)(ii) repair forgets BEFORE the content checks", () => {
+  test("marker set ⇒ forget precedes inspect, and the repair runs", async () => {
+    const { state } = memState();
+    state.bumpRepairPending("grok-box-008", 5);
+    state.bumpRepairPending("grok-box-008", 5);
+    state.setHostkeyMismatch("grok-box-008");
+    const order: string[] = [];
+    const { deps, calls } = stubDeps({
+      async listPeers() { return []; },
+      async inspect(box) {
+        order.push("inspect");
+        calls.inspects.push(box);
+        // what the wiring returns while the marker is set
+        return { ok: true, coherent: false, reason: "hostkey-mismatch" };
+      },
+      async forgetHostKeys(box, scope) {
+        order.push("forget");
+        calls.forgets.push({ box, scope });
+      },
+    });
+    const run = new DiscoverRun(deps, tickOpts(state, { membership: ["grok-box-008"] }));
+    await run.repairPass();
+    expect(order).toEqual(["forget", "inspect"]);
+    expect(calls.forgets).toEqual([{ box: "grok-box-008", scope: "both" }]);
+    expect(calls.adopts).toEqual(["grok-box-008"]);
+    expect(run.summary.repaired).toBe(1);
+  });
+
+  test("marker CLEAR ⇒ no forget at all (the flapping no-op; kills an unconditional forget)", async () => {
+    const { state } = memState();
+    state.bumpRepairPending("grok-box-008", 5);
+    state.bumpRepairPending("grok-box-008", 5);
+    const { deps, calls } = stubDeps({
+      async listPeers() { return []; },
+      async inspect(box) {
+        calls.inspects.push(box);
+        return { ok: true, coherent: true, reason: "coherent" };
+      },
+    });
+    const run = new DiscoverRun(deps, tickOpts(state, { membership: ["grok-box-008"] }));
+    await run.repairPass();
+    expect(calls.forgets).toEqual([]);
+    expect(calls.inspects).toEqual(["grok-box-008"]);
+    expect(calls.adopts).toEqual([]); // a deliberate NO-OP that spends no slot
   });
 });

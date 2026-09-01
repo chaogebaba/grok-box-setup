@@ -148,6 +148,87 @@ describe("D2 discover transport", () => {
     ]);
   });
 
+  test("D11(a): the tailnet argv carries the four known-hosts options BEFORE SSH_OPTS", async () => {
+    const runner = new FakeRunner(() => result({ code: 0, stdout: "" }));
+    const deps = makeDiscoverDeps({
+      env: testEnv({ FLEET_STATE: "/var/lib/grok-fleet" }),
+      cfg: EMPTY_CFG,
+      runner,
+      apiToken: true,
+      readFile: (p) => (p.endsWith("box_passwd") ? "pw" : undefined),
+    });
+    await deps.probe("grok-box-003");
+    const argv = runner.calls.find((c) => c.argv[0] === "sshpass")!.argv;
+    const at = argv.indexOf("UserKnownHostsFile=/var/lib/grok-fleet/known_hosts");
+    expect(at).toBeGreaterThan(-1);
+    expect(argv.slice(at, at + 7)).toEqual([
+      "UserKnownHostsFile=/var/lib/grok-fleet/known_hosts",
+      "-o",
+      "GlobalKnownHostsFile=/dev/null",
+      "-o",
+      "HashKnownHosts=no",
+      "-o",
+      "CheckHostIP=no",
+    ]);
+    // BEFORE SSH_OPTS, so ssh's first-wins rule takes the engine's file.
+    expect(at).toBeLessThan(argv.indexOf("StrictHostKeyChecking=accept-new"));
+    // the probe never reads /root/.ssh/known_hosts
+    expect(argv.join(" ")).not.toContain("/root/.ssh");
+  });
+
+  test("D11(c): a probe that meets the banner reports hostkeyMismatch with reachable:false", async () => {
+    const runner = new FakeRunner(() =>
+      result({ code: 255, stderr: "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!" }),
+    );
+    const deps = makeDiscoverDeps({
+      env: testEnv(),
+      cfg: EMPTY_CFG,
+      runner,
+      apiToken: true,
+      readFile: (p) => (p.endsWith("box_passwd") ? "pw" : undefined),
+    });
+    const p = await deps.probe("grok-box-003");
+    expect(p.reachable).toBe(false);
+    expect(p.hostkeyMismatch).toBe(true);
+  });
+
+  test("D11(b): forgetHostKeys is wired from the runner and the engine's file", async () => {
+    const runner = new FakeRunner((argv) =>
+      argv[0] === "ss"
+        ? result({ stdout: 'LISTEN 0 128 127.0.0.1:20003 0.0.0.0:* users:(("sshd",pid=41,fd=7))\n' })
+        : result({}),
+    );
+    const deps = makeDiscoverDeps({
+      env: testEnv({ FLEET_STATE: "/var/lib/grok-fleet" }),
+      cfg: EMPTY_CFG,
+      runner,
+      apiToken: true,
+      readFile: (p) => (p.endsWith("box_passwd") ? "pw" : undefined),
+    });
+    await deps.forgetHostKeys("grok-box-003", "tailnet");
+    // the file does not exist in this test root, so nothing is spawned — the
+    // wiring still refuses to touch a file it does not own.
+    expect(runner.argvs().every((a) => a[0] !== "ssh-keygen")).toBe(true);
+  });
+
+  test("D11(c): inspect SHORT-CIRCUITS while the mismatch marker is set — no remote read", async () => {
+    const runner = new FakeRunner(() => result({ code: 0, stdout: "" }));
+    const state = memState();
+    state.setHostkeyMismatch("grok-box-003");
+    const deps = makeDiscoverDeps({
+      env: testEnv(),
+      cfg: EMPTY_CFG,
+      runner,
+      apiToken: true,
+      readFile: (p) => (p.endsWith("box_passwd") ? "pw" : undefined),
+      state,
+    });
+    const f = await deps.inspect("grok-box-003");
+    // ok:true takes the REPAIR branch, not the unreachable/backoff branch.
+    expect(f).toEqual({ ok: true, coherent: false, reason: "hostkey-mismatch" });
+    expect(runner.calls).toHaveLength(0);
+  });
+
   test("the probe read splits hostname from boxup version; an EMPTY hostname file reads ''", () => {
     expect(parseProbeRead("grok-box-003\n---fleet2-probe---\nboxup 5.3.0\n")).toEqual({
       hostname: "grok-box-003",
@@ -166,6 +247,7 @@ interface Rec {
   installedVpsKey: boolean;
   installedBoxKey: boolean;
   waited: boolean;
+  forgets: string[];
 }
 
 function happySE(over: Partial<EnrollSideEffects> = {}, rec?: Rec): EnrollSideEffects {
@@ -178,6 +260,7 @@ function happySE(over: Partial<EnrollSideEffects> = {}, rec?: Rec): EnrollSideEf
     async aclHasFleetBrainTagowner() { return 0; },
     lastApiCode() { return 200; },
     async readBoxPubkey() { return "ssh-ed25519 AAAAkey grok-tunnel"; },
+    async forgetHostKeys(box, port) { rec?.forgets.push(`${box}:${port}`); },
     async tunnelUp() { return false; },
     async installVpsAuthorizedKey() { if (rec) rec.installedVpsKey = true; return true; },
     async recordEtcMapping() { return true; },
@@ -193,7 +276,7 @@ function happySE(over: Partial<EnrollSideEffects> = {}, rec?: Rec): EnrollSideEf
 }
 
 function newRec(): Rec {
-  return { enrolled: [], wroteConfig: false, installedVpsKey: false, installedBoxKey: false, waited: false };
+  return { enrolled: [], wroteConfig: false, installedVpsKey: false, installedBoxKey: false, waited: false, forgets: [] };
 }
 
 describe("D3 adoption through the real cmdEnroll", () => {
@@ -393,11 +476,27 @@ describe("D5 repair content checks (wired)", () => {
   });
 });
 
+describe("D11(b)(i) withAbortPoints passes the forget through UNTIMED", () => {
+  test("forgetHostKeys is the same local call, never wrapped in an abort point", async () => {
+    const seen: string[] = [];
+    const base = happySE({
+      async forgetHostKeys(box, port) { seen.push(`${box}:${port}`); },
+    });
+    let now = 0;
+    // A clock that jumps past the whole mutation budget on every read would
+    // abort any TIMED point; the forget must be unaffected because it is local.
+    const { se } = withAbortPoints(base, () => (now += 1_000_000));
+    await se.forgetHostKeys("grok-box-003", 20003);
+    expect(seen).toEqual(["grok-box-003:20003"]);
+  });
+});
+
 // --- D6d worst-case timing ----------------------------------------------------
 
 describe("D6d worst-case timing (virtual clock, stubs at their ceilings)", () => {
   test("discover work + one mutation stays inside 2.5 minutes", async () => {
     let now = 0;
+    let probes = 0;
     const clock = () => now;
     const rec = newRec();
 
@@ -423,8 +522,14 @@ describe("D6d worst-case timing (virtual clock, stubs at their ceilings)", () =>
         },
         async probe() {
           now += DISCOVER_PROBE_CEILING_MS - 1; // the ssh probe at its ceiling
-          return { reachable: true, hostname: "", boxup: "5.3.0" };
+          probes++;
+          // D11(c): the WORST case for a candidate is now a banner on the first
+          // contact followed by a re-probe, so both probes run at their ceiling.
+          return probes === 1
+            ? { reachable: false, hostname: "", boxup: undefined, hostkeyMismatch: true }
+            : { reachable: true, hostname: "", boxup: "5.3.0" };
         },
+        async forgetHostKeys() { /* local processes only — no measurable time */ },
         async adopt() {
           const { se, timedOutPoint } = withAbortPoints(slowSE, clock);
           const rc = await cmdEnroll(["grok-box-003"], se);
@@ -458,8 +563,8 @@ describe("D6d worst-case timing (virtual clock, stubs at their ceilings)", () =>
     expect(elapsed).toBeLessThanOrEqual(DISCOVER_BUDGET_MS + MUTATION_BUDGET_MS);
     expect(elapsed).toBeLessThanOrEqual(150_000);
     // Pinned so a future change that widens a ceiling shows up as a failure
-    // here rather than as a silently longer tick: 15 s status + 20 s probe +
-    // 90 s mutation.
-    expect(elapsed).toBe(124_995);
+    // here rather than as a silently longer tick: 15 s status + 2 x 20 s probe
+    // (the D11c candidate re-probe) + 90 s mutation.
+    expect(elapsed).toBe(144_994);
   });
 });

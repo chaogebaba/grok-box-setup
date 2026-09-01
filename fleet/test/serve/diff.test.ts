@@ -19,7 +19,7 @@ describe("GET /v1/boxes/:name/diff", () => {
     // ss shows the tunnel up so the diff proceeds to the dry-run ssh, which
     // fails (ssh rc 255) ⇒ the core returns rc 2 and emits a reason line.
     const runner = new FakeRunner((argv) => {
-      if (argv[0] === "ss") return result({ stdout: "LISTEN 0 0 127.0.0.1:20001 0.0.0.0:*", code: 0 });
+      if (argv[0] === "ss") return result({ stdout: "LISTEN 0 0 127.0.0.1:20001 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))", code: 0 });
       if (argv[0] === "diff") return result({ stdout: "", code: 0 });
       // the dry-run remote script over ssh fails (unreachable).
       return result({ code: 255, stdout: "", stderr: "ssh: connect refused" });

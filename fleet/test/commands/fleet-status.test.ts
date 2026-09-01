@@ -18,7 +18,7 @@ const DEVICES = JSON.stringify({
 // ss listener up ONLY for grok-box-3 (port 20003); grok-box-5 (20005) down.
 function runnerFor(): FakeRunner {
   return new FakeRunner((argv) => {
-    if (isSs(argv)) return { code: 0, stdout: "LISTEN 0 0 127.0.0.1:20003 0.0.0.0:*\n" };
+    if (isSs(argv)) return { code: 0, stdout: "LISTEN 0 0 127.0.0.1:20003 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" };
     // any tunnel ssh: check OK, status line with a sha for the up box.
     const cmd = argv[argv.length - 1] ?? "";
     if (cmd.includes("boxup check")) return { code: 0 };

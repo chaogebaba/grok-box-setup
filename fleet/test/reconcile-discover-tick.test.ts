@@ -62,6 +62,7 @@ interface Trace {
   order: string[];
   adopts: string[];
   inspects: string[];
+  forgets: Array<{ box: string; scope: "both" | "tailnet" }>;
 }
 
 function traceDeps(trace: Trace, over: Partial<DiscoverDeps> = {}): DiscoverDeps {
@@ -85,6 +86,10 @@ function traceDeps(trace: Trace, over: Partial<DiscoverDeps> = {}): DiscoverDeps
       trace.order.push(`inspect:${box}`);
       trace.inspects.push(box);
       return { ok: true, coherent: false, reason: "[fleet] block missing" };
+    },
+    async forgetHostKeys(box, scope) {
+      trace.order.push(`forget:${box}:${scope}`);
+      trace.forgets.push({ box, scope });
     },
     ...over,
   };
@@ -120,7 +125,7 @@ function baseDeps(over: Partial<ReconcileDeps>): { deps: ReconcileDeps; lines: S
 
 describe("D1 placement inside the tick", () => {
   test("adopt runs BEFORE the empty-membership early return (a brand-new VPS still adopts)", async () => {
-    const trace: Trace = { order: [], adopts: [], inspects: [] };
+    const trace: Trace = { order: [], adopts: [], inspects: [], forgets: [] };
     const { deps, lines } = baseDeps({ targetBoxes: [], discover: traceDeps(trace) });
     const r = await runReconcile(deps);
     expect(r.rc).toBe(0);
@@ -131,7 +136,7 @@ describe("D1 placement inside the tick", () => {
   });
 
   test("repair runs AFTER the membership loop and before the snapshot is written", async () => {
-    const trace: Trace = { order: [], adopts: [], inspects: [] };
+    const trace: Trace = { order: [], adopts: [], inspects: [], forgets: [] };
     // A box the API says is ONLINE with the tunnel DOWN ⇒ row e incoherent.
     const online = JSON.stringify({
       devices: [{ hostname: "grok-box-008", id: "1", online: true, lastSeen: "2999-01-01T00:00:00Z" }],
@@ -166,7 +171,7 @@ describe("D1 placement inside the tick", () => {
   });
 
   test("the marker RESETS on a tick where the incoherent condition does not hold", async () => {
-    const trace: Trace = { order: [], adopts: [], inspects: [] };
+    const trace: Trace = { order: [], adopts: [], inspects: [], forgets: [] };
     const online = JSON.stringify({
       devices: [{ hostname: "grok-box-008", id: "1", online: true, lastSeen: "2999-01-01T00:00:00Z" }],
     });

@@ -95,7 +95,7 @@ describe("TUI-D4 snapshot hook", () => {
     // config pass reaches pushManaged; pushManaged's remote returns in-sync.
     const port = 20008;
     const runner = new FakeRunner((argv) => {
-      if (argv[0] === "ss") return result({ stdout: `LISTEN 0 0 127.0.0.1:${port} 0.0.0.0:*`, code: 0 });
+      if (argv[0] === "ss") return result({ stdout: `LISTEN 0 0 127.0.0.1:${port} 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))`, code: 0 });
       // boxup check ⇒ healthy; managed remote ⇒ cur==want (in sync).
       const joined = argv.join(" ");
       if (joined.includes("boxup check")) return result({ stdout: "check=OK v=5.3.0/abc tunnel=up", code: 0 });

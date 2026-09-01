@@ -113,7 +113,7 @@ function responder(scripts: Record<string, BoxScript>) {
       for (const [box, s] of Object.entries(scripts)) {
         if (s.tunnel !== false) {
           const port = 20000 + Number(box.slice("grok-box-".length));
-          lines.push(`LISTEN 0 128 127.0.0.1:${port} 0.0.0.0:*`);
+          lines.push(`LISTEN 0 128 127.0.0.1:${port} 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))`);
         }
       }
       return result({ stdout: lines.join("\n") + "\n" });
@@ -500,7 +500,7 @@ describe("T12 timeout classification (F4)", () => {
     let installedFlag = false;
     const r = new FakeRunner((argv) => {
       if (argv[0] === "git") return result({ code: 0, stdout: "abc1234\n" });
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if (isScp(argv)) return result({ code: 0 });
       const cmd = argv[argv.length - 1] ?? "";
       if (cmd.startsWith("set -e;")) {
@@ -528,7 +528,7 @@ describe("T12 timeout classification (F4)", () => {
     let verifyRan = false;
     const r = new FakeRunner((argv) => {
       if (argv[0] === "git") return result({ code: 0, stdout: "abc1234\n" });
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if (isScp(argv)) return result({ code: null, signal: "SIGKILL", timedOut: true });
       const cmd = argv[argv.length - 1] ?? "";
       if (cmd === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/old tunnel=up" });

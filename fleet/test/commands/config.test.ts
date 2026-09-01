@@ -54,6 +54,13 @@ describe("T4 render", () => {
 });
 
 describe("T4 diff (F12)", () => {
+  // D11(c): `fleet2 config diff` now gates on tunnelUp, so every runner in this
+  // block must answer the `ss -tlnp` probe with a healthy sshd-owned listener on
+  // grok-box-8's port. A squatter or an absent listener is its own test below.
+  const SS_UP =
+    'LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:(("sshd",pid=41,fd=7))\n';
+  const isSsArgv = (argv: string[]) => argv[0] === "ss";
+
   async function dryRunOutput(box: string, onbox: string, opts: { cur?: string; enabled?: string; support?: string }) {
     const text = renderManaged(FLEET_TOML, undefined);
     const want = await textSha256(text);
@@ -68,6 +75,7 @@ describe("T4 diff (F12)", () => {
   // for the tunnel dry-run. Used by the F2 live-parity tests.
   function realDiffRunner(dryFixture: string): FakeRunner {
     return new FakeRunner((argv) => {
+      if (isSsArgv(argv)) return result({ stdout: SS_UP });
       if (argv[0] === "/usr/bin/diff") {
         const r = Bun.spawnSync(argv);
         return result({ code: r.exitCode ?? 0, stdout: r.stdout.toString(), stderr: r.stderr.toString() });
@@ -124,6 +132,7 @@ describe("T4 diff (F12)", () => {
     const dry = await dryRunOutput("grok-box-8", text, {});
     let remoteCmd = "";
     const runner = new FakeRunner((argv) => {
+      if (isSsArgv(argv)) return result({ stdout: SS_UP });
       if (argv[0] === "/usr/bin/diff") return result({ stdout: "", code: 0 });
       // the tunnel-ssh dry-run call — capture the remote command (last argv elt).
       remoteCmd = argv[argv.length - 1] ?? "";
@@ -139,6 +148,7 @@ describe("T4 diff (F12)", () => {
     const text = renderManaged(FLEET_TOML, undefined);
     const dry = await dryRunOutput("grok-box-8", text.replace(/\n$/, ""), {});
     const runner = new FakeRunner((argv) => {
+      if (isSsArgv(argv)) return result({ stdout: SS_UP });
       if (argv[0] === "/usr/bin/diff") return result({ stdout: "", code: 0 });
       return result({ code: 0, stdout: dry }); // the tunnel dry-run
     });
@@ -150,6 +160,7 @@ describe("T4 diff (F12)", () => {
   test("drift (cur != want) ⇒ rc 1", async () => {
     const dry = await dryRunOutput("grok-box-8", "old body", { cur: "differentsha" });
     const runner = new FakeRunner((argv) => {
+      if (isSsArgv(argv)) return result({ stdout: SS_UP });
       if (argv[0] === "/usr/bin/diff") return result({ stdout: "@@ -1 +1 @@\n-old\n+new\n", code: 1 });
       return result({ code: 0, stdout: dry });
     });
@@ -162,6 +173,7 @@ describe("T4 diff (F12)", () => {
   test("enabled=false ⇒ NOTE + never in-sync (rc 1)", async () => {
     const dry = await dryRunOutput("grok-box-8", "body", { enabled: "false" });
     const runner = new FakeRunner((argv) => {
+      if (isSsArgv(argv)) return result({ stdout: SS_UP });
       if (argv[0] === "/usr/bin/diff") return result({ stdout: "", code: 0 });
       return result({ code: 0, stdout: dry });
     });
@@ -174,6 +186,7 @@ describe("T4 diff (F12)", () => {
   test("support=no ⇒ NOTE + never in-sync (rc 1)", async () => {
     const dry = await dryRunOutput("grok-box-8", "body", { support: "no" });
     const runner = new FakeRunner((argv) => {
+      if (isSsArgv(argv)) return result({ stdout: SS_UP });
       if (argv[0] === "/usr/bin/diff") return result({ stdout: "", code: 0 });
       return result({ code: 0, stdout: dry });
     });
@@ -197,11 +210,30 @@ describe("T4 diff (F12)", () => {
     let err = "";
     const origErr = process.stderr.write.bind(process.stderr);
     (process.stderr as any).write = (s: string) => { err += s; return true; };
-    const runner = new FakeRunner((argv) => (argv[0] === "/usr/bin/diff" ? result({}) : result({ code: 255 })));
+    const runner = new FakeRunner((argv) =>
+      isSsArgv(argv) ? result({ stdout: SS_UP }) : argv[0] === "/usr/bin/diff" ? result({}) : result({ code: 255 }),
+    );
     const rc = await cmdConfig(["diff", "grok-box-8"], { runner, env, source, enrolled, whichDiff });
     (process.stderr as any).write = origErr;
     expect(rc).toBe(2);
     expect(err).toContain("unreachable/failed");
+  });
+
+  test("D11(c): a FOREIGN listener on the port ⇒ rc 2 and NO ssh of any kind", async () => {
+    // A squatter must read as `tunnel: down` on every path, the CLI included —
+    // otherwise this human-invoked diff hands it the rendered managed config on
+    // stdin.
+    let err = "";
+    const origErr = process.stderr.write.bind(process.stderr);
+    (process.stderr as any).write = (s: string) => { err += s; return true; };
+    const squatted =
+      'LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:(("python3",pid=9001,fd=3))\n';
+    const runner = new FakeRunner((argv) => (isSsArgv(argv) ? result({ stdout: squatted }) : result({ code: 0 })));
+    const rc = await cmdConfig(["diff", "grok-box-8"], { runner, env, source, enrolled, whichDiff });
+    (process.stderr as any).write = origErr;
+    expect(rc).toBe(2);
+    expect(err).toContain("tunnel down");
+    expect(runner.argvs().some((a) => a[0] === "ssh")).toBe(false);
   });
 });
 
