@@ -744,7 +744,59 @@ entirely; closing it onto a different box fires exactly one fetch. The
 Views paint through a viewport sized from `rows` minus the frame's own chrome
 (header, banner, spacers, title, message line, and the footer, which is TWO
 lines below 120 columns), so the footer is always the last line on screen and a
-long diff never scrolls it away. The box table's own layout is unchanged.
+long diff never scrolls it away.
+
+### The TUI renders through Ink (5.7.0, blueprint fleet-tui-ink)
+
+The painter is a library's job now. `fleet2 tui` is an [Ink](https://github.com/vadimdemedes/ink)
+(React) application; the 1,300 lines of hand-rolled ANSI in `src/tui/render.ts`
+and `src/tui/term.ts` are deleted. What each file owns:
+
+| file | owns |
+| --- | --- |
+| `tui/state.ts` | `TuiState` and every pure transition (`handleKey`, `applyFleet`, the view/detail rules) |
+| `tui/model.ts` | the presentation model: plain strings and a semantic `Tone`, never an ANSI byte |
+| `tui/layout.ts` | the row budget — how tall each region may be, and the table's window |
+| `tui/keys.ts` | Ink's parsed keypress → the reducer's key vocabulary |
+| `tui/tone.ts` | the only place colour is decided |
+| `tui/render-options.ts` | Ink's render options, shared by production and the frame tests |
+| `tui/app.tsx` + `tui/components/` | the React tree; the components are one `<Text>` per model line |
+
+Alt screen, raw mode, resize and terminal restore are Ink's, via
+`alternateScreen: true` plus its `signal-exit` registration for
+SIGINT/SIGTERM/SIGHUP/exit. The only lifecycle code left is a crash barrier for
+an uncaught exception: unmount, then an empty `stdout.write` whose callback runs
+only after the teardown bytes have reached the kernel, with an unref'd 200 ms
+fallback so a destroyed stdout cannot turn a crash into a hang. `exitOnCtrlC` is
+off so ctrl-c reaches the reducer, and `patchConsole` is off so `log()` on stderr
+is never swallowed.
+
+Three behaviour changes came with the port, all golden-pinned:
+
+1. The box table paints a WINDOW of the fleet plus a `rows a–b of N` indicator,
+   bottom-anchored on the selection. The old painter emitted every row and let
+   the terminal swallow the overflow.
+2. The detail pane is omitted, never clipped, when the row budget is shorter than
+   its fixed height (`DETAIL_ROWS`), in addition to the long-standing 100-column
+   cutoff.
+3. Ctrl and alt combinations other than ctrl-c map to nothing. Ink reports ctrl-P
+   as the letter `p`, which the action table would have read as config-push.
+
+Testing: `bun test` mounts the app TTY-free through the same render-options
+factory and compares against `fleet/test/tui/fixtures/*.txt`, captured from the
+hand-rolled painter before it was deleted. Ink turns the alt screen off when
+stdout is not a TTY, so the alt-screen and restore bytes are covered by a pty
+smoke in `tests/test-makefile-targets.sh` instead (python's `pty.fork`, because
+`script` is not installed everywhere), against a closed port so it can never
+reach the production API.
+
+Dependencies: `ink`, `react`, `@types/react` — and `react-devtools-core` as a
+REGULAR dependency. Ink's reconciler does `await import('./devtools.js')` under
+an `if (process.env.DEV === 'true')` guard and bun's bundler follows that dynamic
+import regardless of the guard, so the package must resolve at build time or
+`make ts-build` fails. `DEV` is never set, so it is never activated. `make
+ts-deps` installs from the TRACKED `fleet/bun.lock` with `--frozen-lockfile`, and
+`ts-test`/`ts-build` (and so `ts-release-build`) depend on it.
 
 ## Retired: bash `fleetctl` (last at c303696)
 
