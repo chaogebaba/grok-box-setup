@@ -4,7 +4,7 @@
 // Mutant (b): drop the FLEET2_JSON branch from `wantsJson` ⇒ every
 // "FLEET2_JSON=1 is equivalent" case fails.
 
-import { describe, test, expect } from "bun:test";
+import { afterAll, describe, test, expect } from "bun:test";
 import { envWantsJson, wantsJson } from "../../src/commands/json-flag.ts";
 import { cmdList, renderListJson, type DiscoverRow } from "../../src/commands/list.ts";
 import { cmdState } from "../../src/commands/state.ts";
@@ -13,8 +13,13 @@ import { FakeRunner, result } from "../fake-runner.ts";
 import { openStore, storePath } from "../../src/store/db.ts";
 import { StoreState } from "../../src/store/state.ts";
 import { testEnv } from "../helpers.ts";
-import { cleanup, scratchDir, T0 } from "../store/helpers.ts";
+import { cleanup, suiteScratch, T0 } from "../store/helpers.ts";
 import { RC } from "../../src/upgrade.ts";
+
+// One bucket for this file, dropped whole in afterAll even if a test threw
+// before its own cleanup (side-fixes-1 portable-scratch API).
+const SCRATCH = suiteScratch("json-output");
+afterAll(() => SCRATCH.clean());
 
 describe("U2 the --json / FLEET2_JSON decision (mutant (b))", () => {
   test("--json wins on its own", () => {
@@ -93,7 +98,7 @@ describe("U2 state check --json / state reconcile-files --json", () => {
   }
 
   test("state check --json parses and carries the documented keys", async () => {
-    const dir = scratchDir("json-check");
+    const dir = SCRATCH.dir("json-check");
     try {
       const state = `${dir}/state`;
       const etc = `${dir}/etc`;
@@ -128,7 +133,7 @@ describe("U2 state check --json / state reconcile-files --json", () => {
   });
 
   test("state check --json on a missing store is still one document", async () => {
-    const dir = scratchDir("json-check-none");
+    const dir = SCRATCH.dir("json-check-none");
     try {
       const { out, d } = deps(`${dir}/state`, `${dir}/etc`);
       expect(await cmdState(["check", "--json"], d)).toBe(RC.OK);
@@ -140,7 +145,7 @@ describe("U2 state check --json / state reconcile-files --json", () => {
   });
 
   test("state reconcile-files --json is a dry-run listing, no prose", async () => {
-    const dir = scratchDir("json-recon");
+    const dir = SCRATCH.dir("json-recon");
     try {
       const state = `${dir}/state`;
       const etc = `${dir}/etc`;
