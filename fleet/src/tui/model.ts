@@ -1,4 +1,4 @@
-// model.ts — the TUI's presentation MODEL (fleet-tui-ink D1).
+// model.ts — the TUI's presentation MODEL (fleet-tui-ink D1, fleet-tui-visual V2–V6).
 //
 // RULE: everything here returns plain strings or plain data. Not one ANSI byte
 // is produced in this file. Colour is a semantic `Tone` the components hand to
@@ -6,6 +6,12 @@
 // `render.ts` painters with every `sgr()` call removed, which is what lets the
 // parity fixtures in `test/tui/fixtures/` compare the new frames against the
 // hand-rolled painter byte for byte.
+//
+// Since fleet-tui-visual the painters emit SEGMENTS as well as text: a line's
+// `text` is still the plain joined string every fixture compares against, and
+// `segments` is the same string cut into per-cell pieces so a drifted VER can
+// glow without painting the whole row yellow. `text` is always exactly the
+// concatenation of `segments`, which the model tests pin.
 
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
 import type { TuiState } from "./state.ts";
@@ -16,12 +22,21 @@ export interface Size {
   rows: number;
 }
 
+/** One coloured piece of a line. */
+export interface Seg {
+  text: string;
+  tone: Tone;
+  bold?: boolean;
+}
+
 /** One painted line: its plain text plus how to colour it. */
 export interface ToneLine {
   text: string;
   tone: Tone;
   /** the old painter's `C.bold` — kept as a flag so the components stay thin. */
   bold?: boolean;
+  /** per-cell colouring; when present the component paints these, not `text`. */
+  segments?: Seg[];
 }
 
 /** A table line additionally knows whether it is the selected row. */
@@ -37,6 +52,39 @@ const STALE_SECONDS = 15 * 60; // TUI-D7
  *  depends on it (the pane is omitted rather than clipped when the budget is
  *  smaller), and the chrome-agreement test pins it against `detailLines`. */
 export const DETAIL_ROWS = 10;
+
+/** The gap between the table column and the Detail column. The old painter
+ *  composed `padVisible(left, leftW) + "  " + right`, so Detail text starts at
+ *  column `leftW + DETAIL_GAP` (74 at 120 columns). Defined here rather than in
+ *  `layout.ts` because `detailLines` now needs the pane's width to frame and
+ *  truncate its card, and `layout.ts` already imports this file. */
+export const DETAIL_GAP = 2;
+
+/** The width of the table column when the Detail pane is shown. */
+export function tableWidth(size: Size): number {
+  return Math.max(40, Math.floor(size.cols * 0.6));
+}
+
+/** The width of the Detail pane, frame included (V5). */
+export function detailWidth(size: Size): number {
+  return size.cols - tableWidth(size) - DETAIL_GAP;
+}
+
+// --- V2 glyphs ---------------------------------------------------------------
+/**
+ * Every glyph the frame paints as a STATUS, in one place so the width test can
+ * measure the set rather than a hand-copied list. All are width 1 in the
+ * terminals fleet2 runs in (kitty / alacritty / gnome-terminal / tmux); no
+ * emoji, because a width-2 cell breaks Ink's measuring.
+ */
+export const GLYPH = {
+  healthy: "●",
+  degraded: "◆",
+  down: "✖",
+  asleep: "☾",
+  unknown: "○",
+  canary: "★",
+} as const;
 
 // --- small formatters (verbatim from render.ts) ------------------------------
 function pad(s: string, w: number): string {
@@ -56,16 +104,55 @@ function stripToWidth(s: string, cols: number): string {
   return s.length > cols ? s.slice(0, cols) : s;
 }
 
+/** The plain text of a segment list — always what the line's `text` is. */
+export function segText(segs: Seg[]): string {
+  let out = "";
+  for (const s of segs) out += s.text;
+  return out;
+}
+
+/** Truncate a segment list to `cols`, then pad it out to exactly `cols`. */
+export function fitSegments(segs: Seg[], cols: number): Seg[] {
+  const out: Seg[] = [];
+  let used = 0;
+  for (const s of segs) {
+    if (used >= cols) break;
+    const text = stripToWidth(s.text, cols - used);
+    if (text === "") continue;
+    out.push({ ...s, text });
+    used += text.length;
+  }
+  if (used < cols) out.push({ text: " ".repeat(cols - used), tone: "plain" });
+  return out;
+}
+
+/** Truncate a segment list to `cols` WITHOUT padding it. */
+export function clipSegments(segs: Seg[], cols: number): Seg[] {
+  const out: Seg[] = [];
+  let used = 0;
+  for (const s of segs) {
+    if (used >= cols) break;
+    const text = stripToWidth(s.text, cols - used);
+    if (text === "") continue;
+    out.push({ ...s, text });
+    used += text.length;
+  }
+  return out;
+}
+
+const SEP = " · "; // V5: the detail card's field separator (MUTED)
+
 // --- health ------------------------------------------------------------------
-/** Glyph + tone for a box's health (TUI-D5). Order: incident > degraded >
- *  asleep > healthy > down/unknown. `◌` (asleep) is DIM, never an error tone. */
+/** Glyph + tone for a box's health (TUI-D5, V2). Order: incident > degraded >
+ *  asleep > healthy > down/unknown. `☾` (asleep) is MUTED, never an error tone —
+ *  a sleeping box is the normal case on this fleet, not a fault. */
 export function boxHealth(state: TuiState, b: SnapshotBox): { glyph: string; tone: Tone } {
   void state;
-  if (b.asleep) return { glyph: "◌", tone: "dim" }; // dim, NOT an error colour
-  if (b.check === "FAIL") return { glyph: "✕", tone: "down" }; // incident
-  if (b.checkfail || b.drift === "yes" || b.config === "drift") return { glyph: "!", tone: "warn" }; // degraded
-  if (b.tunnel === "up" && b.check === "OK") return { glyph: "●", tone: "ok" }; // healthy
-  return { glyph: "○", tone: "dim" }; // down / never-probed / unknown
+  if (b.asleep) return { glyph: GLYPH.asleep, tone: "muted" }; // muted, NOT an error colour
+  if (b.check === "FAIL") return { glyph: GLYPH.down, tone: "down" }; // incident
+  if (b.checkfail || b.drift === "yes" || b.config === "drift") return { glyph: GLYPH.degraded, tone: "warn" }; // degraded
+  if (b.tunnel === "up" && b.check === "OK") return { glyph: GLYPH.healthy, tone: "ok" }; // healthy
+  return { glyph: GLYPH.unknown, tone: "muted" }; // down / never-probed / unknown
 }
 
 /** Count fleet health for the header. */
@@ -84,19 +171,85 @@ export function counts(boxes: SnapshotBox[]): { total: number; healthy: number; 
   return { total: boxes.length, healthy, degraded, down, asleep };
 }
 
+// --- V3 cell tones -----------------------------------------------------------
+/** The EXPIRY column's tone. The boundary is `decide.ts`'s rotate threshold:
+ *  a key with a week or less left is an incident, not a warning. */
+export function expiryTone(days: number | null | undefined): Tone {
+  if (days === null || days === undefined) return "muted";
+  if (days <= 7) return "down";
+  if (days <= 30) return "warn";
+  return "muted";
+}
+
+export interface CellTones {
+  tunnel: Tone;
+  check: Tone;
+  ver: Tone;
+  drift: Tone;
+  config: Tone;
+  expiry: Tone;
+}
+
+/**
+ * V3: every cell carries its OWN meaning; only the glyph and the name carry the
+ * row's health. `quiet is the goal state` — an in-sync config and a no-drift box
+ * are MUTED so the eye lands on the cells that are not.
+ */
+export function cellTones(b: SnapshotBox): CellTones {
+  return {
+    tunnel: b.tunnel === "up" ? "ok" : b.tunnel === "down" ? "down" : "muted",
+    check: b.check === "OK" ? "ok" : b.check === "FAIL" ? "down" : "muted",
+    // the version that is about to be replaced is the thing that should glow.
+    ver: b.drift === "yes" ? "warn" : "plain",
+    drift: b.drift === "yes" ? "warn" : "muted",
+    config: b.config === "drift" ? "warn" : "muted",
+    expiry: expiryTone(b.expiry_days),
+  };
+}
+
+/** V6: the transient message line's tone. A failure is louder than an "ok". */
+export function messageTone(text: string): Tone {
+  const t = text.toLowerCase();
+  if (t.includes("error") || t.includes("failed")) return "down";
+  if (t.startsWith("ok") || t.startsWith("done")) return "ok";
+  return "plain";
+}
+
 // --- header ------------------------------------------------------------------
-export function headerText(state: TuiState, size: Size): string {
+/** V4: the header bar, left→right — identity, health, mode, link. */
+export function headerSegments(state: TuiState, size: Size): Seg[] {
   const c = counts(state.boxes);
-  const applyStr =
-    state.apply === null
-      ? "apply=?"
-      : `apply=${state.apply ? "ON" : "off"}${state.applySource === "config" ? "" : "?"}`;
-  const tick = state.tickAgeS === null ? "tick=?" : `tick=${fmtAge(state.tickAgeS)}`;
-  const linkStr = state.link.up ? "link=up" : "link=DOWN";
-  const scopeStr = state.scope === "admin" ? "admin" : "readonly";
-  const left = `fleet2 ${c.total} boxes  ●${c.healthy} !${c.degraded} ✕${c.down} ◌${c.asleep}  ${applyStr}  ${tick}`;
-  const right = `${scopeStr}  ${linkStr}`;
-  return pad(stripToWidth(`${left}   ${right}`, size.cols), size.cols);
+  const stale = state.tickAgeS !== null && state.tickAgeS >= STALE_SECONDS;
+  const applyText =
+    state.apply === null ? "apply ?" : `apply ${state.apply ? "ON" : "off"}${state.applySource === "config" ? "" : "?"}`;
+  const applyTone: Tone = state.apply === null ? "warn" : state.apply ? "ok" : "muted";
+  const segs: Seg[] = [
+    { text: "fleet2", tone: "main", bold: true },
+    { text: ` ${c.total} boxes`, tone: "plain" },
+    { text: "  ", tone: "plain" },
+    { text: `${GLYPH.healthy} ${c.healthy}`, tone: "ok" },
+    { text: "  ", tone: "plain" },
+    { text: `${GLYPH.degraded} ${c.degraded}`, tone: "warn" },
+    { text: "  ", tone: "plain" },
+    { text: `${GLYPH.down} ${c.down}`, tone: "down" },
+    { text: "  ", tone: "plain" },
+    { text: `${GLYPH.asleep} ${c.asleep}`, tone: "muted" },
+    { text: "  ", tone: "plain" },
+    { text: applyText, tone: applyTone },
+    { text: "  ", tone: "plain" },
+    { text: state.tickAgeS === null ? "tick ?" : `tick ${fmtAge(state.tickAgeS)}`, tone: stale ? "warn" : "muted" },
+    { text: "   ", tone: "plain" },
+    { text: state.scope === "admin" ? "admin" : "readonly", tone: state.scope === "admin" ? "accent" : "muted" },
+    { text: "  ", tone: "plain" },
+    state.link.up
+      ? { text: `link ${GLYPH.healthy} up`, tone: "ok" as Tone }
+      : { text: `link ${GLYPH.down} DOWN`, tone: "down" as Tone },
+  ];
+  return fitSegments(segs, size.cols);
+}
+
+export function headerText(state: TuiState, size: Size): string {
+  return segText(headerSegments(state, size));
 }
 
 // --- box table ---------------------------------------------------------------
@@ -122,35 +275,36 @@ export function tableLines(state: TuiState, size: Size): TableLine[] {
     `${pad("TUNNEL", TABLE_HEADER_COLS.tunnel)}${pad("CHECK", TABLE_HEADER_COLS.check)}` +
     `${pad("VER", TABLE_HEADER_COLS.ver)}${pad("DRIFT", TABLE_HEADER_COLS.drift)}` +
     `${pad("CONFIG", TABLE_HEADER_COLS.config)}${pad("EXPIRY", TABLE_HEADER_COLS.expiry)}${showCanaryCol ? "  C" : ""}`;
-  rows.push({ text: pad(head, size.cols), tone: "dim" });
+  const headText = pad(head, size.cols);
+  rows.push({ text: headText, tone: "main", bold: true, segments: [{ text: headText, tone: "main", bold: true }] });
 
   const list = filteredBoxes(state);
   for (let i = 0; i < list.length; i++) {
     const b = list[i]!;
     const health = boxHealth(state, b);
+    const t = cellTones(b);
     const dash = (v: string | null | undefined): string => (v === null || v === undefined || v === "" ? "-" : String(v));
     const isCanary = state.canary !== null && b.name === state.canary;
-    const cells =
-      `${pad("", 0)}${health.glyph} ` +
-      `${pad(b.name, TABLE_HEADER_COLS.name)}` +
-      `${pad(dash(b.tunnel), TABLE_HEADER_COLS.tunnel)}` +
-      `${pad(dash(b.check), TABLE_HEADER_COLS.check)}` +
-      `${pad(dash(b.ver), TABLE_HEADER_COLS.ver)}` +
-      `${pad(dash(b.drift), TABLE_HEADER_COLS.drift)}` +
-      `${pad(dash(b.config), TABLE_HEADER_COLS.config)}` +
-      `${pad(b.expiry_days === null ? "-" : `${b.expiry_days}d`, TABLE_HEADER_COLS.expiry)}` +
-      `${showCanaryCol ? (isCanary ? "  C" : "   ") : ""}`;
-    // Selection: reverse video (`selected`), and in NO_COLOR mode a leading '>'
-    // so a colourless frame still encodes which row is selected.
     const selected = i === state.selected;
-    rows.push({
-      text: selected && state.noColor ? `>${cells.slice(1)}` : cells,
-      tone: health.tone,
-      selected,
-    });
+    const segs: Seg[] = [
+      { text: `${health.glyph} `, tone: health.tone },
+      { text: pad(b.name, TABLE_HEADER_COLS.name), tone: health.tone, bold: selected },
+      { text: pad(dash(b.tunnel), TABLE_HEADER_COLS.tunnel), tone: b.tunnel === null || b.tunnel === undefined ? "muted" : t.tunnel },
+      { text: pad(dash(b.check), TABLE_HEADER_COLS.check), tone: b.check === null || b.check === undefined ? "muted" : t.check },
+      { text: pad(dash(b.ver), TABLE_HEADER_COLS.ver), tone: t.ver },
+      { text: pad(dash(b.drift), TABLE_HEADER_COLS.drift), tone: t.drift },
+      { text: pad(dash(b.config), TABLE_HEADER_COLS.config), tone: t.config },
+      { text: pad(b.expiry_days === null ? "-" : `${b.expiry_days}d`, TABLE_HEADER_COLS.expiry), tone: t.expiry },
+    ];
+    if (showCanaryCol) segs.push({ text: isCanary ? `  ${GLYPH.canary}` : "   ", tone: "accent" });
+    // Selection: a MAIN-tinted bar (`selected`), and in NO_COLOR mode a leading
+    // '>' so a colourless frame still encodes which row is selected.
+    if (selected && state.noColor) segs[0] = { ...segs[0]!, text: `>${segs[0]!.text.slice(1)}` };
+    rows.push({ text: segText(segs), tone: health.tone, selected, segments: segs });
   }
   if (list.length === 0) {
-    rows.push({ text: pad(state.filter !== "" ? "(no boxes match filter)" : "(no boxes)", size.cols), tone: "dim" });
+    const text = pad(state.filter !== "" ? "(no boxes match filter)" : "(no boxes)", size.cols);
+    rows.push({ text, tone: "muted", segments: [{ text, tone: "muted" }] });
   }
   return rows;
 }
@@ -164,62 +318,161 @@ function dashEm(v: string | number | null | undefined): string {
   return v === null || v === undefined ? DASH : String(v);
 }
 
-/** Render a drift/health sparkline over the box's 24h history (newest-first
- *  lines → we reverse to oldest-first for a left-to-right timeline). */
-export function sparkline(lines: SnapshotLine[], box: string): string {
+/** Health level per history sample: healthy=high, degraded=mid, incident=low. */
+function sparkLevel(b: SnapshotBox): number {
+  if (b.asleep) return 1;
+  if (b.check === "FAIL") return 0;
+  if (b.checkfail || b.drift === "yes" || b.config === "drift") return 3;
+  if (b.tunnel === "up" && b.check === "OK") return 7;
+  return 2;
+}
+
+/** V5: one segment per spark cell, toned by its level. */
+export function sparkSegments(lines: SnapshotLine[], box: string): Seg[] {
   const oldestFirst = [...lines].reverse();
-  let out = "";
+  const out: Seg[] = [];
   for (const l of oldestFirst) {
     const b = l.boxes.find((x) => x.name === box);
     if (b === undefined) {
-      out += " ";
+      out.push({ text: " ", tone: "muted" });
       continue;
     }
-    // map health to a spark height: healthy=high, degraded=mid, incident=low.
-    let level = 0;
-    if (b.asleep) level = 1;
-    else if (b.check === "FAIL") level = 0;
-    else if (b.checkfail || b.drift === "yes" || b.config === "drift") level = 3;
-    else if (b.tunnel === "up" && b.check === "OK") level = 7;
-    else level = 2;
-    out += SPARK[level];
+    const level = sparkLevel(b);
+    const tone: Tone = level === 7 ? "ok" : level === 3 ? "warn" : level <= 1 ? "down" : "muted";
+    out.push({ text: SPARK[level]!, tone });
   }
   return out;
 }
 
-/** The Detail pane's lines — exactly DETAIL_ROWS of them when a box is
- *  selected, none otherwise. */
-export function detailLines(state: TuiState): DetailLine[] {
+/** Render a drift/health sparkline over the box's 24h history (newest-first
+ *  lines → we reverse to oldest-first for a left-to-right timeline). */
+export function sparkline(lines: SnapshotLine[], box: string): string {
+  return segText(sparkSegments(lines, box));
+}
+
+/** One `label value` pair of the detail card. */
+function field(label: string, value: string, tone: Tone): Seg[] {
+  return [
+    { text: label, tone: "muted" },
+    { text: " ", tone: "muted" },
+    { text: value, tone: value === DASH ? "muted" : tone },
+  ];
+}
+
+function joinFields(groups: Seg[][]): Seg[] {
+  const out: Seg[] = [];
+  for (const [i, g] of groups.entries()) {
+    if (i > 0) out.push({ text: SEP, tone: "muted" });
+    out.push(...g);
+  }
+  return out;
+}
+
+/**
+ * The Detail pane's lines — exactly DETAIL_ROWS of them when a box is selected,
+ * none otherwise. V5: a FRAMED card exactly `width` columns wide, labels muted
+ * and values toned like their table cell, every line truncated to the pane so
+ * nothing wraps into the frame (the sparkline used to).
+ */
+export function detailLines(state: TuiState, width: number): DetailLine[] {
   const list = filteredBoxes(state);
   const b = list[state.selected];
   if (b === undefined) return [];
-  const rows: DetailLine[] = [];
-  rows.push({ text: `── ${b.name} ─────`, tone: "plain", bold: true });
-  rows.push({ text: `tunnel: ${b.tunnel}   check: ${b.check}   ver: ${b.ver}`, tone: "plain" });
-  rows.push({
-    text: `drift: ${b.drift}   config: ${b.config ?? "-"}   expiry: ${b.expiry_days === null ? "-" : b.expiry_days + "d"}`,
-    tone: "plain",
-  });
-  rows.push({ text: `checkfail: ${b.checkfail ? "yes" : "no"}   asleep: ${b.asleep ? "yes" : "no"}`, tone: "plain" });
-  const canaryLabel = state.canary === null ? "canary: none" : state.canary === b.name ? "canary: THIS box" : `canary: ${state.canary}`;
-  rows.push({ text: canaryLabel, tone: "plain" });
+  const t = cellTones(b);
+  const inner = Math.max(1, width - 2);
+
+  const body: Seg[][] = [];
+  body.push(
+    joinFields([
+      field("tunnel", b.tunnel, t.tunnel),
+      field("check", b.check, t.check),
+      field("ver", b.ver, t.ver),
+    ]),
+  );
+  body.push(
+    joinFields([
+      field("drift", b.drift, t.drift),
+      field("config", b.config ?? "-", t.config),
+      field("expiry", b.expiry_days === null ? "-" : `${b.expiry_days}d`, t.expiry),
+    ]),
+  );
+  const canary: Seg[] =
+    state.canary === null
+      ? field("canary", "none", "muted")
+      : state.canary === b.name
+        ? [
+            { text: "canary", tone: "muted" },
+            { text: " ", tone: "muted" },
+            { text: `${GLYPH.canary} this box`, tone: "accent" },
+          ]
+        : field("canary", state.canary, "plain");
+  body.push(
+    joinFields([
+      field("checkfail", b.checkfail ? "yes" : "no", b.checkfail ? "warn" : "muted"),
+      field("asleep", b.asleep ? "yes" : "no", "muted"),
+      canary,
+    ]),
+  );
   // D1: the facts the engine records and this pane never showed. Rendered ONLY
   // when the stored facts carry the SELECTED box's name — during an in-flight
   // switch the rows read `—`, never box A's numbers under box B's header.
   const f = state.detailFacts !== undefined && state.detailFacts.box === b.name ? state.detailFacts.facts : undefined;
-  rows.push({ text: `checkfail#: ${dashEm(f?.checkfail_count)}   expires: ${dashEm(f?.expires_at)}`, tone: "plain" });
-  rows.push({ text: `asleep since: ${dashEm(f?.asleep_since)}`, tone: "plain" });
-  rows.push({ text: `asleep last: ${dashEm(f?.asleep_last)}`, tone: "plain" });
+  const cf = f?.checkfail_count;
+  body.push(
+    joinFields([
+      field("checkfail#", dashEm(cf), typeof cf === "number" && cf > 0 ? "warn" : "muted"),
+      field("expires", dashEm(f?.expires_at), "plain"),
+    ]),
+  );
+  body.push(field("asleep since", dashEm(f?.asleep_since), "plain"));
+  body.push(field("asleep last", dashEm(f?.asleep_last), "plain"));
   const ab = f?.api_backoff;
-  rows.push({
-    text: `api backoff: ${ab === null || ab === undefined ? DASH : `${ab.fails} fails, retry ${dashEm(ab.next_retry)}`}`,
-    tone: "plain",
-  });
+  body.push(
+    ab === null || ab === undefined
+      ? field("api backoff", DASH, "muted")
+      : [
+          { text: "api backoff", tone: "muted" as Tone },
+          { text: " ", tone: "muted" as Tone },
+          { text: `${ab.fails} fails`, tone: (ab.fails > 0 ? "warn" : "muted") as Tone },
+          { text: ", retry ", tone: "muted" as Tone },
+          { text: dashEm(ab.next_retry), tone: "plain" as Tone },
+        ],
+  );
   if (state.detail && state.detail.box === b.name) {
-    rows.push({ text: `24h: ${sparkline(state.detail.lines, b.name)}`, tone: "plain" });
+    body.push([
+      { text: "24h", tone: "muted" },
+      { text: " ", tone: "muted" },
+      ...sparkSegments(state.detail.lines, b.name),
+    ]);
   } else {
-    rows.push({ text: "24h: (loading…)", tone: "dim" });
+    body.push([{ text: "24h (loading…)", tone: "muted" }]);
   }
+
+  // --- the frame -------------------------------------------------------------
+  const rows: DetailLine[] = [];
+  const nameFits = stripToWidth(b.name, Math.max(0, inner - 4));
+  const rule = Math.max(0, inner - 3 - nameFits.length);
+  const top: Seg[] = [
+    { text: "╭─ ", tone: "main" },
+    { text: nameFits, tone: "main", bold: true },
+    { text: ` ${"─".repeat(rule)}╮`, tone: "main" },
+  ];
+  rows.push({ text: segText(top), tone: "main", bold: true, segments: top });
+  for (const line of body) {
+    const segs: Seg[] = [
+      { text: "│", tone: "main" },
+      // BUG FIX (V5): every line is truncated to the pane's inner width, so the
+      // 24h sparkline can no longer overflow and wrap into the frame.
+      ...fitSegments(line, inner),
+      { text: "│", tone: "main" },
+    ];
+    rows.push({ text: segText(segs), tone: "plain", segments: segs });
+  }
+  const bottom: Seg[] = [{ text: `╰${"─".repeat(inner)}╯`, tone: "main" }];
+  rows.push({ text: segText(bottom), tone: "main", segments: bottom });
+  // The budget is fixed at DETAIL_ROWS; if the card does not fit, the bottom
+  // line is what goes (V5).
+  while (rows.length > DETAIL_ROWS) rows.splice(rows.length - 1, 1);
   return rows;
 }
 
@@ -227,24 +480,34 @@ export function detailLines(state: TuiState): DetailLine[] {
 /**
  * One line, no new view: what the last tick's discover pass saw and did. Absent
  * on a pre-5.6.0 snapshot and on a tick with discovery disabled, and the frame
- * simply has no row then.
+ * simply has no row then. V4: a NON-zero count is plain against a MUTED line, so
+ * `1 adopted` stands out from a row of zeros.
  */
-export function discoverText(state: TuiState, size: Size): string | undefined {
+export function discoverSegments(state: TuiState, size: Size): Seg[] | undefined {
   const d = state.discover;
   if (d === null || d === undefined) return undefined;
-  const parts = [
-    `discover: ${d.candidates} candidate${d.candidates === 1 ? "" : "s"}`,
-    `${d.adopted} adopted`,
-    `${d.repaired} repaired`,
-    `${d.skipped.length} skipped`,
+  const parts: { text: string; n: number }[] = [
+    { text: `discover: ${d.candidates} candidate${d.candidates === 1 ? "" : "s"}`, n: d.candidates },
+    { text: `${d.adopted} adopted`, n: d.adopted },
+    { text: `${d.repaired} repaired`, n: d.repaired },
+    { text: `${d.skipped.length} skipped`, n: d.skipped.length },
   ];
-  let line = parts.join("  ");
+  const segs: Seg[] = [];
+  for (const [i, p] of parts.entries()) {
+    if (i > 0) segs.push({ text: "  ", tone: "muted" });
+    segs.push({ text: p.text, tone: p.n > 0 ? "plain" : "muted" });
+  }
   if (d.skipped.length > 0) {
     const shown = d.skipped.slice(0, 3).map((s) => `${s.name}:${s.reason}`);
     const more = d.skipped.length > shown.length ? `, +${d.skipped.length - shown.length} more` : "";
-    line += ` (${shown.join(", ")}${more})`;
+    segs.push({ text: ` (${shown.join(", ")}${more})`, tone: "muted" });
   }
-  return pad(stripToWidth(line, size.cols), size.cols);
+  return fitSegments(segs, size.cols);
+}
+
+export function discoverText(state: TuiState, size: Size): string | undefined {
+  const segs = discoverSegments(state, size);
+  return segs === undefined ? undefined : segText(segs);
 }
 
 // --- banners -----------------------------------------------------------------
@@ -267,24 +530,57 @@ export function messageText(state: TuiState): string | undefined {
   return state.message;
 }
 
-// --- footer keys (scope-aware, TUI-D7/R3-A1) ---------------------------------
+// --- footer keys (scope-aware, TUI-D7/R3-A1, V6) -----------------------------
 /**
  * The footer is a LIST OF LINES: the view keys `D diff  J journal  H history`
  * do not fit beside the navigation and action keys at 100 columns. Two lines
  * below 120 columns — navigation + view keys on line 1, action keys on line 2 —
  * one line otherwise, and only when that one line actually FITS the width.
+ *
+ * V6: the key letter is ACCENT and its word MUTED, and the three groups are
+ * separated by a MAIN `│` so the footer is not one unbroken run of letters.
  */
-export function footerLines(state: TuiState, size: Size): string[] {
+const NAV_KEYS: [string, string][] = [["↑↓", "select"], ["/", "filter"], ["r", "refresh"], ["q", "quit"]];
+const VIEW_KEYS: [string, string][] = [["D", "diff"], ["J", "journal"], ["H", "history"]];
+const ACTION_KEYS: [string, string][] = [
+  ["P", "push"],
+  ["M", "rotate"],
+  ["R", "rename"],
+  ["T", "check"],
+  ["C", "reconcile"],
+];
+
+function keyGroup(keys: [string, string][]): Seg[] {
+  const out: Seg[] = [];
+  for (const [i, [k, word]] of keys.entries()) {
+    if (i > 0) out.push({ text: "  ", tone: "muted" });
+    out.push({ text: k, tone: "accent" });
+    out.push({ text: ` ${word}`, tone: "muted" });
+  }
+  return out;
+}
+
+const GROUP_SEP: Seg[] = [
+  { text: " ", tone: "muted" },
+  { text: "│", tone: "main" },
+  { text: " ", tone: "muted" },
+];
+
+/** The footer's lines as SEGMENTS; `footerLines` is their plain text. */
+export function footerSegmentLines(state: TuiState, size: Size): Seg[][] {
   const admin = state.scope === "admin";
-  const nav = ["↑/↓ select", "/ filter", "r refresh", "q quit"].join("  ");
-  const views = ["D diff", "J journal", "H history"].join("  ");
-  const actionKeys = ["P push", "M rotate", "R rename", "T check", "C reconcile"].join("  ");
-  const actions = admin ? actionKeys : `${actionKeys}  (admin token required)`;
-  const navLine = `${nav}  ${views}`;
-  const oneLine = `${navLine}  ${actions}`;
-  const fit = (s: string): string => pad(stripToWidth(s, size.cols), size.cols);
-  if (size.cols >= 120 && oneLine.length <= size.cols) return [fit(oneLine)];
-  return [fit(navLine), fit(actions)];
+  const nav = keyGroup(NAV_KEYS);
+  const views = keyGroup(VIEW_KEYS);
+  const actions: Seg[] = keyGroup(ACTION_KEYS);
+  if (!admin) actions.push({ text: "  (admin token required)", tone: "muted" });
+  const navLine = [...nav, ...GROUP_SEP, ...views];
+  const oneLine = [...navLine, ...GROUP_SEP, ...actions];
+  if (size.cols >= 120 && segText(oneLine).length <= size.cols) return [fitSegments(oneLine, size.cols)];
+  return [fitSegments(navLine, size.cols), fitSegments(actions, size.cols)];
+}
+
+export function footerLines(state: TuiState, size: Size): string[] {
+  return footerSegmentLines(state, size).map(segText);
 }
 
 // --- viewport (D5b) ----------------------------------------------------------
@@ -384,7 +680,7 @@ export function viewLines(state: TuiState, size: Size): ToneLine[] {
   const rows: ToneLine[] = [];
   rows.push({
     text: pad(stripToWidth(`── ${v.kind} ${v.box} ──  ${indicator}`, size.cols), size.cols),
-    tone: "plain",
+    tone: "main",
     bold: true,
   });
   for (const line of content.slice(win.start, win.end)) rows.push({ text: stripToWidth(line, size.cols), tone: "plain" });
@@ -396,15 +692,15 @@ export function modalLines(state: TuiState): ToneLine[] {
   const m = state.modal;
   if (m === undefined) return [];
   const rows: ToneLine[] = [];
-  rows.push({ text: `┌─ ${m.actionLabel} ${m.box} ─┐`, tone: "plain", bold: true });
-  if (m.note) rows.push({ text: m.note, tone: "dim" });
+  rows.push({ text: `┌─ ${m.actionLabel} ${m.box} ─┐`, tone: "main", bold: true });
+  if (m.note) rows.push({ text: m.note, tone: "muted" });
   if (m.target !== undefined) {
     const active = m.field === "target";
     rows.push({ text: `new name: ${m.target}${active ? "_" : ""}`, tone: "plain" });
   }
   const activeConfirm = m.field === "confirm";
   rows.push({ text: `type box name to confirm: ${m.typed}${activeConfirm ? "_" : ""}`, tone: "plain" });
-  rows.push({ text: `(expect "${m.expect}")   Enter=confirm  Esc=cancel`, tone: "dim" });
+  rows.push({ text: `(expect "${m.expect}")   Enter=confirm  Esc=cancel`, tone: "muted" });
   return rows;
 }
 

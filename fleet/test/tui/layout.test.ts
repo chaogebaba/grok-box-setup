@@ -13,6 +13,7 @@ import {
   DETAIL_ROWS,
   bannerText,
   detailLines,
+  detailWidth,
   discoverText,
   footerLines,
   messageText,
@@ -61,13 +62,13 @@ describe("chrome arithmetic agrees with what the components emit", () => {
 
   test("the mounted Detail component emits exactly DETAIL_ROWS lines", async () => {
     const g = GOLDENS.find((x) => x.name === "detail-panel-120x40")!;
-    expect(detailLines(g.state).length).toBe(DETAIL_ROWS);
+    expect(detailLines(g.state, detailWidth(g.size)).length).toBe(DETAIL_ROWS);
     const m = mount(g.state, { size: g.size });
     await settle(40);
     const lines = m.lastFrame().split("\n");
     m.unmount();
     // the pane occupies DETAIL_ROWS consecutive lines starting at the region top.
-    const first = lines.findIndex((l) => l.includes("── grok-box-002 ─────"));
+    const first = lines.findIndex((l) => l.includes("╭─ grok-box-002 "));
     expect(first).toBeGreaterThan(0);
     for (let i = 0; i < DETAIL_ROWS; i++) {
       expect(lines[first + i]!.slice(74).trimEnd().length).toBeGreaterThan(0);

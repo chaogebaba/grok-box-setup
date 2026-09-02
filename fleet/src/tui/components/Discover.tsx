@@ -1,16 +1,11 @@
 // Discover.tsx — the one-line zero-touch-join summary (D7). Never painted while
-// a view is open, which is why `viewChromeRows` does not count it.
+// a view is open, which is why `viewChromeRows` does not count it. V4: MUTED,
+// with any NON-zero count in plain so `1 adopted` stands out from the zeros.
 
 import React from "react";
-import { Box, Text } from "ink";
-import { toneProps } from "../tone.ts";
+import Segments from "./Segments.tsx";
+import type { Seg } from "../model.ts";
 
-export default function Discover({ text, noColor }: { text: string; noColor: boolean }): React.ReactElement {
-  return (
-    <Box flexShrink={0} height={1}>
-      <Text {...toneProps("dim", noColor)} wrap="truncate">
-        {text}
-      </Text>
-    </Box>
-  );
+export default function Discover({ segments, noColor }: { segments: Seg[]; noColor: boolean }): React.ReactElement {
+  return <Segments segments={segments} noColor={noColor} />;
 }

@@ -1,4 +1,4 @@
-fleet2 3 boxes  ●1 !1 ✕1 ◌0  apply=off  tick=10s   admin  link=up                                                       
+fleet2 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ● up                                              
 
 ── history grok-box-001 ──  rows 1–13 of 13                                                                             
 TS                    TUNNEL CHECK VER       DRIFT  CONFIG   CHECKFAIL ASLEEP APPLY
@@ -15,4 +15,4 @@ TS                    TUNNEL CHECK VER       DRIFT  CONFIG   CHECKFAIL ASLEEP AP
 2026-04-30T22:00:00Z  up     OK    5.3.0     no     in-sync  no        no     yes  
 2026-04-30T23:00:00Z  up     OK    5.3.0     no     in-sync  no        no     no   
 
-↑/↓ select  / filter  r refresh  q quit  D diff  J journal  H history  P push  M rotate  R rename  T check  C reconcile 
+↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history │ P push  M rotate  R rename  T check  C reconcile

@@ -5,6 +5,7 @@
 import { test, expect, describe } from "bun:test";
 import {
   detailLines,
+  detailWidth,
   footerLines,
   viewLines,
   viewContent,
@@ -19,7 +20,7 @@ import type { TuiState, ViewState } from "../../src/tui/state.ts";
 import { frameOf } from "./ink-harness.ts";
 
 /** The model's rows as plain text (the old painters returned strings). */
-const renderDetail = (s: TuiState, _size: Size): string[] => detailLines(s).map((l) => l.text);
+const renderDetail = (s: TuiState, size: Size): string[] => detailLines(s, detailWidth(size)).map((l) => l.text);
 const renderFooter = (s: TuiState, size: Size): string[] => footerLines(s, size);
 const renderView = (s: TuiState, size: Size): string[] => viewLines(s, size).map((l) => l.text);
 import type { SnapshotLine } from "../../src/history/schema.ts";
@@ -28,6 +29,7 @@ import { box, state, SIZE_120x40 } from "./helpers.ts";
 
 const SIZE_100x24 = { cols: 100, rows: 24 };
 const SIZE_140x40 = { cols: 140, rows: 40 };
+const SIZE_200x50 = { cols: 200, rows: 50 };
 
 const FACTS: BoxDetail = {
   name: "grok-box-1",
@@ -47,12 +49,26 @@ function line(ts: string, over: Partial<SnapshotLine["boxes"][0]> = {}, apply = 
 describe("D1 detail pane rows", () => {
   test("all five facts render as labelled rows", () => {
     const s = state({ detailFacts: { box: "grok-box-1", facts: FACTS } });
-    const pane = renderDetail(s, SIZE_120x40).join("\n");
-    expect(pane).toContain("checkfail#: 3");
-    expect(pane).toContain("expires: 2026-06-01");
-    expect(pane).toContain("asleep since: 2026-03-20T09:46:40Z");
-    expect(pane).toContain("asleep last: 2026-03-20T10:46:40Z");
-    expect(pane).toContain("api backoff: 2 fails, retry 2026-03-20T12:33:20Z");
+    // A pane wide enough for the longest row: at 120 columns the pane is 46
+    // wide and the api-backoff row does not fit, which V5 TRUNCATES (it used to
+    // overflow and wrap into the next line).
+    const pane = renderDetail(s, SIZE_200x50).join("\n");
+    expect(pane).toContain("checkfail# 3");
+    expect(pane).toContain("expires 2026-06-01");
+    expect(pane).toContain("asleep since 2026-03-20T09:46:40Z");
+    expect(pane).toContain("asleep last 2026-03-20T10:46:40Z");
+    expect(pane).toContain("api backoff 2 fails, retry 2026-03-20T12:33:20Z");
+  });
+
+  // V5's bug fix: nothing the pane paints may be wider than the pane.
+  test("a row wider than the pane is truncated INSIDE the frame, never wrapped", () => {
+    const s = state({ detailFacts: { box: "grok-box-1", facts: FACTS } });
+    const w = detailWidth(SIZE_120x40);
+    const rows = renderDetail(s, SIZE_120x40);
+    for (const r of rows) expect(r.length).toBe(w);
+    const backoff = rows.find((r) => r.includes("api backoff"))!;
+    expect(backoff.startsWith("│api backoff 2 fails, retry 2026-")).toBe(true);
+    expect(backoff.endsWith("│")).toBe(true);
   });
 
   // Acceptance 1's older-engine half: a 5.6.0 API omits every field.
@@ -66,17 +82,17 @@ describe("D1 detail pane rows", () => {
       api_backoff: null,
     };
     const pane = renderDetail(state({ detailFacts: { box: "grok-box-1", facts: older } }), SIZE_120x40).join("\n");
-    expect(pane).toContain("checkfail#: —");
-    expect(pane).toContain("expires: —");
-    expect(pane).toContain("asleep since: —");
-    expect(pane).toContain("asleep last: —");
-    expect(pane).toContain("api backoff: —");
+    expect(pane).toContain("checkfail# —");
+    expect(pane).toContain("expires —");
+    expect(pane).toContain("asleep since —");
+    expect(pane).toContain("asleep last —");
+    expect(pane).toContain("api backoff —");
   });
 
   test("with NO facts loaded at all the rows still render, as —", () => {
     const pane = renderDetail(state({ detailFacts: undefined }), SIZE_120x40).join("\n");
-    expect(pane).toContain("checkfail#: —");
-    expect(pane).toContain("api backoff: —");
+    expect(pane).toContain("checkfail# —");
+    expect(pane).toContain("api backoff —");
   });
 
   // B4's in-flight rule, and the mutant "detail fields rendered without the
@@ -88,9 +104,9 @@ describe("D1 detail pane rows", () => {
       detailFacts: { box: "grok-box-1", facts: FACTS }, // … facts are box-1's
     });
     const pane = renderDetail(s, SIZE_120x40).join("\n");
-    expect(pane).toContain("── grok-box-2");
-    expect(pane).toContain("checkfail#: —");
-    expect(pane).not.toContain("checkfail#: 3");
+    expect(pane).toContain("╭─ grok-box-2");
+    expect(pane).toContain("checkfail# —");
+    expect(pane).not.toContain("checkfail# 3");
     expect(pane).not.toContain("2026-06-01");
   });
 
@@ -104,9 +120,9 @@ describe("D1 detail pane rows", () => {
       detailFacts: { box: "grok-box-1", facts },
     });
     const pane = renderDetail(s, SIZE_120x40).join("\n");
-    expect(pane).toContain("checkfail: yes"); // the fleet line's boolean, unchanged
-    expect(pane).toContain("checkfail#: 0"); // the endpoint's count, which differs
-    expect(pane).toContain("expires: 2026-06-01"); // the endpoint's date, not 7d
+    expect(pane).toContain("checkfail yes"); // the fleet line's boolean, unchanged
+    expect(pane).toContain("checkfail# 0"); // the endpoint's count, which differs
+    expect(pane).toContain("expires 2026-06-01"); // the endpoint's date, not 7d
   });
 
   test("SNAPSHOT: the pane during an in-flight switch shows no stale numbers", () => {
@@ -117,16 +133,16 @@ describe("D1 detail pane rows", () => {
     });
     expect(renderDetail(s, SIZE_120x40).join("\n")).toBe(
       [
-        "── grok-box-2 ─────",
-        "tunnel: up   check: OK   ver: 5.3.0",
-        "drift: no   config: in-sync   expiry: 40d",
-        "checkfail: no   asleep: no",
-        "canary: none",
-        "checkfail#: —   expires: —",
-        "asleep since: —",
-        "asleep last: —",
-        "api backoff: —",
-        "24h: (loading…)",
+        "╭─ grok-box-2 ───────────────────────────────╮",
+        "│tunnel up · check OK · ver 5.3.0            │",
+        "│drift no · config in-sync · expiry 40d      │",
+        "│checkfail no · asleep no · canary none      │",
+        "│checkfail# — · expires —                    │",
+        "│asleep since —                              │",
+        "│asleep last —                               │",
+        "│api backoff —                               │",
+        "│24h (loading…)                              │",
+        "╰────────────────────────────────────────────╯",
       ].join("\n"),
     );
   });
@@ -137,18 +153,18 @@ describe("D5 footer re-layout", () => {
   test("SNAPSHOT at 100 cols: two lines, navigation+views then actions", () => {
     const f = renderFooter(state({ scope: "admin" }), SIZE_100x24);
     expect(f.length).toBe(2);
-    expect(f[0]!.trimEnd()).toBe("↑/↓ select  / filter  r refresh  q quit  D diff  J journal  H history");
+    expect(f[0]!.trimEnd()).toBe("↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history");
     expect(f[1]!.trimEnd()).toBe("P push  M rotate  R rename  T check  C reconcile");
   });
   test("SNAPSHOT at 140 cols: one line carrying every key", () => {
     const f = renderFooter(state({ scope: "admin" }), SIZE_140x40);
     expect(f.length).toBe(1);
     expect(f[0]!.trimEnd()).toBe(
-      "↑/↓ select  / filter  r refresh  q quit  D diff  J journal  H history  P push  M rotate  R rename  T check  C reconcile",
+      "↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history │ P push  M rotate  R rename  T check  C reconcile",
     );
   });
   test("no key falls off at >= 100 cols, at any width and either scope", () => {
-    const keys = ["↑/↓", "/ filter", "r refresh", "q quit", "D diff", "J journal", "H history", "P push", "M rotate", "R rename", "T check", "C reconcile"];
+    const keys = ["↑↓", "/ filter", "r refresh", "q quit", "D diff", "J journal", "H history", "P push", "M rotate", "R rename", "T check", "C reconcile"];
     for (const cols of [100, 110, 119, 120, 121, 130, 140, 200]) {
       for (const scope of ["admin", "readonly"] as const) {
         const joined = renderFooter(state({ scope }), { cols, rows: 40 }).join("\n");
@@ -340,6 +356,6 @@ describe("an open view replaces the table, under the banners", () => {
   });
   test("the header keeps ticking while a view is open (Acceptance 3)", async () => {
     const s = state({ view, tickAgeS: 42 });
-    expect((await frameOf(s, SIZE_120x40)).split("\n")[0]).toContain("tick=42s");
+    expect((await frameOf(s, SIZE_120x40)).split("\n")[0]).toContain("tick 42s");
   });
 });

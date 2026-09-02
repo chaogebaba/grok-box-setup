@@ -790,6 +790,40 @@ smoke in `tests/test-makefile-targets.sh` instead (python's `pty.fork`, because
 `script` is not installed everywhere), against a closed port so it can never
 reach the production API.
 
+### The TUI's palette and glyphs (5.7.2, blueprint fleet-tui-visual)
+
+Colour is named once, in `tui/tone.ts`, and nowhere else. One **main** colour
+carries the chrome (`MAIN #7aa2f7` — the header bar, the column headers, the
+card frame, the group separators, the `fleet2` word), one **accent** carries
+everything interactive (`ACCENT #bb9af7` — the footer's key letters, the
+selected row, the canary star, the admin scope), and four semantic colours carry
+state and nothing else: `OK #9ece6a`, `WARN #e0af68`, `DOWN #f7768e`,
+`MUTED #565f89`. The selected row is a bar (`#3d59a1` ground, `#c0caf5` text),
+never `inverse`, which flips per-cell colours into unreadable pairs. There is no
+`dim` tone: `dimColor` is grey-on-grey on several dark themes, so quiet text is
+the real MUTED colour instead. `NO_COLOR` still erases every prop, so a
+colourless frame is the coloured frame minus its SGR bytes.
+
+The glyph legend — all width 1, no emoji, measured with `string-width` in
+`test/tui/tone.test.ts`, because a width-2 cell shears every column:
+
+| glyph | tone | means |
+| --- | --- | --- |
+| `●` | OK | healthy: tunnel up, check OK, no drift |
+| `◆` | WARN | degraded: drift `yes`, config `drift`, or a checkfail |
+| `✖` | DOWN | the check FAILED |
+| `☾` | MUTED | asleep — the normal case on this fleet, never an error colour |
+| `○` | MUTED | down, never probed, or unknown |
+| `★` | ACCENT | the canary box (the column header stays `C`) |
+
+`!` is gone: it read as an error while it meant "needs attention". The header
+counts use the same glyphs and the same tones, the table tones each CELL by its
+own meaning rather than painting a whole row from the box's health (a drifted
+`VER` glows, an `in-sync` config stays quiet), `EXPIRY` turns WARN inside 30 days
+and DOWN inside 7 (the rotate threshold in `decide.ts`), and the detail pane is a
+framed card whose 24h sparkline is truncated to the pane instead of wrapping into
+the frame.
+
 Dependencies: `ink`, `react`, `@types/react` — and `react-devtools-core` as a
 REGULAR dependency. Ink's reconciler does `await import('./devtools.js')` under
 an `if (process.env.DEV === 'true')` guard and bun's bundler follows that dynamic

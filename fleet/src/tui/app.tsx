@@ -21,14 +21,14 @@ import { toReducerKeys } from "./keys.ts";
 import {
   bannerText,
   detailLines,
-  discoverText,
-  footerLines,
+  discoverSegments,
+  footerSegmentLines,
   messageText,
   modalLines,
   viewLines,
   type Size,
 } from "./model.ts";
-import { DETAIL_GAP, rowRegionRows, showDetail, tableViewLines, tableWidth } from "./layout.ts";
+import { DETAIL_GAP, detailWidth, rowRegionRows, showDetail, tableViewLines, tableWidth } from "./layout.ts";
 import {
   applyFleet,
   applyLinkDown,
@@ -246,9 +246,9 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
   // --- the frame -------------------------------------------------------------
   const noColor = state.noColor;
   const banner = bannerText(state, size);
-  const discover = discoverText(state, size);
+  const discover = discoverSegments(state, size);
   const message = messageText(state);
-  const footer = footerLines(state, size);
+  const footer = footerSegmentLines(state, size);
   const detailOn = showDetail(state, size);
   const leftW = tableWidth(size);
 
@@ -256,7 +256,7 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
     <Box flexDirection="column" flexShrink={0} width={size.cols} height={size.rows}>
       <Header state={state} size={size} />
       {banner !== undefined ? <Banner text={banner.text} tone={banner.tone} noColor={noColor} /> : null}
-      {discover !== undefined && !viewOpen ? <Discover text={discover} noColor={noColor} /> : null}
+      {discover !== undefined && !viewOpen ? <Discover segments={discover} noColor={noColor} /> : null}
       <Box flexShrink={0} height={1} />
       {viewOpen ? (
         <>
@@ -278,7 +278,7 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
             </Box>
             {detailOn ? (
               <Box flexShrink={0} flexDirection="column" marginLeft={DETAIL_GAP} width={size.cols - leftW - DETAIL_GAP}>
-                <Detail lines={detailLines(state)} noColor={noColor} />
+                <Detail lines={detailLines(state, detailWidth(size))} noColor={noColor} />
               </Box>
             ) : null}
           </Box>
