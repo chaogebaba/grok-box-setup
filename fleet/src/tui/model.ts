@@ -255,7 +255,14 @@ export function headerText(state: TuiState, size: Size): string {
 // --- box table ---------------------------------------------------------------
 // DRIFT is 9, not 7: `unknown` is exactly 7 characters, so a 7-wide cell left no
 // gap at all and the fleet read `unknownskip` on screen (r2 fix 1).
-const TABLE_HEADER_COLS = { glyph: 2, name: 14, tunnel: 7, check: 6, ver: 10, drift: 9, config: 9, expiry: 8 };
+//
+// The widths through EXPIRY must sum to at most `tableWidth({cols:100})` = 60,
+// because `layout.ts` clips the header to the table pane once the Detail pane
+// appears at 100 columns. At ver:10/config:9 the header ran to 65 and EXPIRY
+// rendered as "EXP". ver:8 still fits a 5.x.y version with a gap and config:8
+// still fits "in-sync"; the header's own trailing pad absorbs the last 2 cells'
+// slack, so the visible header ends exactly at column 60.
+const TABLE_HEADER_COLS = { glyph: 2, name: 14, tunnel: 7, check: 6, ver: 8, drift: 9, config: 8, expiry: 8 };
 
 /** The filtered box list (case-insensitive substring on name). */
 export function filteredBoxes(state: TuiState): SnapshotBox[] {
