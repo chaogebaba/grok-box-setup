@@ -643,6 +643,14 @@ missing/double rc). **Operator note: `audit.log` is unbounded — configure
 logrotate** (e.g. a weekly `copytruncate` rule) if the fleet mutates often.
 
 ### TUI-D4 — snapshot = history
+**From 5.9.0 the snapshot is STORE ROWS, not a daily file** (state-store D3): the
+tick writes `snapshots` + `snapshot_boxes` + `snapshot_skipped` in one
+transaction, `history/*.jsonl` is no longer written, and the =<2 KB line cap and
+its `boxes_dropped` stub are gone with it. The WIRE SHAPE below is unchanged —
+`GET /v1/fleet` and `GET /v1/history` reassemble exactly this JSON — so
+everything in this section still describes what a client sees. What follows
+describes the 5.8.0 storage, kept because the shape is the contract.
+
 The reconcile tick appends one line to
 `${FLEET_STATE}/history/<YYYY-MM-DD>.jsonl` (daily files):
 `{v:1, ts, apply, canary, boxes:[{name,tunnel,check,ver,drift,config,checkfail,asleep,expiry_days}]}`.
@@ -666,7 +674,7 @@ first history read of a new day (no rollover timer).
 
 **Expected gap under a long mutation:** a long API mutation holds the lock, so a
 timer reconcile tick that lands during it is **skipped** (rc 6 → the CLI logs
-"skipping this run") and writes no history line — a brief history gap. This is
+"skipping this run") and records no snapshot — a brief history gap. This is
 expected and is covered by the STALE banner (a snapshot older than 15 min goes
 yellow).
 
@@ -1073,14 +1081,17 @@ survival relies on `/workspace` persistence, and losing it needs the human URL
 dance once. No auth changes (the box password stays). No boxup delivery from
 discover. No tag gating. Nothing new is added to the Tailscale API surface.
 
-## State store (fleet2 5.8.0, Phase A)
+## State store (fleet2 5.8.0 Phase A, 5.9.0 Phase B)
 
 Before 5.8.0 the brain kept about twenty files under `$FLEET_STATE` plus ten under
 `$FLEET_ETC`. Two of them were written atomically; every counter was a plain
 `writeFileSync` whose failure was swallowed, and a corrupt counter read as `0` —
 "absent", "corrupt" and "zero" were indistinguishable and nothing logged. From
 5.8.0 the engine's mutable state lives in ONE schema-versioned SQLite file and
-the old files become a read-only export.
+the old files become a read-only export. 5.9.0 finishes the move: a box's
+membership and its liveness get NAMES, enrolment becomes a resumable saga, and
+the tick's snapshot joins the same file — `inventory.json` and `history/*.jsonl`
+are retired with it.
 
 ### The file
 
@@ -1110,12 +1121,124 @@ triple), `boxes` (surrogate `box_id`, `name`, `idx`, `port`, `phase`,
 `enrol_stage`, `pubkey`, timestamps), `box_counters` (the eight per-box markers as
 columns), `box_keys` (the Tailscale key id plus BOTH expiry forms in one row),
 `alerts`, `audit` with a 92-day retention and an index on `at`,
-`divergence_findings` and `discover_ledger`. `alerts` has no writer in 5.8.0; it
-exists so the alert-dedup work needs no migration.
+`divergence_findings` and `discover_ledger`.
+
+Schema v2 (5.9.0) adds three tables and two indexes and nothing else:
+`snapshots` (one row per tick — the `SnapshotLine` fields plus the tick's
+resolved `target_ref`/`target_sha`/`target_version`), `snapshot_boxes` (one row
+per box per tick, keyed by NAME so history outlives a rename or a
+`retire --forget`, plus the `observed` label) and `snapshot_skipped` (the
+discover pass's skip list), with `snapshots(ts)` and `snapshot_boxes(name, tick)`.
+Both are additive, so `min_reader` stays 1 and a 5.8.0 binary keeps operating a
+v2 file.
 
 Membership is `boxes WHERE phase='enrolled'`, everywhere, from 5.8.0 on: the
 tick, the inventory, the upgrade planner, the index-collision rail and the export.
 A row that is `enrolling` or `retired` is not a member and is not adoptable.
+
+### Phase: a box's membership, named
+
+| Phase | Meaning |
+|---|---|
+| `enrolling` | the enrol saga has started and not finished. NOT a member, NOT adoptable — the resume pass owns the row. |
+| `enrolled` | a member. The tick manages it, the export lists it, the upgrade planner plans for it. |
+| `retired` | history. Not a member and NOT adoptable, which is the whole point: the name stays parked until an operator says otherwise. |
+
+The only way a phase moves is `store.transition(name, from, to, actor, detail)`,
+which asserts `from`, updates the row and writes the `audit` row in ONE
+transaction. A wrong `from` is rc 1 naming the phase the row actually holds, with
+nothing written. The legal edges are `enrolling -> enrolled`, `enrolled ->
+retired`, `enrolling -> retired` (an operator aborting a stuck saga) and
+`retired -> enrolling` (re-adoption, on the SAME row: counters reset, key row
+dropped, a fresh saga).
+
+### Observed: a box's liveness, named once
+
+Before 5.9.0 a box's liveness was a TUPLE that every reader re-derived: the tick
+had tunnel/check/drift/online plus four marker files, the API had a snapshot row
+plus three live markers, and the TUI had a colour rule of its own. Nothing carried
+a NAME for the state, so no two readers could be shown to agree.
+
+`observe()` computes one per box per tick and stores it in
+`snapshot_boxes.observed`. Precedence, highest first:
+
+| Observed | When |
+|---|---|
+| `hostkey_mismatch` | a tunnel call met the changed-host-key banner, so every reading taken through it is about an unknown machine |
+| `incoherent` | the API says online while both paths are dead — the sources contradict each other |
+| `asleep` | both paths dead AND the API agrees the box is gone |
+| `api_unknown` | the devices GET failed, or the run is latched read-only, so "online" has no value this tick |
+| `unhealthy` | the tunnel is down, or `boxup check` failed |
+| `drifted` | reachable and healthy, but not on the target VERSION |
+| `healthy` | nothing to report |
+
+It is a LABEL, not a decision input: `decide.ts` is untouched and no action
+branches on it. `GET /v1/boxes/:name` and the TUI Detail card show it beside the
+phase; `GET /v1/fleet` and `GET /v1/history` do not carry it, so their JSON is
+unchanged from 5.8.0.
+
+### Retiring a box
+
+```
+fleet2 retire <box>              phase -> retired; the name stays UN-ADOPTABLE
+fleet2 retire --forget <box>     delete the row; the name is a candidate again
+fleet2 retire --dry-run <box>    print the plan, change nothing
+```
+
+Editing `enrolled.tsv` by hand never un-enrolled anything: the discover probe
+reaches a box by PASSWORD over the tailnet, not through the tunnel, so the next
+tick re-adopted the name and the removal undid itself. `retire` works because the
+RECORD of it is a store row the candidate rule consults.
+
+It transitions the row (which leaves membership at once), removes the VPS
+`authorized_keys` line and `$FLEET_ETC/authorized-keys.d/<box>.line`, revokes the
+recorded Tailscale key best-effort (the NODE stays on the tailnet — removing a
+machine is a different decision with a different blast radius), drops the key row
+so the export removes `<box>.expires` and `keys/<idx>.json`, and re-exports. It
+takes the reconcile lock like every other membership mutation, and refuses rc 6
+when the lock is busy. The `known_hosts` pin is LEFT alone: a reused name rebinds
+through the identity-binding path, which forgets the pin at the moment it rebinds.
+
+`fleet2 enroll <box>` on a retired name revives THAT row and runs the saga.
+`--forget` deletes the row and its counters, key row and alerts; the `audit` rows
+survive, because `audit.box` is plain TEXT and not a foreign key.
+
+### The enrol saga
+
+Enrolment is five external writes, and 5.8.0 performed them with no record of how
+far it got, so a half-enrolled box was something discovery had to detect and
+clean up. From 5.9.0 the row is created `phase='enrolling'` BEFORE the first
+write and carries `enrol_stage`:
+
+| Stage | Step | On failure |
+|---|---|---|
+| 1 | install the VPS `authorized_keys` line | rc 1, no advance |
+| 2 | write the `/etc` mapping copy | a WARNING: the stage ADVANCES with `enrol_warn` set |
+| 3 | install the VPS box-access key on the box | rc 1, no advance |
+| 4 | write the box's `[fleet]` block | rc 1, no advance. rc 4 ("config absent on the box") does not advance and does not record, exactly as before |
+| 5 | `transition(enrolling -> enrolled)` + export | — |
+
+Stages 1-4 are re-runnable, so a resume re-runs `enrol_stage+1 .. 5` rather than
+starting over. Only an ATTEMPTED stage that returned failure bumps
+`enrol_fail_streak`; a stage that advanced resets it.
+
+RESUME lives inside the repair pass — no third pass and no third budget share.
+The rules:
+
+- adopt YIELDS when the existing tick-1 repair probe fires OR when an `enrolling`
+  row exists and is not in backoff (the log line reads `adopt deferred
+  (repair/resume pending on X)`);
+- when both a repair-marker box and an enrolling row are due, they alternate by
+  tick parity — even `tick_seq` repair first, odd resume first — so neither
+  starves the other;
+- a failed attempt takes a `discover_ledger` failure and the same doubling
+  backoff, capped at 12 ticks. A budget deferral, a preflight skip and a lost
+  mutation slot are NOT failures: no ledger record, no streak, no warning;
+- two ssh stages rarely fit in one tick's reserve, so a resume advances at least
+  one stage per tick it runs. That is stated behaviour, not a defect;
+- `enrol-stuck` fires at three attempted-and-failed STAGES (not three ticks),
+  once, and at most every 24 h. It is the `alerts` table's first writer.
+  `fleet2 retire <box>` aborts a saga that will not finish.
 
 ### The legacy files are EXPORT-ONLY
 
@@ -1138,6 +1261,13 @@ files with mode enforcement.
 
 Editing `enrolled.tsv` by hand no longer changes membership. The next tick
 REPORTS the difference (see below) and the export overwrites the edit.
+
+`inventory.json` and `history/*.jsonl` are RETIRED in 5.9.0 and are NOT part of
+the export set. `inventory.json` was a second per-box view of the same fleet,
+written by `fleet2 inventory` while the tick wrote a snapshot line; the command
+now renders from the `boxes` rows plus the last tick's snapshot and writes no
+file. The applied upgrade pass's `lastUpgrade` block, which nothing read back
+except the next write of that same file, is an `audit` row now.
 
 ### Import, once
 
@@ -1163,6 +1293,7 @@ would suppress the devices GET for twenty minutes after a rollback), and
 ### Commands
 
 ```
+fleet2 retire [--forget] [--dry-run] <box>   un-enrol a box (see above)
 fleet2 state check                     schema, integrity, rows, divergence (read-only)
 fleet2 state backup                    take today's backup now
 fleet2 state restore <file>            copy a backup over fleet.db (stop the timer first)
@@ -1205,6 +1336,36 @@ absence is never read as emptiness in either direction.
 `file-only` rows (reviving a retired row rather than inserting a second one) and
 only PRINTS `store-only` rows with the `retire` command an operator may run.
 Automatic retirement is deliberately out of scope.
+
+**With `apply=true`, a file-only box is usually adopted before you can reconcile
+it, and that is correct.** The tick reads membership, runs the divergence check
+and reports the finding, and THEN runs discovery — which sees an online,
+unenrolled, un-excluded name and adopts it in the same tick. The finding is real
+(the membership snapshot the tick started from did exclude the box) and the audit
+row and the notify both land; the box is simply already back by the time an
+operator reads them. Nothing is lost, and `state reconcile-files` remains the
+explicit path for a box discovery cannot reach. This was observed on the 5.8.0
+live canary and is recorded here so it is not re-diagnosed as a bug.
+
+### Rolling back 5.9.0 to 5.8.0
+
+5.8.0 opens the v2 file (its log line names `user_version=2 min_reader=1`),
+ignores `snapshots`, `snapshot_boxes` and `snapshot_skipped`, and resumes
+appending `history/<day>.jsonl`. Three consequences worth knowing before you roll
+back:
+
+- **The Phase B period is a GAP in `history/`.** Nothing wrote a daily file while
+  5.9.0 ran, so `GET /v1/history` and the TUI sparkline show the pre-upgrade days
+  and then the post-rollback days with nothing between. The snapshots are still
+  in the store, and re-installing 5.9.0 serves them again. The gap is documented
+  rather than reconstructed: writing daily files from the tables would invent a
+  history that no reader saw at the time.
+- **`enrolling` and `retired` names stay parked.** The candidate exclusion ships
+  in Phase A, so 5.8.0 neither adopts them nor spends the mutation slot on them.
+  They wait for `fleet2 enroll` or `fleet2 retire --forget` after you re-upgrade.
+- **`inventory.json` comes back** — 5.8.0 writes it again on the next
+  `fleet2 inventory` or applied upgrade pass. 5.9.0 ignores whatever it finds
+  there.
 
 ### Exit codes 6 and 7
 
