@@ -487,6 +487,12 @@ Environment=FLEET_ETC=$ETC_DIR
 Environment=FLEET_STATE=$STATE_DIR
 # Dry-run by default; the wrapper adds --apply iff config apply=true.
 ExecStart=/bin/bash -c 'apply=""; grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" "$OPT_DIR/config.toml" && apply="--apply"; exec $OPT_DIR/fleet2 reconcile \$apply'
+# fleet2 5.8.0 (state-store D6/r6-B2/r7-n3): rc 7 is "recorded; export failed" —
+# every store write COMMITTED and only the legacy enrolled.tsv / authorized-keys
+# .map export a rolled-back 5.7.1 would read is stale. That is a SUCCESS for this
+# oneshot: without this line a lagging export would park the unit in 'failed'
+# every five minutes and mask a real failure. The Telegram notify is the signal.
+SuccessExitStatus=7
 EOF
 
   install -m 0644 /dev/stdin "$SYSTEMD_DIR/$TIMER" <<EOF

@@ -1039,6 +1039,154 @@ survival relies on `/workspace` persistence, and losing it needs the human URL
 dance once. No auth changes (the box password stays). No boxup delivery from
 discover. No tag gating. Nothing new is added to the Tailscale API surface.
 
+## State store (fleet2 5.8.0, Phase A)
+
+Before 5.8.0 the brain kept about twenty files under `$FLEET_STATE` plus ten under
+`$FLEET_ETC`. Two of them were written atomically; every counter was a plain
+`writeFileSync` whose failure was swallowed, and a corrupt counter read as `0` —
+"absent", "corrupt" and "zero" were indistinguishable and nothing logged. From
+5.8.0 the engine's mutable state lives in ONE schema-versioned SQLite file and
+the old files become a read-only export.
+
+### The file
+
+`$FLEET_STATE/fleet.db`, opened through `bun:sqlite` by exactly one module
+(`fleet/src/store/db.ts`). WAL journalling, `synchronous=NORMAL`,
+`busy_timeout=5000`, `foreign_keys=ON`, all tables `STRICT`. The database and
+both sidecars (`fleet.db-wal`, `fleet.db-shm`) are mode `0600`; fleet2 sets
+`umask 077` before creating them. A read-only or unwritable `$FLEET_STATE` is a
+refusal (rc 3) naming the directory and the errno — a tick that cannot persist
+must not pretend it did.
+
+### Schema and `min_reader`
+
+`PRAGMA user_version` carries the schema number; `meta.min_reader` is the LOWEST
+schema number that can still operate the file. Migrations are forward-only,
+additive and each runs in its own transaction with the version bump INSIDE it, so
+a crash between the DDL and the bump replays cleanly.
+
+A binary that meets a NEWER file opens it when `min_reader` allows and refuses
+(rc 3, naming the file, both versions and `min_reader`) when it does not. Every
+migration in this design is additive, so `min_reader` stays 1 and a 5.8.0 binary
+keeps working against a Phase B (v2) file, ignoring the tables it does not know.
+That is the Phase B rollback.
+
+Schema v1 holds `meta`, `engine` (tick ordinal + the Tailscale API backoff
+triple), `boxes` (surrogate `box_id`, `name`, `idx`, `port`, `phase`,
+`enrol_stage`, `pubkey`, timestamps), `box_counters` (the eight per-box markers as
+columns), `box_keys` (the Tailscale key id plus BOTH expiry forms in one row),
+`alerts`, `audit` with a 92-day retention and an index on `at`,
+`divergence_findings` and `discover_ledger`. `alerts` has no writer in 5.8.0; it
+exists so the alert-dedup work needs no migration.
+
+Membership is `boxes WHERE phase='enrolled'`, everywhere, from 5.8.0 on: the
+tick, the inventory, the upgrade planner, the index-collision rail and the export.
+A row that is `enrolling` or `retired` is not a member and is not adoptable.
+
+### The legacy files are EXPORT-ONLY
+
+fleet2 5.8.0 no longer treats these as state. It rewrites them from the store
+after every membership write and every key write, so a rollback to 5.7.1 finds
+them correct at any instant. The exact set is:
+
+| File | Written after |
+|---|---|
+| `$FLEET_STATE/enrolled.tsv` | every membership write |
+| `$FLEET_ETC/authorized-keys.map` | every membership write |
+| `$FLEET_STATE/<box>.expires` | every key write |
+| `$FLEET_STATE/keys/<idx>.json` | every key write |
+
+Both text files carry a header line naming the writer; 5.7.1's own `#` comment
+lines are not preserved and rows are ordered by name. Counters are NOT exported —
+they are ephemeral and 5.7.1 rebuilds them in a few ticks. `known_hosts` stays a
+file (OpenSSH reads it), and the secrets under `$FLEET_ETC` stay operator-owned
+files with mode enforcement.
+
+Editing `enrolled.tsv` by hand no longer changes membership. The next tick
+REPORTS the difference (see below) and the export overwrites the edit.
+
+### Import, once
+
+On its first tick 5.8.0 imports the existing files into the store, in one
+transaction, and then resets the marker files it now owns. The gate is
+`meta.legacy_imported_at` being absent — not the files being absent, because a
+crashed import leaves an empty file behind:
+
+| Marker | `enrolled.tsv` | Result |
+|---|---|---|
+| absent | present | import, then write the marker with `source=files` |
+| absent | absent | fresh store, marker with `source=fresh` |
+| present | either | never import |
+
+An unparseable legacy file is rc 3 naming the file, with the transaction rolled
+back and the marker unwritten: corrupt must never read as zero. Imported rows get
+`phase='enrolled'`, `created_at` = import time and `enrolled_at` = NULL. After a
+successful import the counter files are zeroed or removed to match 5.7.1's own
+reset semantics, the API backoff triple is removed (a stale future retry stamp
+would suppress the devices GET for twenty minutes after a rollback), and
+`tick.seq` and `discover.json` are left alone.
+
+### Commands
+
+```
+fleet2 state check                     schema, integrity, rows, divergence (read-only)
+fleet2 state backup                    take today's backup now
+fleet2 state restore <file>            copy a backup over fleet.db (stop the timer first)
+fleet2 state import [--force]          replay the pre-5.8.0 files into the store
+fleet2 state reconcile-files [--apply] resolve a reported divergence (dry-run by default)
+```
+
+`state check` opens the store READ-ONLY: it runs no migrations and no divergence
+check. When the check passes and the integrity flag is set, it reopens read-write
+under `flock -w 90` for the single statement that clears the flag.
+
+### Backups and integrity
+
+Once per UTC day, inside the tick, fleet2 runs `PRAGMA quick_check` and then
+`VACUUM INTO` a temporary file in `$FLEET_STATE/backup/`, chmods it `0600` and
+renames it over `backup/fleet-<date>.db`. A same-day rerun refreshes that file
+rather than adding one, and the seven newest are kept. `quick_check` also runs at
+`fleet2 serve` start and at `fleet2 state check`.
+
+A failing `quick_check` sets `meta.integrity_failed_at` and notifies. While the
+flag is set the tick refuses with one log line and no writes, no backup is taken,
+API MUTATION endpoints return 503 `integrity_failed`, and readonly endpoints and
+the TUI keep serving the last data. `fleet2 serve` STARTS in this mode rather than
+refusing: the unit restarts on failure with no rate limit, so a refusing serve
+would loop full scans forever. The flag is cleared only by a passing
+`fleet2 state check` or by `fleet2 state restore <file>`.
+
+### Divergence between the file and the store
+
+On the tick path only, under the reconcile lock, fleet2 compares the exported
+`enrolled.tsv` with the store's enrolled set. The check is ADVISORY: it never
+changes membership. A name in the file but not the store is `file-only`; the
+reverse is `store-only`. A new or changed finding writes an `audit` row and
+notifies once; an unchanged one re-notifies at most daily. A finding that stops
+diverging is deleted with a `divergence-cleared` audit row. A missing or
+unreadable file is reported as "cannot compare" and changes nothing at all —
+absence is never read as emptiness in either direction.
+
+`fleet2 state reconcile-files` prints the findings. With `--apply` it imports
+`file-only` rows (reviving a retired row rather than inserting a second one) and
+only PRINTS `store-only` rows with the `retire` command an operator may run.
+Automatic retirement is deliberately out of scope.
+
+### Exit codes 6 and 7
+
+- **rc 6** — the reconcile lock was held for the whole 90-second wait. Nothing was
+  done. `fleet2 state check` and `fleet2 state reconcile-files --apply` use it.
+  (`fleet2 rename` returns 1 for the same condition; that inconsistency is known
+  and out of scope here.)
+- **rc 7** — "recorded; export failed". Every store write committed and the
+  mutation succeeded; only the legacy export a rolled-back 5.7.1 would read is
+  stale. The tick, `fleet2 enroll` and the `state` subcommands all use it, and
+  `fleet-reconcile.service` carries `SuccessExitStatus=7` so a lagging export does
+  not park the oneshot unit in `failed` every five minutes. The Telegram notify is
+  the signal, and the next tick's divergence check reports the lag until it
+  clears. API mutation endpoints return 200 with a `warnings` entry
+  (`code: "export_failed"`) instead, because a committed mutation is a success.
+
 ## Prior art / reference URLs
 
 (Consolidated; also inline above.)
