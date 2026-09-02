@@ -8,12 +8,19 @@
 // wiring is here.
 //
 // Exit codes (D9): 0 ok, 1 verified failure/abort, 2 usage, 3 target/staging,
-// 6 refused (VPS-only / missing key / lock held / flock missing).
+// 5 policy precheck refused (enroll; nothing written), 6 refused (VPS-only /
+// missing key / lock held / flock missing) — state-store D8 registers the
+// reconcile-lock timeout under this same code — and 7 "recorded; export failed"
+// (state-store D6/r6-B2): the store write COMMITTED and the mutation succeeded,
+// but the legacy export a rolled-back 5.7.1 would read is stale.
+// `fleet-reconcile.service` carries SuccessExitStatus=7 so a lagging export does
+// not park the oneshot unit in `failed` every five minutes.
 
 import { resolveEnv } from "./env.ts";
 import { BunRunner } from "./runner.ts";
 import { loadConfig, resolveRollout, configCanary, type ParsedConfig } from "./config.ts";
-import { resolveMembership, orderExplicit, isValidBoxName } from "./boxes.ts";
+import { orderExplicit, isValidBoxName } from "./boxes.ts";
+import { readMembership } from "./store/membership.ts";
 import { nodeFs } from "./state.ts";
 import { runInventory, renderTable, fsReadExpires, type DevicesApi } from "./inventory.ts";
 import { tailscaleDevicesApi, resolveTokenFile, fetchTransport } from "./tailscale.ts";
@@ -44,7 +51,7 @@ import {
 import { makeEnrollSideEffects } from "./commands/enroll-wiring.ts";
 import { makeRenameDeps } from "./commands/rename-wiring.ts";
 
-const PKG_VERSION = "5.7.2"; // 5.7.1 rollout fixes (D1/D5) + TUI visual redesign.
+const PKG_VERSION = "5.8.0"; // state-store Phase A: bun:sqlite fleet.db + legacy export.
 
 async function gitShaFromGit(): Promise<string> {
   try {
@@ -62,11 +69,10 @@ export async function resolveGitSha(buildSha: string, runGit: () => Promise<stri
   return runGit();
 }
 
-async function readEnrolled(fleetState: string): Promise<string | undefined> {
-  const file = Bun.file(`${fleetState}/enrolled.tsv`);
-  if (!(await file.exists())) return undefined;
-  return file.text();
-}
+// Membership comes from the STORE from 5.8.0 on (state-store D4/D7); the
+// exported `enrolled.tsv` is a rollback artefact, not the source of truth.
+// `readMembership` keeps the FLEET_BOXES override and falls back to the file
+// only for the window before the first tick creates the store.
 
 /** VPS-only refusal (F2/M2): rc 6 when the box key is absent. */
 async function refuseIfNoKey(cmd: string, boxKey: string): Promise<boolean> {
@@ -168,6 +174,23 @@ async function main(argv: string[]): Promise<number> {
       const { cmdTui } = await import("./tui/main.ts");
       return cmdTui(rest, { env });
     }
+    case "state": {
+      // state-store D8. VPS-only for the same reason `serve` is: the store lives
+      // under $FLEET_STATE on the VPS and these subcommands mutate it.
+      if (await refuseIfNoKey("state", env.FLEET_BOX_KEY)) return RC.REFUSED;
+      const { cmdState } = await import("./commands/state.ts");
+      return cmdState(rest, {
+        env,
+        runner,
+        version: PKG_VERSION,
+        notify: (level, msg) =>
+          notifyFn(level, msg, {
+            telegramEnvPath: env.FLEET_TELEGRAM_ENV,
+            source: fsTelegramSource,
+            poster: fetchPoster,
+          }),
+      });
+    }
   }
 
   // Unreachable (decide() only routes KNOWN_COMMANDS), but keep the compiler happy.
@@ -223,10 +246,9 @@ async function inventoryPass(
   rollout: ReturnType<typeof resolveRollout>,
   runner: BunRunner,
 ) {
-  const enrolled = await readEnrolled(env.FLEET_STATE);
   const parsed = parseBoxArgs(rest, "inventory");
   if (typeof parsed === "number") return { rc: parsed as number };
-  const boxes = parsed.boxes.length > 0 ? parsed.boxes : resolveMembership(env.FLEET_BOXES, enrolled);
+  const boxes = parsed.boxes.length > 0 ? parsed.boxes : readMembership(env);
   const api: DevicesApi = tailscaleDevicesApi(env, cfg);
   const res = await runInventory(boxes, { runner, env, rollout, fs: nodeFs, api, readExpires: fsReadExpires });
   return { rc: RC.OK, res, json: parsed.json };
@@ -348,8 +370,7 @@ async function runUpgradeCmd(
   const canary = p.canaryOverride ?? rollout.canary;
   let boxes: string[];
   if (p.all) {
-    const enrolled = await readEnrolled(env.FLEET_STATE);
-    boxes = resolveMembership(env.FLEET_BOXES, enrolled);
+    boxes = readMembership(env);
   } else if (p.explicit.length > 0) {
     const { ordered, invalid } = orderExplicit(p.explicit, canary);
     if (invalid.length > 0) {
@@ -446,7 +467,7 @@ async function runReconcileCmd(
       return RC.USAGE;
     }
   }
-  return cliReconcile({ env, cfg, rollout, apply, debugExec, argv });
+  return cliReconcile({ env, cfg, rollout, apply, debugExec, argv, version: PKG_VERSION });
 }
 
 if (import.meta.main) {

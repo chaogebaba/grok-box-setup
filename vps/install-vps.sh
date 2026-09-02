@@ -71,7 +71,7 @@ FLEET2_RELEASE_ENV="${FLEET2_RELEASE-}"
 FLEET2_SHA256_ENV="${FLEET2_SHA256-}"
 # `make ts-release-build` rewrites EXACTLY these two lines (fleet/scripts/
 # release-build.sh); keep them at column 0 in `NAME=value` form.
-FLEET2_RELEASE=v5.7.2
+FLEET2_RELEASE=v5.8.0
 # Placeholder until the first `make ts-release-build` writes the real digest.
 # Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
 FLEET2_SHA256=65800612b924cb05dc8b10757415a0fc7aedb5490eb324d44c76c266451aca76
@@ -487,6 +487,12 @@ Environment=FLEET_ETC=$ETC_DIR
 Environment=FLEET_STATE=$STATE_DIR
 # Dry-run by default; the wrapper adds --apply iff config apply=true.
 ExecStart=/bin/bash -c 'apply=""; grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" "$OPT_DIR/config.toml" && apply="--apply"; exec $OPT_DIR/fleet2 reconcile \$apply'
+# fleet2 5.8.0 (state-store D6/r6-B2/r7-n3): rc 7 is "recorded; export failed" —
+# every store write COMMITTED and only the legacy enrolled.tsv / authorized-keys
+# .map export a rolled-back 5.7.1 would read is stale. That is a SUCCESS for this
+# oneshot: without this line a lagging export would park the unit in 'failed'
+# every five minutes and mask a real failure. The Telegram notify is the signal.
+SuccessExitStatus=7
 EOF
 
   install -m 0644 /dev/stdin "$SYSTEMD_DIR/$TIMER" <<EOF

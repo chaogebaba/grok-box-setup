@@ -48,6 +48,14 @@ Brain subcommands (docs/FLEET-BRAIN.md — VPS-side unless noted):
                                  run the tailnet-bound token-auth admin API
                                  (VPS-ONLY, refuses rc 6 off the VPS; port 9891)
   fleet2 tui                     laptop admin panel over the serve API (lane B)
+  fleet2 state check             report the state store: schema, integrity,
+                                 rows, divergence findings (read-only)
+  fleet2 state backup            take today's backup now (VACUUM INTO, keep 7)
+  fleet2 state restore <file>    copy a backup over fleet.db (stop the timer first)
+  fleet2 state import [--force]  replay the pre-5.8.0 files into the store
+  fleet2 state reconcile-files [--apply]
+                                 resolve a reported enrolled.tsv divergence
+                                 (dry-run by default)
   fleet2 version | help
 
 Environment:

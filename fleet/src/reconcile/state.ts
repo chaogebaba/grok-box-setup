@@ -12,6 +12,7 @@
 // synchronously behind a small injectable seam so tests run against a tmp dir.
 
 import { readFileSync, writeFileSync, mkdirSync, rmSync, chmodSync, existsSync, renameSync } from "node:fs";
+import { boxIndex as boxIndexForKeys } from "../boxes.ts";
 
 export interface StateFs {
   read(path: string): string | undefined;
@@ -73,8 +74,67 @@ export const nodeStateFs: StateFs = {
   },
 };
 
+/**
+ * The per-tick state surface, implemented TWICE (state-store D7 Phase A):
+ *
+ *  - `ReconcileState` below — the 5.7.1 file implementation. It is no longer on
+ *    the tick path; it survives as the LEGACY reader the import uses and as the
+ *    byte-for-byte reference the export round-trip test compares against.
+ *  - `StoreState` (store/state.ts) — the bun:sqlite implementation the tick,
+ *    the CLI and the readonly API endpoints use from 5.8.0 on.
+ *
+ * Keeping one interface is what lets `ReconcileDeps.state` stay a single type
+ * and every existing test keep injecting the file version.
+ */
+export interface ReconcileStateApi {
+  bumpCheckfail(box: string): number;
+  resetCheckfail(box: string): void;
+  checkfailCount(box: string): number;
+  bumpSeedfail(box: string): number;
+  resetSeedfail(box: string): void;
+  bumpCfgfail(box: string): number;
+  resetCfgfail(box: string): void;
+  bumpIncoherent(box: string): number;
+  resetIncoherent(box: string): void;
+  readAsleep(box: string): { since: number; last: number } | undefined;
+  writeAsleep(box: string, since: number, last: number): void;
+  resetAsleep(box: string): void;
+  writeExpires(box: string, date: string): void;
+  readExpiresDate(box: string): string | undefined;
+  /**
+   * The recorded Tailscale key id. `box` is optional for source compatibility
+   * with the 5.7.1 file layout (`keys/<index>.json` is index-keyed); the store
+   * uses it when given because `box_keys` is keyed by `box_id`, and two rows may
+   * legitimately share an index (`grok-box-3` + `grok-box-003`, D3/B1).
+   */
+  keyMetaId(index: number, box?: string): string | undefined;
+  recordKeyMeta(index: number, id: string, expires: string, box?: string): boolean;
+  /**
+   * D5: record the key id AND both expiry forms in ONE write. 5.7.1 wrote
+   * `keys/<idx>.json` and then `<box>.expires` as two files with a crash window
+   * between them (survey §4b), which made the mint-window guard fail open and
+   * the next tick re-mint. The store does it in one statement.
+   */
+  recordKey(box: string, meta: { keyId: string; expiresRaw: string; expiresDate: string }): boolean;
+  recordApiFailure(nowSec: number): { n: number; mins: number };
+  resetApiFailure(): void;
+  apiFails(): number;
+  nextRetry(): number | undefined;
+  bumpTick(): number;
+  currentTick(): number;
+  readRepairPending(box: string): { runs: number; tick: number } | undefined;
+  bumpRepairPending(box: string, tick: number): number;
+  resetRepairPending(box: string, tick: number): void;
+  readHostkeyMismatch(box: string): boolean;
+  setHostkeyMismatch(box: string): void;
+  clearHostkeyMismatch(box: string): void;
+  readDiscoverLedger(): DiscoverRecord[];
+  writeDiscoverLedger(records: DiscoverRecord[]): void;
+  mkdirState(): void;
+}
+
 /** Paths under $FLEET_STATE. */
-export class ReconcileState {
+export class ReconcileState implements ReconcileStateApi {
   constructor(
     readonly fleetState: string,
     readonly fs: StateFs = nodeStateFs,
@@ -169,7 +229,8 @@ export class ReconcileState {
 
   // --- keys/<N>.json (main:1744-1763) — {"id":..,"expires":..}, mode 600 ---
   /** key_meta_id (main:860-864): recorded id or undefined. */
-  keyMetaId(index: number): string | undefined {
+  keyMetaId(index: number, box?: string): string | undefined {
+    void box; // index-keyed in the file layout; the store uses the name (D3/B1)
     const raw = this.fs.read(`${this.keysDir()}/${index}.json`);
     if (raw === undefined) return undefined;
     try {
@@ -183,7 +244,8 @@ export class ReconcileState {
    * record_key_meta (main:1744-1763): refuse blank id; atomic tmp+mv, mode 600;
    * read-back must recover the id. Returns false (rc 1) on any failure.
    */
-  recordKeyMeta(index: number, id: string, expires: string): boolean {
+  recordKeyMeta(index: number, id: string, expires: string, box?: string): boolean {
+    void box;
     if (id === "") return false; // blank id cannot satisfy the invariant
     const dir = this.keysDir();
     this.fs.mkdirp(dir);
@@ -200,6 +262,19 @@ export class ReconcileState {
     }
     // read-back invariant
     return this.keyMetaId(index) === id;
+  }
+
+  /**
+   * The FILE implementation of the D5 one-write mint record: still two writes
+   * (that is the whole point of the store), kept so the legacy class satisfies
+   * the interface and so the export round-trip test can produce 5.7.1 bytes.
+   */
+  recordKey(box: string, meta: { keyId: string; expiresRaw: string; expiresDate: string }): boolean {
+    const idx = boxIndexForKeys(box);
+    if (idx === undefined) return false;
+    if (!this.recordKeyMeta(idx, meta.keyId, meta.expiresRaw)) return false;
+    this.writeExpires(box, meta.expiresDate);
+    return true;
   }
 
   // --- api backoff (main:2739-2778) ---

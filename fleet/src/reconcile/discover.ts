@@ -20,7 +20,7 @@
 
 import type { DiscoverRow } from "../commands/list.ts";
 import { boxIndex } from "../boxes.ts";
-import type { ReconcileState, DiscoverRecord } from "./state.ts";
+import type { ReconcileStateApi, DiscoverRecord } from "./state.ts";
 import { log } from "../log.ts";
 
 // --- constants ---------------------------------------------------------------
@@ -97,6 +97,12 @@ export interface AdoptOutcome {
   rc: number;
   /** the named abort point when a remote step hit its ceiling (D6d). */
   timeoutPoint?: string;
+  /**
+   * state-store D6/r5-B4: the enrolment COMMITTED to the store and the legacy
+   * export lagged. `rc` is still 0, so this is an ADOPTION — one warning line,
+   * never a ledger failure and never a wasted slot.
+   */
+  exportError?: string;
 }
 
 /** The injectable transport/orchestration seam. */
@@ -123,14 +129,21 @@ export interface DiscoverDeps {
 
 /** Per-tick facts the caller supplies. */
 export interface DiscoverTick {
-  state: ReconcileState;
+  state: ReconcileStateApi;
   /** the tick ordinal (ReconcileState.bumpTick). */
   tick: number;
   /** the run-wide read-only latch (D4). */
   readonly: boolean;
   apply: boolean;
-  /** the resolved membership for THIS tick. */
+  /** the resolved membership for THIS tick (`phase='enrolled'` from 5.8.0). */
   membership: string[];
+  /**
+   * state-store D4: names the store holds as `retired` or `enrolling`, read ONCE
+   * per tick with membership. `selectCandidates` drops them silently. Absent on
+   * a caller that has no store (tests) — the default is an empty map, so every
+   * existing two-argument call keeps its behaviour.
+   */
+  excluded?: Map<string, "retired" | "enrolling">;
   nowSec: number;
   /** monotonic milliseconds; injected so the budget is deterministic in tests. */
   nowMs(): number;
@@ -232,7 +245,11 @@ export interface CandidateSelection {
  *
  * `DiscoverRow.online` is the STRING "yes"/"no" (parseDiscover), not a boolean.
  */
-export function selectCandidates(rows: DiscoverRow[], membership: string[]): CandidateSelection {
+export function selectCandidates(
+  rows: DiscoverRow[],
+  membership: string[],
+  excluded: Map<string, "retired" | "enrolling"> = new Map(),
+): CandidateSelection {
   const enrolled = new Set(membership);
   const enrolledIdx = new Map<number, string>();
   for (const m of membership) {
@@ -245,6 +262,18 @@ export function selectCandidates(rows: DiscoverRow[], membership: string[]): Can
   for (const r of [...rows].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
     if (enrolled.has(r.name)) continue; // already a member — not a discovery concern
     if (r.online !== "yes") continue; // offline peers are silently uninteresting
+    // state-store D4/r3-B5: a name the store holds as `retired` or `enrolling`
+    // is NOT adoptable and is dropped SILENTLY — no `skipped` entry. A skip
+    // reason is a transient fact; a retired box parked on the tailnet would
+    // otherwise emit ~26k `snapshot_skipped` rows per retention window. The
+    // retire audit row and `fleet2 state check` are the record instead.
+    //
+    // This exclusion ships in PHASE A (the `phase` column is in schema v1), so a
+    // 5.8.0 binary rolled back from Phase B never adopts an `enrolling` or
+    // `retired` name and never spends the mutation slot on it. Removing the VPS
+    // authorized_keys line alone would not stop re-adoption: the discover probe
+    // reaches boxes by PASSWORD over the tailnet, not through the tunnel.
+    if (excluded.has(r.name)) continue;
     if (!CANDIDATE_RE.test(r.name)) {
       // A legacy 1–2 digit name is REPORTED (an operator must rename it); any
       // other shape parseDiscover let through is simply not ours.
@@ -427,7 +456,7 @@ export class DiscoverRun {
     if (this.latched()) return;
 
     const peers = await this.budget.spend("shared", () => this.deps.listPeers());
-    const sel = selectCandidates(peers, this.tick.membership);
+    const sel = selectCandidates(peers, this.tick.membership, this.tick.excluded ?? new Map());
     this.summary.candidates = sel.candidates.length;
     for (const s of sel.skipped) {
       const err = sel.errors.find((e) => e.startsWith(`${s.name} `));
@@ -500,6 +529,11 @@ export class DiscoverRun {
         this.summary.adopted += 1;
         this.clearFailure(name);
         log(`discover: adopted ${name} (boxup ${p.boxup}) — tunnel proven on the next tick`);
+        if (r.exportError !== undefined) {
+          // The store row is committed; only the file a rolled-back 5.7.1 would
+          // read is stale. The tick reports it once and returns rc 7.
+          log(`discover: ${name} recorded; legacy export failed: ${r.exportError}`);
+        }
       } else {
         const reason = r.timeoutPoint !== undefined ? `timeout-${r.timeoutPoint}` : `enroll-rc${r.rc}`;
         this.recordFailure(name, reason);

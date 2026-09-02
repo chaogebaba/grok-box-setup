@@ -24,7 +24,7 @@ import { isHostKeyMismatch, knownHostsFile } from "../hostkey.ts";
 import { boxIndex, portFor } from "../boxes.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../remote.ts";
 import { parseCheck, parseStatusLine } from "../status.ts";
-import { ReconcileState } from "./state.ts";
+import type { ReconcileStateApi } from "./state.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
 import { decide } from "./decide.ts";
 import { devFields, daysUntil } from "./inputs.ts";
@@ -41,6 +41,11 @@ import { log } from "../log.ts";
 import { splitVersion } from "../status.ts";
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
 import { DiscoverRun, type DiscoverDeps, type DiscoverSummary } from "./discover.ts";
+import type { Store } from "../store/db.ts";
+import type { StoreState } from "../store/state.ts";
+import { checkDivergence } from "../store/divergence.ts";
+import { dailyMaintenance } from "../store/backup.ts";
+import { AUDIT_RETENTION_DAYS } from "../store/schema.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
@@ -67,8 +72,26 @@ export interface ReconcileDeps {
   runner: Runner;
   env: Env;
   rollout: RolloutConfig;
-  state: ReconcileState;
+  state: ReconcileStateApi;
   keys: TailscaleKeys;
+  /**
+   * state-store D7 Phase A: the open store, when the tick runs against one
+   * (production from 5.8.0). Omitted ⇒ no integrity halt, no divergence check,
+   * no audit retention and no daily backup — which is exactly what keeps the
+   * existing box-free runReconcile tests hermetic against a fake file state.
+   */
+  store?: Store;
+  /**
+   * The same object as `state` when it is store-backed. Kept as its own field so
+   * the tick can drain the EXPORT errors (D6) without narrowing `state`.
+   */
+  storeState?: StoreState;
+  /**
+   * state-store D4: names the store holds as `retired` or `enrolling`, read once
+   * per tick with membership and handed to `selectCandidates` so neither is
+   * adoptable and neither spends the mutation slot.
+   */
+  excluded?: Map<string, "retired" | "enrolling">;
   ctx: RunContext;
   notify: (level: NotifyLevel, msg: string) => Promise<void> | void;
   targetBoxes: string[];
@@ -105,11 +128,52 @@ export interface ReconcileDeps {
 }
 
 export interface ReconcileResult {
-  rc: 0 | 1;
+  /**
+   * 0 ok, 1 a verified per-box failure, 3 the store declared itself corrupt and
+   * the tick refused (state-store D8), 7 every write committed but the legacy
+   * export lagged (D6/r6-B2 — `fleet-reconcile.service` treats 7 as success).
+   */
+  rc: number;
 }
 
 function now(deps: ReconcileDeps): number {
   return deps.nowSec ?? Math.floor(Date.now() / 1000);
+}
+
+/**
+ * The tick's store epilogue (state-store D6/D8): the once-a-day backup step and
+ * the export-lag verdict.
+ *
+ * A lagging export is NOT a failure of the tick: the store write committed, so
+ * the mutation succeeded and the store is authoritative. rc 7 says exactly that
+ * — "recorded; export failed" — and `fleet-reconcile.service` carries
+ * `SuccessExitStatus=7` so it does not park the oneshot unit in `failed` every
+ * five minutes. The notify is the signal; the next tick's divergence check
+ * reports the lag until it clears.
+ *
+ * A per-box failure (rc 1) OUTRANKS the export lag: it is the more serious
+ * verdict and the operator must not see it downgraded to a success code.
+ */
+function finishStore(deps: ReconcileDeps, rc: number): number {
+  if (deps.store === undefined) return rc;
+  const r = dailyMaintenance(deps.store, { fleetState: deps.env.FLEET_STATE, at: now(deps) });
+  if (r.integrityFailed !== undefined) {
+    void deps.notify(
+      "warn",
+      `state store: quick_check FAILED (${r.integrityFailed}) — the next tick will refuse; run 'fleet2 state check'`,
+    );
+    // The tick that DISCOVERS the corruption reports it too, so the signal does
+    // not depend on the flag having been writable on a damaged file.
+    return 3;
+  }
+  if (r.backupError !== undefined) {
+    void deps.notify("warn", `state store: the daily backup failed (${r.backupError}) — the store itself is unaffected`);
+  }
+  const errs = deps.storeState?.takeExportErrors() ?? [];
+  if (errs.length === 0) return rc;
+  log(`reconcile: ${errs.length} legacy export failure(s) this tick — the store is authoritative; first: ${errs[0]}`);
+  void deps.notify("warn", `state store: recorded, but the legacy export failed: ${errs[0]}`);
+  return rc === 0 ? 7 : rc;
 }
 
 /** devices_json_valid: parses AND has a `.devices` array. */
@@ -126,11 +190,43 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   const mode = deps.apply ? "APPLY" : "DRY-RUN"; // H1: UPPERCASE
   log(`reconcile: start (${mode})`);
 
+  // --- state-store D8 halt rule ---
+  // The flag says a `quick_check` declared this file corrupt. A tick that cannot
+  // trust its own state must not write to it, so it refuses BEFORE the tick
+  // ordinal is bumped: one log line, no writes, and NO backup step (the seven
+  // existing backups are the recovery material). The flag is cleared only by a
+  // passing `fleet2 state check` or by `fleet2 state restore <file>`.
+  if (deps.store !== undefined) {
+    const flagged = deps.store.integrityFailedAt();
+    if (flagged !== undefined) {
+      log(
+        `reconcile: REFUSING — the state store failed quick_check at ` +
+          `${new Date(flagged * 1000).toISOString()}; run 'fleet2 state check' or ` +
+          `'fleet2 state restore <backup>' (no writes this tick)`,
+      );
+      return { rc: 3 };
+    }
+  }
+
   // D5: one tick ordinal per run, bumped BEFORE anything reads it, so
   // `repair_pending_runs` freshness ("the immediately preceding tick" / "the
   // current tick") is a total order with no holes — early-return ticks bump it
   // too.
   const tick = deps.state.bumpTick();
+
+  // --- state-store D6 divergence check (ADVISORY, tick-only) ---
+  // After membership is read (the caller resolved `targetBoxes` from the store)
+  // and BEFORE any action. It never writes membership: it records findings and
+  // notifies, and `fleet2 state reconcile-files` is how an operator resolves
+  // one. A missing or unreadable file is "cannot compare" and is INERT.
+  if (deps.store !== undefined) {
+    const div = checkDivergence(deps.store, { enrolledPath: `${deps.env.FLEET_STATE}/enrolled.tsv`, now: now(deps) });
+    for (const n of div.notifications) await deps.notify(n.level, n.msg);
+    // D3 retention: 92 days of `audit`, once per tick. `audit.log` the FILE is
+    // untouched and stays unbounded (operator logrotate).
+    const pruned = deps.store.pruneAudit(AUDIT_RETENTION_DAYS, now(deps));
+    if (pruned > 0) log(`reconcile: pruned ${pruned} audit row(s) older than ${AUDIT_RETENTION_DAYS} days`);
+  }
 
   // --- devices GET with D4/F5 backoff ---
   let devs = "";
@@ -188,6 +284,7 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
           readonly: deps.ctx.readonly,
           apply: deps.apply,
           membership: deps.targetBoxes,
+          excluded: deps.excluded,
           nowSec: nowS,
           nowMs: deps.nowMsFn ?? (() => Date.now()),
         });
@@ -200,7 +297,7 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
     // R2-A4: an early-return tick still appends a snapshot (empty boxes) so the
     // tick_age freshness signal / STALE banner works even for an empty fleet.
     writeSnapshot(deps, [], null, drun?.summary);
-    return { rc: 0 };
+    return { rc: finishStore(deps, 0) };
   }
 
   // --- per-box loop (SERIAL) ---
@@ -256,7 +353,7 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   writeSnapshot(deps, snapshots, deps.managedFilesPresent ? (cpRes.canary ?? null) : null, drun?.summary);
 
   log(`reconcile: done (${mode})`);
-  return { rc };
+  return { rc: finishStore(deps, rc) };
 }
 
 /**
