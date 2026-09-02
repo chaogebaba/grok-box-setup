@@ -18,6 +18,8 @@ import {
   footerLines,
   messageText,
   modalLines,
+  tableLines,
+  tableWidth,
 } from "../../src/tui/model.ts";
 import {
   TABLE_HEADER_ROWS,
@@ -109,6 +111,26 @@ describe("the table's row budget", () => {
       expect(win.end - 1).toBe(selected);
       expect(win.end - win.start).toBe(rows);
     }
+  });
+
+  // At 100 columns the Detail pane appears and layout.ts clips the header to
+  // tableWidth(100) = 60. The column widths through EXPIRY used to sum to 65, so
+  // the last header cell rendered as "EXP".
+  test("the column header fits the table pane at the 100-column cutoff", () => {
+    const size = { cols: 100, rows: 40 };
+    const s = state({ boxes: thirty });
+    expect(showDetail(s, size)).toBe(true);
+    const head = tableViewLines(s, size)[0]!.text;
+    expect(head.trimEnd().length).toBeLessThanOrEqual(tableWidth(size));
+    expect(head).toContain("EXPIRY");
+    // …and nothing before it was dropped either.
+    for (const label of ["NAME", "TUNNEL", "CHECK", "VER", "DRIFT", "CONFIG"]) expect(head).toContain(label);
+  });
+
+  test("the unclipped header is the same row, just padded to the terminal", () => {
+    const size = { cols: 100, rows: 40 };
+    const s = state({ boxes: thirty });
+    expect(tableLines(s, size)[0]!.text.trimEnd()).toBe(tableViewLines(s, size)[0]!.text.trimEnd());
   });
 
   test("the Detail pane is omitted, never clipped, when the budget is short", () => {

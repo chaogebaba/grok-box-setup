@@ -5,8 +5,10 @@
 // authoritative ~fleet/.ssh/authorized_keys is NEVER touched (F6) — only the
 // box-name-keyed AUDIT copies + the .toml managed overlay move (F11).
 //
-// rc map (§8): 0 ok/dry-run/already-canonical / 1 lock+precheck+poll+verify+
-// delete aborts / 2 usage + validation refusals.
+// rc map (§8): 0 ok/dry-run/already-canonical / 1 precheck+poll+verify+delete
+// aborts / 2 usage + validation refusals / 6 refused because the reconcile lock
+// is held or unopenable (the cli.ts rc table's "lock held"; same mapping as
+// upgrade.ts RC.REFUSED).
 //
 // State I/O is behind a `RenameStore` seam (a tiny fs abstraction) so tests run
 // against a tmp FLEET_STATE/FLEET_ETC; the box step + API poll are behind a
@@ -156,13 +158,16 @@ export async function cmdRename(args: string[], deps: RenameDeps): Promise<numbe
 
   // (F2) lock.
   const lock = await deps.ops.acquireLock();
+  // Both lock outcomes are REFUSALS, not verified failures: nothing was touched.
+  // rc 6 is the cli.ts rc table's "refused (… / lock held / flock missing)",
+  // matching upgrade.ts's RC.REFUSED for a held flock.
   if (lock === "open-fail") {
     log(`rename: cannot open lock ${deps.paths.state}/reconcile.lock`);
-    return 1;
+    return 6;
   }
   if (lock === "busy") {
     log("rename: reconcile busy — could not acquire the reconcile lock within 90s; refusing");
-    return 1;
+    return 6;
   }
 
   // (3) precheck.

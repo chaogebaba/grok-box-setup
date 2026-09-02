@@ -5,19 +5,23 @@
 // enrolled set, and `<box>.expires` / `keys/<idx>.json` have to be
 // BYTE-IDENTICAL to what the 5.7.1 writers produce for the same inputs.
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, readdirSync, chmodSync, statSync } from "node:fs";
 import { parseEnrolled } from "../../src/boxes.ts";
 import { openStore, storePath } from "../../src/store/db.ts";
 import { StoreState } from "../../src/store/state.ts";
 import { exportHeader, parseAuthorizedKeysMap } from "../../src/store/legacy.ts";
 import { ReconcileState, nodeStateFs } from "../../src/reconcile/state.ts";
-import { cleanup, scratchDir, T0 } from "./helpers.ts";
+import { cleanup, suiteScratch, T0 } from "./helpers.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("export");
+afterAll(() => SCRATCH.clean());
 
 const VERSION = "5.8.0";
 
 function fixture(prefix: string) {
-  const dir = scratchDir(prefix);
+  const dir = SCRATCH.dir(prefix);
   const state = `${dir}/state`;
   const etc = `${dir}/etc`;
   const store = openStore({ path: storePath(state), dir: state, now: () => T0 });
@@ -77,7 +81,7 @@ describe("(g) export round-trip", () => {
 
   test("<box>.expires and keys/<idx>.json are byte-identical to the 5.7.1 writers", () => {
     const f = fixture("export-keys");
-    const ref = scratchDir("export-ref");
+    const ref = SCRATCH.dir("export-ref");
     try {
       f.st.recordEnrolled("grok-box-003", 20003, "AAAAKEY003");
       f.st.recordKey("grok-box-003", {

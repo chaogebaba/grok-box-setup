@@ -1,14 +1,18 @@
 // legacy-import.test.ts — the D6 import rule table, its values and its refusals
 // (blueprint fleet2-state-store D9 (b), (p), (v)).
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { ConfigError } from "../../src/store/db.ts";
 import { importLegacy } from "../../src/store/legacy.ts";
-import { cleanup, memStore, put, scratchDir, T0, writeLegacyFixture } from "./helpers.ts";
+import { cleanup, memStore, put, suiteScratch, writeLegacyFixture, T0 } from "./helpers.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("legacy-import");
+afterAll(() => SCRATCH.clean());
 
 function fixture(prefix: string): { dir: string; state: string; etc: string } {
-  const dir = scratchDir(prefix);
+  const dir = SCRATCH.dir(prefix);
   const state = `${dir}/state`;
   const etc = `${dir}/etc`;
   writeLegacyFixture(state, etc);
@@ -100,7 +104,7 @@ describe("(b) import replay from the survey §1a fixture", () => {
       a.close();
 
       // marker absent + NO enrolled.tsv ⇒ fresh store, source='fresh'.
-      const empty = scratchDir("fresh");
+      const empty = SCRATCH.dir("fresh");
       const b = memStore();
       expect(importLegacy(b, { fleetState: `${empty}/state`, etc: `${empty}/etc` }).kind).toBe("fresh");
       expect(b.meta("legacy_import_source")).toBe("fresh");

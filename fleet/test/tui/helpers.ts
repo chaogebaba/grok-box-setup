@@ -23,7 +23,10 @@ export function box(name: string, over: Partial<SnapshotBox> = {}): SnapshotBox 
   };
 }
 
-/** A TuiState with NO_COLOR on (deterministic snapshots) and a fixed clock. */
+/** A TuiState with NO_COLOR on (deterministic snapshots), a fixed clock and a
+ *  fixed ZONE. The zone is pinned to UTC here rather than left to the host, so
+ *  the frame fixtures render one byte-identical frame on any machine — a golden
+ *  captured in America/New_York would not match on a grok box. */
 export function state(over: Partial<TuiState> = {}): TuiState {
   return {
     boxes: [box("grok-box-1")],
@@ -39,6 +42,7 @@ export function state(over: Partial<TuiState> = {}): TuiState {
     filter: "",
     filtering: false,
     noColor: true,
+    tz: "UTC",
     ...over,
   };
 }

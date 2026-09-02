@@ -3,7 +3,7 @@
 // exclusion (blueprint fleet2-state-store D9 (t), (u), and the D4 exclusion that
 // ships in Phase A so a rollback from Phase B never adopts a parked name).
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync } from "node:fs";
 import { runReconcile, type ReconcileDeps } from "../../src/reconcile/run.ts";
 import { RunContext, TailscaleKeys, type KeyTransport } from "../../src/reconcile/tailscale-keys.ts";
@@ -15,8 +15,12 @@ import { testEnv, testRollout } from "../helpers.ts";
 import { setLogSink } from "../../src/log.ts";
 import type { ManagedSource } from "../../src/actions/config-push.ts";
 import type { UpgradeDeps } from "../../src/upgrade.ts";
-import { cleanup, scratchDir, T0 } from "./helpers.ts";
+import { cleanup, suiteScratch, T0 } from "./helpers.ts";
 import { utcDate } from "../../src/store/backup.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("tick");
+afterAll(() => SCRATCH.clean());
 
 let logs: string[] = [];
 let prevSink: (l: string) => void;
@@ -54,7 +58,7 @@ interface Harness {
 }
 
 function harness(prefix: string, opts: { withExport?: boolean } = {}): Harness {
-  const dir = scratchDir(prefix);
+  const dir = SCRATCH.dir(prefix);
   const state = `${dir}/state`;
   const etc = `${dir}/etc`;
   const store = openStore({ path: storePath(state), dir: state, now: () => T0 });

@@ -54,7 +54,18 @@ describe("D1 detail pane rows", () => {
     // overflow and wrap into the next line).
     const pane = renderDetail(s, SIZE_200x50).join("\n");
     expect(pane).toContain("checkfail# 3");
-    expect(pane).toContain("expires 2026-06-01");
+    expect(pane).toContain("expires 2026-06-01 (40d)");
+    // Timestamps are wall-clock readings in the state's zone (UTC in fixtures).
+    expect(pane).toContain("asleep since Mar 20 09:46 UTC (41d ago)");
+    expect(pane).toContain("asleep last Mar 20 10:46 UTC (41d ago)");
+    expect(pane).toContain("api backoff 2 fails, retry Mar 20 12:33 UTC (41d ago)");
+  });
+
+  test("the same five facts under --utc, as raw UTC ISO strings", () => {
+    const s = state({ detailFacts: { box: "grok-box-1", facts: FACTS }, utcRaw: true });
+    const pane = renderDetail(s, SIZE_200x50).join("\n");
+    expect(pane).toContain("checkfail# 3");
+    expect(pane).toContain("expires 2026-06-01 (40d)");
     expect(pane).toContain("asleep since 2026-03-20T09:46:40Z");
     expect(pane).toContain("asleep last 2026-03-20T10:46:40Z");
     expect(pane).toContain("api backoff 2 fails, retry 2026-03-20T12:33:20Z");
@@ -67,7 +78,7 @@ describe("D1 detail pane rows", () => {
     const rows = renderDetail(s, SIZE_120x40);
     for (const r of rows) expect(r.length).toBe(w);
     const backoff = rows.find((r) => r.includes("api backoff"))!;
-    expect(backoff.startsWith("│api backoff 2 fails, retry 2026-")).toBe(true);
+    expect(backoff.startsWith("│api backoff 2 fails, retry Mar 20 12:33 UTC")).toBe(true);
     expect(backoff.endsWith("│")).toBe(true);
   });
 
