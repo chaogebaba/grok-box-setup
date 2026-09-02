@@ -374,6 +374,32 @@ install_fleet2() {
       systemctl daemon-reload >/dev/null 2>&1 || true
     fi
   fi
+
+  # A LONG-RUNNING unit keeps executing the binary it was STARTED with, and the
+  # atomic `mv -f` above unlinks the old inode without touching the process.
+  # Production served /v1/health version 5.5.0 for three and a half hours after
+  # the 5.6.0 install, with /proc/<pid>/exe reading
+  # "/opt/grok-fleet/fleet2 (deleted)". So the swap is only finished once the
+  # running API has been rebound to the new bytes.
+  #
+  # `try-restart` and nothing else. TUI-D8's policy — the installer NEVER
+  # enables and NEVER starts fleet-api.service, the empirical gate does that on
+  # PASS — is unchanged here: try-restart restarts the unit ONLY if it is
+  # already active and is a no-op otherwise. The `is-active` check in front of
+  # it is not redundant with that: it is what lets us say out loud, in the log,
+  # which of the two happened.
+  #
+  # ONLY fleet-api.service. fleet-reconcile.service is Type=oneshot driven by
+  # its timer, so each tick execs the binary afresh and picks up the new one on
+  # its own; restarting it would run an unscheduled tick for no reason.
+  if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet "$API_SERVICE" 2>/dev/null; then
+      systemctl try-restart "$API_SERVICE" >/dev/null 2>&1 || true
+      log "restarted $API_SERVICE (binary changed)"
+    else
+      log "$API_SERVICE not active — not started (TUI-D8)"
+    fi
+  fi
 }
 
 install_config_template() {

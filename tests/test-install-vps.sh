@@ -812,6 +812,107 @@ release_pin_matches_pkg_test() {
 }
 [ "$(release_pin_matches_pkg_test)" = MATCH ] && pass "installer (D9): FLEET2_RELEASE pin matches fleet2 PKG_VERSION" || bad "release pin mismatch: [$(release_pin_matches_pkg_test)]"
 
+# --- fleet-api rebind after a binary swap ------------------------------------
+# A long-running unit keeps executing the binary it was STARTED with, and the
+# installer's atomic `mv -f` unlinks the old inode without touching the process:
+# production served /v1/health version 5.5.0 for 3.5 h after the 5.6.0 install.
+# install_fleet2 now ends with a `try-restart` of fleet-api.service, but ONLY
+# when it is already active — TUI-D8's "never enable, never start" policy stands.
+#
+# The harness evals install_fleet2 with a fake systemctl and a recording stub
+# binary on PATH, both writing to ONE log, so the ORDER of `version` and
+# `try-restart` is assertable and not just their presence. `API_SERVICE` is a
+# global the real script binds before main() calls install_fleet2, so the
+# harness binds it too.
+api_rebind_test() {
+  local active="$1" prefix="$2"
+  local d root inner; d="$(mktemp -d)"; root="$(mktemp -d)"; inner="$(mktemp)"
+  mkdir -p "$root/opt" "$root/systemd"
+  # A fake systemctl: records every invocation, and answers `is-active` from
+  # FAKE_ACTIVE. Anything else succeeds silently.
+  cat > "$d/systemctl" <<SC
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "\$*" >> "$d/calls.log"
+if [ "\$1" = is-active ]; then exit "\${FAKE_ACTIVE:-1}"; fi
+exit 0
+SC
+  chmod +x "$d/systemctl"
+  # The binary under test: records its own `version` smoke into the SAME log.
+  cat > "$d/fleet2-stub" <<ST
+#!/usr/bin/env bash
+printf 'binary %s\n' "\$*" >> "$d/calls.log"
+exit 0
+ST
+  chmod +x "$d/fleet2-stub"
+  cat > "$inner" <<INNER
+set -u
+PATH="$d:\$PATH"
+PREFIX="$prefix"
+OPT_DIR="$root/opt"
+OPT_DIR_REAL="/opt/grok-fleet"
+SYSTEMD_DIR="$root/systemd"
+API_SERVICE="fleet-api.service"
+FLEET2_VERIFIED_BINARY="$d/fleet2-stub"
+log(){ printf 'LOG %s\n' "\$*"; }
+extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_from "$VPS_INSTALL" install_fleet2)"
+FAKE_ACTIVE=$active install_fleet2
+INNER
+  local out; out="$(timeout 20 bash "$inner" 2>&1)"
+  printf '%s\n---CALLS---\n' "$out"
+  cat "$d/calls.log" 2>/dev/null
+  rm -f "$inner"; rm -rf "$d" "$root"
+}
+
+# (a) active (is-active rc 0) => exactly one try-restart, AFTER the version smoke.
+a_out="$(api_rebind_test 0 '')"
+a_calls="$(printf '%s\n' "$a_out" | sed -n '/---CALLS---/,$p')"
+a_try="$(printf '%s\n' "$a_calls" | grep -c 'try-restart fleet-api.service' || true)"
+a_ver_line="$(printf '%s\n' "$a_calls" | grep -n 'binary version' | head -1 | cut -d: -f1)"
+a_try_line="$(printf '%s\n' "$a_calls" | grep -n 'try-restart' | head -1 | cut -d: -f1)"
+if [ "$a_try" = 1 ] && [ -n "$a_ver_line" ] && [ -n "$a_try_line" ] && [ "$a_ver_line" -lt "$a_try_line" ]; then
+  pass "installer: active fleet-api.service => exactly one try-restart, after the version smoke"
+else
+  bad "fleet-api rebind (active) wrong — try-restarts=$a_try version@$a_ver_line try-restart@$a_try_line: [$a_out]"
+fi
+case "$a_out" in
+  *'LOG restarted fleet-api.service (binary changed)'*)
+    pass "installer: the rebind says so in the log" ;;
+  *) bad "fleet-api rebind (active) did not log the restart: [$a_out]" ;;
+esac
+
+# (b) inactive (is-active rc 1) => no restart, no start, no enable. TUI-D8.
+b_out="$(api_rebind_test 1 '')"
+b_calls="$(printf '%s\n' "$b_out" | sed -n '/---CALLS---/,$p')"
+if printf '%s\n' "$b_calls" | grep -Eq 'try-restart|restart |^systemctl start|start fleet-api|enable'; then
+  bad "fleet-api rebind (inactive) touched the unit — TUI-D8 says never start it: [$b_calls]"
+else
+  pass "installer: inactive fleet-api.service => no restart, no start, no enable (TUI-D8)"
+fi
+case "$b_out" in
+  *'LOG fleet-api.service not active — not started (TUI-D8)'*)
+    pass "installer: the inactive case says so in the log" ;;
+  *) bad "fleet-api rebind (inactive) did not log the skip: [$b_out]" ;;
+esac
+
+# (c) PREFIX set (a scratch-root install) => systemctl is not consulted AT ALL.
+c_out="$(api_rebind_test 0 "$(mktemp -d)")"
+c_calls="$(printf '%s\n' "$c_out" | sed -n '/---CALLS---/,$p' | grep '^systemctl' || true)"
+if [ -z "$c_calls" ]; then
+  pass "installer: under PREFIX => no systemctl call at all"
+else
+  bad "fleet-api rebind under PREFIX called systemctl: [$c_calls]"
+fi
+
+# fleet-reconcile is Type=oneshot behind its timer, so it execs the new binary on
+# its next tick; the installer must NOT restart it.
+inst_fn2="$(extract_from "$VPS_INSTALL" install_fleet2)"
+if printf '%s\n' "$inst_fn2" | grep -F 'try-restart' | grep -Fq 'reconcile'; then
+  bad "install_fleet2 try-restarts the reconcile unit — it is oneshot and picks the binary up on its next tick"
+else
+  pass "installer: only fleet-api.service is rebound (the oneshot reconcile unit is left alone)"
+fi
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL INSTALL-VPS TESTS PASSED"; else echo "SOME INSTALL-VPS TESTS FAILED"; fi
 exit "$fail"
