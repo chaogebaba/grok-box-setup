@@ -185,6 +185,12 @@ export async function cmdConfig(args: string[], deps: ConfigDeps): Promise<numbe
   if (cur === wantSha && enabled !== "false" && enabled !== "unknown" && support !== "no") {
     return 0;
   }
+  // U4: the diff body above is DATA on stdout; the verdict that makes this a
+  // non-zero exit is a diagnostic and belongs on stderr, or `config diff` looks
+  // like a silent failure to anything reading only the rc.
+  process.stderr.write(
+    `fleet2 config diff: ${box} DRIFTS from the rendered config (cur=${cur || "?"} want=${wantSha} enabled=${enabled || "?"} support=${support || "?"})\n`,
+  );
   return 1;
 }
 

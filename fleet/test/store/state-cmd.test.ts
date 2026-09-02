@@ -12,6 +12,7 @@ import { RC } from "../../src/upgrade.ts";
 import { testEnv } from "../helpers.ts";
 import { FakeRunner, result } from "../fake-runner.ts";
 import { cleanup, put, suiteScratch, T0 } from "./helpers.ts";
+import { setLogSink } from "../../src/log.ts";
 
 // This file's own scratch bucket; dropped whole when the file finishes.
 const SCRATCH = suiteScratch("state-cmd");
@@ -102,13 +103,20 @@ describe("state check", () => {
       f.store.setIntegrityFailed(T0);
       f.store.close();
       const { out, d } = deps(f.state, f.etc, { acquireLock: async () => "busy" as const });
+      const journal: string[] = [];
+      const prevSink = setLogSink((l) => journal.push(l));
       // rc 6 is the documented lock-busy code (r7-B2).
       expect(await cmdState(["check"], d)).toBe(RC.LOCK_BUSY);
+      setLogSink(prevSink);
       const text = out.join("");
       // The PASSING check result still stands; only the clear did not happen.
       expect(text).toContain("quick_check   ok");
-      expect(text).toContain(RECONCILE_BUSY_LINE);
-      expect(text).toContain("integrity flag left SET");
+      // agent-ux U4: the refusal is a DIAGNOSTIC, so it moved to stderr — stdout
+      // carries only the report (which may be a JSON document).
+      expect(text).not.toContain(RECONCILE_BUSY_LINE);
+      const err = journal.join("\n");
+      expect(err).toContain(RECONCILE_BUSY_LINE);
+      expect(err).toContain("integrity flag left SET");
       const back = openStore({ path: storePath(f.state), dir: f.state, now: () => T0 });
       expect(back.integrityFailedAt()).toBe(T0);
       back.close();
