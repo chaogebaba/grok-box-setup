@@ -242,12 +242,21 @@ export async function runInventory(boxes: string[], deps: InventoryDeps): Promis
   return { inventory, rows, target, previousGeneratedAt };
 }
 
-/** Compute the DRIFT cell for a row given the resolved target. */
+/**
+ * Compute the DRIFT cell for a row given the resolved target.
+ *
+ * D5 — the same VERSION rule the reconciler's row d and the `fleet2 upgrade`
+ * plan use. One rule, all call sites: `fleet2 status` must not report `yes` for
+ * a box the reconciler will correctly never roll, which is what a sha
+ * comparison did after every fleet2-only commit to main. The SHA column beside
+ * this one still shows the stamped sha, which is where that information belongs.
+ */
 export function driftCell(row: ProbeResult, target: Target | null): string {
   if (row.tunnel === "down") return "-";
   if (target === null) return "?";
-  if (row.sha === "?" || row.sha === "-" || row.sha === "unknown") return "?";
-  return row.sha === target.sha ? "no" : "yes";
+  if (target.version === "unknown") return "?";
+  if (row.version === "?" || row.version === "-" || row.version === "unknown") return "?";
+  return row.version === target.version ? "no" : "yes";
 }
 
 /** Render the human table (F9: NAME API TUNNEL CHECK VERSION SHA TARGET DRIFT AUTHKEY). */
