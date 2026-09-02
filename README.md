@@ -81,6 +81,7 @@ external hourly automation calls it by that name.
 | sleep / thaw | tailscaled's map poll (node goes grey) | selfheal worker: stale-heartbeat freeze detection recycles tailscaled |
 | image swap | everything outside `/workspace`: packages, `/etc/shadow`, sshd config, host keys, nft rules, all processes | hourly `boxup once` re-converges from `/workspace/box-setup`: vendored binaries in `bin/`, node identity in `state/tailscale/`, ssh host keys in `state/ssh/` |
 | process crash | sshd / tailscaled / worker | worker restarts procs; hourly `once` restarts the worker |
+| root disk fills | nothing yet — but a full root overlay makes `install.sh` exit 1, so the box stops taking rollouts and the brain sees it stuck | disk guard: every tick reads `df /`; at the fail threshold it truncates the allowlisted platform logs as their owner, and `boxup check` FAILs until usage drops |
 
 Design, environment facts, and the reasoning behind every special case:
 [docs/DESIGN.md](docs/DESIGN.md).
@@ -96,6 +97,38 @@ auth time is the only path that does; set `tags = ""` to register untagged on
 purpose; see AGENT.md §G and use `boxup retag` to fix an already-registered
 node), update repo (`[update] repo`). See
 [etc/config.example.toml](etc/config.example.toml).
+
+## Disk guard
+
+The sandbox host writes `/tmp/sand-host.log` and never rotates it. On
+grok-box-006 it reached 101 GB, filled the root overlay, and made `install.sh`
+exit 1 — the box silently stopped accepting rollouts. Since 5.3.2 every worker
+tick watches for that.
+
+| Knob | Default | What it does |
+|---|---|---|
+| `BOXUP_DISK_WARN_PCT` | `80` | at/above this root usage, `boxup status` shows `disk=NN%/warn` and `boxup check` logs `check: WARN disk NN%` once an hour. Not a check failure. |
+| `BOXUP_DISK_FAIL_PCT` | `90` | at/above this, the guard truncates the allowlist and `boxup check` FAILs with `reason=disk NN% (after truncation) …`, so the brain's existing `reachable-cannot-converge` alert fires. |
+| `DISK_GUARD_TRUNCATE` | `/tmp/sand-host.log` | whitespace-separated allowlist of paths the guard may truncate. Nothing outside it is ever touched, and nothing is ever deleted. |
+| `BOXUP_DISK_TRUNCATE_MIN_BYTES` | `1073741824` (1 GiB) | only a file **larger** than this is truncated. A small log is not what fills a 100 GB overlay, and truncating it would only destroy evidence. |
+| `BOXUP_DISK_INTERVAL` | `60` | seconds between checks. The tick is 15s; four `df` calls a minute buy nothing. |
+
+A symlink named on the allowlist is refused outright, never followed.
+
+**Truncation runs as the file's owner, and that is the whole trick.** `/tmp` is
+sticky and world-writable, and Linux's `fs.protected_regular` refuses an
+`O_TRUNC` open of a file in such a directory unless the opener owns the file or
+the directory — root included. `truncate` as root gets `EACCES` on
+`/tmp/sand-host.log`. So the guard switches first: if it already *is* the owner
+it truncates directly, otherwise `runuser -u <owner>`, falling through to
+`su -s /bin/sh <owner>` when `runuser` is missing or refuses. There is no
+root-truncate fallback, because that is precisely the operation the kernel
+denies; a failure is logged instead of being retried into a silent no-op.
+
+Observations land in three places: the worker log
+(`disk-guard: truncated <path> (<bytes> B, root <pct>%)`), `$RUN_DIR/disk` as
+`<pct>% <level> <epoch>`, and the `disk=` token appended to the end of the
+`boxup status` line (`disk=22%`, `disk=85%/warn`, `disk=93%/fail`).
 
 ## Fleet operations (laptop)
 
