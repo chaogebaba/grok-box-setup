@@ -16,10 +16,14 @@ sudo boxup once
 ```
 
 The installer symlinks `/usr/local/bin/boxup` to `$BOX_SETUP_ROOT/boxup`, so
-`boxup` works unqualified from any shell on the box. The absolute
-`/workspace/box-setup/boxup` keeps working and is what to reach for if the link
-is missing, which happens when `/usr` is read-only — the installer logs that
-and carries on rather than failing an install that otherwise succeeded.
+`boxup` works unqualified from any shell on the box. That link lives in `/usr`,
+which an image swap wipes, so every converge restores it as well — the
+installer only runs on a rollout, and a swapped box would otherwise sit for
+hours with no `boxup` on PATH. A link already pointing at the right target is
+left alone silently. The absolute `/workspace/box-setup/boxup` always works and
+is what to reach for when the link is missing, which happens when `/usr` is
+read-only: both the installer and the converge log one line and carry on rather
+than failing over a convenience link.
 
 **Naming rule.** A box name is `grok-box-` + exactly three decimal digits
 (`grok-box-001` … `grok-box-999`). `boxup` picks the lowest free index and
@@ -85,7 +89,7 @@ external hourly automation calls it by that name.
 | Event | What dies | What brings it back |
 |---|---|---|
 | sleep / thaw | tailscaled's map poll (node goes grey) | selfheal worker: stale-heartbeat freeze detection recycles tailscaled |
-| image swap | everything outside `/workspace`: packages, `/etc/shadow`, sshd config, host keys, nft rules, all processes | hourly `boxup once` re-converges from `/workspace/box-setup`: vendored binaries in `bin/`, node identity in `state/tailscale/`, ssh host keys in `state/ssh/` |
+| image swap | everything outside `/workspace`: packages, `/etc/shadow`, sshd config, host keys, nft rules, the `/usr/local/bin/boxup` PATH link, all processes | hourly `boxup once` re-converges from `/workspace/box-setup`: vendored binaries in `bin/`, node identity in `state/tailscale/`, ssh host keys in `state/ssh/`, the PATH symlink |
 | process crash | sshd / tailscaled / worker | worker restarts procs; hourly `once` restarts the worker |
 | root disk fills | nothing yet — but a full root overlay makes `install.sh` exit 1, so the box stops taking rollouts and the brain sees it stuck | disk guard: every tick reads `df /`; at the fail threshold it truncates the allowlisted platform logs as their owner, and `boxup check` FAILs until usage drops |
 

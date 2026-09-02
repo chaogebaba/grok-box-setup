@@ -2674,6 +2674,48 @@ check_reason() {
 }
 
 
+# ensure_path_symlink: keep /usr/local/bin/boxup pointing at $ROOT/boxup.
+#
+# install.sh creates this link (bug-triage (6)), but it lives in /usr and an
+# image swap wipes everything outside /workspace — so after a thaw the link is
+# gone while $ROOT/boxup is still there, and install.sh does not run again
+# until the next rollout. Without this step a swapped box spends hours or days
+# with no `boxup` on PATH. That is exactly why ensure_sshd and the host-key
+# restore live in converge too: converge is what rebuilds the parts of a box
+# that do not survive a swap.
+#
+# Idempotent and SILENT on the happy path — this runs on every converge, so a
+# link already aimed at the right target is left alone with no log line. It
+# acts only when the link is missing, points elsewhere, or is not a symlink at
+# all (an old copy sitting at that path is "points elsewhere" too; `ln -sfn`
+# replaces it, and -n keeps it from being created INSIDE an existing link's
+# directory). Always returns 0: a read-only /usr costs the convenience link,
+# never the converge.
+#
+# BOX_SETUP_PREFIX roots the LINK for tests. install.sh calls the same knob
+# PREFIX, mirroring vps/install-vps.sh; boxup namespaces it like every other
+# boxup knob (BOX_SETUP_ROOT/RUN/LOG/CONFIG) because boxup is a long-lived
+# daemon that inherits whatever an operator shell exports, and a bare PREFIX is
+# a common variable in build environments. The link TARGET is never prefixed.
+# It is honoured IN-PROCESS only: require_root does not forward it across the
+# sudo re-exec and the worker spawn does not carry it, so it cannot leak from
+# an operator's shell into a real converge. A test never needs root anyway.
+ensure_path_symlink() {
+  local dir link want
+  dir="${BOX_SETUP_PREFIX:-}/usr/local/bin"
+  link="$dir/boxup"
+  want="$ROOT/boxup"
+  if [ -L "$link" ] && [ "$(readlink "$link" 2>/dev/null || true)" = "$want" ]; then
+    return 0
+  fi
+  if mkdir -p "$dir" 2>/dev/null && ln -sfn "$want" "$link" 2>/dev/null; then
+    log "converge: linked $link -> $want"
+    return 0
+  fi
+  log "converge: could not link $link -> $want (read-only /usr?) — use $want directly" >&2
+  return 0
+}
+
 # --- converge ----------------------------------------------------------------
 # The converge body. Runs under the converge lock (via do_ensure).
 # P1: previously every member was bare or `|| true`, so a converge reported
@@ -2713,6 +2755,10 @@ do_ensure_body() {
   _ensure_step packages       ensure_packages
   _ensure_step tailscale-bin  ensure_tailscale_bin
   _ensure_step sshd           ensure_sshd
+  # bug-triage (6): /usr/local/bin/boxup does not survive an image swap, and
+  # install.sh only runs on a rollout. Restore it here, next to the other
+  # things a swap wipes.
+  _ensure_step path-link      ensure_path_symlink
   _ensure_step forwarding     ensure_forwarding
   _ensure_step tailscaled     start_tailscaled
   wait_for_socket || true

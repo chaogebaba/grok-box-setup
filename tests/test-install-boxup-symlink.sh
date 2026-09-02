@@ -1,5 +1,6 @@
 #!/bin/bash
-# test-install-boxup-symlink.sh — install.sh puts boxup on PATH
+# test-install-boxup-symlink.sh — the /usr/local/bin/boxup PATH link, both
+# halves: install.sh CREATES it, and boxup's converge RESTORES it.
 # (bug-triage (6): `grep 'ln -s' install.sh` used to return zero hits, so every
 # operator hint was absolute and `boxup status` over ssh needed the full
 # /workspace/box-setup/boxup).
@@ -25,6 +26,18 @@
 #       ln -s, which would fail on an existing link and leave it stale)
 #   (5) install.sh forwards PREFIX across its sudo re-exec, so a non-root
 #       PREFIX install cannot silently write to the real /usr/local/bin
+#
+# Then the converge half — install.sh only runs on a rollout, but the link
+# lives in /usr, which an image swap wipes. boxup's ensure_path_symlink is what
+# brings it back on the next converge:
+#   (6) link absent          => created, pointing at $ROOT/boxup
+#   (7) link points elsewhere => repointed, no nesting
+#   (8) a REGULAR file squatting the path => replaced by a symlink
+#   (9) link already correct  => untouched and SILENT (this runs every converge)
+#  (10) the step is WIRED IN: the REAL do_ensure_body, with every other
+#       _ensure_step target stubbed to a no-op, creates the link. Dropping the
+#       `_ensure_step path-link ensure_path_symlink` line fails this, which is
+#       the mutant, and a mere grep for the function name would not.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -157,6 +170,120 @@ if grep -q 'PREFIX="\${PREFIX:-}"' "$INSTALL" \
   pass "(5) install.sh defines PREFIX and forwards it across the sudo re-exec"
 else
   bad "(5) install.sh does not forward PREFIX across its sudo re-exec"
+fi
+
+# ===========================================================================
+# boxup converge half: ensure_path_symlink.
+#
+# Drives the REAL functions extracted from boxup. BOX_SETUP_PREFIX roots the
+# LINK under a scratch dir so the suite never touches the machine's
+# /usr/local/bin; the link TARGET stays the real $ROOT/boxup.
+#
+# $1 = scenario: absent | wrong | regular-file | correct | via-converge
+# prints: "target=<readlink> islink=<yes|no> logged=<yes|no>"
+# ===========================================================================
+run_converge_case() {
+  local scenario="$1" inner
+  inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+BOXUP="$ROOT/boxup"
+W="\$(mktemp -d)"
+ROOT="\$W/box-setup"; mkdir -p "\$ROOT"; : > "\$ROOT/boxup"
+BOX_SETUP_PREFIX="\$W/prefix"
+LINKDIR="\$BOX_SETUP_PREFIX/usr/local/bin"
+LOGLINES="\$W/log"; : > "\$LOGLINES"
+log(){ printf '%s\\n' "\$*" >> "\$LOGLINES"; }
+
+extract_fn_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
+eval "\$(extract_fn_from "\$BOXUP" ensure_path_symlink)"
+
+case "$scenario" in
+  absent) ;;
+  wrong)        mkdir -p "\$LINKDIR"; ln -sfn /somewhere/else/boxup "\$LINKDIR/boxup" ;;
+  regular-file) mkdir -p "\$LINKDIR"; echo "an old copy" > "\$LINKDIR/boxup" ;;
+  correct)      mkdir -p "\$LINKDIR"; ln -sfn "\$ROOT/boxup" "\$LINKDIR/boxup" ;;
+esac
+
+if [ "$scenario" = via-converge ]; then
+  # The REAL do_ensure_body + _ensure_step, with every OTHER step's target and
+  # the surrounding collaborators stubbed to no-ops. Only ensure_path_symlink
+  # is real, so the link can only appear if the step is actually wired in.
+  ensure_dirs(){ :; }
+  for f in ensure_packages ensure_tailscale_bin ensure_sshd ensure_forwarding \\
+           start_tailscaled wait_for_socket ensure_login ensure_name ensure_nat \\
+           refresh_exitnode ensure_tunnel_key supervise_tunnel; do
+    eval "\$f(){ :; }"
+  done
+  config_get_file(){ echo true; }
+  CONFIG_FILE="\$W/config.toml"; : > "\$CONFIG_FILE"
+  MANAGED_FILE="\$W/managed.toml"
+  DEGRADED_MARKER="\$W/degraded"
+  eval "\$(extract_fn_from "\$BOXUP" _ensure_step)"
+  eval "\$(extract_fn_from "\$BOXUP" do_ensure_body)"
+  do_ensure_body >/dev/null 2>&1
+else
+  ensure_path_symlink
+fi
+
+tgt=""; [ -e "\$LINKDIR/boxup" ] || [ -L "\$LINKDIR/boxup" ] && tgt="\$(readlink "\$LINKDIR/boxup" 2>/dev/null || echo NOTALINK)"
+islink=no; [ -L "\$LINKDIR/boxup" ] && islink=yes
+logged=no; grep -q 'linked' "\$LOGLINES" && logged=yes
+echo "target=\$tgt islink=\$islink logged=\$logged want=\$ROOT/boxup"
+rm -rf "\$W"
+INNER
+  timeout 30 bash "$inner"
+  rm -f "$inner"
+}
+
+cf() { printf '%s' "$1" | sed -n "s/.*\\b$2=\\([^ ]*\\).*/\\1/p"; }
+
+# (6) absent => created
+o="$(run_converge_case absent)"
+if [ "$(cf "$o" islink)" = yes ] && [ "$(cf "$o" target)" = "$(cf "$o" want)" ] \
+   && [ "$(cf "$o" logged)" = yes ]; then
+  pass "(6) converge: a missing link is created pointing at \$ROOT/boxup, and logged"
+else
+  bad  "(6) missing link not restored: [$o]"
+fi
+
+# (7) points elsewhere => repointed. This is the image-swap-then-rollout case,
+# and the -n in ln -sfn is what stops the new link being made INSIDE the old
+# target's directory.
+o="$(run_converge_case wrong)"
+if [ "$(cf "$o" islink)" = yes ] && [ "$(cf "$o" target)" = "$(cf "$o" want)" ]; then
+  pass "(7) converge: a link aimed elsewhere is repointed at \$ROOT/boxup"
+else
+  bad  "(7) stale link not repointed: [$o]"
+fi
+
+# (8) a REGULAR file squatting the path is replaced by a symlink — a v4-era
+# copy at that path must not shadow the real boxup forever.
+o="$(run_converge_case regular-file)"
+if [ "$(cf "$o" islink)" = yes ] && [ "$(cf "$o" target)" = "$(cf "$o" want)" ]; then
+  pass "(8) converge: a regular file at the link path is replaced by the symlink"
+else
+  bad  "(8) squatting regular file not replaced: [$o]"
+fi
+
+# (9) already correct => untouched AND silent. Converge runs hourly and on
+# every unhealthy tick; a log line here would be permanent noise.
+o="$(run_converge_case correct)"
+if [ "$(cf "$o" islink)" = yes ] && [ "$(cf "$o" target)" = "$(cf "$o" want)" ] \
+   && [ "$(cf "$o" logged)" = no ]; then
+  pass "(9) converge: a correct link is left alone and logs NOTHING"
+else
+  bad  "(9) correct link was touched or logged: [$o]"
+fi
+
+# (10) MUTANT TARGET. The REAL do_ensure_body, every other step stubbed out.
+# The link can only appear if `_ensure_step path-link ensure_path_symlink` is
+# actually in the step list — deleting that line fails this and nothing else.
+o="$(run_converge_case via-converge)"
+if [ "$(cf "$o" islink)" = yes ] && [ "$(cf "$o" target)" = "$(cf "$o" want)" ]; then
+  pass "(10) do_ensure_body runs ensure_path_symlink (the step is wired in)"
+else
+  bad  "(10) converge did NOT create the link — is the _ensure_step line present? [$o]"
 fi
 
 echo
