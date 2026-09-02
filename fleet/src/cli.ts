@@ -44,7 +44,7 @@ import {
 import { makeEnrollSideEffects } from "./commands/enroll-wiring.ts";
 import { makeRenameDeps } from "./commands/rename-wiring.ts";
 
-const PKG_VERSION = "5.7.1"; // rollout target resolved against origin/<ref>.
+const PKG_VERSION = "5.7.2"; // 5.7.1 rollout fixes (D1/D5) + TUI visual redesign.
 
 async function gitShaFromGit(): Promise<string> {
   try {
