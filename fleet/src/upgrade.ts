@@ -294,8 +294,19 @@ async function buildPlan(
     const p = await probeBox(deps.runner, deps.env, box, undefined, undefined);
     probes.set(box, p);
     let action: BoxAction;
+    // D5 — one rule, two call sites: in-sync is a boxup VERSION match, the same
+    // key row-d drift uses (reconcile/run.ts). The stamped sha is informational:
+    // a fleet2-only commit moves it without changing the box payload, and
+    // planning on it made every box look upgradeable after every release.
+    // Unknown on either side ("-" not probed, "?" unparsed, target "unknown" when
+    // the ref has no VERSION file) is NOT in-sync — `fleet2 upgrade` is an
+    // explicit operator command on a named set, so it deploys rather than
+    // silently skipping a box it could not read. (Reconcile's automatic row d
+    // takes the opposite default: unknown never rolls.)
+    const versionsKnown =
+      p.version !== "-" && p.version !== "?" && p.version !== "unknown" && target.version !== "unknown";
     if (p.tunnel === "down") action = "skip:tunnel-down";
-    else if (p.sha === target.sha) action = "in-sync";
+    else if (versionsKnown && p.version === target.version) action = "in-sync";
     else action = "upgrade";
     plan.push({ box, runningVersion: p.version, runningSha: p.sha, action });
   }

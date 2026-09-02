@@ -354,11 +354,41 @@ async function reconcileOne(
   const d = deps.state.readExpiresDate(box);
   if (d !== undefined) expiryDays = daysUntil(d, nowS);
 
-  // Drift: tunnel up && target resolved ⇒ box sha vs target sha.
+  // Drift (D5): tunnel up && target VERSION resolved ⇒ box boxup VERSION vs
+  // target VERSION. NOT the stamped repo sha: every fleet2-only commit to main
+  // (release pins, docs, fleet/ code) moves the target sha without changing the
+  // box payload, and a sha comparison therefore marked the WHOLE fleet drifted
+  // and — with auto=true — re-installed boxup everywhere after every fleet2
+  // release. That is a fleet-wide write for a no-op (empirical r1 FAIL).
+  //
+  // Tri-state is unchanged: either side unknown ⇒ "unknown", and unknown never
+  // rolls. Direction is irrelevant — a box AHEAD of target (a hand-installed
+  // build) is drifted and converges back; target is the authority.
+  //
+  // `checkSha` stays informational (status/TUI/snapshot/lastUpgrade) and the
+  // post-deploy verify in upgrade.ts still requires sha === target.sha: a fresh
+  // deploy stamps the target sha, so sha equality is the right proof that THIS
+  // deploy landed.
   let drift: "yes" | "no" | "unknown" = "unknown";
-  if (tunnel === "up" && deps.targetSha !== undefined) {
-    if (checkSha !== "unknown" && checkSha !== "-" && checkSha !== "?") {
-      drift = checkSha === deps.targetSha ? "no" : "yes";
+  const targetVersionKnown =
+    deps.targetVersion !== undefined && deps.targetVersion !== "unknown" && deps.targetVersion !== "";
+  const boxVersionKnown =
+    checkVersion !== "unknown" && checkVersion !== "-" && checkVersion !== "?" && checkVersion !== "";
+  if (tunnel === "up" && targetVersionKnown && boxVersionKnown) {
+    drift = checkVersion === deps.targetVersion ? "no" : "yes";
+    // D5: ONE debug line per box per tick when the versions agree but the
+    // stamped shas do not — the case that used to force a pointless rollout.
+    if (
+      drift === "no" &&
+      deps.targetSha !== undefined &&
+      checkSha !== "unknown" &&
+      checkSha !== "-" &&
+      checkSha !== "?" &&
+      checkSha !== deps.targetSha
+    ) {
+      log(
+        `drift: ${box} same VERSION ${checkVersion}, sha ${checkSha}≠${deps.targetSha} — content drift ignored (D5)`,
+      );
     }
   }
 
@@ -460,8 +490,9 @@ async function reconcileOne(
     }
 
     // row d: record the drift, the actual pass runs once after the loop (F8).
+    // D5: `cur` is the box's boxup VERSION (the drift key), not its sha.
     if (a === "rollout") {
-      drifted.push({ box, cur: checkSha });
+      drifted.push({ box, cur: checkVersion });
     }
 
     // mint-window guard (P1-1).

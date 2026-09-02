@@ -31,7 +31,7 @@ import { existsSync, readFileSync } from "node:fs";
 const CHECK_TIMEOUT_MS = 20_000;
 
 /** The current version string source (kept in sync with cli.ts PKG_VERSION). */
-export const SERVE_VERSION = "5.7.0";
+export const SERVE_VERSION = "5.7.1";
 
 /** Live per-box marker mirror read from FLEET_STATE (TUI-D4 merge inputs). */
 function liveMarkers(env: ServerContext["env"], box: string): {

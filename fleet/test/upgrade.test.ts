@@ -92,6 +92,14 @@ function boxOf(argv: string[]): string {
 type BoxScript = {
   tunnel?: boolean; // listener present (default true)
   sha?: string; // status/check sha (default != target so it drifts)
+  /**
+   * D5 — the reported boxup VERSION, which is now the plan's in-sync key.
+   * Default: derived from `sha` so every pre-D5 fixture keeps its meaning —
+   * a box at the target SHA also reports the target VERSION (in-sync), a box
+   * at any other sha reports an older version (upgrade). Set it explicitly to
+   * exercise the version/sha disagreement D5 is about.
+   */
+  version?: string;
   done?: number | null; // DONE rc emitted by the poll (default 0)
   checkOk?: boolean; // check rc (default true)
   scpCode?: number; // scp rc (default 0)
@@ -139,8 +147,12 @@ function responder(scripts: Record<string, BoxScript>) {
         // Converged sha after a successful install; else the running (drift) sha.
         const runningSha = s.sha ?? "abc1234";
         const sha = installed.has(box) ? "abc1234" : runningSha;
+        // D5: version follows the sha unless the script pins one.
+        const ver = installed.has(box)
+          ? "5.3.0"
+          : (s.version ?? (runningSha === "abc1234" ? "5.3.0" : "5.2.0"));
         return ok
-          ? result({ code: 0, stdout: `check=OK name=${box} v=5.3.0/${sha} tunnel=up` })
+          ? result({ code: 0, stdout: `check=OK name=${box} v=${ver}/${sha} tunnel=up` })
           : result({ code: 1, stdout: "check=FAIL reason=x" });
       }
     }
@@ -371,6 +383,98 @@ describe("T6/T13 verify loop", () => {
   });
 });
 
+// --- D5: the plan's in-sync key is the boxup VERSION, not the repo sha -------
+
+describe("D5 upgrade plan compares VERSION, not the stamped sha", () => {
+  const D5_TARGET: Target = { ref: "main", sha: "adfdc04", version: "5.3.1" };
+
+  test("5.3.1/f42c967 vs target 5.3.1/adfdc04 ⇒ in-sync (pre-D5 this said upgrade)", async () => {
+    const r = new FakeRunner(
+      responder({
+        "grok-box-008": { sha: "f42c967", version: "5.3.1" },
+        "grok-box-009": { sha: "f42c967", version: "5.3.1" },
+        "grok-box-011": { sha: "f42c967", version: "5.3.1" },
+      }),
+    );
+    const res = await runUpgradePass(
+      baseDeps(r, { resolveTargetFn: async () => D5_TARGET }),
+      args({ apply: false }),
+    );
+    const plan = Object.fromEntries(res.plan.map((p) => [p.box, p.action]));
+    expect(plan["grok-box-008"]).toBe("in-sync");
+    expect(plan["grok-box-009"]).toBe("in-sync");
+    expect(plan["grok-box-011"]).toBe("in-sync");
+    // the row still CARRIES the sha — it is informational, not the key.
+    expect(res.plan[0]!.runningSha).toBe("f42c967");
+    expect(res.plan[0]!.runningVersion).toBe("5.3.1");
+  });
+
+  test("5.3.0/f42c967 vs target 5.3.1 ⇒ upgrade", async () => {
+    const r = new FakeRunner(
+      responder({
+        "grok-box-008": { sha: "f42c967", version: "5.3.0" },
+        "grok-box-009": { sha: "f42c967", version: "5.3.0" },
+        "grok-box-011": { sha: "f42c967", version: "5.3.0" },
+      }),
+    );
+    const res = await runUpgradePass(
+      baseDeps(r, { resolveTargetFn: async () => D5_TARGET }),
+      args({ apply: false }),
+    );
+    const plan = Object.fromEntries(res.plan.map((p) => [p.box, p.action]));
+    expect(plan["grok-box-008"]).toBe("upgrade");
+  });
+
+  test("a box AHEAD of target (5.4.0) ⇒ upgrade — target is the authority", async () => {
+    const r = new FakeRunner(
+      responder({
+        "grok-box-008": { sha: "adfdc04", version: "5.4.0" },
+        "grok-box-009": { sha: "adfdc04", version: "5.4.0" },
+        "grok-box-011": { sha: "adfdc04", version: "5.4.0" },
+      }),
+    );
+    const res = await runUpgradePass(
+      baseDeps(r, { resolveTargetFn: async () => D5_TARGET }),
+      args({ apply: false }),
+    );
+    const plan = Object.fromEntries(res.plan.map((p) => [p.box, p.action]));
+    // sha EQUAL to target, version ahead ⇒ still upgrade (mutant (x) `<` fails here).
+    expect(plan["grok-box-008"]).toBe("upgrade");
+  });
+
+  test("an unreadable box version is NOT in-sync (explicit command deploys)", async () => {
+    const r = new FakeRunner(
+      responder({
+        "grok-box-008": { checkOk: false },
+        "grok-box-009": { checkOk: false },
+        "grok-box-011": { checkOk: false },
+      }),
+    );
+    const res = await runUpgradePass(
+      baseDeps(r, { resolveTargetFn: async () => D5_TARGET }),
+      args({ apply: false }),
+    );
+    const plan = Object.fromEntries(res.plan.map((p) => [p.box, p.action]));
+    expect(plan["grok-box-008"]).toBe("upgrade");
+  });
+
+  test("post-deploy verify is UNCHANGED: version match is not enough, sha must match", async () => {
+    // The box comes back reporting the TARGET version on a DIFFERENT sha. D5
+    // moved the drift/plan key, not the verify: a fresh deploy stamps the target
+    // sha, so sha equality is still the proof that THIS deploy landed.
+    const r = new FakeRunner((argv) => {
+      const cmd = argv[argv.length - 1] ?? "";
+      if (cmd === POLL_COMMAND) return result({ stdout: "install: DONE (rc=0)\n" });
+      if (cmd === CHECK_COMMAND)
+        return result({ code: 0, stdout: "check=OK v=5.3.1/f42c967 tunnel=up" });
+      return result({ code: 1 });
+    });
+    const v = await verifyBox(baseDeps(r), "grok-box-008", "adfdc04");
+    expect(v.ok).toBe(false);
+    expect(v.detail).toBe("verify: sha mismatch after DONE");
+  });
+});
+
 describe("T11/T11b lock re-exec (F2/G3/H2)", () => {
   test("reexecArgv shape: compiled vs dev (G3)", () => {
     const argv = ["/usr/local/bin/fleet2", "/synthetic/entry", "upgrade", "--all", "--apply"];
@@ -512,9 +616,12 @@ describe("T12 timeout classification (F4)", () => {
         return result({ stdout: "install: DONE (rc=0)\n" });
       }
       if (cmd === CHECK_COMMAND) {
-        // drift before deploy, converged after
+        // drift before deploy, converged after. D5: the plan's key is the
+        // VERSION, so the pre-deploy report must be an OLDER version for this
+        // box to be planned "upgrade" at all.
         const sha = installedFlag ? "abc1234" : "old9999";
-        return result({ code: 0, stdout: `check=OK v=5.3.0/${sha} tunnel=up` });
+        const ver = installedFlag ? "5.3.0" : "5.2.0";
+        return result({ code: 0, stdout: `check=OK v=${ver}/${sha} tunnel=up` });
       }
       return result({ code: 1 });
     });
@@ -531,7 +638,8 @@ describe("T12 timeout classification (F4)", () => {
       if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if (isScp(argv)) return result({ code: null, signal: "SIGKILL", timedOut: true });
       const cmd = argv[argv.length - 1] ?? "";
-      if (cmd === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/old tunnel=up" });
+      // D5: an older VERSION is what makes this box planned "upgrade".
+      if (cmd === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.2.0/old tunnel=up" });
       if (cmd === POLL_COMMAND) { verifyRan = true; return result({ stdout: "install: DONE (rc=0)\n" }); }
       return result({ code: 1 });
     });

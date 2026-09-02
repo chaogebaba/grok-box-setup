@@ -1,7 +1,8 @@
 // stage.ts — target resolution + tree staging (D7, F7.2/F7.9).
 //
-// resolveTarget(ref): best-effort `git fetch` (offline ⇒ warn, use local),
-// `git rev-parse --short <ref>` → sha, `git show <sha>:VERSION` → version.
+// resolveTarget(ref): best-effort `git fetch` (offline ⇒ warn, use local), then
+// `git rev-parse --short <origin/ref or ref>` → sha (D1: the remote-tracking ref
+// wins when it exists), `git show <sha>:VERSION` → version.
 // stageTree(sha): `git archive --format=tar` to a temp .tar; zero-byte ⇒ error.
 // The `src` must be a git repo or the command fails BEFORE touching any box
 // (rc 3, message names the config key `[rollout].src`). Every git call goes
@@ -67,6 +68,28 @@ export async function assertGitSrc(runner: Runner, src: string): Promise<void> {
 /**
  * Resolve a git ref to {ref, sha, version}. Fetch is best-effort (offline ⇒
  * warn). rev-parse failure ⇒ ConfigError rc 3. VERSION missing ⇒ "unknown".
+ *
+ * D1 — the REMOTE-TRACKING ref is resolved first when one exists.
+ *
+ * `[rollout].target` is `main`, and `main` in `[rollout].src` is a LOCAL branch
+ * that a `git fetch` never advances: fetch updates `refs/remotes/origin/main`
+ * and leaves the local branch exactly where the last checkout put it. The VPS
+ * source tree is never checked out or pulled by fleet2, so its `main` had been
+ * frozen 77 commits behind `origin/main` since 30 Aug and the resolved target
+ * sha never moved. Every box was therefore "at target" and no boxup release
+ * could ever reach the fleet, with auto-rollout on or off.
+ *
+ * So: probe `refs/remotes/origin/<ref>` and, when it exists, resolve
+ * `origin/<ref>`. A ref with no remote-tracking counterpart — a tag, a raw sha,
+ * a purely local branch — falls through to the bare ref exactly as before.
+ * `stageTree(sha)` is unchanged: `git archive` works on any reachable sha, and
+ * no local branch is ever moved.
+ *
+ * When the FETCH fails, the remote-tracking ref still resolves — to the value of
+ * the last successful fetch. That is the intended offline behaviour: an
+ * unreachable origin means the fleet converges on the newest target the VPS has
+ * actually seen, rather than falling back to a stale local branch or failing the
+ * tick outright.
  */
 export async function resolveTarget(runner: Runner, src: string, ref: string): Promise<Target> {
   await assertGitSrc(runner, src);
@@ -77,7 +100,16 @@ export async function resolveTarget(runner: Runner, src: string, ref: string): P
   if (fetched.code !== 0) {
     log(`stage: git fetch failed (offline?) — resolving '${ref}' against the local repo`);
   }
-  const rp = await runner.run(["git", "-C", src, "rev-parse", "--short", ref], {
+  // --verify --quiet: a pure existence probe. It prints nothing and returns
+  // non-zero for a ref that is not there, so it never has to be parsed.
+  const remoteProbe = await runner.run(
+    ["git", "-C", src, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${ref}`],
+    { timeoutMs: GIT_TIMEOUT_MS },
+  );
+  const useRemote = remoteProbe.code === 0;
+  const resolveRef = useRemote ? `origin/${ref}` : ref;
+
+  const rp = await runner.run(["git", "-C", src, "rev-parse", "--short", resolveRef], {
     timeoutMs: GIT_TIMEOUT_MS,
   });
   if (rp.code !== 0) {
@@ -88,6 +120,11 @@ export async function resolveTarget(runner: Runner, src: string, ref: string): P
     timeoutMs: GIT_TIMEOUT_MS,
   });
   const version = sv.code === 0 ? sv.stdout.trim() : "unknown";
+  // One line per tick, and only when the remote ref was the one used, so the
+  // journal says which of the two refs the target came from.
+  if (useRemote) {
+    log(`stage: target ${ref} → origin/${ref} ${sha} (v${version})`);
+  }
   return { ref, sha, version };
 }
 
