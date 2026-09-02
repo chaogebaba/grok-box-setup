@@ -1,9 +1,11 @@
 // ssh-exec.test.ts — agent-ux U1/U6: `fleet2 ssh <box> <cmd>` is a TRANSPARENT
 // remote exec, not a captured Runner call.
 //
-// Mutant (a): route the non-interactive form back through the Runner ⇒ the
-// "never touches the Runner" and "stdio is inherited" tests both fail, because
-// the exec spawner is never asked for a child and the Runner records a call.
+// Mutant (a) in ANY shape — back through the capturing Runner, or across to the
+// interactive/pty spawner — is killed by the "seam selection" table below, which
+// injects every seam and asserts which one ran. The r1 version only asserted
+// that the Runner had not been called, so the interactive re-route slipped past
+// it on the gate box; asserting the positive is what makes this deterministic.
 
 import { describe, test, expect } from "bun:test";
 import {
@@ -34,6 +36,30 @@ interface Spawned {
   env: Record<string, string>;
   stdin: "inherit" | "ignore";
   kills: string[];
+}
+
+/**
+ * An InteractiveSpawner that records calls and NEVER spawns anything.
+ *
+ * Every non-interactive test injects this even though it must not be used.
+ * gate-r1 found mutant (a) surviving on a box: the earlier tests only asserted
+ * "the Runner was not called", so re-routing the non-interactive form to the
+ * INTERACTIVE spawner went unnoticed — and on a host where the production
+ * spawner's `sshpass` is missing or a connection fails fast, the mutated code
+ * happened to return rcs the assertions tolerated. Injecting both seams and
+ * asserting which one ran makes the check positive, instant and box-independent.
+ */
+function spySpawner(rc = 0): { spawner: InteractiveSpawner; calls: string[][] } {
+  const calls: string[][] = [];
+  return {
+    calls,
+    spawner: {
+      async spawn(argv) {
+        calls.push(argv);
+        return rc;
+      },
+    },
+  };
 }
 
 /** A fake ExecSpawner whose child exits with `code` (or never, when undefined). */
@@ -148,24 +174,56 @@ describe("U1 argument parsing", () => {
   });
 });
 
-describe("U1 transparent exec (mutant (a))", () => {
+describe("U1 seam selection (mutant (a), any shape)", () => {
+  // A table over all four invocation forms: exactly one seam may run, and every
+  // other seam must be untouched. Re-routing the non-interactive form anywhere
+  // else — the capturing Runner, the interactive/pty spawner, a new helper —
+  // fails here immediately, with no process spawned and no network touched.
+  const FORMS: Array<{ name: string; args: string[]; seam: "exec" | "interactive" }> = [
+    { name: "plain command", args: ["grok-box-001", "echo hi"], seam: "exec" },
+    { name: "command + --no-stdin", args: ["grok-box-001", "echo hi", "--no-stdin"], seam: "exec" },
+    { name: "command + --timeout", args: ["grok-box-001", "echo hi", "--timeout", "30"], seam: "exec" },
+    { name: "command + --tty", args: ["grok-box-001", "top", "--tty"], seam: "interactive" },
+    { name: "no command (session)", args: ["grok-box-001"], seam: "interactive" },
+  ];
+
+  for (const f of FORMS) {
+    test(`${f.name} ⇒ ONLY the ${f.seam} seam runs`, async () => {
+      const runner = new FakeRunner(() => ({ code: 0 }));
+      const ex = fakeExec(0);
+      const isp = spySpawner(0);
+      const rc = await cmdSsh(f.args, { runner, cfg: EMPTY_CFG, exec: ex.spawner, interactive: isp.spawner });
+      expect(rc).toBe(0);
+      // the capturing Runner is never right for any form of `fleet2 ssh`.
+      expect(runner.calls.length).toBe(0);
+      expect(ex.seen.length).toBe(f.seam === "exec" ? 1 : 0);
+      expect(isp.calls.length).toBe(f.seam === "interactive" ? 1 : 0);
+    });
+  }
+
   test("the non-interactive form NEVER touches the capturing Runner", async () => {
     const runner = new FakeRunner(() => ({ code: 0 }));
     const ex = fakeExec(0);
-    const rc = await cmdSsh(["grok-box-001", "echo hi"], { runner, cfg: EMPTY_CFG, exec: ex.spawner });
+    const isp = spySpawner(0);
+    const rc = await cmdSsh(["grok-box-001", "echo hi"], {
+      runner,
+      cfg: EMPTY_CFG,
+      exec: ex.spawner,
+      interactive: isp.spawner,
+    });
     expect(rc).toBe(0);
-    // Mutant (a) reinstates `deps.runner.run(...)` here — this is the killer.
     expect(runner.calls.length).toBe(0);
+    expect(isp.calls.length).toBe(0);
     expect(ex.seen.length).toBe(1);
   });
 
   test("stdio: stdin INHERITED by default, IGNORED with --no-stdin", async () => {
     const a = fakeExec(0);
-    await cmdSsh(["grok-box-001", "cat"], { runner: new FakeRunner(), cfg: EMPTY_CFG, exec: a.spawner });
+    await cmdSsh(["grok-box-001", "cat"], { runner: new FakeRunner(), cfg: EMPTY_CFG, exec: a.spawner, interactive: spySpawner(0).spawner });
     expect(a.seen[0]!.stdin).toBe("inherit");
 
     const b = fakeExec(0);
-    await cmdSsh(["grok-box-001", "cat", "--no-stdin"], { runner: new FakeRunner(), cfg: EMPTY_CFG, exec: b.spawner });
+    await cmdSsh(["grok-box-001", "cat", "--no-stdin"], { runner: new FakeRunner(), cfg: EMPTY_CFG, exec: b.spawner, interactive: spySpawner(0).spawner });
     expect(b.seen[0]!.stdin).toBe("ignore");
   });
 
@@ -176,6 +234,7 @@ describe("U1 transparent exec (mutant (a))", () => {
         runner: new FakeRunner(),
         cfg: EMPTY_CFG,
         exec: ex.spawner,
+        interactive: spySpawner(0).spawner,
       });
       expect(rc).toBe(code);
     }
@@ -201,6 +260,7 @@ describe("U1 transparent exec (mutant (a))", () => {
       runner: new FakeRunner(),
       cfg: EMPTY_CFG,
       exec: ex.spawner,
+      interactive: spySpawner(0).spawner,
       envSource: { FLEET_SSH_PASSWORD: "sekret" },
     });
     const s = ex.seen[0]!;
@@ -220,6 +280,7 @@ describe("U1 --timeout ⇒ 124", () => {
       runner: new FakeRunner(),
       cfg: EMPTY_CFG,
       exec: ex.spawner,
+      interactive: spySpawner(0).spawner,
       timers: t.seam,
     });
     // the deadline fires: SIGTERM first.
@@ -245,6 +306,7 @@ describe("U1 --timeout ⇒ 124", () => {
       runner: new FakeRunner(),
       cfg: EMPTY_CFG,
       exec: ex.spawner,
+      interactive: spySpawner(0).spawner,
       timers: t.seam,
     });
     cap.restore();
@@ -256,26 +318,60 @@ describe("U1 --timeout ⇒ 124", () => {
 });
 
 describe("U1 --tty", () => {
-  test("--tty routes to the pty spawner and puts -t on the argv", async () => {
-    let argv: string[] = [];
-    const interactive: InteractiveSpawner = {
-      async spawn(a) {
-        argv = a;
-        return 0;
-      },
-    };
+  test("--tty routes to the pty spawner and puts -tt (not -t) on the argv", async () => {
+    const isp = spySpawner(0);
     const ex = fakeExec(0);
     const rc = await cmdSsh(["grok-box-001", "top", "--tty"], {
       runner: new FakeRunner(),
       cfg: EMPTY_CFG,
-      interactive,
+      interactive: isp.spawner,
       exec: ex.spawner,
     });
     expect(rc).toBe(0);
-    expect(argv).toContain("-t");
+    const argv = isp.calls[0]!;
+    // `-t` alone only asks; ssh declines with "Pseudo-terminal will not be
+    // allocated because stdin is not a terminal" whenever the caller is not at
+    // a terminal — which is every agent that reaches for --tty. `-tt` forces it.
+    expect(argv).toContain("-tt");
+    expect(argv).not.toContain("-t");
     expect(argv[argv.length - 1]).toBe("top");
-    // -t is spliced BEFORE the shared SSH_OPTS, never after.
-    expect(argv.indexOf("-t")).toBeLessThan(argv.indexOf("StrictHostKeyChecking=accept-new"));
+    // -tt is spliced BEFORE the shared SSH_OPTS, never after.
+    expect(argv.indexOf("-tt")).toBeLessThan(argv.indexOf("StrictHostKeyChecking=accept-new"));
     expect(ex.seen.length).toBe(0); // the streaming spawner is not used for a pty
+  });
+});
+
+describe("U1 the first-use known-host banner (gate-r1 finding 4)", () => {
+  test("the non-interactive form asks ssh for LogLevel=ERROR", async () => {
+    const ex = fakeExec(0);
+    await cmdSsh(["grok-box-001", "true"], {
+      runner: new FakeRunner(),
+      cfg: EMPTY_CFG,
+      exec: ex.spawner,
+      interactive: spySpawner(0).spawner,
+    });
+    const argv = ex.seen[0]!.argv;
+    expect(argv).toContain("LogLevel=ERROR");
+    // spliced before the shared opts, like every other extra option: ssh keeps
+    // the FIRST value it sees for an option.
+    expect(argv.indexOf("LogLevel=ERROR")).toBeLessThan(argv.indexOf("StrictHostKeyChecking=accept-new"));
+    // the pinning behaviour itself is unchanged.
+    expect(argv).toContain("StrictHostKeyChecking=accept-new");
+    // D11(a) still holds: no known-hosts redirection on this human-facing command.
+    expect(argv.join(" ")).not.toContain("UserKnownHostsFile");
+  });
+
+  test("the INTERACTIVE forms keep ssh's default log level, banner included", async () => {
+    for (const args of [["grok-box-001"], ["grok-box-001", "top", "--tty"]]) {
+      const isp = spySpawner(0);
+      await cmdSsh(args, {
+        runner: new FakeRunner(),
+        cfg: EMPTY_CFG,
+        interactive: isp.spawner,
+        exec: fakeExec(0).spawner,
+      });
+      // A person opening a session SHOULD see "Permanently added …".
+      expect(isp.calls[0]!.join(" ")).not.toContain("LogLevel");
+    }
   });
 });
