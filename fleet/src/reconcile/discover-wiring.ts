@@ -13,7 +13,7 @@ import { forgetHostKeys, isHostKeyMismatch, knownHostsFile } from "../hostkey.ts
 import type { ReconcileState } from "./state.ts";
 import { discover as listTailnet } from "../commands/list.ts";
 import { boxSsh } from "../commands/box-transport.ts";
-import { cmdEnroll, type EnrollSideEffects } from "../commands/enroll.ts";
+import { cmdEnrollResult, type EnrollSideEffects } from "../commands/enroll.ts";
 import { makeEnrollSideEffects, vpsAuthorizedKeysPath } from "../commands/enroll-wiring.ts";
 import {
   DISCOVER_CONNECT_TIMEOUT_S,
@@ -232,9 +232,12 @@ export function makeDiscoverDeps(opts: DiscoverWiringOpts): DiscoverDeps {
       const pw = password;
       if (pw === undefined) return { rc: 1 };
       const { se, timedOutPoint } = withAbortPoints(enrollSe(pw), clock);
-      const rc = await cmdEnroll([box], se);
+      // state-store D6/r5-B4: the STRUCTURED result, so a committed enrolment
+      // with a lagging export reaches the adopt path as rc 0 (an adoption) and
+      // not as rc 7 (which the rc !== 0 branch would record as a failure).
+      const r = await cmdEnrollResult([box], se);
       const point = timedOutPoint();
-      return point === undefined ? { rc } : { rc, timeoutPoint: point };
+      return point === undefined ? r : { ...r, timeoutPoint: point };
     },
 
     async forgetHostKeys(box, scope): Promise<void> {

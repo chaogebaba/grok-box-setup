@@ -173,7 +173,13 @@ export interface EnrollSideEffects {
   /** enroll_write_box_config: 0 ok / 4 absent / 1 other. */
   writeBoxConfig(box: string, vps: string, idx: number, port: string): Promise<0 | 1 | 4>;
   /** enroll_record_enrolled (idempotent). */
-  recordEnrolled(box: string, port: number): Promise<void>;
+  /**
+   * Record membership. From 5.8.0 this writes the STORE and then exports the
+   * legacy files (state-store D6); the returned string is the EXPORT error, if
+   * any. The store write has already committed when it is set, so the enrolment
+   * is a success with a lagging export — rc 7, never a failure.
+   */
+  recordEnrolled(box: string, port: number, pubkey?: string): Promise<string | undefined>;
   /** notify info. */
   notify(level: "info" | "warn", msg: string): Promise<void>;
   /** the ENROLL_TUNNEL_WAIT budget (raw env string). */
@@ -232,29 +238,41 @@ export function parseEnrollArgs(args: string[]): EnrollArgs | { usage: true } {
   return { box, writeBoxConfig: write };
 }
 
+/**
+ * The enrol RESULT (state-store D6/r5-B4). A committed enrolment whose legacy
+ * export lagged is `{rc: 0, exportError}` — NOT a failure. The discover adopt
+ * path branches on `rc === 0` (discover.ts:496-508), so it counts such an
+ * enrolment as ADOPTED and clears the failure ledger, logging one warning; the
+ * CLI wrapper turns the same result into exit code 7.
+ */
+export interface EnrollResult {
+  rc: number;
+  exportError?: string;
+}
+
 /** cmd_enroll orchestrator (main:1052-1215). */
-export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<number> {
+export async function cmdEnrollResult(args: string[], se: EnrollSideEffects): Promise<EnrollResult> {
   const parsed = parseEnrollArgs(args);
   if ("usage" in parsed) {
     log("usage: fleet2 enroll [--no-box-config] <grok-box-N>");
-    return 2;
+    return { rc: 2 };
   }
   const { box, writeBoxConfig } = parsed;
   if (!/^grok-box-[0-9]/.test(box)) {
     log(`enroll: refusing non-grok box '${box}'`);
-    return 2;
+    return { rc: 2 };
   }
   const n = boxIndex(box);
   if (n === undefined) {
     log(`enroll: bad box name '${box}'`);
-    return 2;
+    return { rc: 2 };
   }
   const port = portFor(box)!;
 
   // Locality guard (F4) — rc 6 before any side effect.
   if (!(await se.vpsUserExists())) {
     log(`enroll: must run on the VPS (user fleet not present here) — see docs/FLEET-BRAIN.md`);
-    return 6;
+    return { rc: 6 };
   }
 
   // Policy precheck (D4/F2/F6) — rc 5 on DENIED; rc 1-verdict warn continues.
@@ -264,7 +282,7 @@ export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<
       log(
         `enroll: sshd effective permitlisten for fleet does not include 127.0.0.1:${port} — re-run vps/install-vps.sh (#12)`,
       );
-      return 5;
+      return { rc: 5 };
     } else if (v === 1) {
       log(`enroll: cannot evaluate sshd permitlisten policy (sshd -T failed) — continuing`);
     }
@@ -286,7 +304,7 @@ export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<
       log('enroll: set FLEET_VPS_ADDR in the env, or add  vps = "<addr>"  under');
       log("enroll: [fleet-brain] in the brain config (docs/FLEET-BRAIN.md §ops).");
       log("enroll: (or pass --no-box-config to skip the box-side write entirely).");
-      return 1;
+      return { rc: 1 };
     }
     vps = addr;
     vpsPort = se.fleetVpsPort();
@@ -296,13 +314,13 @@ export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<
   const aclRc = await se.aclHasFleetBrainTagowner();
   if (aclRc === 2) {
     log(`enroll: ACL read FAILED (HTTP ${se.lastApiCode()}) — refusing (cannot confirm tag:fleet-brain tagOwners)`);
-    return 1;
+    return { rc: 1 };
   }
   if (aclRc !== 0) {
     log("enroll: REFUSING — 'tag:fleet-brain' has no tagOwners entry in the ACL.");
     log('enroll: add  "tag:fleet-brain": ["autogroup:admin"]  to tagOwners first (Resolved decision 3),');
     log("enroll: else a tagged rejoin fails opaquely.");
-    return 1;
+    return { rc: 1 };
   }
 
   // (2) read the box tunnel pubkey.
@@ -310,11 +328,11 @@ export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<
   const pubkey = await se.readBoxPubkey(box);
   if (pubkey === undefined) {
     log(`enroll: could not read ${BOX_TUNNEL_PUB} on ${box} (is it on the tailnet? has boxup run once?)`);
-    return 1;
+    return { rc: 1 };
   }
   if (!pubkey.startsWith("ssh-ed25519 ")) {
     log(`enroll: unexpected pubkey shape from ${box}: [${pubkey.split(" ")[0]} ...]`);
-    return 1;
+    return { rc: 1 };
   }
 
   // (F7) pre-listener warning (log-only).
@@ -328,7 +346,7 @@ export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<
   const line = authorizedKeysLine(port, pubkey);
   if (!(await se.installVpsAuthorizedKey(line))) {
     log("enroll: failed to install VPS authorized_keys line");
-    return 1;
+    return { rc: 1 };
   }
   log(`enroll: installed VPS fleet authorized_keys line for ${box} (permitlisten 127.0.0.1:${port})`);
   if (!(await se.recordEtcMapping(box, port, line))) {
@@ -339,11 +357,11 @@ export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<
   const vpspub = await se.vpsBoxAccessPubkey();
   if (vpspub === undefined) {
     log(`enroll: no VPS box-access key at <FLEET_BOX_KEY>(.pub) — generate it on the VPS first`);
-    return 1;
+    return { rc: 1 };
   }
   if (!(await se.installBoxAuthorizedKey(box, vpspub))) {
     log(`enroll: failed to install VPS key into ${box} authorized_keys`);
-    return 1;
+    return { rc: 1 };
   }
   log(`enroll: installed VPS box-access key into ${box}:~box/.ssh/authorized_keys`);
 
@@ -356,14 +374,14 @@ export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<
     } else if (wbc === 4) {
       log(`enroll: WARNING box config not written — ${BOX_CONFIG} is ABSENT on ${box}; run install.sh on the box first`);
       log(`enroll:   (then re-run 'fleet2 enroll ${box}'). NOT recording enrollment; the VPS-side key is installed and harmless.`);
-      return 1;
+      return { rc: 1 };
     } else {
       const portFrag = vpsPort !== "22" ? ` port=${vpsPort}` : "";
       log("enroll: WARNING box config not written — run the manual [fleet] step:");
       log(`enroll:   set [fleet] vps="${vps}" box_index=${n}${portFrag} in ${box}:${BOX_CONFIG},`);
       log(`enroll:   then: sudo ${BOXUP_REMOTE} once. NOT recording enrollment; the VPS-side`);
       log(`enroll:   key is installed and harmless — re-run 'fleet2 enroll ${box}' to retry (idempotent).`);
-      return 1;
+      return { rc: 1 };
     }
   } else {
     log(
@@ -371,16 +389,31 @@ export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<
     );
   }
 
-  // Record (AFTER box-config success, D8).
-  await se.recordEnrolled(box, port);
+  // Record (AFTER box-config success, D8). The key MATERIAL (field 2 of the
+  // pubkey line) is what `authorized-keys.map` carries and what `mapCoherent`
+  // compares, so that is what the store row keeps.
+  const exportError = await se.recordEnrolled(box, port, pubkey.split(/\s+/)[1]);
   await se.notify("info", `enrolled ${box} (reverse port 127.0.0.1:${port})`);
+  if (exportError !== undefined) {
+    log(`enroll: ${box} recorded; export failed: ${exportError}`);
+  }
 
   if (!writeBoxConfig) {
     log(
       `enroll: ${box} DONE — box-side [fleet] not written (--no-box-config); tunnel comes up after you set it and run 'boxup once'`,
     );
-    return 0;
+    return { rc: 0, exportError };
   }
-  return waitTunnel(box, se);
+  return { rc: await waitTunnel(box, se), exportError };
+}
+
+/**
+ * The CLI entry: the same orchestrator, collapsed to an exit code. rc 7 is
+ * "recorded; export failed" (state-store D6/r6-B2) — 5 was already the policy
+ * precheck refusal where nothing was written.
+ */
+export async function cmdEnroll(args: string[], se: EnrollSideEffects): Promise<number> {
+  const r = await cmdEnrollResult(args, se);
+  return r.rc === 0 && r.exportError !== undefined ? 7 : r.rc;
 }
 

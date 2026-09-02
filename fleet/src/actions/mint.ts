@@ -15,7 +15,7 @@
 import type { Runner } from "../runner.ts";
 import type { Env } from "../env.ts";
 import type { TailscaleKeys } from "../reconcile/tailscale-keys.ts";
-import type { ReconcileState } from "../reconcile/state.ts";
+import type { ReconcileStateApi } from "../reconcile/state.ts";
 import { tunnelSsh } from "../tunnel.ts";
 import { knownHostsFile } from "../hostkey.ts";
 import { boxIndex, isValidBoxName } from "../boxes.ts";
@@ -36,7 +36,7 @@ export interface MintDeps {
   runner: Runner;
   env: Env;
   keys: TailscaleKeys;
-  state: ReconcileState;
+  state: ReconcileStateApi;
   /** FLEET_KEY_EXPIRY_SECS (default 7776000). */
   keyExpirySecs?: number;
   nowMs?: number;
@@ -83,13 +83,22 @@ export async function mintKey(box: string, deps: MintDeps): Promise<MintResult> 
   // Persist meta (main:1707-1711). Bash records the RAW `$expires` here (not the
   // normalized $expdate); the field is informational (only .id is read back).
   deps.state.mkdirState();
-  if (!deps.state.recordKeyMeta(boxIndex(box)!, create.id, create.expiresRaw ?? expdate)) {
+  // state-store D5: ONE write for the key id AND both expiry forms. 5.7.1 wrote
+  // `keys/<idx>.json` and then `<box>.expires` separately (main:1707-1714), and a
+  // crash between them left a key id with no expiry date, so the mint-window
+  // guard failed open and the next tick re-minted (survey §4b). The store
+  // records the raw `$expires` alongside the normalised date, exactly as the two
+  // files did between them.
+  if (
+    !deps.state.recordKey(box, {
+      keyId: create.id,
+      expiresRaw: create.expiresRaw ?? expdate,
+      expiresDate: expdate,
+    })
+  ) {
     await revokeMintedKey(box, create.id, "FAILED to persist key meta for", "; re-mint on next rejoin/expiry trigger", deps);
     return { rc: 1 };
   }
-
-  // Mint-window marker (main:1714): AFTER verified seed + persisted meta.
-  deps.state.writeExpires(box, expdate);
   log(`mint-key: ${box} seeded a fresh per-box key (expires ${expdate}); verified via boxup status; key id recorded`);
   return { rc: 0 };
 }
@@ -153,12 +162,12 @@ export async function revokeMintedKey(
  * mint_window_valid (main:1724-1736): true (skip re-mint) iff <box>.expires
  * exists AND key_meta_id non-empty AND date parses AND daysUntil >= 7.
  */
-export function mintWindowValid(box: string, deps: { state: ReconcileState; nowSec?: number }): boolean {
+export function mintWindowValid(box: string, deps: { state: ReconcileStateApi; nowSec?: number }): boolean {
   const d = deps.state.readExpiresDate(box);
   if (d === undefined) return false;
   const idx = boxIndex(box);
   if (idx === undefined) return false;
-  if (deps.state.keyMetaId(idx) === undefined) return false;
+  if (deps.state.keyMetaId(idx, box) === undefined) return false;
   // daysUntil >= 7 (import here to avoid a cycle at module top)
   const t = /^\d{4}-\d{2}-\d{2}$/.test(d) ? Date.parse(`${d}T00:00:00Z`) : Date.parse(d);
   if (Number.isNaN(t)) return false;

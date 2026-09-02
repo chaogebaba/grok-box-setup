@@ -21,7 +21,7 @@ function fsMod() {
 }
 
 /** fs-backed RenameStore over FLEET_STATE / FLEET_ETC. */
-function makeStore(env: Env): RenameStore {
+function makeStore(env: Env, version: string): RenameStore {
   const state = env.FLEET_STATE;
   const etc = env.FLEET_ETC;
   const akDir = process.env.FLEET_ETC_AK_DIR ?? `${etc}/authorized-keys.d`;
@@ -64,38 +64,51 @@ function makeStore(env: Env): RenameStore {
     return undefined;
   };
 
+  // state-store D4/D5: membership lives in the STORE; `enrolled.tsv` and
+  // `authorized-keys.map` are EXPORTED from it. The rename order is unchanged —
+  // INSERT the new-name row FIRST (same port, counters and key row copied), then
+  // the external steps under the existing `flock -w 90`, then DELETE the old row
+  // LAST — so every abort path still leaves both names valid and re-running
+  // resumes. The non-membership artefacts (the authorized-keys.d line, the box's
+  // managed TOML) are still plain file copies.
+  const withStore = <T,>(fn: (st: import("../store/state.ts").StoreState) => T): T => {
+    const { openStore, storePath } = require("../store/db.ts") as typeof import("../store/db.ts");
+    const { StoreState } = require("../store/state.ts") as typeof import("../store/state.ts");
+    const store = openStore({ path: storePath(env.FLEET_STATE), dir: env.FLEET_STATE });
+    try {
+      return fn(new StoreState(store, { paths: { fleetState: state, etc, version } }));
+    } finally {
+      store.close();
+    }
+  };
+
   return {
     enrolledPort(box) {
-      return rowPort(read(enr), box);
+      const p = withStore((st) => st.boxRow(box)?.port ?? undefined);
+      return p === undefined ? undefined : String(p);
     },
     hasEnrolledRow(box) {
-      return rowPort(read(enr), box) !== undefined;
+      return withStore((st) => st.boxRow(box)?.phase === "enrolled");
     },
     copyState(old, neu) {
       try {
-        for (const f of ["expires", "checkfail", "cfgfail"]) cp(`${state}/${old}.${f}`, `${state}/${neu}.${f}`);
+        // `<box>.expires`, `<box>.checkfail` and `<box>.cfgfail` are STORE
+        // columns now; the row copy below carries them and the export rewrites
+        // the files. Only the artefacts the store does not own are copied here.
         cp(`${akDir}/${old}.line`, `${akDir}/${neu}.line`, 0o600);
         cp(`${managedBoxDir}/${old}.toml`, `${managedBoxDir}/${neu}.toml`);
-        // enrolled.tsv: add a <new> row with the same port (dedup <new> first).
-        const enrC = read(enr);
-        const port = rowPort(enrC, old);
-        if (enrC !== undefined && port !== undefined) {
-          const kept = enrC.split("\n").filter((l) => l !== "" && !l.startsWith(`${neu}\t`));
-          write(enr, [...kept, `${neu}\t${port}`].join("\n") + "\n");
-        }
-        // authorized-keys.map: add a <new> row copying <old>'s port+key.
-        const mapC = read(map);
-        if (mapC !== undefined) {
-          const oldRow = mapC.split("\n").find((l) => l.startsWith(`${old}\t`));
-          if (oldRow !== undefined) {
-            const parts = oldRow.split("\t");
-            parts[0] = neu;
-            const kept = mapC.split("\n").filter((l) => l !== "" && !l.startsWith(`${neu}\t`));
-            write(map, [...kept, parts.join("\t")].join("\n") + "\n");
-            fsMod().chmodSync(map, 0o600);
-          }
-        }
-        return true;
+        // The new-name row: same port, same pubkey, `phase='enrolled'`, and
+        // exactly the state 5.7.1 copied — `checkfail`, `cfgfail` and the key
+        // row. The other counters start at their defaults. Both the membership
+        // export (enrolled.tsv + authorized-keys.map) and the key export run off
+        // this one write.
+        return withStore((st) => {
+          const oldRow = st.boxRow(old);
+          if (oldRow === undefined || oldRow.port === null) return false;
+          st.recordEnrolled(neu, oldRow.port, oldRow.pubkey ?? undefined);
+          st.copyRenameState(old, neu);
+          return !st.hasExportError();
+        });
       } catch {
         return false;
       }
@@ -105,15 +118,16 @@ function makeStore(env: Env): RenameStore {
         for (const f of ["expires", "checkfail", "cfgfail"]) rm(`${state}/${old}.${f}`);
         rm(`${akDir}/${old}.line`);
         rm(`${managedBoxDir}/${old}.toml`);
-        const enrC = read(enr);
-        if (enrC !== undefined) write(enr, enrC.split("\n").filter((l) => l !== "" && !l.startsWith(`${old}\t`)).join("\n") + "\n");
-        const mapC = read(map);
-        if (mapC !== undefined) {
-          write(map, mapC.split("\n").filter((l) => l !== "" && !l.startsWith(`${old}\t`)).join("\n") + "\n");
-          fsMod().chmodSync(map, 0o600);
-        }
+        // The old row goes LAST (D5). Deleting it cascades its counters and key
+        // row and re-exports; `<old>.expires` is removed with it, while
+        // `keys/<idx>.json` is NOT — old and new share the index in the
+        // canonical 1–2-digit → 3-digit rename, so that file belongs to the
+        // surviving row.
         void neu;
-        return true;
+        return withStore((st) => {
+          st.deleteBox(old);
+          return !st.hasExportError();
+        });
       } catch {
         return false;
       }
@@ -238,9 +252,9 @@ function makeOps(env: Env, cfg: ParsedConfig, runner: Runner): RenameOps {
 }
 
 /** Build production RenameDeps for `fleet2 rename`. */
-export function makeRenameDeps(env: Env, cfg: ParsedConfig, runner: Runner): RenameDeps {
+export function makeRenameDeps(env: Env, cfg: ParsedConfig, runner: Runner, version = "5.8.0"): RenameDeps {
   return {
-    store: makeStore(env),
+    store: makeStore(env, version),
     ops: makeOps(env, cfg, runner),
     paths: {
       state: env.FLEET_STATE,

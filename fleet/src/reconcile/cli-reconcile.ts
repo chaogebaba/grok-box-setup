@@ -18,6 +18,9 @@ import { resolveMembership } from "../boxes.ts";
 import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
 import { ReconcileState, nodeStateFs } from "./state.ts";
+import { ConfigError, openStore, storePath, type Store } from "../store/db.ts";
+import { StoreState } from "../store/state.ts";
+import { importLegacy } from "../store/legacy.ts";
 import { runReconcile } from "./run.ts";
 import { makeDiscoverDeps } from "./discover-wiring.ts";
 import type { ReconcileDeps } from "./run.ts";
@@ -29,7 +32,16 @@ import type { UpgradeDeps } from "../upgrade.ts";
 import { log } from "../log.ts";
 import { existsSync, readFileSync, mkdirSync } from "node:fs";
 
-export const RECONCILE_RC = { OK: 0, FAILURE: 1, USAGE: 2, LOCK_OPEN_FAIL: 1 } as const;
+export const RECONCILE_RC = {
+  OK: 0,
+  FAILURE: 1,
+  USAGE: 2,
+  LOCK_OPEN_FAIL: 1,
+  /** state-store D1/D8: the store refused to open, or declared itself corrupt. */
+  STORE: 3,
+  /** state-store D6/r6-B2: everything committed; the legacy export lagged. */
+  EXPORT_FAILED: 7,
+} as const;
 
 export interface ReconcileCliDeps {
   env: Env;
@@ -41,6 +53,8 @@ export interface ReconcileCliDeps {
   /** injectable for tests. */
   spawner?: Spawner;
   nowSec?: number;
+  /** PKG_VERSION, stamped into the legacy export header (state-store D6). */
+  version?: string;
 }
 
 /** managed_files_present + a ManagedSource backed by $FLEET_ETC files. */
@@ -85,11 +99,28 @@ export async function assembleTickDeps(
   env: Env,
   cfg: ParsedConfig,
   rollout: RolloutConfig,
-  opts: { apply: boolean; nowSec?: number; runner?: BunRunner } = { apply: false },
+  opts: { apply: boolean; nowSec?: number; runner?: BunRunner; version?: string } = { apply: false },
 ): Promise<ReconcileDeps> {
   const runner = opts.runner ?? new BunRunner();
-  const state = new ReconcileState(env.FLEET_STATE, nodeStateFs);
   const ctx = new RunContext();
+
+  // --- state store (state-store D1/D6/D7 Phase A) ---
+  //
+  // The TICK is the one path that opens the store read-write, so it is also the
+  // one path that creates it, migrates it and imports the 5.7.1 files into it.
+  // `openStore` throws ConfigError (rc 3) when $FLEET_STATE is unwritable or the
+  // file's `min_reader` says this binary must not operate it; the caller maps
+  // that to rc 3 rather than running a tick that cannot persist.
+  const store = openStore({ path: storePath(env.FLEET_STATE), dir: env.FLEET_STATE, now: opts.nowSec === undefined ? undefined : () => opts.nowSec! });
+  // Import ONCE, gated on `meta.legacy_imported_at` being ABSENT — not on the
+  // files being absent, because a crashed import leaves an empty file behind.
+  const imported = importLegacy(store, { fleetState: env.FLEET_STATE, etc: env.FLEET_ETC });
+  const state = new StoreState(store, {
+    paths: { fleetState: env.FLEET_STATE, etc: env.FLEET_ETC, version: opts.version ?? "5.8.0" },
+  });
+  // Export straight after an import so a rollback to 5.7.1 in the next minute
+  // reads files the store itself wrote (D6).
+  if (imported.kind === "imported") state.exportAll();
 
   // Tailscale client — token read once (F13). Missing token ⇒ READ-ONLY run.
   const tokenFile = resolveTokenFile(env, cfg);
@@ -104,9 +135,15 @@ export async function assembleTickDeps(
       ? new TailscaleKeys(fetchTransport, env.FLEET_TS_API, env.FLEET_TS_TAILNET, token, ctx)
       : missingTokenKeys(ctx);
 
-  // Target boxes.
-  const enrolled = readIfExists(`${env.FLEET_STATE}/enrolled.tsv`);
-  const targetBoxes = resolveMembership(env.FLEET_BOXES, enrolled);
+  // Target boxes. MEMBERSHIP IS `phase='enrolled'` from 5.8.0 on (D4/D7/r2-B5);
+  // FLEET_BOXES still overrides it, and that override deliberately bypasses the
+  // store (it is the explicit membership seam, and D6(e) disables discovery with
+  // it). The `excluded` map is read ONCE here, with membership.
+  const targetBoxes =
+    env.FLEET_BOXES !== undefined && env.FLEET_BOXES.trim() !== ""
+      ? resolveMembership(env.FLEET_BOXES, undefined)
+      : state.membership();
+  const excluded = state.excludedNames();
 
   // Zero-touch join (D1/P1/D6e). The token was read ONCE above; discover is
   // told the RESULT rather than reading it again. D6(e): an explicit
@@ -145,6 +182,9 @@ export async function assembleTickDeps(
     env,
     rollout,
     state,
+    store,
+    storeState: state,
+    excluded,
     keys,
     ctx,
     notify,
@@ -196,12 +236,29 @@ export async function cliReconcile(deps: ReconcileCliDeps): Promise<number> {
   }
 
   // --- CHILD side (locked): assemble deps + run the tick. ---
-  const deps2 = await assembleTickDeps(deps.env, deps.cfg, deps.rollout, {
-    apply: deps.apply,
-    nowSec: deps.nowSec,
-  });
-  const res = await runReconcile(deps2);
-  return res.rc;
+  let deps2;
+  try {
+    deps2 = await assembleTickDeps(deps.env, deps.cfg, deps.rollout, {
+      apply: deps.apply,
+      nowSec: deps.nowSec,
+      version: deps.version,
+    });
+  } catch (e) {
+    // state-store D1: an unwritable $FLEET_STATE, or a file whose `min_reader`
+    // says this binary must not operate it, is rc 3 with the reason named. A
+    // tick that cannot persist must not pretend it did.
+    if (e instanceof ConfigError) {
+      log(e.message);
+      return RECONCILE_RC.STORE;
+    }
+    throw e;
+  }
+  try {
+    const res = await runReconcile(deps2);
+    return res.rc;
+  } finally {
+    deps2.store?.close();
+  }
 }
 
 /** A TailscaleKeys whose GET always fails (missing token ⇒ READ-ONLY run). */

@@ -11,11 +11,11 @@
 // notify() is injected (the phase-1 notify seam), the clock is injected, and the
 // state is a ReconcileState — so the whole thing is deterministic in tests.
 
-import type { ReconcileState } from "./state.ts";
+import type { ReconcileStateApi } from "./state.ts";
 import type { NotifyLevel } from "../notify.ts";
 
 export interface AlertDeps {
-  state: ReconcileState;
+  state: ReconcileStateApi;
   notify: (level: NotifyLevel, msg: string) => Promise<void> | void;
   nowSec: number;
   asleepTSecs?: number; // default 7200

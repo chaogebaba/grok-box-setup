@@ -14,7 +14,7 @@
 // the non-canary loop over every target box.
 
 import type { Runner } from "../runner.ts";
-import type { ReconcileState } from "../reconcile/state.ts";
+import type { ReconcileStateApi } from "../reconcile/state.ts";
 import type { NotifyLevel } from "../notify.ts";
 import { tunnelUp } from "../tunnel.ts";
 import { pushManaged, type ManagedSource } from "./config-push.ts";
@@ -25,7 +25,7 @@ export interface ConfigPassDeps {
   runner: Runner;
   env: PushDeps["env"];
   source: ManagedSource;
-  state: ReconcileState;
+  state: ReconcileStateApi;
   notify: (level: NotifyLevel, msg: string) => Promise<void> | void;
   /** target boxes in reconcile order (parseEnrolled / FLEET_BOXES). */
   targetBoxes: string[];

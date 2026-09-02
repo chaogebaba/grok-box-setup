@@ -17,7 +17,7 @@ export interface RotateResult {
 
 export async function rotate(box: string, deps: MintDeps): Promise<RotateResult> {
   const idx = boxIndex(box);
-  const oldId = idx !== undefined ? deps.state.keyMetaId(idx) : undefined;
+  const oldId = idx !== undefined ? deps.state.keyMetaId(idx, box) : undefined;
 
   const minted = await mintKey(box, deps);
   if (minted.rc !== 0) {

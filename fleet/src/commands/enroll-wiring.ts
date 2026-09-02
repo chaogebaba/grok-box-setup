@@ -37,6 +37,8 @@ export interface EnrollWiringOpts {
   password?: string;
   connectTimeoutS?: number;
   tunnelWaitBudget?: string;
+  /** PKG_VERSION, stamped into the legacy export header (state-store D6). */
+  version?: string;
 }
 
 function boxSsh(
@@ -270,16 +272,23 @@ export function makeEnrollSideEffects(
       if (r.code !== 0) return 1;
       return 0;
     },
-    async recordEnrolled(box, port) {
+    async recordEnrolled(box, port, pubkey) {
+      // state-store D4/D6: membership is a STORE row (`phase='enrolled'`), and
+      // `enrolled.tsv` + `authorized-keys.map` are EXPORTED from it afterwards.
+      // 5.7.1's read-modify-rewrite of the whole file with no temp file and no
+      // lock (survey §4a) is gone: a crash between truncate and write can no
+      // longer lose the fleet's membership.
+      const { openStore, storePath } = require("../store/db.ts") as typeof import("../store/db.ts");
+      const { StoreState } = require("../store/state.ts") as typeof import("../store/state.ts");
+      const store = openStore({ path: storePath(env.FLEET_STATE), dir: env.FLEET_STATE });
       try {
-        const { mkdirSync, existsSync, readFileSync, writeFileSync } = fs();
-        mkdirSync(env.FLEET_STATE, { recursive: true });
-        const enr = `${env.FLEET_STATE}/enrolled.tsv`;
-        const prior = existsSync(enr) ? readFileSync(enr, "utf8") : "";
-        const kept = prior.split("\n").filter((l) => l !== "" && !l.startsWith(`${box}\t`));
-        writeFileSync(enr, [...kept, `${box}\t${port}`].join("\n") + "\n");
-      } catch {
-        /* swallowed (bash parity) */
+        const st = new StoreState(store, {
+          paths: { fleetState: env.FLEET_STATE, etc: env.FLEET_ETC, version: wiringOpts.version ?? "5.8.0" },
+        });
+        st.recordEnrolled(box, port, pubkey);
+        return st.takeExportErrors()[0];
+      } finally {
+        store.close();
       }
     },
     async notify(level, msg) {
