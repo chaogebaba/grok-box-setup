@@ -144,7 +144,7 @@ describe("T9/T9b backoff (D4/F5)", () => {
     // managed present so we can see the config pass run despite backoff
     const src: ManagedSource = { fleetToml: () => "[ssh]\npassword = x\n", boxToml: () => undefined };
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" }); // 008 tunnel up
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" }); // 008 tunnel up
       return result({ code: 0, stdout: "sha=X cur=X support=yes enabled=true" });
     });
     const deps = baseDeps({
@@ -181,7 +181,7 @@ describe("T7 D4: WOULD 'read-only ' prefix is CONDITIONAL on the latch (F3, m9)"
     const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: false, lastSeen: "2000-01-01T00:00:00Z" }] });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       return result({ code: 1 });
     });
@@ -200,7 +200,7 @@ describe("T7 D4: WOULD 'read-only ' prefix is CONDITIONAL on the latch (F3, m9)"
     const { keys, ctx } = fakeKeys(() => ({ code: 200, body: devs }));
     ctx.latch(); // pre-latched ⇒ ctx.readonly true
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       return result({ code: 1 });
     });
@@ -220,7 +220,7 @@ describe("T7 D4: WOULD 'read-only ' prefix is CONDITIONAL on the latch (F3, m9)"
     const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: true, lastSeen: "2999-01-01T00:00:00Z" }] });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       // the config-pass dry-run remote: report a DIFFERENT cur sha ⇒ WOULD push.
       return result({ code: 0, stdout: "cur=OTHERSHA want=IGNORED support=yes enabled=true" });
@@ -268,7 +268,7 @@ describe("T12 rollout gating (D10/F8)", () => {
     const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: true, lastSeen: "2999-01-01T00:00:00Z", tags: ["t"], keyExpiryDisabled: true }] });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/OLDSHA tunnel=up" });
       return result({ code: 1 });
     });
@@ -295,7 +295,7 @@ describe("T13 D6c: config pass failure never changes run rc", () => {
     });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       // config push (sudo sh -c) ⇒ rc 2 no status ⇒ push rc 5
       return result({ code: 2, stdout: "" });
@@ -326,7 +326,7 @@ describe("T2 latch suppresses a mint-worthy box even in apply mode (m2)", () => 
     const { keys, ctx, apiCalls } = fakeKeys(() => ({ code: 200, body: devs }));
     ctx.latch(); // pre-latched
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
       return result({ code: 1 });
     });
@@ -342,5 +342,63 @@ describe("T2 latch suppresses a mint-worthy box even in apply mode (m2)", () => 
     expect(logs.some((l) => l.includes("grok-box-008 WOULD mint"))).toBe(true);
     // m2 guard: the API createKey (POST /keys) was NEVER called (latch honoured).
     expect(apiCalls.some((c) => c.includes("POST") && c.includes("/keys"))).toBe(false);
+  });
+});
+
+// --- D12: the row-e path is reachable at last --------------------------------
+
+describe("D12 a connected box with the tunnel down is incoherent, not asleep", () => {
+  /** The live devices shape: connectedToControl, no `online` field anywhere. */
+  const connected = (box: string, ctc: boolean, nowSec: number) =>
+    JSON.stringify({
+      devices: [{ hostname: box, nodeId: "A", connectedToControl: ctc, lastSeen: new Date(nowSec * 1000).toISOString() }],
+    });
+  const NOWS = 1_000_000;
+
+  test("two consecutive ticks ⇒ the incoherent alert AND repair_pending_runs = 2", async () => {
+    const { fs, store } = memState();
+    const state = new ReconcileState("/s", fs);
+    const notes: string[] = [];
+    const run = async () => {
+      const { keys, ctx } = fakeKeys(() => ({ code: 200, body: connected("grok-box-008", true, NOWS) }));
+      const deps = baseDeps({
+        state,
+        keys,
+        ctx,
+        notify: (_l, m) => { notes.push(m); },
+        targetBoxes: ["grok-box-008"],
+        nowSec: NOWS,
+        // the default runner returns no ss row ⇒ the tunnel is down
+      });
+      await runReconcile(deps);
+    };
+    await run();
+    // tick +1 is SILENT: alertIncoherent notifies only from the second run.
+    expect(notes).toEqual([]);
+    expect(state.readRepairPending("grok-box-008")!.runs).toBe(1);
+
+    await run();
+    expect(notes.some((m) => m.includes("incoherent-both-dead"))).toBe(true);
+    expect(state.readRepairPending("grok-box-008")!.runs).toBe(2);
+    void store;
+  });
+
+  test("a box that is NOT connected to control is asleep and never bumps the counter", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    const notes: string[] = [];
+    const { keys, ctx } = fakeKeys(() => ({ code: 200, body: connected("grok-box-008", false, NOWS) }));
+    const deps = baseDeps({
+      state,
+      keys,
+      ctx,
+      notify: (_l, m) => { notes.push(m); },
+      targetBoxes: ["grok-box-008"],
+      nowSec: NOWS,
+    });
+    await runReconcile(deps);
+    expect(notes).toEqual([]); // asleep alerts only after 2h of continuous both-dead
+    expect(state.readAsleep("grok-box-008")).toBeDefined();
+    expect(state.readRepairPending("grok-box-008")!.runs).toBe(0);
   });
 });

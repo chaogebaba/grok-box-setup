@@ -24,13 +24,14 @@ import { RunContext, TailscaleKeys } from "../reconcile/tailscale-keys.ts";
 import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { readJournal } from "./journal.ts";
 import { tunnelUp, tunnelSsh } from "../tunnel.ts";
+import { knownHostsFile } from "../hostkey.ts";
 import { CHECK_COMMAND } from "../remote.ts";
 import { existsSync, readFileSync } from "node:fs";
 
 const CHECK_TIMEOUT_MS = 20_000;
 
 /** The current version string source (kept in sync with cli.ts PKG_VERSION). */
-export const SERVE_VERSION = "5.5.0";
+export const SERVE_VERSION = "5.6.0";
 
 /** Live per-box marker mirror read from FLEET_STATE (TUI-D4 merge inputs). */
 function liveMarkers(env: ServerContext["env"], box: string): {
@@ -149,6 +150,10 @@ export function handleFleet(ctx: ServerContext, auth: RequestAuth): Response {
     canary: latest?.canary ?? null,
     scope: auth.scope, // R3-A1: TUI dims action keys for a readonly token
     boxes,
+    // D7: this response is an EXPLICIT object, not a spread of the snapshot
+    // line, so `discover` has to be named here too. null (not absent) when the
+    // line predates 5.6.0 or the tick ran no discovery.
+    discover: latest?.discover ?? null,
   });
 }
 
@@ -216,6 +221,7 @@ export async function handleCheck(ctx: ServerContext, box: string, auth: Request
     if (!up) return 1;
     const chk = await tunnelSsh(ctx.runner, box, ctx.env.FLEET_BOX_KEY, CHECK_COMMAND, {
       timeoutMs: CHECK_TIMEOUT_MS,
+      knownHosts: knownHostsFile(ctx.env),
     });
     return chk.code === 0 ? 0 : 1;
   });

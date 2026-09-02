@@ -44,7 +44,7 @@ import {
 import { makeEnrollSideEffects } from "./commands/enroll-wiring.ts";
 import { makeRenameDeps } from "./commands/rename-wiring.ts";
 
-const PKG_VERSION = "5.5.0"; // A17: fleet2 admin panel (serve API + TUI) release.
+const PKG_VERSION = "5.6.0"; // zero-touch join: discover + adopt + repair.
 
 async function gitShaFromGit(): Promise<string> {
   try {

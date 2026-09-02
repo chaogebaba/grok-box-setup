@@ -16,6 +16,7 @@
 import type { Runner } from "../runner.ts";
 import type { Env } from "../env.ts";
 import { tunnelSsh } from "../tunnel.ts";
+import { knownHostsFile } from "../hostkey.ts";
 import { classify } from "../runner.ts";
 import { renderManaged, unknownManagedKeys } from "../managed/render.ts";
 import { validateManaged } from "../managed/validate.ts";
@@ -96,6 +97,7 @@ export async function pushManaged(box: string, dry: boolean, deps: PushDeps): Pr
     // here + in textSha256 hashed a double newline, disagreeing with bash).
     stdin: text,
     timeoutMs: PUSH_TIMEOUT_MS,
+    knownHosts: knownHostsFile(deps.env),
   });
   const out = r.stdout;
   const status = hadStatus(out);

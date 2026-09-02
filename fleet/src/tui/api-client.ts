@@ -6,7 +6,7 @@
 // call returns a discriminated result, never throws, so the loop can grey the
 // last-good data and keep retrying. `fetch` is injected so tests use a fake.
 
-import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
+import type { SnapshotBox, SnapshotDiscover, SnapshotLine } from "../history/schema.ts";
 import type { Scope } from "../serve/tokens.ts";
 
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
@@ -21,6 +21,8 @@ export interface FleetView {
   canary: string | null;
   scope: Scope;
   boxes: SnapshotBox[];
+  /** zero-touch join summary (D7); null on a server or tick without one. */
+  discover: SnapshotDiscover | null;
 }
 
 /** A discriminated result: ok payload, or a link-down/auth/other failure. */
@@ -131,6 +133,8 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
           canary: o.canary ?? null,
           scope: (o.scope as Scope) ?? "readonly",
           boxes: o.boxes as SnapshotBox[],
+          // D7: absent on a pre-5.6.0 server; the renderer tolerates null.
+          discover: (o.discover as SnapshotDiscover | undefined) ?? null,
         };
       });
     },

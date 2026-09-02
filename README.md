@@ -49,6 +49,14 @@ open it, approve the node, run `boxup once` again. With a reusable auth key in
 `secrets/ts-authkey` the join is unattended. Full operator procedure:
 [docs/AGENT.md](docs/AGENT.md).
 
+**That is the whole box-side procedure.** A box only needs to reach the tailnet
+under a `grok-box-NNN` name; the fleet brain does the rest. Its next reconcile
+tick discovers the unenrolled box, enrols it, writes its `[fleet]` block, and
+keeps those artefacts repaired after an image swap. Nobody runs
+`fleet2 enroll` by hand. The brain needs the box ssh password once, installed
+with `BOX_PASSWD=... bash vps/install-vps.sh` on the VPS — see
+[docs/FLEET-BRAIN.md](docs/FLEET-BRAIN.md) → "Zero-touch join".
+
 ## Commands
 
 ```

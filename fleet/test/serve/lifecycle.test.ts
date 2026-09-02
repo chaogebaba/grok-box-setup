@@ -13,6 +13,7 @@
 
 import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { SERVE_VERSION } from "../../src/serve/handlers.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -93,7 +94,7 @@ describe("serve process lifecycle (r1 gate regression)", () => {
         expect(health).toBeDefined();
         const body = (await health!.json()) as { ok: boolean; version: string };
         expect(body.ok).toBe(true);
-        expect(body.version).toBe("5.5.0");
+        expect(body.version).toBe(SERVE_VERSION);
 
         // 2) it is STILL alive after a further ~1.5s (proves it did not exit
         //    right after logging "listening").

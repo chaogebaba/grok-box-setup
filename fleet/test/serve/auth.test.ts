@@ -7,6 +7,7 @@ import { makeFetch } from "../../src/serve/server.ts";
 import { TokenStore, TOKEN_NAME_RE, parseTokens } from "../../src/serve/tokens.ts";
 import { fakeContext, memTokenFs, getReq, postReq, TWO_TOKENS, fakeSyscalls, fakeLockDeps, memAudit } from "./helpers.ts";
 import { setLogSink } from "../../src/log.ts";
+import { SERVE_VERSION } from "../../src/serve/handlers.ts";
 
 let restore: (l: string) => void;
 beforeEach(() => {
@@ -157,7 +158,7 @@ describe("rc→HTTP table (mutant: map a domain rc to a non-200)", () => {
     expect(r.status).toBe(200);
     const body = await r.json();
     expect(body.ok).toBe(true);
-    expect(body.version).toBe("5.5.0");
+    expect(body.version).toBe(SERVE_VERSION);
     expect(body).toHaveProperty("tick_age_s");
   });
 

@@ -17,6 +17,7 @@ import type { Env } from "../env.ts";
 import type { TailscaleKeys } from "../reconcile/tailscale-keys.ts";
 import type { ReconcileState } from "../reconcile/state.ts";
 import { tunnelSsh } from "../tunnel.ts";
+import { knownHostsFile } from "../hostkey.ts";
 import { boxIndex, isValidBoxName } from "../boxes.ts";
 import { parseStatusLine } from "../status.ts";
 import {
@@ -105,6 +106,7 @@ export async function seedKeyOverTunnel(
   const seed = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, cmd, {
     stdin: `${key}\n`, // key travels on STDIN, never argv (M11)
     timeoutMs: SEED_TIMEOUT_MS,
+    knownHosts: knownHostsFile(deps.env),
   });
   if (seed.code !== 0) {
     const firstLine = (seed.stderr.split("\n")[0] ?? "").slice(0, 200);
@@ -114,6 +116,7 @@ export async function seedKeyOverTunnel(
   // Verify: boxup status non-empty ∧ converged ∧ read-back .expires == expires.
   const st = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, `sudo ${BOX_ROOT}/boxup status`, {
     timeoutMs: STATUS_TIMEOUT_MS,
+    knownHosts: knownHostsFile(deps.env),
   });
   if (st.code !== 0 || st.stdout.trim() === "") return false;
   if (!seedStatusConverged(st.stdout)) return false;
@@ -123,7 +126,7 @@ export async function seedKeyOverTunnel(
     box,
     deps.env.FLEET_BOX_KEY,
     `sudo cat '${BOX_AUTHKEY_EXPIRES}'`,
-    { timeoutMs: STATUS_TIMEOUT_MS },
+    { timeoutMs: STATUS_TIMEOUT_MS, knownHosts: knownHostsFile(deps.env) },
   );
   return readBack.stdout.replace(/\s+/g, "") === expires;
 }

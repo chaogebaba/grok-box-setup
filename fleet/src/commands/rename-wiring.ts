@@ -7,6 +7,7 @@ import type { Runner } from "../runner.ts";
 import type { Env } from "../env.ts";
 import type { ParsedConfig } from "../config.ts";
 import { tunnelUp, tunnelSsh } from "../tunnel.ts";
+import { knownHostsFile } from "../hostkey.ts";
 import { parseDevices, baseName, resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { RunContext, TailscaleKeys } from "../reconcile/tailscale-keys.ts";
 import { BOX_ROOT } from "../reconcile/seed-remote.ts";
@@ -163,6 +164,7 @@ function makeOps(env: Env, cfg: ParsedConfig, runner: Runner): RenameOps {
     async boxBoxupVersion(box) {
       const r = await tunnelSsh(runner, box, env.FLEET_BOX_KEY, `sudo ${BOX_ROOT}/boxup version`, {
         timeoutMs: TUNNEL_TIMEOUT_MS,
+        knownHosts: knownHostsFile(env),
       });
       if (r.code !== 0) return "";
       const last = r.stdout.trim().split(/\s+/).pop() ?? "";
@@ -170,7 +172,10 @@ function makeOps(env: Env, cfg: ParsedConfig, runner: Runner): RenameOps {
     },
     async writeHostnameAndOnce(old, neu) {
       const cmd = `printf '%s\\n' '${neu}' | sudo tee '${BOX_ROOT}/hostname' >/dev/null && sudo ${BOX_ROOT}/boxup once`;
-      const r = await tunnelSsh(runner, old, env.FLEET_BOX_KEY, cmd, { timeoutMs: TUNNEL_TIMEOUT_MS });
+      const r = await tunnelSsh(runner, old, env.FLEET_BOX_KEY, cmd, {
+        timeoutMs: TUNNEL_TIMEOUT_MS,
+        knownHosts: knownHostsFile(env),
+      });
       return r.code === 0;
     },
     async pollDevices(old, neu): Promise<PollResult> {

@@ -777,6 +777,41 @@ case "$(dropin_reload_fatal)" in
   *) bad "#12 F8: reload-failure not fatal: [$(dropin_reload_fatal)]" ;;
 esac
 
+# --- P2 box_passwd seam (blueprint fleet2-zero-touch-join) -------------------
+# Adoption drives a box over the tailnet BEFORE it is enrolled, so the engine
+# needs the box ssh password in $ETC_DIR/box_passwd. The installer writes it
+# only from env BOX_PASSWD, at mode 600, and must never log the value.
+
+box_passwd_absent_test() {
+  local pfx; pfx="$(mktemp -d)"
+  FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  if [ -e "$pfx/etc/grok-fleet/box_passwd" ]; then echo "CREATED"; else echo "UNTOUCHED"; fi
+  rm -rf "$pfx"
+}
+[ "$(box_passwd_absent_test)" = UNTOUCHED ] && pass "installer (P2): no BOX_PASSWD => \$ETC_DIR/box_passwd left untouched" || bad "installer created box_passwd without BOX_PASSWD: [$(box_passwd_absent_test)]"
+
+box_passwd_written_test() {
+  local pfx out f; pfx="$(mktemp -d)"
+  out="$(FLEET2_BINARY="$STUB" PREFIX="$pfx" BOX_PASSWD='s3cr3t-not-in-logs' bash "$VPS_INSTALL" 2>&1)"
+  f="$pfx/etc/grok-fleet/box_passwd"
+  if [ ! -f "$f" ]; then echo "MISSING"; rm -rf "$pfx"; return; fi
+  if [ "$(stat -c '%a' "$f")" != 600 ]; then echo "MODE:$(stat -c '%a' "$f")"; rm -rf "$pfx"; return; fi
+  if [ "$(cat "$f")" != 's3cr3t-not-in-logs' ]; then echo "CONTENT"; rm -rf "$pfx"; return; fi
+  case "$out" in *s3cr3t-not-in-logs*) echo "LEAKED";; *) echo "OK";; esac
+  rm -rf "$pfx"
+}
+[ "$(box_passwd_written_test)" = OK ] && pass "installer (P2): BOX_PASSWD => box_passwd written 0600 and never logged" || bad "installer box_passwd wrong: [$(box_passwd_written_test)]"
+
+# The pin bump that ships with this release (D9): the committed FLEET2_RELEASE
+# must match fleet2's own PKG_VERSION, or ts-release-build refuses the pair.
+release_pin_matches_pkg_test() {
+  local tag ver
+  tag="$(grep -E '^FLEET2_RELEASE=' "$VPS_INSTALL" | head -1 | cut -d= -f2)"
+  ver="$(grep -E '^const PKG_VERSION = ' "$ROOT/fleet/src/cli.ts" | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+  if [ "$tag" = "v$ver" ]; then echo "MATCH"; else echo "MISMATCH:$tag vs $ver"; fi
+}
+[ "$(release_pin_matches_pkg_test)" = MATCH ] && pass "installer (D9): FLEET2_RELEASE pin matches fleet2 PKG_VERSION" || bad "release pin mismatch: [$(release_pin_matches_pkg_test)]"
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL INSTALL-VPS TESTS PASSED"; else echo "SOME INSTALL-VPS TESTS FAILED"; fi
 exit "$fail"

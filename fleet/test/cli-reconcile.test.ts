@@ -4,8 +4,8 @@
 // real flock/process runs.
 
 import { test, expect, describe } from "bun:test";
-import { cliReconcile, type ReconcileCliDeps } from "../src/reconcile/cli-reconcile.ts";
-import { parseConfig } from "../src/config.ts";
+import { cliReconcile, assembleTickDeps, type ReconcileCliDeps } from "../src/reconcile/cli-reconcile.ts";
+import { parseConfig, loadConfig } from "../src/config.ts";
 import { testEnv, testRollout } from "./helpers.ts";
 import type { ReexecResult } from "../src/reexec.ts";
 
@@ -42,5 +42,32 @@ describe("T13/m15 cliReconcile lock rc", () => {
     // The spawner represents the flock child having run the locked tick to rc 0.
     const rc = await cliReconcile(deps({ code: 0, launched: true }));
     expect(rc).toBe(0);
+  });
+});
+
+// --- D6(e): FLEET_BOXES disables discovery entirely --------------------------
+
+describe("D6e discovery seam", () => {
+  test("FLEET_BOXES set ⇒ assembleTickDeps builds NO discover deps", async () => {
+    const deps = await assembleTickDeps(
+      testEnv({ FLEET_BOXES: "grok-box-008", FLEET_STATE: "/tmp/does-not-exist-ztj" }),
+      await loadConfig("/nonexistent-config.toml"),
+      testRollout(),
+      { apply: false },
+    );
+    expect(deps.discover).toBeUndefined();
+    expect(deps.targetBoxes).toEqual(["grok-box-008"]);
+  });
+
+  test("no FLEET_BOXES ⇒ discovery is wired, and its apiToken mirrors the ONE token read", async () => {
+    const deps = await assembleTickDeps(
+      testEnv({ FLEET_STATE: "/tmp/does-not-exist-ztj", FLEET_API_TOKEN_FILE: "/nonexistent-token" }),
+      await loadConfig("/nonexistent-config.toml"),
+      testRollout(),
+      { apply: false },
+    );
+    expect(deps.discover).toBeDefined();
+    // P1: no readable token this tick ⇒ discover is told so rather than reading again.
+    expect(deps.discover!.apiToken).toBe(false);
   });
 });

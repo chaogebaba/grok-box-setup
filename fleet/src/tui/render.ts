@@ -4,7 +4,7 @@
 // per §5: header, box table (glyphs + CONFIG column), detail pane (24h
 // sparkline), footer keys; modals + LINK DOWN / STALE banners.
 
-import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
+import type { SnapshotBox, SnapshotDiscover, SnapshotLine } from "../history/schema.ts";
 import type { Scope } from "../serve/tokens.ts";
 
 export interface Size {
@@ -57,6 +57,8 @@ export interface TuiState {
   modal?: ModalState;
   /** whether NO_COLOR is set. */
   noColor: boolean;
+  /** zero-touch join summary for the last tick (D7); null/absent ⇒ no row. */
+  discover?: SnapshotDiscover | null;
 }
 
 // --- ANSI palette (NO_COLOR-aware) -------------------------------------------
@@ -241,6 +243,31 @@ export function renderDetail(state: TuiState, size: Size): string[] {
   return rows;
 }
 
+// --- discover summary row (D7) -----------------------------------------------
+/**
+ * One line, no new view: what the last tick's discover pass saw and did. Absent
+ * on a pre-5.6.0 snapshot and on a tick with discovery disabled, and the frame
+ * simply has no row then. The skip list is summarised by count and the first
+ * few names, because it is the only unbounded part of the object.
+ */
+export function renderDiscover(state: TuiState, size: Size): string | undefined {
+  const d = state.discover;
+  if (d === null || d === undefined) return undefined;
+  const parts = [
+    `discover: ${d.candidates} candidate${d.candidates === 1 ? "" : "s"}`,
+    `${d.adopted} adopted`,
+    `${d.repaired} repaired`,
+    `${d.skipped.length} skipped`,
+  ];
+  let line = parts.join("  ");
+  if (d.skipped.length > 0) {
+    const shown = d.skipped.slice(0, 3).map((s) => `${s.name}:${s.reason}`);
+    const more = d.skipped.length > shown.length ? `, +${d.skipped.length - shown.length} more` : "";
+    line += ` (${shown.join(", ")}${more})`;
+  }
+  return sgr(state, C.dim, pad(stripToWidth(line, size.cols), size.cols));
+}
+
 // --- banners -----------------------------------------------------------------
 export function renderBanner(state: TuiState, size: Size): string | undefined {
   if (!state.link.up) {
@@ -291,6 +318,8 @@ export function renderFrame(state: TuiState, size: Size): string {
   lines.push(renderHeader(state, size));
   const banner = renderBanner(state, size);
   if (banner !== undefined) lines.push(banner);
+  const discoverRow = renderDiscover(state, size);
+  if (discoverRow !== undefined) lines.push(discoverRow);
   lines.push("");
 
   const table = renderTable(state, size);

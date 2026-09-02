@@ -41,7 +41,7 @@ function sshResponder(map: {
 }) {
   return (argv: string[]) => {
     if (isSs(argv)) {
-      const lines = (map.ssListens ?? []).map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:*`);
+      const lines = (map.ssListens ?? []).map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))`);
       return result({ stdout: lines.join("\n") + "\n" });
     }
     if (argv[0] === "ssh") {

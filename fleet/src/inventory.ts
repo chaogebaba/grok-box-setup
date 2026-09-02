@@ -16,6 +16,7 @@ import type { Env } from "./env.ts";
 import type { RolloutConfig } from "./config.ts";
 import type { FsSeam, Inventory, BoxEntry } from "./state.ts";
 import { tunnelUp, tunnelSsh } from "./tunnel.ts";
+import { knownHostsFile } from "./hostkey.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "./remote.ts";
 import { parseCheck, parseStatusLine, type BoxStatus } from "./status.ts";
 import { resolveTarget, type Target } from "./stage.ts";
@@ -81,6 +82,7 @@ export async function probeBox(
 
   const checkRes = await tunnelSsh(runner, box, env.FLEET_BOX_KEY, CHECK_COMMAND, {
     timeoutMs: CHECK_TIMEOUT_MS,
+    knownHosts: knownHostsFile(env),
   }).then(
     (r) => parseCheck(r.code, r.stdout + (r.stdout && r.stderr ? "\n" : "") + r.stderr),
     () => parseCheck(1, ""),
@@ -104,6 +106,7 @@ export async function probeBox(
   // Unhealthy: second ssh for the status line to fill VERSION/SHA (G4/S-C).
   const statusLine = await tunnelSsh(runner, box, env.FLEET_BOX_KEY, STATUS_COMMAND, {
     timeoutMs: STATUS_TIMEOUT_MS,
+    knownHosts: knownHostsFile(env),
   }).then(
     (r) => r.stdout,
     () => "",

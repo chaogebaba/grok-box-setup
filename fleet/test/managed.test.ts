@@ -234,7 +234,7 @@ function memState(): { fs: StateFs; store: Map<string, string> } {
 function passRunner(upPorts: number[]): FakeRunner {
   return new FakeRunner((argv) => {
     if (isSs(argv)) {
-      const lines = upPorts.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:*`);
+      const lines = upPorts.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))`);
       return result({ stdout: lines.join("\n") + "\n" });
     }
     // config push: emit an in-sync status line (cur==sha) so it reports rc 0.
@@ -362,7 +362,7 @@ describe("T11 config pass canary routing (F1/F2)", () => {
   function pushRunner(upPorts: number[], pushCode: number, pushOut: string): FakeRunner {
     return new FakeRunner((argv) => {
       if (isSs(argv)) {
-        const lines = upPorts.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:*`);
+        const lines = upPorts.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))`);
         return result({ stdout: lines.join("\n") + "\n" });
       }
       return result({ code: pushCode, stdout: pushOut });
@@ -395,7 +395,7 @@ describe("T11 config pass canary routing (F1/F2)", () => {
     const { fs } = memState();
     // canary push returns ssh rc 255 ⇒ push rc 6; a non-canary box then pushes ok.
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20002 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:20004 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20002 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\nLISTEN 0 128 127.0.0.1:20004 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       // canary 002 (port 20002) ⇒ transport rc 255; others push ok.
       if (argv.includes("20002")) return result({ code: 255, stdout: "" });
       return result({ code: 0, stdout: "sha=X cur=X support=yes enabled=true" });
@@ -424,7 +424,7 @@ describe("T11 config pass canary routing (F1/F2)", () => {
   test("m8: canary content-fail cn<=3 ⇒ NO notify (log only); cn>3 ⇒ notify", async () => {
     // canary push returns rc 2 no status ⇒ push rc 5 (content) ⇒ bump cfgfail.
     const runner = new FakeRunner((argv) => {
-      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20002 0.0.0.0:*\n" });
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20002 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
       return result({ code: 2, stdout: "" });
     });
     // cn=1 (first failure) ⇒ NO notify

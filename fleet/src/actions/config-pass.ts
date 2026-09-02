@@ -112,7 +112,15 @@ export async function configPass(deps: ConfigPassDeps): Promise<ConfigPassResult
     skipped++;
   } else {
     const cf = deps.state.checkfailCount(canary);
-    if (!(await tunnelUp(deps.runner, canary))) {
+    if (deps.state.readHostkeyMismatch(canary)) {
+      // D11(c): the config push is a tunnel WRITE, so it is deferred for as long
+      // as the marker is set — the push lands on the tick after the repair
+      // re-binds the pin. The shape mirrors the tunnel-down canary: log, skip,
+      // continue without canary protection.
+      log(`config: ${canary} deferred — host key mismatch`);
+      perBox.set(canary, "skip");
+      skipped++;
+    } else if (!(await tunnelUp(deps.runner, canary))) {
       log(
         `config: canary ${canary} tunnel down — canary check skipped this tick, continuing without canary protection`,
       );
@@ -163,6 +171,13 @@ export async function configPass(deps: ConfigPassDeps): Promise<ConfigPassResult
   // The rest, serially, in target order (minus the canary).
   for (const b of deps.targetBoxes) {
     if (b === canary) continue;
+    if (deps.state.readHostkeyMismatch(b)) {
+      // D11(c), as for the canary above.
+      log(`config: ${b} deferred — host key mismatch`);
+      perBox.set(b, "skip");
+      skipped++;
+      continue;
+    }
     if (!(await tunnelUp(deps.runner, b))) {
       log(`config: skip ${b} — tunnel down (drift reported when the box returns)`);
       perBox.set(b, "skip");

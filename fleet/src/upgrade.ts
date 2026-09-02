@@ -16,6 +16,7 @@ import { inventoryPath, writeInventory, readInventory } from "./state.ts";
 import type { Target } from "./stage.ts";
 import { classify } from "./runner.ts";
 import { tunnelUp, tunnelScp, tunnelSsh } from "./tunnel.ts";
+import { knownHostsFile } from "./hostkey.ts";
 import {
   REMOTE_TAR,
   renderInstallCommand,
@@ -183,7 +184,10 @@ export async function verifyBox(
   let doneRc: number | null = null;
   for (let i = 0; i < rollout.verifyTries; i++) {
     await sleep(rollout.verifyInterval * 1000);
-    const r = await tunnelSsh(runner, box, key, POLL_COMMAND, { timeoutMs: POLL_TIMEOUT_MS });
+    const r = await tunnelSsh(runner, box, key, POLL_COMMAND, {
+      timeoutMs: POLL_TIMEOUT_MS,
+      knownHosts: knownHostsFile(env),
+    });
     // transport/killed consumes a try but is not itself a failure here.
     const cls = classify(r);
     if (cls === "transport" || cls === "killed") continue;
@@ -203,7 +207,10 @@ export async function verifyBox(
   // Phase 2: two consecutive passing checks (rc 0 AND sha == target).
   let consecutive = 0;
   for (let i = 0; i < rollout.verifyTries; i++) {
-    const r = await tunnelSsh(runner, box, key, CHECK_COMMAND, { timeoutMs: CHECK_TIMEOUT_MS });
+    const r = await tunnelSsh(runner, box, key, CHECK_COMMAND, {
+      timeoutMs: CHECK_TIMEOUT_MS,
+      knownHosts: knownHostsFile(env),
+    });
     const cls = classify(r);
     if (cls === "transport" || cls === "killed") {
       consecutive = 0;
@@ -237,7 +244,10 @@ export async function deployBox(
   const key = env.FLEET_BOX_KEY;
 
   // scp: any non-zero (incl. 255/killed) ⇒ per-box FAILURE, nothing landed (F4).
-  const scp = await tunnelScp(runner, box, key, tar, REMOTE_TAR, SCP_TIMEOUT_MS);
+  const scp = await tunnelScp(runner, box, key, tar, REMOTE_TAR, {
+    timeoutMs: SCP_TIMEOUT_MS,
+    knownHosts: knownHostsFile(env),
+  });
   if (scp.code !== 0) {
     const cls = classify(scp);
     return { box, result: "failed", detail: `scp: ${cls}` };
@@ -245,7 +255,10 @@ export async function deployBox(
 
   // install command (G1/H1). F6-validates the sha (throws ⇒ caller catches).
   const installCmd = renderInstallCommand(targetSha);
-  const install = await tunnelSsh(runner, box, key, installCmd, { timeoutMs: INSTALL_TIMEOUT_MS });
+  const install = await tunnelSsh(runner, box, key, installCmd, {
+    timeoutMs: INSTALL_TIMEOUT_MS,
+    knownHosts: knownHostsFile(env),
+  });
   const icls = classify(install);
   // transport/killed on install is NOT itself a failure — verify decides (F4).
   if (icls === "remote") {
