@@ -215,9 +215,17 @@ What each does, what we borrowed, why we diverged.
   restart). Diverged: we cannot own PID 1 (tini + the sand supervisor do), so
   the loop is a userspace tick, not a real supervisor.
 - **[ansible-pull](https://docs.ansible.com/ansible/latest/cli/ansible-pull.html)**
-  — pull-based convergence. Borrowed: the shim's re-clone +
-  reinstall is exactly pull-based self-heal. Diverged: triggered by the hourly
-  automation, not a control node.
+  — pull-based convergence. Borrowed: the shim's re-clone + reinstall is
+  pull-based self-heal FOR A MISSING OR CORRUPT `boxup` only. Diverged: it is
+  not a pull-based UPDATE path and never has been. The hourly
+  `box-bootstrap.sh --once` execs the co-located `boxup` and touches GitHub only
+  when that file is absent or fails its sanity gate, so a healthy box never
+  re-clones and never acquires new code on its own. (Measured 2026-09-02: every
+  box's `/var/log/box-bootstrap.log` still dated from the one-time 27 Aug
+  install. An earlier belief that the hourly shim self-updated the platform is
+  RETRACTED.) New releases reach a box only through the brain's rollout —
+  fleet2 decision-table row d, `[rollout]` in docs/FLEET-BRAIN.md — which IS the
+  control node this comparison says we diverged from.
 - **[`tailscale up --reset`](https://tailscale.com/kb/1080/cli/#up)** — resets
   prefs to flags given. Informs our
   set-only-after-first-login rule: we never want the reset semantics post-join,
