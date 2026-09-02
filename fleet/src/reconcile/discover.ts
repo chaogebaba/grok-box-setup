@@ -127,6 +127,22 @@ export interface DiscoverDeps {
   forgetHostKeys(box: string, scope: "both" | "tailnet"): Promise<void>;
 }
 
+/**
+ * state-store D5: the `enrolling` rows the RESUME pass owns, and the enrol-stuck
+ * alert. Absent on a caller with no store (the box-free discover tests), which
+ * is exactly the 5.8.0 behaviour: no resume pass and no enrolling rows.
+ */
+export interface EnrolSurface {
+  /** `enrolling` rows, OLDEST `created_at` first. */
+  rows(): Array<{ name: string; stage: number; streak: number; created_at: number }>;
+  /**
+   * An attempted stage just FAILED. Fires `enrol-stuck` when the row's streak
+   * has reached 3 — three attempted-and-failed STAGES, not three ticks — and
+   * then at most once per 24 h, throttled through the `alerts` table.
+   */
+  stuck(box: string): Promise<void>;
+}
+
 /** Per-tick facts the caller supplies. */
 export interface DiscoverTick {
   state: ReconcileStateApi;
@@ -144,6 +160,8 @@ export interface DiscoverTick {
    * existing two-argument call keeps its behaviour.
    */
   excluded?: Map<string, "retired" | "enrolling">;
+  /** state-store D5: the resume pass's view of the store. Omitted ⇒ no resumes. */
+  enrol?: EnrolSurface;
   nowSec: number;
   /** monotonic milliseconds; injected so the budget is deterministic in tests. */
   nowMs(): number;
@@ -450,6 +468,22 @@ export class DiscoverRun {
     return undefined;
   }
 
+  /**
+   * state-store D5: an `enrolling` row that is NOT inside its backoff window,
+   * i.e. one the resume pass may actually spend the slot on this tick.
+   *
+   * The backoff test is what stops a permanently unreachable half-enrolled box
+   * from starving every candidate behind it: the row is due on the ticks its
+   * ladder allows and invisible to this check on the rest, so adopt runs then.
+   * Mutant (m14) drops the test and the starvation ladder fails.
+   */
+  private pendingEnrolRow(): string | undefined {
+    for (const r of this.tick.enrol?.rows() ?? []) {
+      if (this.inBackoff(r.name) === undefined) return r.name;
+    }
+    return undefined;
+  }
+
   // --- adopt -----------------------------------------------------------------
 
   async adoptPass(): Promise<void> {
@@ -470,9 +504,15 @@ export class DiscoverRun {
     if (sel.candidates.length === 0) return;
     if (!this.preflight(sel.candidates)) return;
 
-    const pending = this.pendingRepairBox();
+    // D6c + state-store D5/r4-B3/r5-B1/r6-B1: the yield is a DISJUNCTION. Adopt
+    // yields when the EXISTING tick-1 repair probe fires (unchanged, so repair's
+    // priority over adopt from the zero-touch-join work is intact on a fleet
+    // with no enrolling rows) OR when an `enrolling` row exists and is not in
+    // backoff. Parity plays NO part here — it is only the tie-break INSIDE
+    // repairPass. Mutant (m16) drops the repair disjunct.
+    const pending = this.pendingRepairBox() ?? this.pendingEnrolRow();
     if (pending !== undefined) {
-      log(`discover: adopt deferred (repair pending on ${pending})`);
+      log(`discover: adopt deferred (repair/resume pending on ${pending})`);
       return;
     }
 
@@ -554,14 +594,30 @@ export class DiscoverRun {
    */
   async repairPass(): Promise<void> {
     if (this.latched()) return;
-    const due = this.tick.membership.filter((box) => {
+    const repairDue = this.tick.membership.filter((box) => {
       const m = this.tick.state.readRepairPending(box);
       return m !== undefined && m.tick === this.tick.tick && m.runs >= 2;
     });
-    if (due.length === 0) return;
-    if (!this.preflight(due)) return;
+    // state-store D5: the RESUME work lives in this pass — no third pass and no
+    // third budget share. An `enrolling` row inside its backoff window is not
+    // due (the ladder is what keeps it from starving the adopt slot).
+    const resumeDue = (this.tick.enrol?.rows() ?? [])
+      .filter((r) => this.inBackoff(r.name) === undefined)
+      .map((r) => r.name);
+    if (repairDue.length === 0 && resumeDue.length === 0) return;
+    if (!this.preflight([...repairDue, ...resumeDue])) return;
 
-    for (const box of due) {
+    // D5 ordering: repair-marker boxes (enrolled boxes that are BROKEN) before
+    // enrolling rows (oldest `created_at` first, the order the surface returns).
+    // When BOTH are due they alternate by tick parity — even `tick_seq` repair
+    // first, odd resume first — so neither starves the other across ticks.
+    const repairItems = repairDue.map((name) => ({ name, resume: false }));
+    const resumeItems = resumeDue.map((name) => ({ name, resume: true }));
+    const order =
+      this.tick.tick % 2 === 0 ? [...repairItems, ...resumeItems] : [...resumeItems, ...repairItems];
+
+    for (const item of order) {
+      const box = item.name;
       if (this.slotUsed) return; // D6c cap, shared with adopt
       const failures = this.inBackoff(box);
       if (failures !== undefined) {
@@ -571,6 +627,11 @@ export class DiscoverRun {
       if (!this.budget.canStart("repair", DISCOVER_PROBE_CEILING_MS)) {
         log(`discover: repair budget spent (${this.budget.spent().repair}ms) — ${box} deferred`);
         return;
+      }
+      if (item.resume) {
+        await this.resumeOne(box);
+        if (this.slotUsed) return;
+        continue;
       }
       // D11(b)(ii): a box carrying the mismatch marker gets its pins forgotten
       // BEFORE the content checks — otherwise the tailnet reads hit the banner
@@ -613,6 +674,46 @@ export class DiscoverRun {
       }
       return;
     }
+  }
+
+  /**
+   * state-store D5: RESUME one half-enrolled box. `deps.adopt` runs the SAME
+   * enrol saga the adopt path runs — `beginEnrol` reads the row's recorded
+   * `enrol_stage` and re-runs stages `enrol_stage+1 … 5`, so this needs no
+   * separate transport.
+   *
+   * Two ssh stages rarely fit inside repair's 30 s reserve and `canStart`'s 20 s
+   * ceiling, so a resume advances AT LEAST one stage per tick it runs. That is
+   * stated behaviour, not a defect: the row records how far it got and the next
+   * tick continues.
+   *
+   * FAILURE accounting (D5): only an ATTEMPTED stage that returned failure is a
+   * failure. The saga hooks bump `enrol_fail_streak` and set `enrol_warn`; this
+   * records the `discover_ledger` failure that drives the doubling backoff, and
+   * asks the alert surface whether the streak has reached `enrol-stuck`. A
+   * budget deferral, a preflight skip and a lost slot never reach here.
+   */
+  private async resumeOne(box: string): Promise<void> {
+    if (!this.tick.apply) {
+      const row = this.tick.enrol?.rows().find((r) => r.name === box);
+      log(`resume: would resume ${box} from enrol stage ${row?.stage ?? 0} (dry-run/no-apply)`);
+      return;
+    }
+    const r = await this.budget.spend("repair", () => this.deps.adopt(box));
+    this.slotUsed = true; // a partial enrol IS a mutation — the slot is spent
+    if (r.rc === 0) {
+      this.summary.adopted += 1;
+      this.clearFailure(box);
+      log(`resume: ${box} enrolment completed — tunnel proven on the next tick`);
+      if (r.exportError !== undefined) {
+        log(`resume: ${box} recorded; legacy export failed: ${r.exportError}`);
+      }
+      return;
+    }
+    const reason = r.timeoutPoint !== undefined ? `timeout-${r.timeoutPoint}` : `enroll-rc${r.rc}`;
+    this.recordFailure(box, reason);
+    this.skip(box, reason);
+    await this.tick.enrol?.stuck(box);
   }
 
   // --- finish ----------------------------------------------------------------

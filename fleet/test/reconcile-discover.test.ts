@@ -457,7 +457,7 @@ describe("D5 hysteresis + per-consumer freshness", () => {
     await run.adoptPass();
     expect(calls.adopts).toEqual([]);
     expect(calls.probes).toEqual([]);
-    expect(logs.some((l) => l.includes("adopt deferred (repair pending on grok-box-008)"))).toBe(true);
+    expect(logs.some((l) => l.includes("adopt deferred (repair/resume pending on grok-box-008)"))).toBe(true);
 
     // the loop then stamps the CURRENT tick with runs 2 ⇒ repair takes the slot.
     state.bumpRepairPending("grok-box-008", 6);

@@ -186,6 +186,32 @@ export interface EnrollSideEffects {
   tunnelWaitBudget(): string;
   /** sleep 5s (stubbed in tests). */
   sleep5(): Promise<void>;
+
+  // --- the enrol SAGA (state-store D5, Phase B) ------------------------------
+  //
+  // Five EXTERNAL stages, in exactly this order:
+  //   1 installVpsAuthorizedKey   3 installBoxAuthorizedKey   5 recordEnrolled
+  //   2 recordEtcMapping          4 writeBoxConfig
+  //
+  // Stages 1–4 are re-runnable (the box-side install `grep -vF`s the key then
+  // appends and `mv -f`s; the VPS-side writes dedup by port and key material),
+  // which is what lets the resume pass restart from `enrol_stage` instead of
+  // from scratch.
+  //
+  // All three are OPTIONAL. A caller that supplies none gets the 5.8.0
+  // behaviour — every stage runs, nothing is staged — which is what keeps the
+  // box-free enroll tests hermetic against a store they do not have.
+
+  /**
+   * Open or RESUME the saga and return the stage already reached (0 ⇒ run them
+   * all). Called after the tunnel pubkey is read and before stage 1, so a
+   * failure at the ACL or pubkey step leaves no `enrolling` row behind.
+   */
+  beginEnrol?(box: string, port: number, pubkey?: string): Promise<{ stage: number }>;
+  /** A stage COMPLETED. `warn` is stage 2's warning path (D5). */
+  stageOk?(box: string, stage: number, warn?: string): Promise<void>;
+  /** A stage was ATTEMPTED and FAILED: record it, bump the streak, do not advance. */
+  stageFailed?(box: string, stage: number, warn: string): Promise<void>;
 }
 
 /** enroll_wait_tunnel (main:1818-1840): rc 0 up/skip, rc 4 timeout. */
@@ -342,46 +368,81 @@ export async function cmdEnrollResult(args: string[], se: EnrollSideEffects): Pr
     );
   }
 
-  // (3) install VPS authorized_keys line.
+  // --- the SAGA opens here (state-store D5) ---------------------------------
+  // The row is created (or resumed, or revived from `retired`) BEFORE the first
+  // external write, so a crash after stage 1 leaves a record of exactly how far
+  // the enrolment got. Everything above this line is a precheck that wrote
+  // nothing, so a failure there must leave no `enrolling` row.
   const line = authorizedKeysLine(port, pubkey);
-  if (!(await se.installVpsAuthorizedKey(line))) {
-    log("enroll: failed to install VPS authorized_keys line");
-    return { rc: 1 };
-  }
-  log(`enroll: installed VPS fleet authorized_keys line for ${box} (permitlisten 127.0.0.1:${port})`);
-  if (!(await se.recordEtcMapping(box, port, line))) {
-    log(`enroll: WARNING could not write /etc mapping copy for ${box}`);
-  }
+  const material = pubkey.split(/\s+/)[1];
+  const done = (await se.beginEnrol?.(box, port, material))?.stage ?? 0;
+  if (done > 0) log(`enroll: ${box} resuming the enrol saga from stage ${done}`);
 
-  // (4) install VPS box-access pubkey into the box.
-  const vpspub = await se.vpsBoxAccessPubkey();
-  if (vpspub === undefined) {
-    log(`enroll: no VPS box-access key at <FLEET_BOX_KEY>(.pub) — generate it on the VPS first`);
-    return { rc: 1 };
-  }
-  if (!(await se.installBoxAuthorizedKey(box, vpspub))) {
-    log(`enroll: failed to install VPS key into ${box} authorized_keys`);
-    return { rc: 1 };
-  }
-  log(`enroll: installed VPS box-access key into ${box}:~box/.ssh/authorized_keys`);
-
-  // (5) box-side [fleet] block (D8 partial-enroll contract).
-  if (writeBoxConfig) {
-    const wbc = await se.writeBoxConfig(box, vps, n, vpsPort === "22" ? "" : vpsPort);
-    if (wbc === 0) {
-      const portmsg = vpsPort !== "22" ? ` port=${vpsPort}` : "";
-      log(`enroll: wrote ${box}:${BOX_CONFIG} [fleet] block (vps=${vps} box_index=${n}${portmsg}) and verified it`);
-    } else if (wbc === 4) {
-      log(`enroll: WARNING box config not written — ${BOX_CONFIG} is ABSENT on ${box}; run install.sh on the box first`);
-      log(`enroll:   (then re-run 'fleet2 enroll ${box}'). NOT recording enrollment; the VPS-side key is installed and harmless.`);
+  // (stage 1) install VPS authorized_keys line.
+  if (done < 1) {
+    if (!(await se.installVpsAuthorizedKey(line))) {
+      log("enroll: failed to install VPS authorized_keys line");
+      await se.stageFailed?.(box, 1, "installVpsAuthorizedKey failed");
       return { rc: 1 };
+    }
+    log(`enroll: installed VPS fleet authorized_keys line for ${box} (permitlisten 127.0.0.1:${port})`);
+    await se.stageOk?.(box, 1);
+  }
+
+  // (stage 2) the /etc mapping copy. Its failure is a WARNING today and stays
+  // one: the stage ADVANCES with `enrol_warn` set, because the mapping is an
+  // audit copy and the enrolment it describes is real either way.
+  if (done < 2) {
+    if (await se.recordEtcMapping(box, port, line)) {
+      await se.stageOk?.(box, 2);
     } else {
-      const portFrag = vpsPort !== "22" ? ` port=${vpsPort}` : "";
-      log("enroll: WARNING box config not written — run the manual [fleet] step:");
-      log(`enroll:   set [fleet] vps="${vps}" box_index=${n}${portFrag} in ${box}:${BOX_CONFIG},`);
-      log(`enroll:   then: sudo ${BOXUP_REMOTE} once. NOT recording enrollment; the VPS-side`);
-      log(`enroll:   key is installed and harmless — re-run 'fleet2 enroll ${box}' to retry (idempotent).`);
+      log(`enroll: WARNING could not write /etc mapping copy for ${box}`);
+      await se.stageOk?.(box, 2, "recordEtcMapping failed (/etc mapping copy missing)");
+    }
+  }
+
+  // (stage 3) install VPS box-access pubkey into the box.
+  if (done < 3) {
+    const vpspub = await se.vpsBoxAccessPubkey();
+    if (vpspub === undefined) {
+      log(`enroll: no VPS box-access key at <FLEET_BOX_KEY>(.pub) — generate it on the VPS first`);
+      await se.stageFailed?.(box, 3, "no VPS box-access key");
       return { rc: 1 };
+    }
+    if (!(await se.installBoxAuthorizedKey(box, vpspub))) {
+      log(`enroll: failed to install VPS key into ${box} authorized_keys`);
+      await se.stageFailed?.(box, 3, "installBoxAuthorizedKey failed");
+      return { rc: 1 };
+    }
+    log(`enroll: installed VPS box-access key into ${box}:~box/.ssh/authorized_keys`);
+    await se.stageOk?.(box, 3);
+  }
+
+  // (stage 4) box-side [fleet] block (D8 partial-enroll contract). rc 4 —
+  // "config absent on the box" — does NOT advance and does NOT record the
+  // enrolment, exactly as 5.8.0 behaves; it is still an ATTEMPTED stage that
+  // returned failure, so it bumps the streak.
+  if (writeBoxConfig) {
+    if (done < 4) {
+      const wbc = await se.writeBoxConfig(box, vps, n, vpsPort === "22" ? "" : vpsPort);
+      if (wbc === 0) {
+        const portmsg = vpsPort !== "22" ? ` port=${vpsPort}` : "";
+        log(`enroll: wrote ${box}:${BOX_CONFIG} [fleet] block (vps=${vps} box_index=${n}${portmsg}) and verified it`);
+        await se.stageOk?.(box, 4);
+      } else if (wbc === 4) {
+        log(`enroll: WARNING box config not written — ${BOX_CONFIG} is ABSENT on ${box}; run install.sh on the box first`);
+        log(`enroll:   (then re-run 'fleet2 enroll ${box}'). NOT recording enrollment; the VPS-side key is installed and harmless.`);
+        await se.stageFailed?.(box, 4, `${BOX_CONFIG} absent on the box (run install.sh there first)`);
+        return { rc: 1 };
+      } else {
+        const portFrag = vpsPort !== "22" ? ` port=${vpsPort}` : "";
+        log("enroll: WARNING box config not written — run the manual [fleet] step:");
+        log(`enroll:   set [fleet] vps="${vps}" box_index=${n}${portFrag} in ${box}:${BOX_CONFIG},`);
+        log(`enroll:   then: sudo ${BOXUP_REMOTE} once. NOT recording enrollment; the VPS-side`);
+        log(`enroll:   key is installed and harmless — re-run 'fleet2 enroll ${box}' to retry (idempotent).`);
+        await se.stageFailed?.(box, 4, "writeBoxConfig failed");
+        return { rc: 1 };
+      }
     }
   } else {
     log(
@@ -389,10 +450,12 @@ export async function cmdEnrollResult(args: string[], se: EnrollSideEffects): Pr
     );
   }
 
-  // Record (AFTER box-config success, D8). The key MATERIAL (field 2 of the
-  // pubkey line) is what `authorized-keys.map` carries and what `mapCoherent`
-  // compares, so that is what the store row keeps.
-  const exportError = await se.recordEnrolled(box, port, pubkey.split(/\s+/)[1]);
+  // (stage 5) record + export (AFTER box-config success, D8). This IS the
+  // `enrolling -> enrolled` transition: the phase change, the stage/streak reset
+  // and the audit row commit together. The key MATERIAL (field 2 of the pubkey
+  // line) is what `authorized-keys.map` carries and what `mapCoherent` compares,
+  // so that is what the store row keeps.
+  const exportError = await se.recordEnrolled(box, port, material);
   await se.notify("info", `enrolled ${box} (reverse port 127.0.0.1:${port})`);
   if (exportError !== undefined) {
     log(`enroll: ${box} recorded; export failed: ${exportError}`);

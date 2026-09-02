@@ -81,6 +81,33 @@ export function supersededAuthorizedKeysLine(existing: string, line: string): bo
   return false;
 }
 
+/**
+ * Run `fn` against a read-write `StoreState`, closing the handle afterwards.
+ *
+ * Every saga hook opens its own handle rather than sharing one across the
+ * enrolment: an enrol takes up to 90 s of remote calls, and holding a write
+ * handle open across them would keep a WAL writer alive while the tick's
+ * readers and the API want the file.
+ */
+function withStore<T>(
+  env: Env,
+  wiringOpts: EnrollWiringOpts,
+  fn: (st: import("../store/state.ts").StoreState) => T,
+): T {
+  const { openStore, storePath } = require("../store/db.ts") as typeof import("../store/db.ts");
+  const { StoreState } = require("../store/state.ts") as typeof import("../store/state.ts");
+  const store = openStore({ path: storePath(env.FLEET_STATE), dir: env.FLEET_STATE });
+  try {
+    return fn(
+      new StoreState(store, {
+        paths: { fleetState: env.FLEET_STATE, etc: env.FLEET_ETC, version: wiringOpts.version ?? "5.9.0" },
+      }),
+    );
+  } finally {
+    store.close();
+  }
+}
+
 /** Build the production EnrollSideEffects for `fleet2 enroll`. */
 export function fleetVpsUser(): string {
   return process.env.FLEET_VPS_USER ?? process.env.FLEET_USER ?? "fleet";
@@ -277,19 +304,23 @@ export function makeEnrollSideEffects(
       // `enrolled.tsv` + `authorized-keys.map` are EXPORTED from it afterwards.
       // 5.7.1's read-modify-rewrite of the whole file with no temp file and no
       // lock (survey §4a) is gone: a crash between truncate and write can no
-      // longer lose the fleet's membership.
-      const { openStore, storePath } = require("../store/db.ts") as typeof import("../store/db.ts");
-      const { StoreState } = require("../store/state.ts") as typeof import("../store/state.ts");
-      const store = openStore({ path: storePath(env.FLEET_STATE), dir: env.FLEET_STATE });
-      try {
-        const st = new StoreState(store, {
-          paths: { fleetState: env.FLEET_STATE, etc: env.FLEET_ETC, version: wiringOpts.version ?? "5.8.0" },
-        });
+      // longer lose the fleet's membership. From 5.9.0 this is the saga's stage
+      // 5, i.e. the `enrolling -> enrolled` transition (state-store D5).
+      return withStore(env, wiringOpts, (st) => {
         st.recordEnrolled(box, port, pubkey);
         return st.takeExportErrors()[0];
-      } finally {
-        store.close();
-      }
+      });
+    },
+
+    // --- the enrol saga (state-store D5, Phase B) -----------------------------
+    async beginEnrol(box, port, pubkey) {
+      return withStore(env, wiringOpts, (st) => st.beginEnrol(box, port, pubkey));
+    },
+    async stageOk(box, stage, warn) {
+      withStore(env, wiringOpts, (st) => st.advanceStage(box, stage, warn));
+    },
+    async stageFailed(box, stage, warn) {
+      withStore(env, wiringOpts, (st) => st.failStage(box, stage, warn));
     },
     async notify(level, msg) {
       const { notify: n } = await import("../notify.ts");

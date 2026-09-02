@@ -39,6 +39,12 @@ Brain subcommands (docs/FLEET-BRAIN.md — VPS-side unless noted):
                                  (same index/port); copy-first, verify, then
                                  delete the old-name state. --dry-run prints the
                                  plan only.
+  fleet2 retire [--forget] [--dry-run] <grok-box-N>
+                                 un-enrol a box: phase -> retired, VPS key line
+                                 and /etc mapping removed, Tailscale key revoked,
+                                 files re-exported. The name stays UN-ADOPTABLE
+                                 until 'fleet2 enroll' revives it; --forget drops
+                                 the row and frees the name entirely.
   fleet2 config render <box>     print the box's rendered managed.toml (stdout)
   fleet2 config diff <box>       unified diff of on-box vs rendered (exit 1 on drift)
   fleet2 config push <box>       push the rendered managed.toml to ONE box (D5)

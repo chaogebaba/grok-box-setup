@@ -29,6 +29,7 @@ export const KNOWN_COMMANDS = [
   "enroll",
   "reconcile",
   "rename",
+  "retire", // state-store D4: un-enrol a box and keep the name un-adoptable
   "config",
   "mint-key",
   "fleet-status",
