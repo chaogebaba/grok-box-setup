@@ -225,7 +225,12 @@ What each does, what we borrowed, why we diverged.
   install. An earlier belief that the hourly shim self-updated the platform is
   RETRACTED.) New releases reach a box only through the brain's rollout —
   fleet2 decision-table row d, `[rollout]` in docs/FLEET-BRAIN.md — which IS the
-  control node this comparison says we diverged from.
+  control node this comparison says we diverged from. What that rollout keys on
+  is the **root `VERSION` file** (5.7.1+, D5): row d and the `fleet2 upgrade`
+  plan compare the box's boxup VERSION against `git show <target>:VERSION`, not
+  the stamped repo sha, so a change under `boxup/` ships to the fleet only with
+  a VERSION bump. Rollout is a release action, not a file sync — the same
+  discipline the fleet2 installer already uses for its own pinned release.
 - **[`tailscale up --reset`](https://tailscale.com/kb/1080/cli/#up)** — resets
   prefs to flags given. Informs our
   set-only-after-first-login rule: we never want the reset semantics post-join,

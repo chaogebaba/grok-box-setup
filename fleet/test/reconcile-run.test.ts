@@ -264,7 +264,7 @@ describe("T15 identity pass log-only + empty-devs enrolled loop (G2)", () => {
 
 describe("T12 rollout gating (D10/F8)", () => {
   test("auto=false ⇒ WOULD rollout line, engine NOT called", async () => {
-    // 008 drifted: target sha != box sha, tunnel up, healthy check.
+    // 008 drifted: target VERSION != box VERSION (D5), tunnel up, healthy check.
     const devs = JSON.stringify({ devices: [{ hostname: "grok-box-008", online: true, lastSeen: "2999-01-01T00:00:00Z", tags: ["t"], keyExpiryDisabled: true }] });
     const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
     const runner = new FakeRunner((argv) => {
@@ -278,11 +278,130 @@ describe("T12 rollout gating (D10/F8)", () => {
       apply: true,
       targetBoxes: ["grok-box-008"],
       targetSha: "NEWSHA",
-      targetVersion: "5.3.0",
+      targetVersion: "5.3.1",
       rollout: testRollout({ auto: false }),
     });
     await runReconcile(deps);
-    expect(logs.some((l) => l.includes("WOULD rollout grok-box-008 OLDSHA→NEWSHA"))).toBe(true);
+    expect(logs.some((l) => l.includes("WOULD rollout grok-box-008 5.3.0→5.3.1 (NEWSHA)"))).toBe(true);
+  });
+});
+
+// --- D5: drift is a boxup VERSION comparison, not a repo-sha comparison ------
+
+describe("D5 row-d drift compares VERSION, not the stamped repo sha", () => {
+  /** One enrolled box, online+fresh, tunnel up, `boxup check` healthy at v/sha. */
+  function driftDeps(boxVersion: string, boxSha: string, over: Partial<ReconcileDeps> = {}) {
+    const devs = JSON.stringify({
+      devices: [
+        {
+          hostname: "grok-box-005",
+          online: true,
+          lastSeen: "2999-01-01T00:00:00Z",
+          tags: ["t"],
+          keyExpiryDisabled: true,
+        },
+      ],
+    });
+    const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv))
+        return result({ stdout: "LISTEN 0 128 127.0.0.1:20005 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND)
+        return result({ code: 0, stdout: `check=OK v=${boxVersion}/${boxSha} tunnel=up` });
+      return result({ code: 1 });
+    });
+    return baseDeps({
+      keys,
+      runner,
+      apply: true,
+      targetBoxes: ["grok-box-005"],
+      targetSha: "adfdc04",
+      targetVersion: "5.3.1",
+      rollout: testRollout({ auto: false }),
+      ...over,
+    });
+  }
+
+  /** The snapshot the tick wrote for grok-box-005. */
+  function snapDrift(lines: unknown[]): string | undefined {
+    const last = lines[lines.length - 1] as { boxes: { name: string; drift: string }[] } | undefined;
+    return last?.boxes.find((b) => b.name === "grok-box-005")?.drift;
+  }
+
+  test("same VERSION, different sha ⇒ drift no, no rollout, ONE D5 debug line", async () => {
+    // The empirical r1 FAIL, exactly: box 005 runs boxup 5.3.1 stamped f42c967
+    // while the target sha has moved to adfdc04 on a fleet2-only commit.
+    const lines: unknown[] = [];
+    const deps = driftDeps("5.3.1", "f42c967", { history: (l) => lines.push(l) });
+    await runReconcile(deps);
+    expect(logs.some((l) => l.includes("WOULD rollout"))).toBe(false);
+    expect(snapDrift(lines)).toBe("no");
+    const dbg = logs.filter((l) =>
+      l.includes("drift: grok-box-005 same VERSION 5.3.1, sha f42c967≠adfdc04 — content drift ignored (D5)"),
+    );
+    expect(dbg.length).toBe(1); // exactly once per box per tick
+  });
+
+  test("older VERSION ⇒ drift yes, WOULD rollout names the versions and the target sha", async () => {
+    const lines: unknown[] = [];
+    const deps = driftDeps("5.3.0", "f42c967", { history: (l) => lines.push(l) });
+    await runReconcile(deps);
+    expect(snapDrift(lines)).toBe("yes");
+    expect(
+      logs.some((l) => l.includes("reconcile: WOULD rollout grok-box-005 5.3.0→5.3.1 (adfdc04)")),
+    ).toBe(true);
+    // the D5 debug line is for the versions-EQUAL case only.
+    expect(logs.some((l) => l.includes("content drift ignored (D5)"))).toBe(false);
+  });
+
+  test("a box AHEAD of target (5.4.0) is drifted and converges — mutant (x) kill", async () => {
+    // Direction is irrelevant: target is the authority. A `<` comparison would
+    // call this in-sync.
+    const lines: unknown[] = [];
+    const deps = driftDeps("5.4.0", "adfdc04", { history: (l) => lines.push(l) });
+    await runReconcile(deps);
+    expect(snapDrift(lines)).toBe("yes");
+    expect(logs.some((l) => l.includes("WOULD rollout grok-box-005 5.4.0→5.3.1 (adfdc04)"))).toBe(true);
+  });
+
+  test("box version unknown ⇒ drift unknown, no rollout", async () => {
+    // `v=` absent from the status line ⇒ splitVersion yields "unknown".
+    const lines: unknown[] = [];
+    const devs = JSON.stringify({
+      devices: [{ hostname: "grok-box-005", online: true, lastSeen: "2999-01-01T00:00:00Z", tags: ["t"], keyExpiryDisabled: true }],
+    });
+    const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv))
+        return result({ stdout: "LISTEN 0 128 127.0.0.1:20005 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND)
+        return result({ code: 0, stdout: "check=OK tunnel=up" });
+      return result({ code: 1 });
+    });
+    const deps = baseDeps({
+      keys,
+      runner,
+      apply: true,
+      targetBoxes: ["grok-box-005"],
+      targetSha: "adfdc04",
+      targetVersion: "5.3.1",
+      rollout: testRollout({ auto: false }),
+      history: (l) => lines.push(l),
+    });
+    await runReconcile(deps);
+    expect(snapDrift(lines)).toBe("unknown");
+    expect(logs.some((l) => l.includes("WOULD rollout"))).toBe(false);
+  });
+
+  test("targetVersion undefined ⇒ drift unknown, no rollout even when the shas differ", async () => {
+    const lines: unknown[] = [];
+    const deps = driftDeps("5.3.0", "f42c967", {
+      targetVersion: undefined,
+      history: (l) => lines.push(l),
+    });
+    await runReconcile(deps);
+    expect(snapDrift(lines)).toBe("unknown");
+    expect(logs.some((l) => l.includes("WOULD rollout"))).toBe(false);
   });
 });
 
