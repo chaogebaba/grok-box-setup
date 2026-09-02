@@ -10,9 +10,13 @@ hostname
 # H10: auth keys must never land in the tree even if dropped OUTSIDE secrets/.
 # A live tailnet key was once left at the repo root as auth_key.txt (untracked
 # but not ignored). Belt-and-braces filename patterns — no hook, no scanner.
+# Underscore AND hyphen spellings both count: `auth-key.txt` / `tskey.txt` used
+# to fall through the underscore-only patterns.
 auth_key.txt
 *authkey*
 *auth_key*
+*auth-key*
+tskey*
 tskey-*
 *.authkey
 
