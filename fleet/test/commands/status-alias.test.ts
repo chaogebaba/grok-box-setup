@@ -5,9 +5,10 @@ import { statusSummaryLines } from "../../src/commands/aliases.ts";
 import type { InventoryResult, ProbeResult } from "../../src/inventory.ts";
 
 /**
- * D5: `version` is now what decides the drift half of the summary (the MIXED
- * half still counts distinct shas, and says so in its own line). It defaults to
- * the target's 5.3.0 so a row is in-sync unless a test asks otherwise.
+ * D5: `version` decides BOTH halves of the summary — the drift half and the
+ * MIXED-version count. It defaults to the target's 5.3.0 so a row is in-sync
+ * unless a test asks otherwise; `sha` varies freely and must not move the
+ * MIXED line.
  */
 function row(
   box: string,
@@ -39,22 +40,37 @@ function res(rows: ProbeResult[], targetSha: string | null): InventoryResult {
 }
 
 describe("T6 status summary (F2 Q1 addendum, main:303/306)", () => {
-  test("MIXED-version when >1 distinct sha; drift when a box differs from target", () => {
-    // D5: the drift half needs a VERSION difference, so 005 is one release back.
+  test("MIXED-version when >1 distinct version; drift when a box differs from target", () => {
+    // D5: both halves need a VERSION difference, so 005 is one release back.
     const r = res([row("grok-box-3", "aaa"), row("grok-box-5", "bbb", "up", "5.2.0")], "aaa");
     const lines = statusSummaryLines(r);
-    expect(lines).toContain("status: fleet is MIXED-version (2 distinct shas); target=aaa");
+    expect(lines).toContain("status: fleet is MIXED-version (2 distinct versions); target=aaa");
     expect(lines).toContain("status: some boxes drift from target=aaa");
   });
 
-  test("D5: differing shas at the SAME version are MIXED but NOT drift", () => {
-    // The empirical r1 case at the status call site: two boxes on boxup 5.3.0
-    // stamped from different commits. The fleet is genuinely mixed-sha and the
-    // line says so, but neither box is drifted and neither will be rolled.
+  test("same version, different shas ⇒ no MIXED line", () => {
+    // The empirical case at the status call site: after any fleet2-only commit
+    // to main every box runs the same boxup version but carries a fresh stamped
+    // repo sha. That is neither mixed nor drifted, and the summary must be silent.
     const r = res([row("grok-box-3", "aaa"), row("grok-box-5", "bbb")], "aaa");
+    expect(statusSummaryLines(r)).toEqual([]);
+  });
+
+  test("three boxes, two versions ⇒ MIXED counts versions, not the three shas", () => {
+    const r = res(
+      [row("grok-box-3", "aaa"), row("grok-box-5", "bbb"), row("grok-box-9", "ccc", "up", "5.2.0")],
+      "aaa",
+    );
     const lines = statusSummaryLines(r);
-    expect(lines).toContain("status: fleet is MIXED-version (2 distinct shas); target=aaa");
-    expect(lines.some((l) => l.includes("drift"))).toBe(false);
+    expect(lines).toContain("status: fleet is MIXED-version (2 distinct versions); target=aaa");
+  });
+
+  test("unknown/'?' versions are excluded from the MIXED count", () => {
+    const r = res(
+      [row("grok-box-3", "aaa"), row("grok-box-5", "bbb", "up", "unknown"), row("grok-box-9", "ccc", "up", "?")],
+      "aaa",
+    );
+    expect(statusSummaryLines(r).some((l) => l.includes("MIXED-version"))).toBe(false);
   });
 
   test("all on target, single sha ⇒ no summary lines", () => {

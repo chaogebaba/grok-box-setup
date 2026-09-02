@@ -33,20 +33,25 @@ export const ROLLOUT_DIRTY_COMPAT_LINE =
 
 /**
  * status fleet summary lines from the inventory rows (F2 Q1 addendum, main:303/306).
- * MIXED-version when >1 distinct non-unknown sha across probed boxes; drift when
- * any probed box's sha != target sha. Returns the lines to log (may be empty).
+ * MIXED-version when >1 distinct non-unknown boxup VERSION across probed boxes;
+ * drift when any probed box's version != target version. Both halves are keyed
+ * on VERSION since D5 (62eebe6/1928c26): every fleet2-only commit to main
+ * restamps each box with a fresh repo sha at the SAME boxup version, so counting
+ * shas here reported a MIXED fleet with zero drift after every such commit.
+ * Returns the lines to log (may be empty).
  */
 export function statusSummaryLines(res: InventoryResult): string[] {
   const target = res.target;
   const lines: string[] = [];
-  const shas = new Set<string>();
+  const versions = new Set<string>();
   let anyDrift = false;
   for (const r of res.rows) {
-    if (r.sha !== "-" && r.sha !== "?" && r.sha !== "unknown") shas.add(r.sha);
+    if (r.version !== "-" && r.version !== "?" && r.version !== "unknown") versions.add(r.version);
     if (target && driftCell(r, target) === "yes") anyDrift = true;
   }
   const targetSha = target ? target.sha : "unknown";
-  if (shas.size > 1) lines.push(`status: fleet is MIXED-version (${shas.size} distinct shas); target=${targetSha}`);
+  if (versions.size > 1)
+    lines.push(`status: fleet is MIXED-version (${versions.size} distinct versions); target=${targetSha}`);
   if (anyDrift) lines.push(`status: some boxes drift from target=${targetSha}`);
   return lines;
 }
