@@ -7,7 +7,10 @@
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { openStore, type Store } from "../../src/store/db.ts";
 
-export const SCRATCH_ROOT = "/data/claude-scratch/worker-scratch/state-store-a";
+// Overridable so the same suite runs on a grok box, where /data belongs to
+// another user and /workspace is the writable tree.
+export const SCRATCH_ROOT =
+  process.env.FLEET_TEST_SCRATCH ?? "/data/claude-scratch/worker-scratch/state-store-a";
 
 /** A throwaway directory that the caller removes with `cleanup`. */
 export function scratchDir(prefix: string): string {
