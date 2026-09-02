@@ -483,7 +483,10 @@ path, no second implementation.
 
 ### Commands
 
-- `fleet2 version` — prints `fleet2 <version> (<git sha>) (bun <ver>)`.
+- `fleet2 version [--json]` — prints `fleet2 <version> (<git sha>) (bun <ver>)`, or `{name, version, sha, bun}`.
+- `fleet2 rc [--json]` — the exit-code table (see below). Needs no config, so it answers on any host.
+- `fleet2 ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd…]` — run one command on a box, or open a session. See "For agents" below.
+- `fleet2 list [--json]` — the tailnet peers named `grok-box-N`, with their Tailscale IP and online state.
 - `fleet2 inventory [--json] [box…]` — one row per enrolled box: `NAME API TUNNEL CHECK VERSION SHA TARGET DRIFT AUTHKEY`. `API` (online/offline + `lastSeen`) comes from the Tailscale devices endpoint (`GET /tailnet/<tailnet>/devices?fields=all`, Bearer token from the same 0600 file bash `fleet2` uses — `FLEET_API_TOKEN_FILE` > `[fleet-brain].api_token_file` > `$FLEET_ETC/api-token`); the API is unavailable ⇒ `?`. `TUNNEL` is the VPS-side `ss -tln` probe; a tunnel-down box shows `-` for CHECK/VERSION/SHA/DRIFT. Persists `$FLEET_STATE/inventory.json` atomically (0600, includes per-box `lastSeen`) — the first machine-readable fleet inventory. Always exits 0; `inventory` never fails on an unresolvable target (TARGET/DRIFT render `?`) nor on an API failure.
 - `fleet2 upgrade [--to REF] [--all | box…] [--apply] [--canary BOX] [--json]` — **dry-run by default**: prints the plan (`box  running v/sha  target v/sha  action`) and exits 0 without staging. `--apply` stages the tree once and deploys **serially**: canary first, then the rest in enrolled order. Tunnel-down non-canary ⇒ skip; in-sync ⇒ skip; **canary unreachable or verified-failure ⇒ ABORT** (zero others touched). Rollback is the same command with `--to <previous sha>` — no special path.
 
@@ -505,7 +508,16 @@ After the install command returns, fleet2 polls `/var/log/boxup-install.log` (wh
 
 ### Exit codes
 
-`0` ok · `1` verified failure / abort · `2` usage · `3` target/staging error · `6` refused (not on the VPS / missing box key / `reconcile.lock` held / `flock` missing).
+Run **`fleet2 rc`** (or `fleet2 rc --json`). The table is rendered from the `RC` constant in `fleet/src/upgrade.ts`, so it cannot go stale: `0` ok · `1` verified failure / abort · `2` usage · `3` target/staging/config · `4` enroll tunnel never came up, or `config push` render refused · `5` policy precheck refused, nothing written · `6` refused, nothing done (not on the VPS / missing box key / `reconcile.lock` held / `flock` missing) · `7` recorded, but the legacy file export failed · `124` `fleet2 ssh --timeout` elapsed · `255` ssh transport failure.
+
+### For agents (non-interactive callers)
+
+`fleet2` is meant to be driven by a script or an agent, not only by a human at a terminal. Four rules cover it.
+
+- **`fleet2 ssh <box> '<cmd>'` is a transparent remote exec.** stdout and stderr stream through unbuffered and in order, and the process exit code is the **remote** command's rc exactly (ssh's own `255` still means transport failure, never a remote rc). Pass **ONE quoted command string**: the remaining words are joined with a single space and handed to the remote login shell, exactly like bash's `"$*"`, so `fleet2 ssh grok-box-001 'cd /workspace && git status'` is right and relying on per-argument quoting is not. There is **no timeout by default**; `--timeout <seconds>` kills the command (SIGTERM, then SIGKILL five seconds later) and exits `124`, the `timeout(1)` convention. `--no-stdin` closes the child's stdin instead of inheriting it, and `--tty` forces a pty (`ssh -t`) for programs that need one. fleet2 adds nothing of its own to those streams, so whatever you parse is the box's output and nothing else.
+- **`--json` on every read command** — `list`, `status`, `inventory`, `version`, `rc`, `state check`, `state reconcile-files`, and `upgrade` in its dry-run form. The output is ONE JSON document on stdout with no trailing prose; without the flag the human rendering is unchanged. Setting **`FLEET2_JSON=1`** in the environment is equivalent wherever `--json` exists, so an agent can set it once for a whole session.
+- **stdout is data, stderr is diagnostics.** Errors, refusals and progress never appear on stdout, so `fleet2 status --json | jq .` is always safe to pipe. The one deliberate exception is `fleet2 ssh`, where stdout belongs to the remote command.
+- **No non-zero exit is silent.** Every failing path prints one line to stderr naming the command and the reason before it returns. The single exemption is a non-zero rc coming back from `fleet2 ssh`: that rc is the remote command's, and ssh's own stderr is already inherited.
 
 ### FLEET_CONFIG default (stated deviation)
 
