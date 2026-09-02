@@ -452,10 +452,16 @@ export class StoreState implements ReconcileStateApi {
     if (from === undefined || to === undefined) return;
     this.store.tx(() => {
       this.store.db.query("INSERT OR IGNORE INTO box_counters(box_id) VALUES(?)").run(to);
+      // COALESCE, because the OLD box may have no `box_counters` row at all:
+      // counter rows are created lazily on the first bump, so a box enrolled and
+      // renamed before its first failing tick has none, and the bare subselects
+      // returned NULL into two NOT NULL columns — which made `copyState` throw,
+      // which rename-wiring reported as "failed to copy brain state". Nothing
+      // inherits a count that was never recorded, so 0 is the right value.
       this.store.db
         .query(
-          `UPDATE box_counters SET checkfail = (SELECT checkfail FROM box_counters WHERE box_id = ?),
-                                   cfgfail   = (SELECT cfgfail   FROM box_counters WHERE box_id = ?)
+          `UPDATE box_counters SET checkfail = COALESCE((SELECT checkfail FROM box_counters WHERE box_id = ?), 0),
+                                   cfgfail   = COALESCE((SELECT cfgfail   FROM box_counters WHERE box_id = ?), 0)
            WHERE box_id = ?`,
         )
         .run(from, from, to);

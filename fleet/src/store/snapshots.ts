@@ -259,8 +259,16 @@ export function observedFor(store: Store, box: string): Observed | undefined {
   return (r?.o as Observed | undefined) ?? undefined;
 }
 
-/** D3 retention: 92 days of snapshots, once per tick. Children cascade. */
+/**
+ * D3 retention: 92 days of snapshots, once per tick. Children cascade.
+ *
+ * The count is taken with a SELECT rather than read off the DELETE: bun's
+ * `changes` includes the rows the ON DELETE CASCADE removed, so a naive read
+ * would report "pruned 13 snapshots" for one snapshot of twelve boxes.
+ */
 export function pruneSnapshots(store: Store, retentionDays: number, at: number): number {
-  const r = store.db.query("DELETE FROM snapshots WHERE ts < ?").run(at - retentionDays * 86400);
-  return Number(r.changes ?? 0);
+  const cutoff = at - retentionDays * 86400;
+  const n = (store.db.query("SELECT COUNT(*) AS n FROM snapshots WHERE ts < ?").get(cutoff) as { n: number }).n;
+  if (n > 0) store.db.query("DELETE FROM snapshots WHERE ts < ?").run(cutoff);
+  return n;
 }
