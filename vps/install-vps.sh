@@ -74,7 +74,7 @@ FLEET2_SHA256_ENV="${FLEET2_SHA256-}"
 FLEET2_RELEASE=v5.6.0
 # Placeholder until the first `make ts-release-build` writes the real digest.
 # Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
-FLEET2_SHA256=8a66a5fedd0dc47cd57634c32d267958cc07de404a8a1df3eee0e3a81b9040d4
+FLEET2_SHA256=194e86c67290a7e27f2f086b6b2a78522e8ced49b5aab0f702ce719628822944
 
 # D10 — the fetch ORIGIN is a seam so the security-critical paths (good fetch,
 # corrupt body, 404, a 200 whose body is an HTML error page) can be tested
