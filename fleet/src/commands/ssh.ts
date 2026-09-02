@@ -9,14 +9,25 @@
 // captured Runner call. It used to run through the Runner, which buffers stdout
 // and stderr into a result object that cmd_ssh then THREW AWAY, so a
 // non-interactive caller (an agent verifying a change) saw nothing at all. Now:
-//   * stdout/stderr are "inherit" — bytes stream through unbuffered, in order;
+//   * stdout/stderr are "inherit" — fleet2 hands ssh its OWN file descriptors,
+//     so nothing is buffered, copied or reordered on the way through. Note what
+//     that does and does not promise: each stream arrives in write order, but
+//     the RELATIVE order of the two is ssh's to lose, not fleet2's to keep.
+//     sshd reads the remote command's stdout and stderr pipes separately and
+//     packetises them, so writes that land in one read window arrive grouped
+//     (`o1 o2 o3 e1 e2 e3` for a tight loop) — measured identically with plain
+//     `ssh` and no fleet2 in the picture, and correctly interleaved as soon as
+//     the writes are ~300 ms apart. A caller that needs strict interleaving
+//     merges on the REMOTE side (`'cmd 2>&1'`) or asks for a pty with --tty;
 //   * stdin is "inherit" (or "ignore" with --no-stdin);
 //   * the process rc is the REMOTE command's rc exactly, and ssh's own 255
 //     (transport failure) stays 255;
 //   * there is NO fleet2 deadline by default. `--timeout <seconds>` kills the
 //     child (SIGTERM, then SIGKILL after 5 s) and exits 124, the timeout(1)
 //     convention (`fleet2 rc`);
-//   * `--tty` forces the interactive form (`ssh -t`) for programs needing a pty.
+//   * `--tty` forces the interactive form (`ssh -tt`) for programs needing a
+//     pty. -tt, not -t: -t only ASKS, and declines whenever the caller's own
+//     stdin is not a terminal — which is every agent that would reach for it.
 //
 // U4 exemption, deliberate: a non-zero REMOTE rc gets NO `fleet2: ssh: …` line.
 // The whole point of the command is that fleet2 adds nothing to the child's
@@ -49,6 +60,28 @@ const SSH_OPTS = [
   "-o",
   "BatchMode=no",
 ];
+
+/**
+ * Extra options for the NON-INTERACTIVE form only (gate-r1 finding 4).
+ *
+ * `StrictHostKeyChecking=accept-new` pins an unknown host key silently in every
+ * other respect, but ssh still announces it: `Warning: Permanently added
+ * 'grok-box-001' (ED25519) to the list of known hosts.` on STDERR. For a human
+ * that banner is the point. For an agent it is a one-shot, environment-
+ * dependent extra line in the middle of what U1 promises is the remote
+ * command's stderr and nothing else — a caller comparing stderr byte-for-byte
+ * passes on every host that has connected before and fails on a fresh one.
+ *
+ * LogLevel=ERROR drops that INFO-level banner and keeps everything that matters:
+ * a failed connection still prints `ssh: connect to host … Connection timed
+ * out` (rc 255), and a CHANGED host key is still a fatal ERROR that refuses the
+ * connection. Verified on a fresh known_hosts before it was adopted.
+ *
+ * The INTERACTIVE form deliberately does NOT get this: a person opening a
+ * session should see the banner, and D11(a) keeps that form on ssh's own
+ * defaults and the user's own known_hosts.
+ */
+export const QUIET_OPTS = ["-o", "LogLevel=ERROR"];
 
 /** ssh_password (main:108): FLEET_SSH_PASSWORD env > [ssh].password > default. */
 export function resolveSshPassword(
@@ -86,7 +119,7 @@ export interface SshPlan {
   box: string;
   /** The remote command ("$*" join), or undefined for an interactive session. */
   command?: string;
-  /** --tty: use `ssh -t` and the interactive (pty) form even with a command. */
+  /** --tty: use `ssh -tt` and the interactive (pty) form even with a command. */
   tty: boolean;
   /** stdin mode for the non-interactive form. */
   stdin: "inherit" | "ignore";
@@ -164,13 +197,17 @@ export const SSH_HELP = [
   "",
   "  no cmd            interactive session (inherited stdio)",
   "  <cmd...>          transparent remote exec: stdout/stderr stream through, rc is the REMOTE rc",
-  "  --tty             force a pty (ssh -t) for programs that need one",
+  "  --tty             force a pty (ssh -tt) for programs that need one",
   "  --no-stdin        close the child's stdin instead of inheriting it",
   "  --timeout <s>     kill the remote command after <s> seconds (SIGTERM, SIGKILL after 5s) and exit 124",
   "  --                end fleet2 flags; everything after it is command text",
   "",
   "Pass ONE quoted command string: the words are joined with a single space and",
   "run by the remote login shell, exactly like bash's \"$*\".",
+  "",
+  "stdout and stderr each arrive in write order. Their relative order is ssh's to",
+  "keep, not fleet2's: a tight loop writing to both arrives grouped per stream.",
+  "Merge on the remote side ('cmd 2>&1') or use --tty if you need interleaving.",
   "",
   RC_POINTER_LINE,
   "",
@@ -280,13 +317,20 @@ export async function cmdSsh(args: string[], deps: SshDeps): Promise<number> {
   // rc = ssh's.
   if (plan.command === undefined || plan.tty) {
     const spawner = deps.interactive ?? bunInteractiveSpawner;
-    const extra = plan.tty ? ["-t"] : [];
+    // `-tt`, not `-t`: a single -t asks for a pty only when the CLIENT's stdin
+    // is itself a terminal, and prints `Pseudo-terminal will not be allocated
+    // because stdin is not a terminal` and runs without one otherwise. An agent
+    // reaching for --tty is by definition not at a terminal, so the flag would
+    // have been a no-op exactly for the caller who asked for it. -tt forces it.
+    const extra = plan.tty ? ["-tt"] : [];
     return spawner.spawn(sshCmdArgv(plan.box, plan.command, extra), { SSHPASS: pw });
   }
 
-  // Non-interactive: TRANSPARENT exec. No Runner (it captures and discards).
+  // Non-interactive: TRANSPARENT exec. No Runner (it captures and discards),
+  // and NOT the interactive spawner either — this form must be signalable for
+  // --timeout and must choose its own stdin mode.
   const spawner = deps.exec ?? bunExecSpawner;
-  const child = spawner.spawn(sshCmdArgv(plan.box, plan.command), { SSHPASS: pw }, { stdin: plan.stdin });
+  const child = spawner.spawn(sshCmdArgv(plan.box, plan.command, QUIET_OPTS), { SSHPASS: pw }, { stdin: plan.stdin });
 
   if (plan.timeoutSecs === undefined) {
     const code = await child.exited;
