@@ -1,6 +1,6 @@
 // lifecycle.test.ts — the r1-gate blocker regression test.
 //
-// The bug: `fleet2 serve` logged "listening" then EXITED immediately, because
+// The bug: `grokfleet serve` logged "listening" then EXITED immediately, because
 // cli.ts does `process.exit(rc)` after main() resolves and cmdServe used to
 // resolve right after Bun.serve — so the socket died with the process and curl
 // got connection refused on the VPS. An in-process handler test CANNOT catch
@@ -8,13 +8,13 @@
 // event loop). So this test SPAWNS the real binary: it must still be alive and
 // answering /v1/health after ~2s, and a SIGTERM must produce a CLEAN exit 0.
 //
-// Uses the COMPILED binary (dist/fleet2) when present AND current, else falls
+// Uses the COMPILED binary (dist/grokfleet) when present AND current, else falls
 // back to `bun run src/cli.ts` (same code path through main() → process.exit).
 // `dist/` is gitignored and nothing rebuilds it on checkout, so any dev who ran
 // `make ts-build` at an older release keeps a binary that answers /v1/health
 // with the OLD version and fails the SERVE_VERSION assertion below. The binary
-// is therefore used only when `dist/fleet2 version` reports SERVE_VERSION;
-// FLEET2_TEST_BIN overrides the whole choice for a caller that knows better.
+// is therefore used only when `dist/grokfleet version` reports SERVE_VERSION;
+// GROKFLEET_TEST_BIN overrides the whole choice for a caller that knows better.
 
 import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
@@ -33,13 +33,13 @@ afterEach(() => {
   }
 });
 
-/** `fleet2 version` prints `fleet2 <ver> (<sha>) (bun <v>)`; pull out <ver>.
+/** `grokfleet version` prints `grokfleet <ver> (<sha>) (bun <v>)`; pull out <ver>.
  *  Returns undefined when the binary will not run or prints something else. */
 export function binaryVersion(bin: string): string | undefined {
   try {
     const r = Bun.spawnSync([bin, "version"], { stdout: "pipe", stderr: "pipe" });
     if (r.exitCode !== 0) return undefined;
-    const m = /^fleet2 (\S+)/.exec(new TextDecoder().decode(r.stdout).trim());
+    const m = /^grokfleet (\S+)/.exec(new TextDecoder().decode(r.stdout).trim());
     return m?.[1];
   } catch {
     return undefined;
@@ -53,15 +53,15 @@ function sourceCommand(): string[] {
 }
 
 /**
- * Resolve how to launch `fleet2 serve`. The compiled binary is preferred, but
- * ONLY when it reports SERVE_VERSION — a stale `dist/fleet2` left over from an
+ * Resolve how to launch `grokfleet serve`. The compiled binary is preferred, but
+ * ONLY when it reports SERVE_VERSION — a stale `dist/grokfleet` left over from an
  * older release would answer /v1/health with its own version and fail the test
  * for a reason that has nothing to do with the lifecycle bug under test.
- * `forced` (FLEET2_TEST_BIN) skips the check entirely.
+ * `forced` (GROKFLEET_TEST_BIN) skips the check entirely.
  */
 export function resolveServeCommand(compiled: string, forced?: string): string[] {
   if (forced !== undefined && forced !== "") {
-    console.log(`lifecycle: FLEET2_TEST_BIN forces ${forced}`);
+    console.log(`lifecycle: GROKFLEET_TEST_BIN forces ${forced}`);
     return [forced, "serve"];
   }
   if (existsSync(compiled)) {
@@ -74,12 +74,12 @@ export function resolveServeCommand(compiled: string, forced?: string): string[]
       `lifecycle: ignoring STALE ${compiled} (reports ${v ?? "no version"}, need ${SERVE_VERSION}) — running from source`,
     );
   }
-  console.log("lifecycle: running fleet2 serve from source via bun");
+  console.log("lifecycle: running grokfleet serve from source via bun");
   return sourceCommand();
 }
 
 function serveCommand(): string[] {
-  return resolveServeCommand(join(import.meta.dir, "..", "..", "dist", "fleet2"), process.env.FLEET2_TEST_BIN);
+  return resolveServeCommand(join(import.meta.dir, "..", "..", "dist", "grokfleet"), process.env.GROKFLEET_TEST_BIN);
 }
 
 /** Poll GET /v1/health until it answers or the deadline passes. */
@@ -97,7 +97,7 @@ async function waitHealthy(port: number, deadlineMs: number): Promise<Response |
 }
 
 function scratchEnv(): { dir: string; etc: string; state: string } {
-  const dir = mkdtempSync(join(tmpdir(), "fleet2-serve-life-"));
+  const dir = mkdtempSync(join(tmpdir(), "grokfleet-serve-life-"));
   dirs.push(dir);
   const etc = join(dir, "etc");
   const state = join(dir, "state");
@@ -240,11 +240,11 @@ describe("cmdServe graceful-shutdown seam (in-process unit)", () => {
 });
 
 describe("serve launcher picks a CURRENT binary or falls back to source", () => {
-  /** A stand-in `fleet2` whose `version` output the test controls. */
+  /** A stand-in `grokfleet` whose `version` output the test controls. */
   function fakeBinary(line: string): string {
-    const dir = mkdtempSync(join(tmpdir(), "fleet2-fakebin-"));
+    const dir = mkdtempSync(join(tmpdir(), "grokfleet-fakebin-"));
     dirs.push(dir);
-    const bin = join(dir, "fleet2");
+    const bin = join(dir, "grokfleet");
     writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(line)}\n`);
     chmodSync(bin, 0o755);
     return bin;
@@ -253,7 +253,7 @@ describe("serve launcher picks a CURRENT binary or falls back to source", () => 
   const fromSource = (cmd: string[]): boolean => cmd[0] === process.execPath && cmd[1] === "run";
 
   test("a STALE binary is ignored and the launcher runs from source", () => {
-    const stale = fakeBinary("fleet2 0.0.1 (deadbee) (bun 1.0.0)");
+    const stale = fakeBinary("grokfleet 0.0.1 (deadbee) (bun 1.0.0)");
     expect(binaryVersion(stale)).toBe("0.0.1");
     const cmd = resolveServeCommand(stale);
     expect(fromSource(cmd)).toBe(true);
@@ -262,7 +262,7 @@ describe("serve launcher picks a CURRENT binary or falls back to source", () => 
   });
 
   test("a CURRENT binary is used", () => {
-    const current = fakeBinary(`fleet2 ${SERVE_VERSION} (abc1234) (bun 1.4.0)`);
+    const current = fakeBinary(`grokfleet ${SERVE_VERSION} (abc1234) (bun 1.4.0)`);
     expect(resolveServeCommand(current)).toEqual([current, "serve"]);
   });
 
@@ -271,11 +271,11 @@ describe("serve launcher picks a CURRENT binary or falls back to source", () => 
     expect(binaryVersion(mute)).toBeUndefined();
     expect(fromSource(resolveServeCommand(mute))).toBe(true);
     // and a path that does not exist at all
-    expect(fromSource(resolveServeCommand(join(tmpdir(), "definitely-not-here", "fleet2")))).toBe(true);
+    expect(fromSource(resolveServeCommand(join(tmpdir(), "definitely-not-here", "grokfleet")))).toBe(true);
   });
 
-  test("FLEET2_TEST_BIN wins over the staleness check", () => {
-    const stale = fakeBinary("fleet2 0.0.1 (deadbee) (bun 1.0.0)");
+  test("GROKFLEET_TEST_BIN wins over the staleness check", () => {
+    const stale = fakeBinary("grokfleet 0.0.1 (deadbee) (bun 1.0.0)");
     expect(resolveServeCommand(stale, stale)).toEqual([stale, "serve"]);
   });
 });

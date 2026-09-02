@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// cli.ts — fleet2 entry. Hand-rolled arg parsing: `fleet2 <cmd> [flags]`.
+// cli.ts — grokfleet entry. Hand-rolled arg parsing: `grokfleet <cmd> [flags]`.
 //
 // Phase 3 (D1): the full operator surface. Commands: version | help | list |
 // status | check | rollout | ssh | remove-timer | install-timer(retired) |
@@ -8,16 +8,16 @@
 // wiring is here.
 //
 // Exit codes (D9): the table is NOT duplicated here. `RC` in upgrade.ts is the
-// one constant and `commands/rc.ts` renders it — run `fleet2 rc` (agent-ux U3).
+// one constant and `commands/rc.ts` renders it — run `grokfleet rc` (agent-ux U3).
 // Notable entries: 6 covers both the VPS-only refusal and the state-store D8
 // reconcile-lock timeout ("refused, nothing done"), and 7 is state-store
 // D6/r6-B2 "recorded; export failed" — the store write COMMITTED and the
 // mutation succeeded, but the legacy export a rolled-back 5.7.1 would read is
-// stale. `fleet-reconcile.service` carries SuccessExitStatus=7 so a lagging
+// stale. `grokfleet-reconcile.service` carries SuccessExitStatus=7 so a lagging
 // export does not park the oneshot unit in `failed` every five minutes.
 //
 // For agents (agent-ux): stdout is DATA, stderr is diagnostics; every read
-// command takes `--json` (or FLEET2_JSON=1); no non-zero rc is silent.
+// command takes `--json` (or GROKFLEET_JSON=1); no non-zero rc is silent.
 
 import { resolveEnv } from "./env.ts";
 import { BunRunner } from "./runner.ts";
@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.9.0"; // state-store Phase B: explicit phase, enrol saga, snapshots in the store.
+const PKG_VERSION = "5.10.0"; // 5.10.0: the brain is named grokfleet everywhere the operator sees it.
 
 async function gitShaFromGit(): Promise<string> {
   try {
@@ -67,7 +67,7 @@ async function gitShaFromGit(): Promise<string> {
   }
 }
 
-/** Resolve the git sha for `fleet2 version` (build-embedded, else runtime git). */
+/** Resolve the git sha for `grokfleet version` (build-embedded, else runtime git). */
 export async function resolveGitSha(buildSha: string, runGit: () => Promise<string>): Promise<string> {
   if (buildSha !== "") return buildSha;
   return runGit();
@@ -98,9 +98,9 @@ async function main(argv: string[]): Promise<number> {
 
   if (decision.kind === "version") {
     const sha = await resolveGitSha(buildGitSha, gitShaFromGit);
-    // U2: `--json` (or FLEET2_JSON) ⇒ {name, version, sha, bun}.
+    // U2: `--json` (or GROKFLEET_JSON) ⇒ {name, version, sha, bun}.
     if (wantsJson(args.slice(1))) {
-      stdout(JSON.stringify({ name: "fleet2", version: PKG_VERSION, sha, bun: Bun.version }, null, 2) + "\n");
+      stdout(JSON.stringify({ name: "grokfleet", version: PKG_VERSION, sha, bun: Bun.version }, null, 2) + "\n");
       return RC.OK;
     }
     return emit(decision, versionString(PKG_VERSION, sha, Bun.version), stdout, stderr);
@@ -197,7 +197,7 @@ async function main(argv: string[]): Promise<number> {
       });
     }
 
-    // --- fleet2 admin panel (TUI-D11) ---
+    // --- grokfleet admin panel (TUI-D11) ---
     case "serve": {
       // VPS-only (refuseVpsOnly precedent, rc 6) — the API drives boxes over the
       // reverse tunnels, so it only makes sense on the VPS.
@@ -259,13 +259,13 @@ function devicesBodySource(env: ReturnType<typeof resolveEnv>, cfg: ParsedConfig
 // --- inventory / status / check / upgrade / rollout wiring ------------------
 
 function parseBoxArgs(rest: string[], label: string): { boxes: string[]; json: boolean } | number {
-  // U2: FLEET2_JSON=1 is equivalent to --json wherever --json exists.
+  // U2: GROKFLEET_JSON=1 is equivalent to --json wherever --json exists.
   let json = wantsJson(rest);
   const explicit: string[] = [];
   for (const a of rest) {
     if (a === "--json") json = true;
     else if (a === "--help" || a === "-h") {
-      stdout(`see \`fleet2 help\`\nexit codes: fleet2 rc\n`);
+      stdout(`see \`grokfleet help\`\nexit codes: grokfleet rc\n`);
       return RC.OK;
     } else if (a.startsWith("--")) {
       log(`${label}: unknown flag ${a}`);
@@ -371,7 +371,7 @@ function parseUpgradeArgs(rest: string[], canaryDefault: string): {
   let to: string | undefined;
   let all = false;
   let apply = false;
-  // U2: FLEET2_JSON=1 is equivalent to --json here too.
+  // U2: GROKFLEET_JSON=1 is equivalent to --json here too.
   let json = wantsJson(rest);
   let debugExec = false;
   let dirty = false;
@@ -432,13 +432,13 @@ async function runUpgradeCmd(
     notifyDeps: { telegramEnvPath: env.FLEET_TELEGRAM_ENV, source: fsTelegramSource, poster: fetchPoster },
   };
 
-  if (p.apply && !env.FLEET2_LOCKED) {
+  if (p.apply && !env.GROKFLEET_LOCKED) {
     // U4: every arm of takeLockAndReexec that refuses already logs its reason,
     // and the child that DID run owns its own diagnostics on inherited stderr.
     const lr = await takeLockAndReexec(deps, process.argv, p.debugExec);
     return lr.rc;
   }
-  if (p.apply && env.FLEET2_LOCKED && p.debugExec) {
+  if (p.apply && env.GROKFLEET_LOCKED && p.debugExec) {
     process.stderr.write(`exec: locked pid=${process.pid}\n`);
   }
 
@@ -454,7 +454,7 @@ async function runUpgradeCmd(
     stdout(res.summary + "\n");
   }
   // U4: the summary is DATA on stdout, so a non-zero rc still needs its one
-  // stderr line — otherwise `fleet2 upgrade --apply` fails silently for anyone
+  // stderr line — otherwise `grokfleet upgrade --apply` fails silently for anyone
   // reading only stderr (a systemd unit, an agent checking rc).
   if (res.rc !== RC.OK) log(`${alias ? "rollout" : "upgrade"}: ${res.summary}`);
   return res.rc;
@@ -506,7 +506,7 @@ async function runReconcileCmd(
     else if (a === "--dry-run") apply = false;
     else if (a === "--debug-exec") debugExec = true;
     else if (a === "--help" || a === "-h") {
-      stdout("see `fleet2 help`\nexit codes: fleet2 rc\n");
+      stdout("see `grokfleet help`\nexit codes: grokfleet rc\n");
       return RC.OK;
     } else {
       log(`reconcile: unknown arg '${a}'`);
@@ -516,7 +516,7 @@ async function runReconcileCmd(
   const rc = await cliReconcile({ env, cfg, rollout, apply, debugExec, argv, version: PKG_VERSION });
   // U4: cliReconcile's own arms log, but a rc it invents without a line would
   // otherwise be silent — name the code so the tick is never a mystery.
-  if (rc !== RC.OK) log(`reconcile: pass finished with rc ${rc} (see the lines above; fleet2 rc)`);
+  if (rc !== RC.OK) log(`reconcile: pass finished with rc ${rc} (see the lines above; grokfleet rc)`);
   return rc;
 }
 

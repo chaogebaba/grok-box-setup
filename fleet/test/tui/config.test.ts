@@ -18,8 +18,8 @@ function fs(over: {
 }
 
 describe("resolveTuiConfig", () => {
-  test("env override wins (FLEET2_ADMIN_URL/TOKEN), config not even required", () => {
-    const c = resolveTuiConfig(fs({ missing: true, env: { FLEET2_ADMIN_URL: "http://h:9891/", FLEET2_ADMIN_TOKEN: "T" } }));
+  test("env override wins (GROKFLEET_ADMIN_URL/TOKEN), config not even required", () => {
+    const c = resolveTuiConfig(fs({ missing: true, env: { GROKFLEET_ADMIN_URL: "http://h:9891/", GROKFLEET_ADMIN_TOKEN: "T" } }));
     expect(c).toEqual({ url: "http://h:9891", token: "T" }); // trailing slash stripped
   });
   test("reads url+token from a mode-600 tui.toml", () => {
@@ -37,7 +37,7 @@ describe("resolveTuiConfig", () => {
     expect(() => resolveTuiConfig(fs({ missing: true, env: {} }))).toThrow(/url, token/);
   });
   test("env url + file token compose", () => {
-    const c = resolveTuiConfig(fs({ body: `token = "FT"\n`, mode: 0o600, env: { FLEET2_ADMIN_URL: "http://envh" } }));
+    const c = resolveTuiConfig(fs({ body: `token = "FT"\n`, mode: 0o600, env: { GROKFLEET_ADMIN_URL: "http://envh" } }));
     expect(c).toEqual({ url: "http://envh", token: "FT" });
   });
 });

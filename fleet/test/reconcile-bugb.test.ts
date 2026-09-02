@@ -18,7 +18,7 @@ function runCli(env: Record<string, string>): { stderr: string; stdout: string; 
 
 describe("T13 BUG-B: locked child's stderr reaches the parent (F3 inherit)", () => {
   test("reconcile --dry-run: stderr has lines and 'reconcile: start' is present", () => {
-    const dir = mkdtempSync(`${tmpdir()}/fleet2-bugb-`);
+    const dir = mkdtempSync(`${tmpdir()}/grokfleet-bugb-`);
     const state = `${dir}/state`;
     const etc = `${dir}/etc`;
     const key = `${etc}/box_access_ed25519`;
@@ -45,7 +45,7 @@ describe("T13 BUG-B: locked child's stderr reaches the parent (F3 inherit)", () 
   });
 
   test("T14b: the API token bytes never appear in the child's stderr", () => {
-    const dir = mkdtempSync(`${tmpdir()}/fleet2-t14b-`);
+    const dir = mkdtempSync(`${tmpdir()}/grokfleet-t14b-`);
     const state = `${dir}/state`;
     const etc = `${dir}/etc`;
     Bun.spawnSync(["mkdir", "-p", state, etc]);

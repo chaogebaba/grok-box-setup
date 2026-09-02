@@ -2,7 +2,7 @@
 //
 // Every test injects a FakeRunner that records the argv of each call and
 // returns a scripted result chosen by a matcher. This is the sole seam between
-// the fleet2 logic and a real process, so every path is exercised without a box.
+// the grokfleet logic and a real process, so every path is exercised without a box.
 
 import type { Runner, RunOpts, RunResult } from "../src/runner.ts";
 

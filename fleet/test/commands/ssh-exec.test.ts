@@ -1,4 +1,4 @@
-// ssh-exec.test.ts — agent-ux U1/U6: `fleet2 ssh <box> <cmd>` is a TRANSPARENT
+// ssh-exec.test.ts — agent-ux U1/U6: `grokfleet ssh <box> <cmd>` is a TRANSPARENT
 // remote exec, not a captured Runner call.
 //
 // Mutant (a) in ANY shape — back through the capturing Runner, or across to the
@@ -156,7 +156,7 @@ describe("U1 argument parsing", () => {
     cap.restore();
     expect(rc).toBe(RC.USAGE);
     expect(cap.lines.length).toBe(1);
-    expect(cap.lines[0]).toContain("usage: fleet2 ssh");
+    expect(cap.lines[0]).toContain("usage: grokfleet ssh");
     expect(ex.seen.length).toBe(0);
   });
 
@@ -169,7 +169,7 @@ describe("U1 argument parsing", () => {
     });
     expect(rc).toBe(RC.OK);
     expect(text).toBe(SSH_HELP);
-    expect(text).toContain("exit codes: fleet2 rc");
+    expect(text).toContain("exit codes: grokfleet rc");
     expect(text).toContain("--timeout <s>");
   });
 });
@@ -194,7 +194,7 @@ describe("U1 seam selection (mutant (a), any shape)", () => {
       const isp = spySpawner(0);
       const rc = await cmdSsh(f.args, { runner, cfg: EMPTY_CFG, exec: ex.spawner, interactive: isp.spawner });
       expect(rc).toBe(0);
-      // the capturing Runner is never right for any form of `fleet2 ssh`.
+      // the capturing Runner is never right for any form of `grokfleet ssh`.
       expect(runner.calls.length).toBe(0);
       expect(ex.seen.length).toBe(f.seam === "exec" ? 1 : 0);
       expect(isp.calls.length).toBe(f.seam === "interactive" ? 1 : 0);
@@ -240,7 +240,7 @@ describe("U1 seam selection (mutant (a), any shape)", () => {
     }
   });
 
-  test("a non-zero REMOTE rc prints NO fleet2 line (the documented U4 exemption)", async () => {
+  test("a non-zero REMOTE rc prints NO grokfleet line (the documented U4 exemption)", async () => {
     const cap = captureLog();
     const ex = fakeExec(3);
     const rc = await cmdSsh(["grok-box-001", "false"], {
@@ -250,7 +250,7 @@ describe("U1 seam selection (mutant (a), any shape)", () => {
     });
     cap.restore();
     expect(rc).toBe(3);
-    // fleet2 adds nothing to the child's streams; ssh's own stderr is inherited.
+    // grokfleet adds nothing to the child's streams; ssh's own stderr is inherited.
     expect(cap.lines).toEqual([]);
   });
 

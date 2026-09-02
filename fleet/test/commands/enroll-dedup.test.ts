@@ -23,7 +23,7 @@ const roots: string[] = [];
 const savedEnv: Record<string, string | undefined> = {};
 
 function scratch(): { env: ReturnType<typeof testEnv>; ak: string; map: string } {
-  const root = mkdtempSync(`${tmpdir()}/fleet2-dedup-`);
+  const root = mkdtempSync(`${tmpdir()}/grokfleet-dedup-`);
   roots.push(root);
   const etc = `${root}/etc`;
   mkdirSync(etc, { recursive: true });

@@ -54,7 +54,7 @@ describe("T4 render", () => {
 });
 
 describe("T4 diff (F12)", () => {
-  // D11(c): `fleet2 config diff` now gates on tunnelUp, so every runner in this
+  // D11(c): `grokfleet config diff` now gates on tunnelUp, so every runner in this
   // block must answer the `ss -tlnp` probe with a healthy sshd-owned listener on
   // grok-box-8's port. A squatter or an absent listener is its own test below.
   const SS_UP =

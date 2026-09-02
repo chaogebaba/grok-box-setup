@@ -1,4 +1,4 @@
-// upgrade.ts — `fleet2 upgrade [--to REF] [--all|box…] [--apply] [--canary BOX]
+// upgrade.ts — `grokfleet upgrade [--to REF] [--all|box…] [--apply] [--canary BOX]
 // [--json] [--debug-exec]` (D8, F1-F6, G1-G4, H1-H2).
 //
 // Dry-run is the DEFAULT (M01 precedent): print the plan, exit 0, stage nothing.
@@ -37,7 +37,7 @@ const POLL_TIMEOUT_MS = 20_000;
 const CHECK_TIMEOUT_MS = 20_000;
 
 /**
- * Exit codes (D9). THE table — `fleet2 rc` renders from this constant and
+ * Exit codes (D9). THE table — `grokfleet rc` renders from this constant and
  * `commands/rc.ts:RC_MEANING` must carry a line for every distinct number here
  * (TypeScript enforces it), so the documented table cannot drift from the code
  * (agent-ux U3).
@@ -64,7 +64,7 @@ export const RC = {
    * Same NUMBER as REFUSED — 6 has always meant "refused, nothing was done", and
    * lock-busy is that. Named separately because the reason differs.
    *
-   * `fleet2 rename` returns 1 for the same condition (commands/rename.ts:163-166):
+   * `grokfleet rename` returns 1 for the same condition (commands/rename.ts:163-166):
    * an existing inconsistency, named here and deliberately left alone.
    */
   LOCK_BUSY: 6,
@@ -74,20 +74,20 @@ export const RC = {
    * read is stale. 5 was already `enroll`'s policy-precheck refusal, where
    * nothing was written, so 7 is the first free code.
    *
-   * `fleet-reconcile.service` carries `SuccessExitStatus=7` (vps/install-vps.sh)
+   * `grokfleet-reconcile.service` carries `SuccessExitStatus=7` (vps/install-vps.sh)
    * so a lagging export does not park the oneshot unit in `failed` every five
    * minutes — the notify is the signal.
    */
   EXPORT_FAILED: 7,
   /**
-   * `fleet2 ssh --timeout <s>` elapsed and fleet2 killed the child (SIGTERM,
+   * `grokfleet ssh --timeout <s>` elapsed and grokfleet killed the child (SIGTERM,
    * then SIGKILL after a grace window). The timeout(1) convention, so a shell
    * wrapper already knows what 124 means (agent-ux U1).
    */
   TIMEOUT: 124,
   /**
    * ssh transport failure — the box was unreachable. Passed through from ssh(1)
-   * verbatim so `fleet2 ssh` is transparent: 255 is never a remote command's rc.
+   * verbatim so `grokfleet ssh` is transparent: 255 is never a remote command's rc.
    */
   TRANSPORT: 255,
 } as const;
@@ -163,7 +163,7 @@ export interface UpgradeDeps {
 
 /**
  * Compute the flock child argv (G3). In a compiled binary process.execPath IS
- * fleet2 and argv[1] must NOT be re-passed; under `bun run` execPath is bun and
+ * grokfleet and argv[1] must NOT be re-passed; under `bun run` execPath is bun and
  * argv[1] (the entry .ts) MUST be re-passed.
  */
 export function reexecArgv(
@@ -202,8 +202,8 @@ export async function takeLockAndReexec(
     process.stderr.write(`exec: ${JSON.stringify(child)}\n`);
   }
   // Spawn OUTSIDE the Runner seam with inherited stdio (F2). The child owns the
-  // whole locked pass; there is no fleet2 deadline on it.
-  const r = await spawnReexec(child, { FLEET2_LOCKED: "1" }, deps.spawner);
+  // whole locked pass; there is no grokfleet deadline on it.
+  const r = await spawnReexec(child, { GROKFLEET_LOCKED: "1" }, deps.spawner);
   if (!r.launched) {
     // ENOENT — flock not on PATH.
     log("upgrade: refused — util-linux flock not found on PATH (needed for reconcile.lock)");
@@ -214,7 +214,7 @@ export async function takeLockAndReexec(
     return { rc: RC.REFUSED, ran: false };
   }
   if (r.code === 6) {
-    log("upgrade: refused — reconcile.lock held (reconciler tick or another fleet2 running)");
+    log("upgrade: refused — reconcile.lock held (reconciler tick or another grokfleet running)");
     return { rc: RC.REFUSED, ran: false };
   }
   return { rc: r.code ?? RC.FAILURE, ran: true };
@@ -360,10 +360,10 @@ async function buildPlan(
     let action: BoxAction;
     // D5 — one rule, two call sites: in-sync is a boxup VERSION match, the same
     // key row-d drift uses (reconcile/run.ts). The stamped sha is informational:
-    // a fleet2-only commit moves it without changing the box payload, and
+    // a grokfleet-only commit moves it without changing the box payload, and
     // planning on it made every box look upgradeable after every release.
     // Unknown on either side ("-" not probed, "?" unparsed, target "unknown" when
-    // the ref has no VERSION file) is NOT in-sync — `fleet2 upgrade` is an
+    // the ref has no VERSION file) is NOT in-sync — `grokfleet upgrade` is an
     // explicit operator command on a named set, so it deploys rather than
     // silently skipping a box it could not read. (Reconcile's automatic row d
     // takes the opposite default: unknown never rolls.)
@@ -578,7 +578,7 @@ export function storeRecordOutcomes(env: Env): (rows: UpgradeRecord[]) => void {
       store.tx(() => {
         for (const r of rows) {
           store.audit({
-            actor: "fleet2",
+            actor: "grokfleet",
             action: "upgrade",
             box: r.box,
             rc: r.result === "ok" ? 0 : 1,

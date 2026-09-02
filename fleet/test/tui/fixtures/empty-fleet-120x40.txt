@@ -1,4 +1,4 @@
-fleet2 0 boxes  ● 0  ◆ 0  ✖ 0  ☾ 0  apply off  tick 10s   admin  link ● up                                              
+grokfleet 0 boxes  ● 0  ◆ 0  ✖ 0  ☾ 0  apply off  tick 10s   admin  link ● up                                              
 
   NAME          TUNNEL CHECK VER     DRIFT    CONFIG  EXPIRY
 (no boxes)

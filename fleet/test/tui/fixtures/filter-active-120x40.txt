@@ -1,4 +1,4 @@
-fleet2 30 boxes  ● 19  ◆ 5  ✖ 4  ☾ 2  apply off  tick 10s   admin  link ● up                                            
+grokfleet 30 boxes  ● 19  ◆ 5  ✖ 4  ☾ 2  apply off  tick 10s   admin  link ● up                                            
 
   NAME          TUNNEL CHECK VER     DRIFT    CONFIG  EXPIRY                                                              ╭─ grok-box-011 ─────────────────────────────╮
 ● grok-box-001  up     OK    5.3.0   no       in-sync 40d                 │tunnel down · check FAIL · ver 5.3.0        │

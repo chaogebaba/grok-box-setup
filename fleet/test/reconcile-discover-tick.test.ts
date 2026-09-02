@@ -214,7 +214,7 @@ describe("D7 the summary reaches GET /v1/fleet", () => {
       boxes: [],
       discover: { candidates: 2, adopted: 1, repaired: 0, skipped: [{ name: "grok-box-004", reason: "unreachable" }] },
     };
-    const state = SCRATCH.dir("fleet2-disc");
+    const state = SCRATCH.dir("grokfleet-disc");
     dirs.push(state);
     seedSnapshots(state, [withDiscover], { firstTick: 1 });
     const ctx = await fakeContext({ enrolled: [] });

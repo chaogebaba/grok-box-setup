@@ -8,7 +8,10 @@
 
 import type { Scope } from "./tokens.ts";
 
-const JSON_HEADERS = { "content-type": "application/json" };
+// N1: every response names the product. `server` is the one header a client
+// (or a curl by hand) sees without parsing a body.
+export const SERVER_HEADER = "grokfleet";
+const JSON_HEADERS = { "content-type": "application/json", server: SERVER_HEADER };
 
 /** A JSON 200/2xx response with an arbitrary body. */
 export function jsonOk(body: unknown, status = 200): Response {
@@ -38,9 +41,9 @@ export const err = {
    * endpoints refuse — they share the reconcile lock and would otherwise write
    * to a database that has declared itself corrupt. READONLY endpoints keep
    * serving the last data, so the TUI stays useful while an operator runs
-   * `fleet2 state check` or `fleet2 state restore`.
+   * `grokfleet state check` or `grokfleet state restore`.
    */
-  integrityFailed: (msg = "state store failed quick_check — run 'fleet2 state check'") =>
+  integrityFailed: (msg = "state store failed quick_check — run 'grokfleet state check'") =>
     jsonError(503, "integrity_failed", msg),
 };
 

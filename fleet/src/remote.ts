@@ -36,7 +36,7 @@ export function assertRemoteValue(parameter: string, value: string): void {
 
 /**
  * Render the install command (single line, `;`-joined) per G1 + H1. The leading
- * `sudo truncate -s 0 <log>` (H1) means fleet2 owns the log truncation, so the
+ * `sudo truncate -s 0 <log>` (H1) means grokfleet owns the log truncation, so the
  * only writer between the truncate and our DONE match is this run's detached
  * phase. `BOX_SETUP_ONCE=1` (G1) forces the detached path so the DONE marker is
  * always written and no foreground `boxup once` races the detached one.
@@ -68,7 +68,7 @@ export const STATUS_COMMAND = "sudo /workspace/box-setup/boxup status";
 
 /**
  * Match the LAST `DONE (rc=N)` line in a slice (H1). Returns the rc, or null
- * when no marker is present. Because fleet2 truncated the log itself, any DONE
+ * when no marker is present. Because grokfleet truncated the log itself, any DONE
  * in the slice is this run's by construction.
  */
 export function matchDoneRc(slice: string): number | null {

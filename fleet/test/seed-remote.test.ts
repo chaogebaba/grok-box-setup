@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { SEED_REMOTE_SCRIPT, keySha256 } from "../src/reconcile/seed-remote.ts";
 
 function runSeed(key: string, sha: string): { code: number; dst: string; expFile: string; dir: string } {
-  const dir = mkdtempSync(`${tmpdir()}/fleet2-seed-`);
+  const dir = mkdtempSync(`${tmpdir()}/grokfleet-seed-`);
   const tmp = `${dir}/.ts-authkey.tmp`;
   const dst = `${dir}/ts-authkey`;
   const expFile = `${dir}/ts-authkey.expires`;

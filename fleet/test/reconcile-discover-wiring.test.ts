@@ -132,7 +132,7 @@ describe("D2 discover transport", () => {
     expect(first).toBeLessThan(shared); // ssh uses the FIRST value it obtains
   });
 
-  test("SSH_OPTS itself is unchanged — `fleet2 ssh` still gets ConnectTimeout 6 and nothing else", () => {
+  test("SSH_OPTS itself is unchanged — `grokfleet ssh` still gets ConnectTimeout 6 and nothing else", () => {
     expect(sshCmdArgv("grok-box-003", "uptime")).toEqual([
       "sshpass",
       "-e",
@@ -230,12 +230,12 @@ describe("D2 discover transport", () => {
   });
 
   test("the probe read splits hostname from boxup version; an EMPTY hostname file reads ''", () => {
-    expect(parseProbeRead("grok-box-003\n---fleet2-probe---\nboxup 5.3.0\n")).toEqual({
+    expect(parseProbeRead("grok-box-003\n---grokfleet-probe---\nboxup 5.3.0\n")).toEqual({
       hostname: "grok-box-003",
       boxup: "5.3.0",
     });
-    expect(parseProbeRead("\n---fleet2-probe---\nboxup 5.3.0\n")).toEqual({ hostname: "", boxup: "5.3.0" });
-    expect(parseProbeRead("\n---fleet2-probe---\n")).toEqual({ hostname: "", boxup: undefined });
+    expect(parseProbeRead("\n---grokfleet-probe---\nboxup 5.3.0\n")).toEqual({ hostname: "", boxup: "5.3.0" });
+    expect(parseProbeRead("\n---grokfleet-probe---\n")).toEqual({ hostname: "", boxup: undefined });
   });
 });
 

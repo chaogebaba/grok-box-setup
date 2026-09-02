@@ -1,0 +1,122 @@
+# rename-allowlist.txt — N3/N5 of the 5.10.0 rename (blueprint
+# fleet2-rename-grokfleet). Checked by tests/test-rename-allowlist.sh.
+#
+# FORMAT, one entry per line, TAB-separated:
+#
+#     <tracked path><TAB><extended regex><TAB><number of matching LINES>
+#
+# NEVER a bare path (r2-B6): a whole-file exemption would make the very test
+# that enforces the rename blind to new mentions. Two properties follow from the
+# count. A mention that APPEARS in an allowlisted file fails, because the count
+# moves. A mention that DISAPPEARS fails too — which matters here, because most
+# of these lines are a compatibility surface that must survive 5.10.0 intact.
+#
+# Each entry is counted INDEPENDENTLY (`grep -cE`), so a file may carry several
+# entries whose line sets overlap: a broad `fleet2` count for the file plus a
+# narrow one for a specific mention. That overlap is the point (r4-n2). The soak
+# marker gets its own path-only pattern in every file that names it, so renaming
+# the marker fails on that entry even if the file's overall count happens to
+# stay put — a single blanket count would hide exactly that.
+#
+# WHY EACH GROUP STAYS
+#   fleet2-state-store / fleet2-zero-touch-join / fleet2-release-install /
+#   fleet2-rename-grokfleet
+#       Blueprint FILENAMES cited from comments. Those documents exist under
+#       those names; a "corrected" citation would be a wrong citation.
+#   /var/lib/grok-fleet/fleet2.soak-ok
+#       r3-n1. State under $FLEET_STATE that gates flipping apply=true.
+#       Renaming it would silently reset an in-flight soak.
+#   FLEET2_*
+#       N7. The pre-rename env spellings, accepted for ONE release beside
+#       GROKFLEET_*, and the tests that prove BOTH are accepted.
+#   fleet2.prev / fleet2.conf / the residual `fleet2`
+#       N2/N6. The compatibility surface itself: $OPT_DIR/fleet2 and its .prev
+#       (what the cutover consumes), the obsolete phase-2 drop-in the installer
+#       still removes by its historical name, the /usr/local/bin/fleet2 link,
+#       and the tests that assert all of it by BOTH names rather than
+#       substituting one for the other.
+#   tmp/orch/*
+#       Historical records — dispatch logs and gate memos, never edited.
+#
+# EVERY LINE HERE EXCEPT THE SOAK MARKER AND THE BLUEPRINT FILENAMES IS DELETED
+# IN 5.11.0, when the compatibility layer goes. This file is that checklist.
+Makefile	fleet2-release-install	1
+Makefile	/var/lib/grok-fleet/fleet2\.soak-ok	1
+Makefile	fleet2	2
+README.md	FLEET2_	1
+README.md	fleet2	2
+docs/FLEET-BRAIN.md	/var/lib/grok-fleet/fleet2\.soak-ok	2
+docs/FLEET-BRAIN.md	FLEET2_	1
+docs/FLEET-BRAIN.md	fleet2	11
+fleet/src/commands/retire-wiring.ts	fleet2-state-store	1
+fleet/src/commands/retire-wiring.ts	fleet2	1
+fleet/src/commands/retire.ts	fleet2-state-store	1
+fleet/src/commands/retire.ts	fleet2	1
+fleet/src/commands/state.ts	fleet2-state-store	1
+fleet/src/commands/state.ts	fleet2	1
+fleet/src/reconcile/discover.ts	fleet2-zero-touch-join	1
+fleet/src/reconcile/discover.ts	fleet2	1
+fleet/src/reconcile/observe.ts	fleet2-state-store	1
+fleet/src/reconcile/observe.ts	fleet2	1
+fleet/src/state.ts	fleet2-state-store	1
+fleet/src/state.ts	fleet2	1
+fleet/src/store/backup.ts	fleet2-state-store	1
+fleet/src/store/backup.ts	fleet2	1
+fleet/src/store/db.ts	fleet2-state-store	1
+fleet/src/store/db.ts	fleet2	1
+fleet/src/store/divergence.ts	fleet2-state-store	1
+fleet/src/store/divergence.ts	fleet2	1
+fleet/src/store/legacy.ts	fleet2-state-store	1
+fleet/src/store/legacy.ts	fleet2	1
+fleet/src/store/membership.ts	fleet2-state-store	1
+fleet/src/store/membership.ts	fleet2	1
+fleet/src/store/schema.ts	fleet2-state-store	1
+fleet/src/store/schema.ts	fleet2	1
+fleet/src/store/snapshots.ts	fleet2-state-store	1
+fleet/src/store/snapshots.ts	fleet2	1
+fleet/src/store/state.ts	fleet2-state-store	1
+fleet/src/store/state.ts	fleet2	1
+fleet/test/commands/enroll-saga.test.ts	fleet2-state-store	1
+fleet/test/commands/enroll-saga.test.ts	fleet2	1
+fleet/test/commands/retire.test.ts	fleet2-state-store	1
+fleet/test/commands/retire.test.ts	fleet2	1
+fleet/test/reconcile-observe.test.ts	fleet2-state-store	1
+fleet/test/reconcile-observe.test.ts	fleet2	1
+fleet/test/reconcile-resume.test.ts	fleet2-state-store	1
+fleet/test/reconcile-resume.test.ts	fleet2	1
+fleet/test/store/counters.test.ts	fleet2-state-store	1
+fleet/test/store/counters.test.ts	fleet2	1
+fleet/test/store/db.test.ts	fleet2-state-store	1
+fleet/test/store/db.test.ts	fleet2	6
+fleet/test/store/divergence.test.ts	fleet2-state-store	1
+fleet/test/store/divergence.test.ts	fleet2	1
+fleet/test/store/legacy-import.test.ts	fleet2-state-store	1
+fleet/test/store/legacy-import.test.ts	fleet2	1
+fleet/test/store/phase.test.ts	fleet2-state-store	1
+fleet/test/store/phase.test.ts	fleet2	1
+fleet/test/store/rename.test.ts	fleet2-state-store	1
+fleet/test/store/rename.test.ts	fleet2	1
+fleet/test/store/snapshots.test.ts	fleet2-state-store	1
+fleet/test/store/snapshots.test.ts	fleet2	1
+fleet/test/store/state-cmd.test.ts	fleet2-state-store	1
+fleet/test/store/state-cmd.test.ts	fleet2	1
+fleet/test/store/tick-snapshot.test.ts	fleet2-state-store	1
+fleet/test/store/tick-snapshot.test.ts	fleet2	1
+fleet/test/store/tick.test.ts	fleet2-state-store	1
+fleet/test/store/tick.test.ts	fleet2	1
+tests/test-install-vps.sh	fleet2-zero-touch-join	1
+tests/test-install-vps.sh	fleet2-release-install	3
+tests/test-install-vps.sh	fleet2-rename-grokfleet	1
+tests/test-install-vps.sh	FLEET2_	8
+tests/test-install-vps.sh	fleet2\.prev	4
+tests/test-install-vps.sh	fleet2	38
+tests/test-makefile-targets.sh	fleet2-release-install	1
+tests/test-makefile-targets.sh	/var/lib/grok-fleet/fleet2\.soak-ok	2
+tests/test-makefile-targets.sh	fleet2	3
+tmp/orch/fleetctl-test-coverage-map.md	fleet2	7
+vps/install-vps.sh	fleet2-release-install	1
+vps/install-vps.sh	fleet2-rename-grokfleet	2
+vps/install-vps.sh	FLEET2_	6
+vps/install-vps.sh	fleet2\.prev	4
+vps/install-vps.sh	fleet2\.conf	2
+vps/install-vps.sh	fleet2	26

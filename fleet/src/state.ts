@@ -1,4 +1,4 @@
-// state.ts — the `fleet2 inventory` VIEW types.
+// state.ts — the `grokfleet inventory` VIEW types.
 //
 // This module used to own `inventory.json`: a per-box snapshot the CLI wrote
 // after every inventory pass and the upgrade pass rewrote after every applied
@@ -8,8 +8,8 @@
 // rows plus the last tick's snapshot are the one view now, and the applied
 // pass's `lastUpgrade` block became an `audit` row (upgrade.ts).
 //
-// What survives is the SHAPE, because `fleet2 inventory --json` and
-// `fleet2 status --json` still print it. Nothing persists it any more.
+// What survives is the SHAPE, because `grokfleet inventory --json` and
+// `grokfleet status --json` still print it. Nothing persists it any more.
 
 export interface BoxEntry {
   api: string | null;

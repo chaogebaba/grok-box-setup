@@ -1,7 +1,7 @@
-// hostkey.ts — fleet2 owns its known_hosts (zero-touch join D11).
+// hostkey.ts — grokfleet owns its known_hosts (zero-touch join D11).
 //
 // The engine used to let ssh resolve `~/.ssh/known_hosts` from the passwd entry,
-// so both units read /root/.ssh/known_hosts — a file fleet2 neither owns nor can
+// so both units read /root/.ssh/known_hosts — a file grokfleet neither owns nor can
 // reason about. When a port or a name is REUSED across identities (a retired
 // record, a box that lost /workspace and so its persisted host keys), OpenSSH's
 // `REMOTE HOST IDENTIFICATION HAS CHANGED` banner made every tunnel call rc 255
@@ -12,7 +12,7 @@
 // D11's shape:
 //   (a) one engine-owned file, `$FLEET_STATE/known_hosts`, on the two
 //       fleet-driven argv builders only (the tunnel and the tailnet box ssh).
-//       Interactive `fleet2 ssh` is UNCHANGED — a human on a laptop keeps their
+//       Interactive `grokfleet ssh` is UNCHANGED — a human on a laptop keeps their
 //       own host verification.
 //   (b) pins are forgotten ONLY at identity-binding moments (an enrol, a repair,
 //       a candidate re-probe), never on a banner, and the tunnel spec's forget
@@ -186,7 +186,7 @@ export async function forgetHostKeys(runner: Runner, opts: ForgetOpts): Promise<
   const access = (opts.access ?? fileAccess)(opts.file);
   if (access !== "ok") {
     // ssh creates the file 0600 root-owned because both units run as root, so a
-    // hand-run `fleet2 enroll` as a non-root operator lands here.
+    // hand-run `grokfleet enroll` as a non-root operator lands here.
     say(
       access === "absent"
         ? `hostkey: ${opts.file} absent — no pins to forget`

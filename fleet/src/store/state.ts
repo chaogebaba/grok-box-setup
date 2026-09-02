@@ -28,7 +28,7 @@ import { boxIndex, portFor } from "../boxes.ts";
 import { exportKeyFiles, exportMembership, type ExportPaths } from "./legacy.ts";
 import { log } from "../log.ts";
 
-/** One `boxes` row, as every reader in fleet2 wants it. */
+/** One `boxes` row, as every reader in grokfleet wants it. */
 export interface BoxRow {
   box_id: number;
   name: string;
@@ -229,7 +229,7 @@ export class StoreState implements ReconcileStateApi {
       }
       const from = existing?.phase;
       this.store.audit({
-        actor: "fleet2",
+        actor: "grokfleet",
         action: "enrolled",
         box: name,
         rc: 0,
@@ -342,12 +342,12 @@ export class StoreState implements ReconcileStateApi {
              VALUES(?,?,?,'enrolling',0,?,NULL,?,?)`,
           )
           .run(name, idx, port, at, at, pubkey ?? null);
-        this.store.audit({ actor: "fleet2", action: "enrol-begin", box: name, rc: 0, at, detail: `port=${port}` });
+        this.store.audit({ actor: "grokfleet", action: "enrol-begin", box: name, rc: 0, at, detail: `port=${port}` });
       });
       return { stage: 0 };
     }
     if (row.phase === "retired") {
-      this.transition(name, "retired", "enrolling", "fleet2", "re-adoption");
+      this.transition(name, "retired", "enrolling", "grokfleet", "re-adoption");
       if (pubkey !== undefined) {
         this.store.db.query("UPDATE boxes SET pubkey=?, port=?, updated_at=? WHERE box_id=?").run(pubkey, port, at, row.box_id);
       }
@@ -473,7 +473,7 @@ export class StoreState implements ReconcileStateApi {
                                              expires_date=excluded.expires_date, minted_at=excluded.minted_at`,
         )
         .run(to, from);
-      this.store.audit({ actor: "fleet2", action: "rename-copy", box: neu, rc: 0, detail: `from ${old}` });
+      this.store.audit({ actor: "grokfleet", action: "rename-copy", box: neu, rc: 0, detail: `from ${old}` });
     });
     this.runExport("keys", neu);
   }
@@ -484,7 +484,7 @@ export class StoreState implements ReconcileStateApi {
     if (row === undefined) return;
     this.store.tx(() => {
       this.store.db.query("DELETE FROM boxes WHERE box_id = ?").run(row.box_id);
-      this.store.audit({ actor: "fleet2", action: "row-deleted", box: name, rc: 0 });
+      this.store.audit({ actor: "grokfleet", action: "row-deleted", box: name, rc: 0 });
     });
     this.runExport("membership");
   }

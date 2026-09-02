@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "fleet2",
+      "name": "grokfleet",
       "dependencies": {
         "ink": "^7.1",
         "react": "^19",

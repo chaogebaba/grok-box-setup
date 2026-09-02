@@ -1,4 +1,4 @@
-// state-cmd.test.ts — `fleet2 state <sub>` (blueprint fleet2-state-store D8/D6,
+// state-cmd.test.ts — `grokfleet state <sub>` (blueprint fleet2-state-store D8/D6,
 // D9 (u) read-write reopen, (t) reconcile-files, (p) import --force).
 
 import { afterAll, describe, expect, test } from "bun:test";
@@ -246,7 +246,7 @@ describe("state reconcile-files", () => {
       expect(await cmdState(["reconcile-files", "--apply"], d)).toBe(RC.OK);
       const text = out.join("");
       expect(text).toContain("store-only grok-box-005");
-      expect(text).toContain("fleet2 retire grok-box-005");
+      expect(text).toContain("grokfleet retire grok-box-005");
       const back = openStore({ path: storePath(f.state), dir: f.state, now: () => T0 });
       expect(
         (back.db.query("SELECT phase FROM boxes WHERE name='grok-box-005'").get() as { phase: string }).phase,

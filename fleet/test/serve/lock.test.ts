@@ -12,7 +12,7 @@ import { setLogSink } from "../../src/log.ts";
 
 const dirs: string[] = [];
 function tmpLock(): string {
-  const d = mkdtempSync(join(tmpdir(), "fleet2-lock-"));
+  const d = mkdtempSync(join(tmpdir(), "grokfleet-lock-"));
   dirs.push(d);
   return join(d, "reconcile.lock");
 }

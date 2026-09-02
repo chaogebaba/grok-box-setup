@@ -1,4 +1,4 @@
-// enroll.ts — `fleet2 enroll [--no-box-config] <grok-box-N>` (D10), the VPS-side
+// enroll.ts — `grokfleet enroll [--no-box-config] <grok-box-N>` (D10), the VPS-side
 // box-enrollment command. Ports cmd_enroll (main:1052-1215) + its helpers
 // (main:1035-1330, 1374-1505, 1792-1840). The side-effecting steps are behind an
 // injectable `EnrollSideEffects` seam so tests drive the real orchestration with
@@ -280,7 +280,7 @@ export interface EnrollResult {
 export async function cmdEnrollResult(args: string[], se: EnrollSideEffects): Promise<EnrollResult> {
   const parsed = parseEnrollArgs(args);
   if ("usage" in parsed) {
-    log("usage: fleet2 enroll [--no-box-config] <grok-box-N>");
+    log("usage: grokfleet enroll [--no-box-config] <grok-box-N>");
     return { rc: 2 };
   }
   const { box, writeBoxConfig } = parsed;
@@ -431,7 +431,7 @@ export async function cmdEnrollResult(args: string[], se: EnrollSideEffects): Pr
         await se.stageOk?.(box, 4);
       } else if (wbc === 4) {
         log(`enroll: WARNING box config not written — ${BOX_CONFIG} is ABSENT on ${box}; run install.sh on the box first`);
-        log(`enroll:   (then re-run 'fleet2 enroll ${box}'). NOT recording enrollment; the VPS-side key is installed and harmless.`);
+        log(`enroll:   (then re-run 'grokfleet enroll ${box}'). NOT recording enrollment; the VPS-side key is installed and harmless.`);
         await se.stageFailed?.(box, 4, `${BOX_CONFIG} absent on the box (run install.sh there first)`);
         return { rc: 1 };
       } else {
@@ -439,7 +439,7 @@ export async function cmdEnrollResult(args: string[], se: EnrollSideEffects): Pr
         log("enroll: WARNING box config not written — run the manual [fleet] step:");
         log(`enroll:   set [fleet] vps="${vps}" box_index=${n}${portFrag} in ${box}:${BOX_CONFIG},`);
         log(`enroll:   then: sudo ${BOXUP_REMOTE} once. NOT recording enrollment; the VPS-side`);
-        log(`enroll:   key is installed and harmless — re-run 'fleet2 enroll ${box}' to retry (idempotent).`);
+        log(`enroll:   key is installed and harmless — re-run 'grokfleet enroll ${box}' to retry (idempotent).`);
         await se.stageFailed?.(box, 4, "writeBoxConfig failed");
         return { rc: 1 };
       }

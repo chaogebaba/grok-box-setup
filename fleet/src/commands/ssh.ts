@@ -1,39 +1,39 @@
-// ssh.ts — `fleet2 ssh [flags] <box> [cmd...]` (D15/F15 + agent-ux U1), the
+// ssh.ts — `grokfleet ssh [flags] <box> [cmd...]` (D15/F15 + agent-ux U1), the
 // laptop-side tailnet ssh AND the fleet's transparent remote-exec primitive.
 //
 // Ports cmd_ssh (main:694-712) + box_ssh (main:206-215): `sshpass -e ssh` with
 // -o StrictHostKeyChecking=accept-new -o ConnectTimeout=6 -o BatchMode=no to
-// box@<box>. No box ⇒ `usage: fleet2 ssh <box> [cmd...]` rc 2 (main:696-699).
+// box@<box>. No box ⇒ `usage: grokfleet ssh <box> [cmd...]` rc 2 (main:696-699).
 //
 // agent-ux U1 — the non-interactive form is a TRANSPARENT remote exec, not a
 // captured Runner call. It used to run through the Runner, which buffers stdout
 // and stderr into a result object that cmd_ssh then THREW AWAY, so a
 // non-interactive caller (an agent verifying a change) saw nothing at all. Now:
-//   * stdout/stderr are "inherit" — fleet2 hands ssh its OWN file descriptors,
+//   * stdout/stderr are "inherit" — grokfleet hands ssh its OWN file descriptors,
 //     so nothing is buffered, copied or reordered on the way through. Note what
 //     that does and does not promise: each stream arrives in write order, but
-//     the RELATIVE order of the two is ssh's to lose, not fleet2's to keep.
+//     the RELATIVE order of the two is ssh's to lose, not grokfleet's to keep.
 //     sshd reads the remote command's stdout and stderr pipes separately and
 //     packetises them, so writes that land in one read window arrive grouped
 //     (`o1 o2 o3 e1 e2 e3` for a tight loop) — measured identically with plain
-//     `ssh` and no fleet2 in the picture, and correctly interleaved as soon as
+//     `ssh` and no grokfleet in the picture, and correctly interleaved as soon as
 //     the writes are ~300 ms apart. A caller that needs strict interleaving
 //     merges on the REMOTE side (`'cmd 2>&1'`) or asks for a pty with --tty;
 //   * stdin is "inherit" (or "ignore" with --no-stdin);
 //   * the process rc is the REMOTE command's rc exactly, and ssh's own 255
 //     (transport failure) stays 255;
-//   * there is NO fleet2 deadline by default. `--timeout <seconds>` kills the
+//   * there is NO grokfleet deadline by default. `--timeout <seconds>` kills the
 //     child (SIGTERM, then SIGKILL after 5 s) and exits 124, the timeout(1)
-//     convention (`fleet2 rc`);
+//     convention (`grokfleet rc`);
 //   * `--tty` forces the interactive form (`ssh -tt`) for programs needing a
 //     pty. -tt, not -t: -t only ASKS, and declines whenever the caller's own
 //     stdin is not a terminal — which is every agent that would reach for it.
 //
-// U4 exemption, deliberate: a non-zero REMOTE rc gets NO `fleet2: ssh: …` line.
-// The whole point of the command is that fleet2 adds nothing to the child's
+// U4 exemption, deliberate: a non-zero REMOTE rc gets NO `grokfleet: ssh: …` line.
+// The whole point of the command is that grokfleet adds nothing to the child's
 // streams — ssh's own stderr is inherited, so a transport failure is never
 // silent, and inventing a line would corrupt the output an agent is parsing.
-// fleet2's OWN failures (usage, --timeout) do print one line, as U4 requires.
+// grokfleet's OWN failures (usage, --timeout) do print one line, as U4 requires.
 //
 // F15/M11 SECRET CONTRACT (unchanged): the password reaches sshpass ONLY through
 // the spawned child's env (SSHPASS), never process.env of the parent, never
@@ -105,7 +105,7 @@ export function resolveSshPassword(
  * option to the FIRST value it obtains, so an `-o ConnectTimeout=20` appended
  * after SSH_OPTS' `ConnectTimeout=6` would be silently ignored. The discover
  * transport (D2) relies on this ordering to raise its connect timeout WITHOUT
- * changing SSH_OPTS, which `fleet2 ssh` and enroll share.
+ * changing SSH_OPTS, which `grokfleet ssh` and enroll share.
  */
 export function sshCmdArgv(box: string, command: string | undefined, extraOpts: string[] = []): string[] {
   const argv = ["sshpass", "-e", "ssh", ...extraOpts, ...SSH_OPTS, `${BOX_USER}@${box}`];
@@ -123,7 +123,7 @@ export interface SshPlan {
   tty: boolean;
   /** stdin mode for the non-interactive form. */
   stdin: "inherit" | "ignore";
-  /** --timeout, in seconds; undefined ⇒ no fleet2 deadline (the default). */
+  /** --timeout, in seconds; undefined ⇒ no grokfleet deadline (the default). */
   timeoutSecs?: number;
 }
 
@@ -132,12 +132,12 @@ export type SshParse = { plan: SshPlan } | { err: string } | { help: true };
 /**
  * Parse `[flags] <box> [cmd...]`.
  *
- * fleet2's own flags (`--tty`, `--no-stdin`, `--timeout <s>`, `--json` is not
+ * grokfleet's own flags (`--tty`, `--no-stdin`, `--timeout <s>`, `--json` is not
  * one of them) are recognised ANYWHERE in the list, because the natural agent
- * form puts them last: `fleet2 ssh box 'sleep 30' --timeout 2`. An UNKNOWN
+ * form puts them last: `grokfleet ssh box 'sleep 30' --timeout 2`. An UNKNOWN
  * `--flag` before the box is a usage error; after the box it belongs to the
- * remote command (`fleet2 ssh box ls --color` must work, main:701 parity).
- * `--` ends fleet2 flag scanning: everything after it is command text verbatim.
+ * remote command (`grokfleet ssh box ls --color` must work, main:701 parity).
+ * `--` ends grokfleet flag scanning: everything after it is command text verbatim.
  */
 export function parseSshArgs(args: string[]): SshParse {
   let box: string | undefined;
@@ -178,35 +178,35 @@ export function parseSshArgs(args: string[]): SshParse {
         timeoutSecs = n;
         continue;
       }
-      // An unknown fleet2 flag is only an error BEFORE the box name.
+      // An unknown grokfleet flag is only an error BEFORE the box name.
       if (box === undefined && a.startsWith("-") && a !== "-") return { err: `unknown flag ${a}` };
     }
     if (box === undefined) box = a;
     else words.push(a);
   }
 
-  if (box === undefined || box === "") return { err: "usage: fleet2 ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd...]" };
+  if (box === undefined || box === "") return { err: "usage: grokfleet ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd...]" };
   return {
     plan: { box, command: words.length > 0 ? words.join(" ") : undefined, tty, stdin, timeoutSecs },
   };
 }
 
-/** `fleet2 ssh --help` (U3/U5): greppable, one line per flag, rc pointer last. */
+/** `grokfleet ssh --help` (U3/U5): greppable, one line per flag, rc pointer last. */
 export const SSH_HELP = [
-  "fleet2 ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd...]  — run a command on a box, or open a session",
+  "grokfleet ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd...]  — run a command on a box, or open a session",
   "",
   "  no cmd            interactive session (inherited stdio)",
   "  <cmd...>          transparent remote exec: stdout/stderr stream through, rc is the REMOTE rc",
   "  --tty             force a pty (ssh -tt) for programs that need one",
   "  --no-stdin        close the child's stdin instead of inheriting it",
   "  --timeout <s>     kill the remote command after <s> seconds (SIGTERM, SIGKILL after 5s) and exit 124",
-  "  --                end fleet2 flags; everything after it is command text",
+  "  --                end grokfleet flags; everything after it is command text",
   "",
   "Pass ONE quoted command string: the words are joined with a single space and",
   "run by the remote login shell, exactly like bash's \"$*\".",
   "",
   "stdout and stderr each arrive in write order. Their relative order is ssh's to",
-  "keep, not fleet2's: a tight loop writing to both arrives grouped per stream.",
+  "keep, not grokfleet's: a tight loop writing to both arrives grouped per stream.",
   "Merge on the remote side ('cmd 2>&1') or use --tty if you need interleaving.",
   "",
   RC_POINTER_LINE,
@@ -237,7 +237,7 @@ export const bunInteractiveSpawner: InteractiveSpawner = {
   },
 };
 
-/** A spawned child fleet2 can wait on and signal (the --timeout path). */
+/** A spawned child grokfleet can wait on and signal (the --timeout path). */
 export interface ExecChild {
   /** Resolves when the child exits: the rc, or null iff a signal killed it. */
   readonly exited: Promise<number | null>;
@@ -351,7 +351,7 @@ export async function cmdSsh(args: string[], deps: SshDeps): Promise<number> {
   if (killHandle !== undefined) timers.clear(killHandle);
 
   if (firedTimeout) {
-    // fleet2's OWN failure, so U4 applies: one stderr line naming the reason.
+    // grokfleet's OWN failure, so U4 applies: one stderr line naming the reason.
     log(`ssh: ${plan.box}: timed out after ${plan.timeoutSecs}s — remote command killed`);
     return RC.TIMEOUT;
   }

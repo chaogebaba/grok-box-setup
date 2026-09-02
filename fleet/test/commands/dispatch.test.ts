@@ -24,14 +24,14 @@ describe("T6 dispatch (main:3850-3874, F10)", () => {
     let out = "";
     const rc = emit(d, versionString("5.4.0", "abc1234", "1.4.0"), (s) => (out += s), () => {});
     expect(rc).toBe(0);
-    expect(out).toBe("fleet2 5.4.0 (abc1234) (bun 1.4.0)\n");
+    expect(out).toBe("grokfleet 5.4.0 (abc1234) (bun 1.4.0)\n");
   });
 
   test("version string shape 5.4.0 (D17)", () => {
-    expect(versionString("5.4.0", "deadbee", "1.4.0")).toBe("fleet2 5.4.0 (deadbee) (bun 1.4.0)");
+    expect(versionString("5.4.0", "deadbee", "1.4.0")).toBe("grokfleet 5.4.0 (deadbee) (bun 1.4.0)");
   });
 
-  test("unknown ⇒ 'fleet2: unknown command: X' + usage BOTH on STDERR, rc 2 (m11)", () => {
+  test("unknown ⇒ 'grokfleet: unknown command: X' + usage BOTH on STDERR, rc 2 (m11)", () => {
     const d = decide("frobnicate");
     expect(d.kind).toBe("unknown");
     let out = "";
@@ -39,7 +39,7 @@ describe("T6 dispatch (main:3850-3874, F10)", () => {
     const rc = emit(d, "", (s) => (out += s), (s) => (err += s));
     expect(rc).toBe(2);
     expect(out).toBe(""); // nothing on stdout
-    expect(err).toBe(`fleet2: unknown command: frobnicate\n${USAGE}`);
+    expect(err).toBe(`grokfleet: unknown command: frobnicate\n${USAGE}`);
   });
 
   test("every documented subcommand is routed", () => {
@@ -53,11 +53,11 @@ describe("T6 dispatch (main:3850-3874, F10)", () => {
 
 describe("T6 usage text (F2/M5)", () => {
   test("VPS-side line 1; remove-timer present; NO install-timer line (M5)", () => {
-    expect(USAGE.split("\n")[0]).toBe("fleet2 — grok-fleet brain (VPS-side; list/ssh also run from the laptop)");
-    expect(USAGE).toContain("fleet2 remove-timer");
-    expect(USAGE).not.toContain("fleet2 install-timer");
+    expect(USAGE.split("\n")[0]).toBe("grokfleet — grok-fleet brain (VPS-side; list/ssh also run from the laptop)");
+    expect(USAGE).toContain("grokfleet remove-timer");
+    expect(USAGE).not.toContain("grokfleet install-timer");
   });
-  test("fleet2 wording, no fleetctl", () => {
+  test("grokfleet wording, no fleetctl", () => {
     expect(USAGE).not.toContain("fleetctl");
     expect(USAGE).toContain("FLEET_CONFIG         config path (default /opt/grok-fleet/config.toml)");
   });

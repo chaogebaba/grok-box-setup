@@ -34,7 +34,10 @@ import { existsSync, readFileSync } from "node:fs";
 const CHECK_TIMEOUT_MS = 20_000;
 
 /** The current version string source (kept in sync with cli.ts PKG_VERSION). */
-export const SERVE_VERSION = "5.9.0";
+/** The product name reported by the API (N1): `/v1/health`.name and the
+ * `server` response header. */
+export const SERVE_NAME = "grokfleet";
+export const SERVE_VERSION = "5.10.0";
 
 /**
  * state-store D3/D7 (Phase B): every snapshot read is a STORE query.
@@ -238,7 +241,10 @@ export function tickAgeSeconds(latest: SnapshotLine | undefined, now: Date): num
 export function handleHealth(ctx: ServerContext): Response {
   const latest = latestSnapshot(ctx.env);
   const now = ctx.now ? ctx.now() : new Date();
-  return jsonOk({ ok: true, version: SERVE_VERSION, tick_age_s: tickAgeSeconds(latest, now) });
+  // N1: `name` is the product name as a MACHINE-READABLE field. A consumer
+  // that parses it (the TUI, a monitor) would break silently on a rename that
+  // only touched display text, so it is asserted by a JSON-parsing test.
+  return jsonOk({ ok: true, name: SERVE_NAME, version: SERVE_VERSION, tick_age_s: tickAgeSeconds(latest, now) });
 }
 
 // --- GET /v1/fleet (readonly) ------------------------------------------------

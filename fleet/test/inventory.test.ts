@@ -152,8 +152,8 @@ describe("driftCell", () => {
   });
 
   test("D5: the cell is the VERSION verdict, not the sha verdict", () => {
-    // The empirical r1 case: same boxup VERSION, sha moved by a fleet2-only
-    // commit. `fleet2 status` must agree with the reconciler and say `no`.
+    // The empirical r1 case: same boxup VERSION, sha moved by a grokfleet-only
+    // commit. `grokfleet status` must agree with the reconciler and say `no`.
     expect(driftCell({ tunnel: "up", version: "5.3.0", sha: "f42c967" } as never, target)).toBe("no");
     // And the converse: the sha happens to match but the payload version does
     // not, so the box IS drifted (a hand-installed build, direction irrelevant).

@@ -8,7 +8,7 @@
 export interface RunOpts {
   /** Bytes to write to the child's stdin. When absent, stdin is "ignore". */
   stdin?: string | Uint8Array;
-  /** fleet2's own deadline; on elapse the child gets SIGKILL. */
+  /** grokfleet's own deadline; on elapse the child gets SIGKILL. */
   timeoutMs: number;
   /** Extra environment for the child (merged over process.env). */
   env?: Record<string, string>;
@@ -21,7 +21,7 @@ export interface RunResult {
   signal: string | null;
   stdout: string;
   stderr: string;
-  /** True iff fleet2's deadline elapsed and it sent SIGKILL. */
+  /** True iff grokfleet's deadline elapsed and it sent SIGKILL. */
   timedOut: boolean;
 }
 

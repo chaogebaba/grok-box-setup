@@ -454,7 +454,7 @@ INNER
 
 # ---------------------------------------------------------------------------
 # (b1)/(b2) the status token: present, LAST, after tunnel=/tunnelfail=, bare at
-# ok and level-suffixed at fail. "Last" is the contract that keeps fleet2 and
+# ok and level-suffixed at fail. "Last" is the contract that keeps grokfleet and
 # every legacy reader unaffected (G3).
 # ---------------------------------------------------------------------------
 o="$(run_line 22 status)"; line="$(r1 "$o")"

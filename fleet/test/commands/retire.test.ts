@@ -1,4 +1,4 @@
-// retire.test.ts — D9 (r): `fleet2 retire` (blueprint fleet2-state-store D4).
+// retire.test.ts — D9 (r): `grokfleet retire` (blueprint fleet2-state-store D4).
 //
 // The command is driven end to end against a real store under the worker
 // scratch, so the assertions cover what an operator actually gets: the row's
@@ -171,7 +171,7 @@ describe("removeAuthorizedKeysLines (pure)", () => {
   });
 });
 
-describe("(r) fleet2 retire", () => {
+describe("(r) grokfleet retire", () => {
   test("the happy path: row retired, artefacts removed, key revoked, export rewritten", async () => {
     const f = fixture();
     try {

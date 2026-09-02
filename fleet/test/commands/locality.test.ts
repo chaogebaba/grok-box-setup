@@ -27,7 +27,7 @@ describe("T-locality (F2/M2)", () => {
       cap.restore();
       expect(refused).toBe(true);
       expect(cap.lines[0]).toContain(
-        `${cmd}: VPS-only in fleet2 — this command now runs over the reverse tunnels (docs/FLEET-BRAIN.md §retirement)`,
+        `${cmd}: VPS-only in grokfleet — this command now runs over the reverse tunnels (docs/FLEET-BRAIN.md §retirement)`,
       );
     }
   });

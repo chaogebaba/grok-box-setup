@@ -8,6 +8,7 @@ lint:
 	bash -n vps/install-vps.sh
 	bash -n fleet/scripts/release-build.sh
 	bash -n fleet/scripts/release-publish.sh
+	bash -n tests/test-rename-allowlist.sh
 	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-publish.sh || echo "shellcheck not installed; skipped"
 
 test:
@@ -18,13 +19,14 @@ test:
 	bash tests/test-boxup-disk-guard.sh
 	bash tests/test-install-boxup-symlink.sh
 	bash tests/test-makefile-targets.sh
+	bash tests/test-rename-allowlist.sh
 
-# --- fleet2 (bun+TS brain) ---------------------------------------------------
+# --- grokfleet (bun+TS brain) ---------------------------------------------------
 # These targets require bun; the bash `test`/`lint` targets above do NOT, so a
 # machine without bun still runs the shell suite (blueprint D1). Since phase 3
-# (D7) fleet2 IS the brain engine — bash fleetctl is retired.
+# (D7) grokfleet IS the brain engine — bash fleetctl is retired.
 VPS ?= root@107.172.132.211
-FLEET2_REMOTE ?= /opt/grok-fleet/fleet2
+GROKFLEET_REMOTE ?= /opt/grok-fleet/grokfleet
 
 # The TUI is an Ink (React) app since fleet-tui-ink D4, so the bun targets need
 # the node_modules tree. `--frozen-lockfile` makes the tracked fleet/bun.lock the
@@ -40,11 +42,11 @@ ts-build: ts-deps
 	cd fleet && bun build src/cli.ts --compile --minify --sourcemap \
 		--target=bun-linux-x64 --define IS_COMPILED=true \
 		--define process.env.NODE_ENV='"production"' \
-		--define FLEET2_GIT_SHA="\"$$(git rev-parse --short HEAD)\"" \
-		--outfile dist/fleet2
+		--define GROKFLEET_GIT_SHA="\"$$(git rev-parse --short HEAD)\"" \
+		--outfile dist/grokfleet
 
 # --- release (blueprint fleet2-release-install D12/D15) -----------------------
-# Hosts no longer BUILD fleet2 (they needed bun + make + a checkout, and the r2
+# Hosts no longer BUILD grokfleet (they needed bun + make + a checkout, and the r2
 # gate died on `make: command not found`); vps/install-vps.sh downloads a pinned
 # release asset instead. These two targets are how that asset comes to exist.
 #
@@ -56,31 +58,31 @@ ts-build: ts-deps
 #   3. make ts-release-publish CONFIRM=1     (tags THAT commit, uploads the asset)
 # The tag is created in step 3 at the commit from step 2, so the tag always names
 # a commit whose installer pin matches the published bytes.
-FLEET2_ASSET        = fleet2-linux-x64
-FLEET2_DIST         = fleet/dist/$(FLEET2_ASSET)
-FLEET2_REPO        ?= chaogebaba/grok-box-setup
-FLEET2_INSTALLER    = vps/install-vps.sh
+GROKFLEET_ASSET        = grokfleet-linux-x64
+GROKFLEET_DIST         = fleet/dist/$(GROKFLEET_ASSET)
+GROKFLEET_REPO        ?= chaogebaba/grok-box-setup
+GROKFLEET_INSTALLER    = vps/install-vps.sh
 
 ts-release-build:
-	@bash fleet/scripts/release-build.sh "$(FLEET2_INSTALLER)" "$(FLEET2_DIST)"
+	@bash fleet/scripts/release-build.sh "$(GROKFLEET_INSTALLER)" "$(GROKFLEET_DIST)"
 
 ts-release-publish:
-	@bash fleet/scripts/release-publish.sh "$(FLEET2_INSTALLER)" "$(FLEET2_DIST)" "$(FLEET2_REPO)" "$(CONFIRM)"
+	@bash fleet/scripts/release-publish.sh "$(GROKFLEET_INSTALLER)" "$(GROKFLEET_DIST)" "$(GROKFLEET_REPO)" "$(CONFIRM)"
 
 # Atomic deploy (D10/S9): scp to a temp name, keep the previous binary as
-# fleet2.prev, chmod, then `mv -f` over the live path, and smoke `version`.
-# Rollback of fleet2 itself is `mv fleet2.prev fleet2`. Note: on the VPS the
-# canonical install path is `vps/install-vps.sh` (D7 install_fleet2); this
+# grokfleet.prev, chmod, then `mv -f` over the live path, and smoke `version`.
+# Rollback of grokfleet itself is `mv grokfleet.prev grokfleet`. Note: on the VPS the
+# canonical install path is `vps/install-vps.sh` (D7 install_grokfleet); this
 # target is a fast dev redeploy of the binary only.
 ts-deploy: ts-build
-	scp fleet/dist/fleet2 $(VPS):$(FLEET2_REMOTE).tmp
+	scp fleet/dist/grokfleet $(VPS):$(GROKFLEET_REMOTE).tmp
 	ssh $(VPS) 'set -e; \
-		[ -f $(FLEET2_REMOTE) ] && cp -f $(FLEET2_REMOTE) $(FLEET2_REMOTE).prev || true; \
-		chmod 0755 $(FLEET2_REMOTE).tmp; \
-		mv -f $(FLEET2_REMOTE).tmp $(FLEET2_REMOTE); \
-		$(FLEET2_REMOTE) version'
+		[ -f $(GROKFLEET_REMOTE) ] && cp -f $(GROKFLEET_REMOTE) $(GROKFLEET_REMOTE).prev || true; \
+		chmod 0755 $(GROKFLEET_REMOTE).tmp; \
+		mv -f $(GROKFLEET_REMOTE).tmp $(GROKFLEET_REMOTE); \
+		$(GROKFLEET_REMOTE) version'
 
-# --- fleet2 cutover / soak / apply-flip / cutback (systemd drop-in; runs ON the
+# --- grokfleet cutover / soak / apply-flip / cutback (systemd drop-in; runs ON the
 # VPS) ------------------------------------------------------------------------
 # The same unit / timer / env / lock, so two engines never run concurrently
 # (D15). All targets daemon-reload and print the resulting ExecStart. They touch
@@ -88,8 +90,14 @@ ts-deploy: ts-build
 # rollback tooling — do not delete them again (they were dropped by 634b922 and
 # restored here; docs/FLEET-BRAIN.md §"Cutover / soak / apply-flip / cutback"
 # documents them and tests/test-makefile-targets.sh now binds docs to Makefile).
-DROPIN_DIR = /etc/systemd/system/fleet-reconcile.service.d
-DROPIN = $(DROPIN_DIR)/fleet2.conf
+# r3-n2: the drop-in directory MUST carry the REAL unit name. systemd
+# resolves drop-ins by the real unit, so a directory named after the 5.10.0
+# compatibility alias (fleet-reconcile.service.d) would be silently ignored.
+DROPIN_DIR = /etc/systemd/system/grokfleet-reconcile.service.d
+DROPIN = $(DROPIN_DIR)/grokfleet.conf
+# r3-n1: the soak marker KEEPS its pre-rename name. It is state under
+# $(FLEET_STATE) and it gates flipping apply=true; renaming it would silently
+# reset an in-flight soak. It is allowlisted in tests/lib/rename-allowlist.txt.
 SOAK_MARKER = /var/lib/grok-fleet/fleet2.soak-ok
 CONFIG = /opt/grok-fleet/config.toml
 # systemctl is a variable ONLY so the shell test-suite can drive the real
@@ -99,8 +107,8 @@ SYSTEMCTL ?= systemctl
 # T2 hazard: $$apply must stay a BARE $apply inside the single-quoted bash -c —
 # $${apply} would be expanded by systemd against the unit env to empty and
 # --apply lost silently. (Makefile $$ ⇒ a literal $ in the recipe.)
-WRAPPER_EXEC = ExecStart=/bin/bash -c 'apply=""; grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" $(CONFIG) && apply="--apply"; exec $(FLEET2_REMOTE) reconcile $$apply'
-SOAK_EXEC = ExecStart=$(FLEET2_REMOTE) reconcile --dry-run
+WRAPPER_EXEC = ExecStart=/bin/bash -c 'apply=""; grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:space:]]*true" $(CONFIG) && apply="--apply"; exec $(GROKFLEET_REMOTE) reconcile $$apply'
+SOAK_EXEC = ExecStart=$(GROKFLEET_REMOTE) reconcile --dry-run
 # R2-B1 (production defect): WRAPPER_EXEC must reach the drop-in file with a
 # LITERAL $apply. Interpolating it into a recipe as "$(WRAPPER_EXEC)" does NOT
 # work: make expands $$apply to a bare $apply in the recipe TEXT, and then the
@@ -128,7 +136,7 @@ else
 	@echo "ts-cutover: installed WRAPPER drop-in (runtime apply-evaluated)"
 endif
 	$(SYSTEMCTL) daemon-reload
-	@$(SYSTEMCTL) cat fleet-reconcile.service 2>/dev/null | grep -A1 '^ExecStart' || cat $(DROPIN)
+	@$(SYSTEMCTL) cat grokfleet-reconcile.service 2>/dev/null | grep -A1 '^ExecStart' || cat $(DROPIN)
 
 # ts-apply-flip: verify a trailing SOAK window (I1 binding; H4/I3), write the
 # marker, and swap the soak drop-in for the wrapper form. SOAK_SINCE may only
@@ -139,24 +147,24 @@ SOAK_SINCE ?= -24h
 ts-apply-flip:
 	@bash fleet/scripts/apply-flip.sh "$(SOAK_SINCE)" "$(FORCE)" "$(SOAK_MARKER)" "$(DROPIN)" "$(DROPIN_DIR)" "$$WRAPPER_EXEC"
 	$(SYSTEMCTL) daemon-reload
-	@$(SYSTEMCTL) cat fleet-reconcile.service 2>/dev/null | grep -A1 '^ExecStart' || cat $(DROPIN)
+	@$(SYSTEMCTL) cat grokfleet-reconcile.service 2>/dev/null | grep -A1 '^ExecStart' || cat $(DROPIN)
 
 # ts-cutback: PHASE-3 ROLLBACK. The pre-phase-3 semantic ("rm the drop-in and
 # daemon-reload, back to bash fleetctl") is DEAD: D7 retired bash fleetctl and
 # /opt/grok-fleet/fleetctl no longer exists, so removing the drop-in would leave
 # the unit pointing at a missing binary. The phase-3-correct rollback is instead
-# to (1) restore the PREVIOUS fleet2 binary kept by ts-deploy / install_fleet2 as
-# fleet2.prev, and (2) reinstall the SOAK (dry-run) drop-in, so a bad binary
+# to (1) restore the PREVIOUS grokfleet binary kept by ts-deploy / install_grokfleet as
+# grokfleet.prev, and (2) reinstall the SOAK (dry-run) drop-in, so a bad binary
 # CANNOT apply mutations while it is being diagnosed. Re-flip with ts-apply-flip
 # after a fresh clean soak window. Refuses (rc 1) when there is no .prev.
 ts-cutback:
-	@if [ ! -f $(FLEET2_REMOTE).prev ]; then \
-		echo "ts-cutback: REFUSED — no previous binary at $(FLEET2_REMOTE).prev; nothing to roll back to (deploy keeps .prev only when the binary changed)" >&2; \
+	@if [ ! -f $(GROKFLEET_REMOTE).prev ]; then \
+		echo "ts-cutback: REFUSED — no previous binary at $(GROKFLEET_REMOTE).prev; nothing to roll back to (deploy keeps .prev only when the binary changed)" >&2; \
 		exit 1; \
 	fi
-	mv -f $(FLEET2_REMOTE).prev $(FLEET2_REMOTE)
+	mv -f $(GROKFLEET_REMOTE).prev $(GROKFLEET_REMOTE)
 	@mkdir -p $(DROPIN_DIR)
 	@printf '%s\n' '[Service]' 'ExecStart=' '$(SOAK_EXEC)' > $(DROPIN)
-	@echo "ts-cutback: restored $(FLEET2_REMOTE) from .prev and forced the SOAK (dry-run) drop-in"
+	@echo "ts-cutback: restored $(GROKFLEET_REMOTE) from .prev and forced the SOAK (dry-run) drop-in"
 	$(SYSTEMCTL) daemon-reload
-	@$(SYSTEMCTL) cat fleet-reconcile.service 2>/dev/null | grep -A1 '^ExecStart' || cat $(DROPIN)
+	@$(SYSTEMCTL) cat grokfleet-reconcile.service 2>/dev/null | grep -A1 '^ExecStart' || cat $(DROPIN)

@@ -286,7 +286,7 @@ log "installed boxup $(cat "$DEST/VERSION" 2>/dev/null || echo '?') at $DEST"
 # `grep 'ln -s' install.sh` had zero hits, every operator hint in this file is
 # absolute, and boxup's own `export PATH` (boxup:36) only covers ITS children.
 # The practical cost is that `boxup status` over ssh on 003/004 required the
-# full /workspace/box-setup/boxup. vps/install-vps.sh has linked fleet2 into
+# full /workspace/box-setup/boxup. vps/install-vps.sh has linked grokfleet into
 # /usr/local/bin since F4; the box side never got the equivalent.
 #
 # mkdir -p + `ln -sfn` so a re-run is idempotent (and replaces a stale link

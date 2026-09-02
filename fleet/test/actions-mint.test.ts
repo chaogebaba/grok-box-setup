@@ -218,7 +218,7 @@ describe("T5 mint rc map + revoke arms", () => {
 
   test("m4: rc 1 + REVOKE on meta-persist failure (verified seed, recordKeyMeta fails)", async () => {
     // Seed + verify succeed, but persisting the key meta fails (the atomic
-    // tmp→rename throws). fleet2 MUST revoke the just-minted key (an unrecorded
+    // tmp→rename throws). grokfleet MUST revoke the just-minted key (an unrecorded
     // live key on the tailnet is the exact hazard) and NOT write <box>.expires.
     // m4 (skip revoke on persist failure) leaves the key live ⇒ no DELETE.
     const { keys, calls } = fakeKeys((c) => {
