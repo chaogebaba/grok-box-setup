@@ -47,7 +47,8 @@ Brain subcommands (docs/FLEET-BRAIN.md — VPS-side unless noted):
   fleet2 serve [--bind <ip>] [--port <n>]
                                  run the tailnet-bound token-auth admin API
                                  (VPS-ONLY, refuses rc 6 off the VPS; port 9891)
-  fleet2 tui                     laptop admin panel over the serve API (lane B)
+  fleet2 tui [--utc]             laptop admin panel over the serve API (lane B)
+                                 --utc: raw UTC timestamps, not local time
   fleet2 state check             report the state store: schema, integrity,
                                  rows, divergence findings (read-only)
   fleet2 state backup            take today's backup now (VACUUM INTO, keep 7)

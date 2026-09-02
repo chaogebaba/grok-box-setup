@@ -7,6 +7,7 @@
 
 import { test, expect, describe, afterEach } from "bun:test";
 import { cmdTui, installCrashBarrier, NOT_A_TTY_MESSAGE } from "../../src/tui/main.ts";
+import { hostZone, resolveTsOptions } from "../../src/tui/ts-options.ts";
 import { setLogSink } from "../../src/log.ts";
 import type { ConfigFs } from "../../src/tui/config.ts";
 import type { Env } from "../../src/env.ts";
@@ -119,5 +120,39 @@ describe("the crash barrier", () => {
     expect(process.listenerCount("uncaughtException")).toBe(before + 1);
     detach();
     expect(process.listenerCount("uncaughtException")).toBe(before);
+  });
+});
+
+
+describe("timestamp rendering options for the run", () => {
+  const zone = (): string => "America/New_York";
+
+  test("by default the viewer's zone is used and timestamps are localised", () => {
+    expect(resolveTsOptions([], undefined, zone)).toEqual({ tz: "America/New_York", utcRaw: false });
+  });
+
+  test("--utc keeps the raw UTC ISO strings", () => {
+    expect(resolveTsOptions(["--utc"], undefined, zone)).toEqual({ tz: "America/New_York", utcRaw: true });
+  });
+
+  test("FLEET_TUI_UTC=1 does the same, and only the exact value 1", () => {
+    expect(resolveTsOptions([], "1", zone).utcRaw).toBe(true);
+    expect(resolveTsOptions([], "0", zone).utcRaw).toBe(false);
+    expect(resolveTsOptions([], "yes", zone).utcRaw).toBe(false);
+    expect(resolveTsOptions([], undefined, zone).utcRaw).toBe(false);
+  });
+
+  test("hostZone reads the host's zone and honours TZ", async () => {
+    expect(hostZone()).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    // TZ is the documented third way to get UTC clock readings, so prove it
+    // reaches hostZone rather than asserting it from the same process.
+    const p = Bun.spawn([process.execPath, "-e", 'import{hostZone}from"./src/tui/ts-options.ts";console.log(hostZone())'], {
+      env: { ...process.env, TZ: "Asia/Tokyo" },
+      cwd: new URL("../..", import.meta.url).pathname,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(await new Response(p.stdout).text()).toContain("Asia/Tokyo");
+    expect(await p.exited).toBe(0);
   });
 });

@@ -14,6 +14,7 @@ import { makeApiClient, type ApiClient } from "./api-client.ts";
 import { resolveTuiConfig, TuiConfigError, type ConfigFs, nodeConfigFs } from "./config.ts";
 import { makeRenderOptions, processIo, type RenderIo } from "./render-options.ts";
 import { log } from "../log.ts";
+import { hostZone, resolveTsOptions } from "./ts-options.ts";
 
 /** The refusal the hand-rolled core raised as `NotATtyError`; the text and the
  *  rc are unchanged. */
@@ -28,6 +29,8 @@ export interface TuiDeps {
   now?: () => number;
   /** the fleet poll's period; defaults to POLL_INTERVAL_MS. */
   pollIntervalMs?: number;
+  /** the viewer's IANA zone; defaults to the host's (tests inject a fixed one). */
+  resolveZone?: () => string;
 }
 
 /**
@@ -35,10 +38,10 @@ export interface TuiDeps {
  * locality guard). Returns the process rc; it resolves when the user quits.
  */
 export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
-  void rest;
   const io = deps.io ?? processIo;
   const now = deps.now ?? (() => Date.now());
   const noColor = process.env.NO_COLOR !== undefined;
+  const ts = resolveTsOptions(rest, process.env.FLEET_TUI_UTC, deps.resolveZone ?? hostZone);
 
   let cfg;
   try {
@@ -64,7 +67,10 @@ export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
     pollIntervalMs: deps.pollIntervalMs ?? POLL_INTERVAL_MS,
   };
 
-  const instance = render(React.createElement(App, { initial: initialState(now(), noColor), deps: appDeps }), makeRenderOptions(io));
+  const instance = render(
+    React.createElement(App, { initial: initialState(now(), noColor, ts), deps: appDeps }),
+    makeRenderOptions(io),
+  );
   const detach = installCrashBarrier(instance.unmount, io);
   try {
     await instance.waitUntilExit();
@@ -109,3 +115,5 @@ export function installCrashBarrier(unmount: () => void, io: RenderIo): () => vo
     process.off("unhandledRejection", onFatal);
   };
 }
+
+export { hostZone, resolveTsOptions } from "./ts-options.ts";
