@@ -7,6 +7,7 @@ import {
   recoverSelection,
   applyFleet,
   applyLinkDown,
+  CONNECTING_MESSAGE,
   initialState,
   detailEffectFor,
   selectedBoxName,
@@ -89,6 +90,41 @@ describe("A15 selection recovery", () => {
     };
     const next = applyFleet(s, view, Date.now());
     expect(next.selected).toBe(0);
+  });
+});
+
+// --- r2 fix 4: the opening banner must not outlive the first answer ----------
+describe("the `connecting…` message is retired by the first successful poll", () => {
+  const view = (boxes = [box("grok-box-1")]): FleetView => ({
+    snapshot_ts: "2026-05-01T00:01:00Z",
+    apply: false,
+    canary: null,
+    scope: "admin",
+    boxes,
+  });
+
+  test("initialState opens with it", () => {
+    expect(initialState(Date.parse("2026-05-01T00:00:00Z"), true).message).toBe(CONNECTING_MESSAGE);
+  });
+
+  test("the first fleet answer clears it", () => {
+    const s = initialState(Date.parse("2026-05-01T00:00:00Z"), true);
+    expect(applyFleet(s, view(), Date.parse("2026-05-01T00:01:05Z")).message).toBeUndefined();
+  });
+
+  test("it does not come back on later polls", () => {
+    let s = initialState(Date.parse("2026-05-01T00:00:00Z"), true);
+    s = applyFleet(s, view(), Date.parse("2026-05-01T00:01:05Z"));
+    s = applyFleet(s, view(), Date.parse("2026-05-01T00:01:10Z"));
+    expect(s.message).toBeUndefined();
+  });
+
+  // The mutant this guards: clearing the message UNCONDITIONALLY. `run-action`
+  // polls immediately after the action, so an unconditional clear would wipe the
+  // action's own result off the screen before it could be read.
+  test("an ACTION's message survives the refresh the action triggers", () => {
+    const s = { ...state({ boxes: [box("grok-box-1")] }), message: "check grok-box-1 → rc=0" };
+    expect(applyFleet(s, view(), Date.parse("2026-05-01T00:01:05Z")).message).toBe("check grok-box-1 → rc=0");
   });
 });
 

@@ -253,7 +253,9 @@ export function headerText(state: TuiState, size: Size): string {
 }
 
 // --- box table ---------------------------------------------------------------
-const TABLE_HEADER_COLS = { glyph: 2, name: 14, tunnel: 7, check: 6, ver: 10, drift: 7, config: 9, expiry: 8 };
+// DRIFT is 9, not 7: `unknown` is exactly 7 characters, so a 7-wide cell left no
+// gap at all and the fleet read `unknownskip` on screen (r2 fix 1).
+const TABLE_HEADER_COLS = { glyph: 2, name: 14, tunnel: 7, check: 6, ver: 10, drift: 9, config: 9, expiry: 8 };
 
 /** The filtered box list (case-insensitive substring on name). */
 export function filteredBoxes(state: TuiState): SnapshotBox[] {
@@ -316,6 +318,18 @@ const SPARK = "▁▂▃▄▅▆▇█";
 const DASH = "—";
 function dashEm(v: string | number | null | undefined): string {
   return v === null || v === undefined ? DASH : String(v);
+}
+
+/** Epoch 0 in the shapes the engine can hand us: the API writes the zero time
+ *  for "never", and `1970-01-01T00:00:00Z` under `asleep last` reads as a real
+ *  event that happened 56 years ago (r2 fix 2). */
+const EPOCH_ZERO = /^1970-01-01[T ]00:00:00(\.0+)?(Z|\+00:00)?$/;
+
+/** dashEm for a TIMESTAMP field: absent, empty and epoch 0 all render `—`. */
+function dashTs(v: string | number | null | undefined): string {
+  if (v === null || v === undefined || v === "" || v === 0) return DASH;
+  const s = String(v);
+  return EPOCH_ZERO.test(s) ? DASH : s;
 }
 
 /** Health level per history sample: healthy=high, degraded=mid, incident=low. */
@@ -421,11 +435,11 @@ export function detailLines(state: TuiState, width: number): DetailLine[] {
   body.push(
     joinFields([
       field("checkfail#", dashEm(cf), typeof cf === "number" && cf > 0 ? "warn" : "muted"),
-      field("expires", dashEm(f?.expires_at), "plain"),
+      field("expires", dashTs(f?.expires_at), "plain"),
     ]),
   );
-  body.push(field("asleep since", dashEm(f?.asleep_since), "plain"));
-  body.push(field("asleep last", dashEm(f?.asleep_last), "plain"));
+  body.push(field("asleep since", dashTs(f?.asleep_since), "plain"));
+  body.push(field("asleep last", dashTs(f?.asleep_last), "plain"));
   const ab = f?.api_backoff;
   body.push(
     ab === null || ab === undefined
@@ -435,7 +449,7 @@ export function detailLines(state: TuiState, width: number): DetailLine[] {
           { text: " ", tone: "muted" as Tone },
           { text: `${ab.fails} fails`, tone: (ab.fails > 0 ? "warn" : "muted") as Tone },
           { text: ", retry ", tone: "muted" as Tone },
-          { text: dashEm(ab.next_retry), tone: "plain" as Tone },
+          { text: dashTs(ab.next_retry), tone: "plain" as Tone },
         ],
   );
   if (state.detail && state.detail.box === b.name) {

@@ -1,6 +1,6 @@
 fleet2 0 boxes  ● 0  ◆ 0  ✖ 0  ☾ 0  apply off  tick 10s   admin  link ● up                                              
 
-  NAME          TUNNEL CHECK VER       DRIFT  CONFIG   EXPIRY
+  NAME          TUNNEL CHECK VER       DRIFT    CONFIG   EXPIRY
 (no boxes)
 
 ↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history │ P push  M rotate  R rename  T check  C reconcile

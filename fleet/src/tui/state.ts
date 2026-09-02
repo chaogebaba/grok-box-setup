@@ -209,6 +209,11 @@ export function recoverSelection(state: TuiState): TuiState {
 }
 
 /** Apply a fresh fleet view to the state (preserve selection by box name). */
+/** The message the TUI opens with, before the first poll answers. It is the ONE
+ *  message `applyFleet` clears (r2 fix 4): every other message is an action's
+ *  own feedback, and the immediate post-action refresh must not wipe it. */
+export const CONNECTING_MESSAGE = "connecting…";
+
 export function applyFleet(state: TuiState, view: FleetView, nowMs: number): TuiState {
   const prevList = filteredBoxes(state);
   const prevName = prevList[state.selected]?.name;
@@ -225,6 +230,9 @@ export function applyFleet(state: TuiState, view: FleetView, nowMs: number): Tui
     nowMs,
   };
   next = deriveFreshness(next);
+  // The first successful poll retires the opening banner; an action's message
+  // survives the refresh that the action itself triggers.
+  if (next.message === CONNECTING_MESSAGE) next = { ...next, message: undefined };
   const list = filteredBoxes(next);
   if (prevName !== undefined) {
     const idx = list.findIndex((b) => b.name === prevName);
@@ -450,7 +458,7 @@ export function initialState(nowMs: number, noColor: boolean): TuiState {
     selected: 0,
     filter: "",
     filtering: false,
-    message: "connecting…",
+    message: CONNECTING_MESSAGE,
     noColor,
   };
 }

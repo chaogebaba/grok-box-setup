@@ -296,3 +296,88 @@ describe("segments and text never drift apart", () => {
     }
   });
 });
+
+// --- r2 fix 1: the DRIFT column must not butt against CONFIG ------------------
+describe("table column gaps", () => {
+  test("`unknown` in DRIFT still leaves a gap before CONFIG", () => {
+    const rows = tableLines(
+      state({ boxes: [box("grok-box-1", { drift: "unknown", config: "skip" })] }),
+      SIZE_120x40,
+    ).map((l) => l.text);
+    const row = rows.find((r) => r.includes("grok-box-1"))!;
+    expect(row).toContain("unknown  skip");
+    expect(row).not.toContain("unknownskip");
+  });
+
+  test("every DRIFT value the engine emits leaves at least one space", () => {
+    for (const drift of ["yes", "no", "unknown"]) {
+      const row = tableLines(state({ boxes: [box("b", { drift, config: "in-sync" })] }), SIZE_120x40)
+        .map((l) => l.text)
+        .find((r) => r.includes(" b "))!;
+      expect(/(yes|no|unknown) {2,}in-sync/.test(row)).toBe(true);
+    }
+  });
+
+  test("the column header row keeps its labels aligned with the cells", () => {
+    const rows = tableLines(state({ boxes: [box("grok-box-1", { drift: "unknown" })] }), SIZE_120x40).map((l) => l.text);
+    expect(rows[0]!.indexOf("CONFIG")).toBe(rows[1]!.indexOf("in-sync"));
+    expect(rows[0]!.indexOf("DRIFT")).toBe(rows[1]!.indexOf("unknown"));
+  });
+});
+
+// --- r2 fix 2: epoch 0 is "never", not a 1970 event --------------------------
+describe("detail timestamps: epoch 0 reads as absent", () => {
+  const facts = (over: Record<string, unknown>): Record<string, unknown> => ({
+    name: "grok-box-1",
+    checkfail_count: 0,
+    asleep_since: null,
+    asleep_last: null,
+    expires_at: null,
+    api_backoff: null,
+    ...over,
+  });
+  const pane = (over: Record<string, unknown>): string =>
+    detailLines(
+      state({ boxes: [box("grok-box-1")], detailFacts: { box: "grok-box-1", facts: facts(over) as never } }),
+      160,
+    )
+      .map((l) => l.text)
+      .join("\n");
+
+  test("the zero time renders — on asleep since / asleep last / expires", () => {
+    const p = pane({
+      asleep_since: "1970-01-01T00:00:00Z",
+      asleep_last: "1970-01-01T00:00:00Z",
+      expires_at: "1970-01-01T00:00:00Z",
+    });
+    expect(p).toContain("asleep since —");
+    expect(p).toContain("asleep last —");
+    expect(p).toContain("expires —");
+    expect(p).not.toContain("1970");
+  });
+
+  test("every epoch-0 spelling, and empty / numeric zero, render —", () => {
+    for (const v of [
+      "1970-01-01T00:00:00Z",
+      "1970-01-01T00:00:00.000Z",
+      "1970-01-01T00:00:00+00:00",
+      "1970-01-01 00:00:00",
+      "",
+      0,
+      null,
+      undefined,
+    ]) {
+      expect(pane({ asleep_last: v })).toContain("asleep last —");
+    }
+  });
+
+  test("a REAL timestamp is still shown verbatim", () => {
+    const p = pane({ asleep_last: "2026-09-02T05:10:27Z" });
+    expect(p).toContain("asleep last 2026-09-02T05:10:27Z");
+  });
+
+  test("an epoch-0 api-backoff retry renders — while the fail count stays", () => {
+    const p = pane({ api_backoff: { fails: 2, next_retry: "1970-01-01T00:00:00Z" } });
+    expect(p).toContain("api backoff 2 fails, retry —");
+  });
+});
