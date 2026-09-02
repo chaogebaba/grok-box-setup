@@ -71,10 +71,10 @@ FLEET2_RELEASE_ENV="${FLEET2_RELEASE-}"
 FLEET2_SHA256_ENV="${FLEET2_SHA256-}"
 # `make ts-release-build` rewrites EXACTLY these two lines (fleet/scripts/
 # release-build.sh); keep them at column 0 in `NAME=value` form.
-FLEET2_RELEASE=v5.8.0
+FLEET2_RELEASE=v5.9.0
 # Placeholder until the first `make ts-release-build` writes the real digest.
 # Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
-FLEET2_SHA256=4b975e6274861f07f56afa2a7edfe564fef81f90894911064ff64c150d6dd1fc
+FLEET2_SHA256=5f0de549002c0405c212eb4a4128a8317b91dec11a1931765b70318fdbf010ba
 
 # D10 — the fetch ORIGIN is a seam so the security-critical paths (good fetch,
 # corrupt body, 404, a 200 whose body is an HTML error page) can be tested
