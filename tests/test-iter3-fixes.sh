@@ -876,12 +876,16 @@ SH
   chmod +x "$repo/boxup" "$repo/box-bootstrap.sh" "$repo/install.sh"
   local log="$dest.install.log" t0 t1 elapsed
   mkdir -p "$dest"
+  # PREFIX keeps install.sh's /usr/local/bin/boxup symlink (bug-triage (6))
+  # inside $work. Without it a suite run as root would point the REAL
+  # /usr/local/bin/boxup at this throwaway $dest, which is deleted below.
   # Run install.sh in a CHILD shell (the "SSH session"); capture its pid;
   # SIGKILL that shell immediately after install.sh returns, so only a truly
   # detached grandchild can finish `boxup once` (3s) and write once.marker.
   t0=$(date +%s)
   PATH="$bindir:$PATH" \
     BOX_SETUP_ROOT="$dest" \
+    PREFIX="$work/prefix" \
     BOX_SETUP_ONCE=1 \
     BOX_SETUP_GIT_SHA=deadbee \
     BOX_SETUP_INSTALL_LOG="$log" \

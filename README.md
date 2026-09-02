@@ -12,8 +12,14 @@ Everything is one program: [`boxup`](boxup), installed at
 ```bash
 git clone https://github.com/chaogebaba/grok-box-setup.git /tmp/grok-box-setup
 sudo bash /tmp/grok-box-setup/install.sh
-sudo /workspace/box-setup/boxup once
+sudo boxup once
 ```
+
+The installer symlinks `/usr/local/bin/boxup` to `$BOX_SETUP_ROOT/boxup`, so
+`boxup` works unqualified from any shell on the box. The absolute
+`/workspace/box-setup/boxup` keeps working and is what to reach for if the link
+is missing, which happens when `/usr` is read-only — the installer logs that
+and carries on rather than failing an install that otherwise succeeded.
 
 **Naming rule.** A box name is `grok-box-` + exactly three decimal digits
 (`grok-box-001` … `grok-box-999`). `boxup` picks the lowest free index and

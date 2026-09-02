@@ -20,6 +20,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 DEST="${BOX_SETUP_ROOT:-/workspace/box-setup}"
+# PREFIX lets a test install the PATH symlink into a throwaway root. Empty =>
+# the real /. Mirrors vps/install-vps.sh, which has had it since F4. It affects
+# ONLY the symlink directory below; $DEST is unchanged, because the link TARGET
+# must resolve on the live system even under a scratch PREFIX.
+PREFIX="${PREFIX:-}"
 
 log() { echo "install: $*"; }
 
@@ -29,6 +34,7 @@ STATE_DIR_MIG="$DEST/state/tailscale"
 if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     exec sudo env BOX_SETUP_ROOT="$DEST" \
+      PREFIX="$PREFIX" \
       BOX_SETUP_ONCE="${BOX_SETUP_ONCE:-}" \
       BOX_SETUP_AUTHKEY="${BOX_SETUP_AUTHKEY:-}" \
       BOX_SETUP_GIT_SHA="${BOX_SETUP_GIT_SHA:-}" \
@@ -275,6 +281,26 @@ rm -f "$DEST/RUNBOOK.md" "$DEST/etc/default-tailscaled" /etc/default/tailscaled 
 bash "$DEST/boxup" stop >/dev/null 2>&1 || true
 
 log "installed boxup $(cat "$DEST/VERSION" 2>/dev/null || echo '?') at $DEST"
+
+# bug-triage (6): put boxup on PATH. Until now this installer never did —
+# `grep 'ln -s' install.sh` had zero hits, every operator hint in this file is
+# absolute, and boxup's own `export PATH` (boxup:36) only covers ITS children.
+# The practical cost is that `boxup status` over ssh on 003/004 required the
+# full /workspace/box-setup/boxup. vps/install-vps.sh has linked fleet2 into
+# /usr/local/bin since F4; the box side never got the equivalent.
+#
+# mkdir -p + `ln -sfn` so a re-run is idempotent (and replaces a stale link
+# from an install with a different $DEST). The TARGET is the REAL, non-PREFIX
+# $DEST path: under a PREFIX= scratch install only the LINK moves, so a test
+# never writes to the live /usr/local/bin and a real install never points at a
+# scratch tree. Both halves are `|| true`: a read-only /usr is a reason to skip
+# the convenience link, never to fail an install that already succeeded.
+BIN_LINK_DIR="$PREFIX/usr/local/bin"
+if mkdir -p "$BIN_LINK_DIR" 2>/dev/null && ln -sfn "$DEST/boxup" "$BIN_LINK_DIR/boxup" 2>/dev/null; then
+  log "linked $BIN_LINK_DIR/boxup -> $DEST/boxup"
+else
+  log "could not link $BIN_LINK_DIR/boxup -> $DEST/boxup (not fatal; use $DEST/boxup)"
+fi
 
 # F4 — hand the disruptive tail to a session-detached, HUP-immune process.
 # Disruptive work is pending when the build changed (MIGRATE=1 ⇒ tailscaled
