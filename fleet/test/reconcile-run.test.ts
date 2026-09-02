@@ -344,3 +344,61 @@ describe("T2 latch suppresses a mint-worthy box even in apply mode (m2)", () => 
     expect(apiCalls.some((c) => c.includes("POST") && c.includes("/keys"))).toBe(false);
   });
 });
+
+// --- D12: the row-e path is reachable at last --------------------------------
+
+describe("D12 a connected box with the tunnel down is incoherent, not asleep", () => {
+  /** The live devices shape: connectedToControl, no `online` field anywhere. */
+  const connected = (box: string, ctc: boolean, nowSec: number) =>
+    JSON.stringify({
+      devices: [{ hostname: box, nodeId: "A", connectedToControl: ctc, lastSeen: new Date(nowSec * 1000).toISOString() }],
+    });
+  const NOWS = 1_000_000;
+
+  test("two consecutive ticks ⇒ the incoherent alert AND repair_pending_runs = 2", async () => {
+    const { fs, store } = memState();
+    const state = new ReconcileState("/s", fs);
+    const notes: string[] = [];
+    const run = async () => {
+      const { keys, ctx } = fakeKeys(() => ({ code: 200, body: connected("grok-box-008", true, NOWS) }));
+      const deps = baseDeps({
+        state,
+        keys,
+        ctx,
+        notify: (_l, m) => { notes.push(m); },
+        targetBoxes: ["grok-box-008"],
+        nowSec: NOWS,
+        // the default runner returns no ss row ⇒ the tunnel is down
+      });
+      await runReconcile(deps);
+    };
+    await run();
+    // tick +1 is SILENT: alertIncoherent notifies only from the second run.
+    expect(notes).toEqual([]);
+    expect(state.readRepairPending("grok-box-008")!.runs).toBe(1);
+
+    await run();
+    expect(notes.some((m) => m.includes("incoherent-both-dead"))).toBe(true);
+    expect(state.readRepairPending("grok-box-008")!.runs).toBe(2);
+    void store;
+  });
+
+  test("a box that is NOT connected to control is asleep and never bumps the counter", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    const notes: string[] = [];
+    const { keys, ctx } = fakeKeys(() => ({ code: 200, body: connected("grok-box-008", false, NOWS) }));
+    const deps = baseDeps({
+      state,
+      keys,
+      ctx,
+      notify: (_l, m) => { notes.push(m); },
+      targetBoxes: ["grok-box-008"],
+      nowSec: NOWS,
+    });
+    await runReconcile(deps);
+    expect(notes).toEqual([]); // asleep alerts only after 2h of continuous both-dead
+    expect(state.readAsleep("grok-box-008")).toBeDefined();
+    expect(state.readRepairPending("grok-box-008")!.runs).toBe(0);
+  });
+});

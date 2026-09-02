@@ -835,7 +835,13 @@ converges because the VPS line is now deduped by PORT as well as key material.
 ### Repair (the survival property)
 
 A box IN membership whose tunnel is down while the tailnet says it is live is
-the condition decision-table row e already computes. Repair fires only after
+the condition decision-table row e already computes. **"Live" means
+`connectedToControl`, not `online`** — the Tailscale v2 devices endpoint has no
+`online` field and never did, so the bash brain and its port both read `online`
+as always false and row e could only ever say "asleep"; repair, the incoherent
+alert and the repair-over-adopt priority were unreachable in production until
+5.6.0 fixed the derivation (a device is also fresh whenever it is live, because
+the API may omit `lastSeen` for a connected device). Repair fires only after
 that condition has held for **two consecutive ticks**, counted in a marker
 distinct from the incoherent alert counter, written inside the membership loop
 at the row-e evaluation and carrying the stamp of the tick that wrote it. Adopt,
