@@ -10,5 +10,13 @@
     "start": "bun run src/cli.ts",
     "test": "bun test"
   },
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "ink": "^7.1",
+    "react": "^19",
+    "react-devtools-core": "^7.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18"
+  }
 }

@@ -44,7 +44,7 @@ import {
 import { makeEnrollSideEffects } from "./commands/enroll-wiring.ts";
 import { makeRenameDeps } from "./commands/rename-wiring.ts";
 
-const PKG_VERSION = "5.6.0"; // zero-touch join: discover + adopt + repair.
+const PKG_VERSION = "5.7.0"; // TUI per-box detail + diff/journal/history views.
 
 async function gitShaFromGit(): Promise<string> {
   try {

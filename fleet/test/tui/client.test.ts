@@ -121,3 +121,105 @@ describe("history", () => {
     if (r.ok) expect(r.value.length).toBe(1);
   });
 });
+
+// --- 5.7.0: the two NEW methods (D1/D2) --------------------------------------
+
+describe("GET /v1/boxes/:name (D1 detail facts)", () => {
+  const FULL = JSON.stringify({
+    name: "grok-box-1",
+    checkfail_count: 3,
+    asleep_since: "2026-03-20T09:46:40Z",
+    asleep_last: "2026-03-20T10:46:40Z",
+    expires_at: "2026-06-01",
+    api_backoff: { fails: 2, next_retry: "2026-03-20T12:33:20Z" },
+  });
+  test("happy: every fact is carried through", async () => {
+    const { fetch, calls } = fakeFetch(() => ({ status: 200, body: FULL }));
+    const r = await makeApiClient("http://h", "T", fetch).box("grok-box-1");
+    expect(calls[0]!.url).toBe("http://h/v1/boxes/grok-box-1");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.checkfail_count).toBe(3);
+      expect(r.value.expires_at).toBe("2026-06-01");
+      expect(r.value.api_backoff).toEqual({ fails: 2, next_retry: "2026-03-20T12:33:20Z" });
+    }
+  });
+
+  // Acceptance 1: a 5.6.0 engine omits all five fields. The shape validator keys
+  // on `name` ONLY, so that body VALIDATES and the pane renders `—`; it must not
+  // fall into the malformed-body path, which is LINK DOWN.
+  test("a 5.6.0 body with none of the fields still validates (never LINK DOWN)", async () => {
+    const old = JSON.stringify({ name: "grok-box-1", snapshot_ts: "t", box: null, markers: {} });
+    const { fetch } = fakeFetch(() => ({ status: 200, body: old }));
+    const r = await makeApiClient("http://h", "T", fetch).box("grok-box-1");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.value.name).toBe("grok-box-1");
+      expect(r.value.checkfail_count).toBeNull();
+      expect(r.value.asleep_since).toBeNull();
+      expect(r.value.expires_at).toBeNull();
+      expect(r.value.api_backoff).toBeNull();
+    }
+  });
+  test("a body with NO name is malformed ⇒ link_down", async () => {
+    const { fetch } = fakeFetch(() => ({ status: 200, body: JSON.stringify({ checkfail_count: 1 }) }));
+    const r = await makeApiClient("http://h", "T", fetch).box("grok-box-1");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.kind).toBe("link_down");
+  });
+  test("a transport failure is link_down, not a throw", async () => {
+    const { fetch } = fakeFetch(() => "throw");
+    const r = await makeApiClient("http://h", "T", fetch).box("grok-box-1");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.kind).toBe("link_down");
+  });
+});
+
+describe("GET /v1/boxes/:name/diff (D2)", () => {
+  test("happy: the {rc, log} body becomes the view's lines", async () => {
+    const { fetch, calls } = fakeFetch(() => ({ status: 200, body: JSON.stringify({ rc: 1, log: ["--- a", "+++ b"] }) }));
+    const r = await makeApiClient("http://h", "T", fetch).diff("grok-box-1");
+    expect(calls[0]!.url).toBe("http://h/v1/boxes/grok-box-1/diff");
+    expect(calls[0]!.init.method).toBe("GET");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value.log).toEqual(["--- a", "+++ b"]);
+  });
+  test("an EMPTY log is a valid answer (the view renders `in sync`)", async () => {
+    const { fetch } = fakeFetch(() => ({ status: 200, body: JSON.stringify({ rc: 0, log: [] }) }));
+    const r = await makeApiClient("http://h", "T", fetch).diff("grok-box-1");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value.log).toEqual([]);
+  });
+  test("a network error is link_down, not a throw", async () => {
+    const { fetch } = fakeFetch(() => "throw");
+    const r = await makeApiClient("http://h", "T", fetch).diff("grok-box-1");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.kind).toBe("link_down");
+  });
+  test("the box name is URL-encoded", async () => {
+    const { fetch, calls } = fakeFetch(() => ({ status: 200, body: "{}" }));
+    await makeApiClient("http://h", "T", fetch).diff("a b/c");
+    expect(calls[0]!.url).toBe("http://h/v1/boxes/a%20b%2Fc/diff");
+  });
+});
+
+describe("GET /v1/boxes/:name/journal wired to the J key (D3)", () => {
+  test("happy: 80 lines requested, log returned", async () => {
+    const { fetch, calls } = fakeFetch(() => ({ status: 200, body: JSON.stringify({ rc: 0, log: ["unit started"] }) }));
+    const r = await makeApiClient("http://h", "T", fetch).journal("grok-box-1", 80);
+    expect(calls[0]!.url).toBe("http://h/v1/boxes/grok-box-1/journal?lines=80");
+    expect(r.ok && r.value.log).toEqual(["unit started"]);
+  });
+  test("a readonly token gets 403 ⇒ forbidden (NOT link_down, so the view can word it)", async () => {
+    const { fetch } = fakeFetch(() => ({ status: 403, body: JSON.stringify({ error: { message: "admin scope required" } }) }));
+    const r = await makeApiClient("http://h", "READONLY", fetch).journal("grok-box-1", 80);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.kind).toBe("forbidden");
+  });
+  test("a network error is link_down, not a throw", async () => {
+    const { fetch } = fakeFetch(() => "throw");
+    const r = await makeApiClient("http://h", "T", fetch).journal("grok-box-1", 80);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.kind).toBe("link_down");
+  });
+});

@@ -1,10 +1,11 @@
 // helpers.ts — shared fixtures for the lane-B TUI tests.
 
 import type { SnapshotBox } from "../../src/history/schema.ts";
-import type { TuiState, Size } from "../../src/tui/render.ts";
-import type { TermIo } from "../../src/tui/term.ts";
+import type { TuiState } from "../../src/tui/state.ts";
+import type { Size } from "../../src/tui/model.ts";
 
-export type { TuiState, Size } from "../../src/tui/render.ts";
+export type { TuiState } from "../../src/tui/state.ts";
+export type { Size } from "../../src/tui/model.ts";
 
 /** A snapshot box with sane defaults; override per test. */
 export function box(name: string, over: Partial<SnapshotBox> = {}): SnapshotBox {
@@ -44,61 +45,3 @@ export function state(over: Partial<TuiState> = {}): TuiState {
 
 export const SIZE_80x24: Size = { cols: 80, rows: 24 };
 export const SIZE_120x40: Size = { cols: 120, rows: 40 };
-
-/** A fake TermIo that records writes + lets a test drive keys/resize/signals. */
-export function fakeTermIo(opts: { tty?: boolean } = {}): {
-  io: TermIo;
-  writes: string[];
-  rawModeCalls: boolean[];
-  fireKey: (data: string) => void;
-  fireResize: () => void;
-  fireSignal: (sig: NodeJS.Signals) => void;
-  fireExit: () => void;
-  fireUnhandled: () => void;
-} {
-  const writes: string[] = [];
-  const rawModeCalls: boolean[] = [];
-  const keyCbs: Array<(d: string) => void> = [];
-  const resizeCbs: Array<() => void> = [];
-  const signalCbs = new Map<string, Array<() => void>>();
-  const exitCbs: Array<() => void> = [];
-  const rejCbs: Array<() => void> = [];
-  const io: TermIo = {
-    isTTY: () => opts.tty ?? true,
-    setRawMode: (on) => rawModeCalls.push(on),
-    write: (s) => writes.push(s),
-    size: () => SIZE_120x40,
-    onKey: (cb) => {
-      keyCbs.push(cb);
-      return () => {};
-    },
-    onResize: (cb) => {
-      resizeCbs.push(cb);
-      return () => {};
-    },
-    onSignal: (sig, cb) => {
-      const arr = signalCbs.get(sig) ?? [];
-      arr.push(cb);
-      signalCbs.set(sig, arr);
-      return () => {};
-    },
-    onExit: (cb) => {
-      exitCbs.push(cb);
-      return () => {};
-    },
-    onUnhandledRejection: (cb) => {
-      rejCbs.push(cb);
-      return () => {};
-    },
-  };
-  return {
-    io,
-    writes,
-    rawModeCalls,
-    fireKey: (d) => keyCbs.forEach((c) => c(d)),
-    fireResize: () => resizeCbs.forEach((c) => c()),
-    fireSignal: (sig) => (signalCbs.get(sig) ?? []).forEach((c) => c()),
-    fireExit: () => exitCbs.forEach((c) => c()),
-    fireUnhandled: () => rejCbs.forEach((c) => c()),
-  };
-}

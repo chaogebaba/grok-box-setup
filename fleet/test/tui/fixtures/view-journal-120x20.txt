@@ -1,0 +1,20 @@
+fleet2 3 boxes  ●1 !1 ✕1 ◌0  apply=off  tick=10s   admin  link=up                                                       
+
+── journal grok-box-002 ──  rows 1–15 of 200                                                                            
+Apr 30 12:00:00 box grok-agent[1]: line 0
+Apr 30 12:01:00 box grok-agent[1]: line 1
+Apr 30 12:02:00 box grok-agent[1]: line 2
+Apr 30 12:03:00 box grok-agent[1]: line 3
+Apr 30 12:04:00 box grok-agent[1]: line 4
+Apr 30 12:05:00 box grok-agent[1]: line 5
+Apr 30 12:06:00 box grok-agent[1]: line 6
+Apr 30 12:07:00 box grok-agent[1]: line 7
+Apr 30 12:08:00 box grok-agent[1]: line 8
+Apr 30 12:09:00 box grok-agent[1]: line 9
+Apr 30 12:10:00 box grok-agent[1]: line 10
+Apr 30 12:11:00 box grok-agent[1]: line 11
+Apr 30 12:12:00 box grok-agent[1]: line 12
+Apr 30 12:13:00 box grok-agent[1]: line 13
+Apr 30 12:14:00 box grok-agent[1]: line 14
+
+↑/↓ select  / filter  r refresh  q quit  D diff  J journal  H history  P push  M rotate  R rename  T check  C reconcile 

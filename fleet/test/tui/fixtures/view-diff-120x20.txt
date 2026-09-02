@@ -1,0 +1,20 @@
+fleet2 3 boxes  ●1 !1 ✕1 ◌0  apply=off  tick=10s   admin  link=up                                                       
+
+── diff grok-box-001 ──  rows 21–35 of 200                                                                              
+--- diff line 20 for the config push
+--- diff line 21 for the config push
+--- diff line 22 for the config push
+--- diff line 23 for the config push
+--- diff line 24 for the config push
+--- diff line 25 for the config push
+--- diff line 26 for the config push
+--- diff line 27 for the config push
+--- diff line 28 for the config push
+--- diff line 29 for the config push
+--- diff line 30 for the config push
+--- diff line 31 for the config push
+--- diff line 32 for the config push
+--- diff line 33 for the config push
+--- diff line 34 for the config push
+
+↑/↓ select  / filter  r refresh  q quit  D diff  J journal  H history  P push  M rotate  R rename  T check  C reconcile 

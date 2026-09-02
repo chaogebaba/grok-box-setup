@@ -4,8 +4,9 @@
 import { test, expect, describe } from "bun:test";
 import { serializeLine, MAX_LINE_BYTES } from "../../src/history/write.ts";
 import type { SnapshotBox, SnapshotLine } from "../../src/history/schema.ts";
-import { renderDiscover, renderFrame } from "../../src/tui/render.ts";
-import type { TuiState } from "../../src/tui/render.ts";
+import { discoverText as renderDiscover } from "../../src/tui/model.ts";
+import type { TuiState } from "../../src/tui/state.ts";
+import { frameOf } from "../tui/ink-harness.ts";
 
 function box(name: string): SnapshotBox {
   return {
@@ -93,13 +94,13 @@ function tuiState(over: Partial<TuiState> = {}): TuiState {
 describe("D7 TUI row", () => {
   const size = { cols: 120, rows: 40 };
 
-  test("no discover ⇒ NO row at all (a pre-5.6.0 snapshot renders exactly as before)", () => {
+  test("no discover ⇒ NO row at all (a pre-5.6.0 snapshot renders exactly as before)", async () => {
     expect(renderDiscover(tuiState(), size)).toBeUndefined();
     expect(renderDiscover(tuiState({ discover: null }), size)).toBeUndefined();
-    expect(renderFrame(tuiState(), size)).not.toContain("discover:");
+    expect(await frameOf(tuiState(), size)).not.toContain("discover:");
   });
 
-  test("one summary row, no new view", () => {
+  test("one summary row, no new view", async () => {
     const s = tuiState({
       discover: {
         candidates: 3,
@@ -114,7 +115,7 @@ describe("D7 TUI row", () => {
     expect(row).toContain("0 repaired");
     expect(row).toContain("1 skipped");
     expect(row).toContain("grok-box-004:unreachable");
-    const frame = renderFrame(s, size).split("\n");
+    const frame = (await frameOf(s, size)).split("\n");
     expect(frame.filter((l) => l.includes("discover:"))).toHaveLength(1);
   });
 

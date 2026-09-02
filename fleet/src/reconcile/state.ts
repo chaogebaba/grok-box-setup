@@ -215,6 +215,18 @@ export class ReconcileState {
     this.fs.remove(this.p("api.next_retry"));
     this.fs.remove(this.p("api.backoff_min"));
   }
+  /**
+   * READ-ONLY consecutive-API-failure count (5.7.0 D1, gate r1 B3).
+   *
+   * `recordApiFailure` is the only other public path that yields this number,
+   * and it BUMPS the counter and writes `api.next_retry`/`api.backoff_min` on
+   * the way. A read path that called it would push the engine into a fabricated
+   * backoff, so `GET /v1/boxes/:name` calls THIS instead. Plain `readCounter`
+   * idiom: no writes at all.
+   */
+  apiFails(): number {
+    return this.readCounter("api.fails");
+  }
   /** api.next_retry epoch (main:2767-2774), or undefined when absent/invalid. */
   nextRetry(): number | undefined {
     const raw = this.fs.read(this.p("api.next_retry"));
