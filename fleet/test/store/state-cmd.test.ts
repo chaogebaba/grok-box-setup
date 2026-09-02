@@ -60,7 +60,7 @@ describe("state check", () => {
       const { out, d } = deps(f.state, f.etc);
       expect(await cmdState(["check"], d)).toBe(RC.OK);
       const text = out.join("");
-      expect(text).toContain("user_version=1 min_reader=1");
+      expect(text).toContain("user_version=2 min_reader=1");
       expect(text).toContain("quick_check   ok");
       expect(text).toContain("integrity     ok");
       // `state check` LISTS the retired and enrolling rows, and says nothing

@@ -24,10 +24,11 @@ import { importLegacy } from "../store/legacy.ts";
 import { runReconcile } from "./run.ts";
 import { makeDiscoverDeps } from "./discover-wiring.ts";
 import type { ReconcileDeps } from "./run.ts";
-import { appendSnapshot } from "../history/write.ts";
+import type { EnrolSurface } from "./discover.ts";
+import { writeSnapshot } from "../store/snapshots.ts";
+import { ENROL_STUCK_RENOTIFY_SECS, ENROL_STUCK_STREAK } from "../store/state.ts";
 import { resolveTarget } from "../stage.ts";
 import { fsTelegramSource, fetchPoster, notify as notifyFn } from "../notify.ts";
-import { nodeFs } from "../state.ts";
 import type { UpgradeDeps } from "../upgrade.ts";
 import { log } from "../log.ts";
 import { existsSync, readFileSync, mkdirSync } from "node:fs";
@@ -116,7 +117,7 @@ export async function assembleTickDeps(
   // files being absent, because a crashed import leaves an empty file behind.
   const imported = importLegacy(store, { fleetState: env.FLEET_STATE, etc: env.FLEET_ETC });
   const state = new StoreState(store, {
-    paths: { fleetState: env.FLEET_STATE, etc: env.FLEET_ETC, version: opts.version ?? "5.8.0" },
+    paths: { fleetState: env.FLEET_STATE, etc: env.FLEET_ETC, version: opts.version ?? "5.9.0" },
   });
   // Export straight after an import so a rollback to 5.7.1 in the next minute
   // reads files the store itself wrote (D6).
@@ -173,7 +174,6 @@ export async function assembleTickDeps(
     runner,
     env,
     rollout,
-    fs: nodeFs,
     notifyDeps: { telegramEnvPath: env.FLEET_TELEGRAM_ENV, source: fsTelegramSource, poster: fetchPoster },
   };
 
@@ -198,9 +198,50 @@ export async function assembleTickDeps(
     apply: opts.apply,
     nowSec: opts.nowSec,
     discover,
-    // TUI-D4: production tick appends a snapshot line under FLEET_STATE/history.
-    history: (line) => {
-      appendSnapshot(env.FLEET_STATE, line);
+    enrol: enrolSurface(state, notify),
+    // TUI-D4 + state-store D3: the production tick writes ONE snapshot into the
+    // three `snapshots` tables, in ONE transaction. `history/*.jsonl` is no
+    // longer written — a 5.8.0 binary rolled back onto this file resumes
+    // appending its own daily files, and the Phase B period is a documented GAP
+    // in them rather than a silently reconstructed history.
+    //
+    // Best-effort exactly as the file append was: a snapshot failure logs and
+    // never fails the tick, because the snapshot is an observability record and
+    // the membership/counter writes that matter have already committed.
+    history: (line, ctx) => {
+      try {
+        writeSnapshot(store, { tick: ctx.tick, line, observed: ctx.observed, target: { ref: rollout.target, sha: targetSha ?? null, version: targetVersion ?? null } });
+      } catch (e) {
+        log(`reconcile: snapshot write failed (${e instanceof Error ? e.message : String(e)}) — the tick's own writes are unaffected`);
+      }
+    },
+  };
+}
+
+/**
+ * state-store D5: the resume pass's view of the store — which rows are
+ * `enrolling`, and whether a failing one has reached `enrol-stuck`.
+ *
+ * The alert is throttled through the `alerts` TABLE rather than a counter file,
+ * which makes it the first consumer of a table schema v1 created with no writer.
+ * Threshold: three ATTEMPTED-and-failed stages (not three ticks), then at most
+ * once per 24 h.
+ */
+function enrolSurface(
+  state: StoreState,
+  notify: (level: "info" | "warn", msg: string) => Promise<void> | void,
+): EnrolSurface {
+  return {
+    rows: () => state.enrollingRows(),
+    async stuck(box) {
+      const row = state.boxRow(box);
+      if (row === undefined || row.enrol_fail_streak < ENROL_STUCK_STREAK) return;
+      if (!state.alertDue(box, "enrol-stuck", ENROL_STUCK_RENOTIFY_SECS)) return;
+      await notify(
+        "warn",
+        `${box}: enrol-stuck — ${row.enrol_fail_streak} failed enrol stages, stuck at stage ${row.enrol_stage}` +
+          `${row.enrol_warn === null ? "" : ` (${row.enrol_warn})`}; 'fleet2 retire ${box}' aborts it`,
+      );
     },
   };
 }

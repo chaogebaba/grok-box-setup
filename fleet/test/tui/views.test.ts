@@ -30,6 +30,9 @@ import { box, state, SIZE_120x40 } from "./helpers.ts";
 const SIZE_100x24 = { cols: 100, rows: 24 };
 const SIZE_140x40 = { cols: 140, rows: 40 };
 const SIZE_200x50 = { cols: 200, rows: 50 };
+/** Wide enough for the widest single row: the folded `asleep last · api backoff`
+ *  pair needs ~82 columns inside the frame (state-store D4 row budget). */
+const SIZE_300x50 = { cols: 300, rows: 50 };
 
 const FACTS: BoxDetail = {
   name: "grok-box-1",
@@ -38,6 +41,9 @@ const FACTS: BoxDetail = {
   asleep_last: "2026-03-20T10:46:40Z",
   expires_at: "2026-06-01",
   api_backoff: { fails: 2, next_retry: "2026-03-20T12:33:20Z" },
+  // state-store D4 (Phase B): the membership phase and the liveness label.
+  phase: "enrolled",
+  observed: "healthy",
 };
 
 /** A snapshot line carrying one box, for the history view. */
@@ -47,23 +53,30 @@ function line(ts: string, over: Partial<SnapshotLine["boxes"][0]> = {}, apply = 
 
 // --- D1: the detail pane rows ------------------------------------------------
 describe("D1 detail pane rows", () => {
-  test("all five facts render as labelled rows", () => {
+  test("all seven facts render as labelled rows", () => {
     const s = state({ detailFacts: { box: "grok-box-1", facts: FACTS } });
     // A pane wide enough for the longest row: at 120 columns the pane is 46
-    // wide and the api-backoff row does not fit, which V5 TRUNCATES (it used to
-    // overflow and wrap into the next line).
-    const pane = renderDetail(s, SIZE_200x50).join("\n");
+    // wide and the folded asleep-last/api-backoff row does not fit, which V5
+    // TRUNCATES (it used to overflow and wrap into the next line).
+    const pane = renderDetail(s, SIZE_300x50).join("\n");
     expect(pane).toContain("checkfail# 3");
     expect(pane).toContain("expires 2026-06-01 (40d)");
     // Timestamps are wall-clock readings in the state's zone (UTC in fixtures).
     expect(pane).toContain("asleep since Mar 20 09:46 UTC (41d ago)");
     expect(pane).toContain("asleep last Mar 20 10:46 UTC (41d ago)");
     expect(pane).toContain("api backoff 2 fails, retry Mar 20 12:33 UTC (41d ago)");
+    // state-store D4: the two facts a box's state used to be re-derived for.
+    expect(pane).toContain("phase enrolled");
+    expect(pane).toContain("observed healthy");
   });
 
   test("the same five facts under --utc, as raw UTC ISO strings", () => {
     const s = state({ detailFacts: { box: "grok-box-1", facts: FACTS }, utcRaw: true });
-    const pane = renderDetail(s, SIZE_200x50).join("\n");
+    // 300 columns, not 200: the asleep-last/api-backoff pair shares ONE row
+    // (state-store D4 row budget), and raw ISO strings make that row the widest
+    // the card paints. A narrower pane truncates it and this case is about the
+    // timestamp FORMAT, not the truncation.
+    const pane = renderDetail(s, SIZE_300x50).join("\n");
     expect(pane).toContain("checkfail# 3");
     expect(pane).toContain("expires 2026-06-01 (40d)");
     expect(pane).toContain("asleep since 2026-03-20T09:46:40Z");
@@ -77,8 +90,10 @@ describe("D1 detail pane rows", () => {
     const w = detailWidth(SIZE_120x40);
     const rows = renderDetail(s, SIZE_120x40);
     for (const r of rows) expect(r.length).toBe(w);
-    const backoff = rows.find((r) => r.includes("api backoff"))!;
-    expect(backoff.startsWith("│api backoff 2 fails, retry Mar 20 12:33 UTC")).toBe(true);
+    // TUI-D4 row budget: `api backoff` rides on the `asleep last` row so the
+    // new phase/observed line costs no rows (the card is fixed at DETAIL_ROWS).
+    const backoff = rows.find((r) => r.includes("asleep last"))!;
+    expect(backoff.startsWith("│asleep last Mar 20 10:46 UTC (41d ago) · api")).toBe(true);
     expect(backoff.endsWith("│")).toBe(true);
   });
 
@@ -91,6 +106,8 @@ describe("D1 detail pane rows", () => {
       asleep_last: null,
       expires_at: null,
       api_backoff: null,
+      phase: null,
+      observed: null,
     };
     const pane = renderDetail(state({ detailFacts: { box: "grok-box-1", facts: older } }), SIZE_120x40).join("\n");
     expect(pane).toContain("checkfail# —");
@@ -98,6 +115,10 @@ describe("D1 detail pane rows", () => {
     expect(pane).toContain("asleep since —");
     expect(pane).toContain("asleep last —");
     expect(pane).toContain("api backoff —");
+    // A 5.8.0 engine omits both new fields; the pane renders them as — rather
+    // than dropping the row, so the card keeps its fixed height either way.
+    expect(pane).toContain("phase —");
+    expect(pane).toContain("observed —");
   });
 
   test("with NO facts loaded at all the rows still render, as —", () => {
@@ -149,9 +170,9 @@ describe("D1 detail pane rows", () => {
         "│drift no · config in-sync · expiry 40d      │",
         "│checkfail no · asleep no · canary none      │",
         "│checkfail# — · expires —                    │",
+        "│phase — · observed —                        │",
         "│asleep since —                              │",
-        "│asleep last —                               │",
-        "│api backoff —                               │",
+        "│asleep last — · api backoff —               │",
         "│24h (loading…)                              │",
         "╰────────────────────────────────────────────╯",
       ].join("\n"),

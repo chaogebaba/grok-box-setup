@@ -24,7 +24,6 @@ import { BunRunner } from "./runner.ts";
 import { loadConfig, resolveRollout, configCanary, type ParsedConfig } from "./config.ts";
 import { orderExplicit, isValidBoxName } from "./boxes.ts";
 import { readMembership } from "./store/membership.ts";
-import { nodeFs } from "./state.ts";
 import { runInventory, renderTable, fsReadExpires, type DevicesApi } from "./inventory.ts";
 import { tailscaleDevicesApi, resolveTokenFile, fetchTransport } from "./tailscale.ts";
 import { runUpgradePass, takeLockAndReexec, RC, type UpgradeArgs, type UpgradeDeps } from "./upgrade.ts";
@@ -56,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.8.0"; // state-store Phase A: bun:sqlite fleet.db + legacy export.
+const PKG_VERSION = "5.9.0"; // state-store Phase B: explicit phase, enrol saga, snapshots in the store.
 
 async function gitShaFromGit(): Promise<string> {
   try {
@@ -174,9 +173,29 @@ async function main(argv: string[]): Promise<number> {
     case "mint-key":
       return cmdMintKey(rest[0] ?? "", { env, cfg, runner });
     case "enroll":
-      return cmdEnroll(rest, makeEnrollSideEffects(env, cfg, runner));
+      return cmdEnroll(rest, makeEnrollSideEffects(env, cfg, runner, { version: PKG_VERSION }));
     case "rename":
-      return cmdRename(rest, makeRenameDeps(env, cfg, runner));
+      return cmdRename(rest, makeRenameDeps(env, cfg, runner, PKG_VERSION));
+    case "retire": {
+      // state-store D4: a membership mutation, so VPS-only for the same reason
+      // `enroll` and `state` are — it rewrites the fleet user's authorized_keys
+      // and the store under $FLEET_STATE.
+      if (await refuseIfNoKey("retire", env.FLEET_BOX_KEY)) return RC.REFUSED;
+      const { cmdRetire } = await import("./commands/retire.ts");
+      const { makeRetireOps, makeRetireOpen } = await import("./commands/retire-wiring.ts");
+      return cmdRetire(rest, {
+        env,
+        runner,
+        ops: makeRetireOps(env, cfg, runner),
+        open: makeRetireOpen(env, PKG_VERSION),
+        notify: (level, msg) =>
+          notifyFn(level, msg, {
+            telegramEnvPath: env.FLEET_TELEGRAM_ENV,
+            source: fsTelegramSource,
+            poster: fetchPoster,
+          }),
+      });
+    }
 
     // --- fleet2 admin panel (TUI-D11) ---
     case "serve": {
@@ -271,7 +290,7 @@ async function inventoryPass(
   if (typeof parsed === "number") return { rc: parsed as number };
   const boxes = parsed.boxes.length > 0 ? parsed.boxes : readMembership(env);
   const api: DevicesApi = tailscaleDevicesApi(env, cfg);
-  const res = await runInventory(boxes, { runner, env, rollout, fs: nodeFs, api, readExpires: fsReadExpires });
+  const res = await runInventory(boxes, { runner, env, rollout, api, readExpires: fsReadExpires });
   return { rc: RC.OK, res, json: parsed.json };
 }
 
@@ -410,7 +429,6 @@ async function runUpgradeCmd(
     runner,
     env,
     rollout,
-    fs: nodeFs,
     notifyDeps: { telegramEnvPath: env.FLEET_TELEGRAM_ENV, source: fsTelegramSource, poster: fetchPoster },
   };
 

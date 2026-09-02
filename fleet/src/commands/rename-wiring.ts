@@ -252,7 +252,7 @@ function makeOps(env: Env, cfg: ParsedConfig, runner: Runner): RenameOps {
 }
 
 /** Build production RenameDeps for `fleet2 rename`. */
-export function makeRenameDeps(env: Env, cfg: ParsedConfig, runner: Runner, version = "5.8.0"): RenameDeps {
+export function makeRenameDeps(env: Env, cfg: ParsedConfig, runner: Runner, version = "5.9.0"): RenameDeps {
   return {
     store: makeStore(env, version),
     ops: makeOps(env, cfg, runner),

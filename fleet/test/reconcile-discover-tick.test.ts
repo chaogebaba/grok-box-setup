@@ -6,9 +6,8 @@
 // loop; repair after the loop and BEFORE the snapshot; the summary reaching the
 // snapshot line and GET /v1/fleet.
 
-import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { runReconcile, type ReconcileDeps } from "../src/reconcile/run.ts";
 import { ReconcileState, type StateFs } from "../src/reconcile/state.ts";
@@ -21,7 +20,12 @@ import type { ManagedSource } from "../src/actions/config-push.ts";
 import type { UpgradeDeps } from "../src/upgrade.ts";
 import type { SnapshotLine } from "../src/history/schema.ts";
 import { makeFetch } from "../src/serve/server.ts";
-import { fakeContext, getReq } from "./serve/helpers.ts";
+import { fakeContext, getReq, seedSnapshots } from "./serve/helpers.ts";
+import { suiteScratch } from "./store/helpers.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("discover-tick");
+afterAll(() => SCRATCH.clean());
 
 let logs: string[] = [];
 let prevSink: (l: string) => void;
@@ -210,10 +214,9 @@ describe("D7 the summary reaches GET /v1/fleet", () => {
       boxes: [],
       discover: { candidates: 2, adopted: 1, repaired: 0, skipped: [{ name: "grok-box-004", reason: "unreachable" }] },
     };
-    const state = mkdtempSync(join(tmpdir(), "fleet2-disc-"));
+    const state = SCRATCH.dir("fleet2-disc");
     dirs.push(state);
-    mkdirSync(join(state, "history"), { recursive: true });
-    writeFileSync(join(state, "history", "2026-09-01.jsonl"), JSON.stringify(withDiscover) + "\n");
+    seedSnapshots(state, [withDiscover], { firstTick: 1 });
     const ctx = await fakeContext({ enrolled: [] });
     (ctx as { env: { FLEET_STATE: string } }).env.FLEET_STATE = state;
     (ctx as { env: { FLEET_CONFIG: string } }).env.FLEET_CONFIG = join(state, "nope.toml");
@@ -226,7 +229,7 @@ describe("D7 the summary reaches GET /v1/fleet", () => {
 
     // A pre-5.6.0 line has no such field: the response says null, never throws.
     const older: SnapshotLine = { v: 1, ts: "2026-09-01T00:01:00Z", apply: true, canary: null, boxes: [] };
-    writeFileSync(join(state, "history", "2026-09-01.jsonl"), JSON.stringify(older) + "\n");
+    seedSnapshots(state, [older], { firstTick: 2 });
     const r2 = await fetch(getReq("/v1/fleet", "READSECRET"));
     expect(((await r2.json()) as { discover: unknown }).discover).toBeNull();
   });

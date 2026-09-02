@@ -38,6 +38,7 @@ VPS-side (refuse rc 6 elsewhere):
   fleet2 reconcile [--apply]               — the 5-min decision table (dry-run by default)
   fleet2 enroll [--no-box-config] <box>    — trust a box's reverse tunnel and record membership
   fleet2 rename [--dry-run] <old> <new>    — live-rename a box to canonical grok-box-NNN (same port)
+  fleet2 retire [--forget] <box>           — un-enrol a box: retired, un-adoptable until enroll revives it
   fleet2 mint-key <box>                    — mint a per-box tag-scoped auth key and seed it
   fleet2 config render|diff|push <box>     — the box's managed.toml: print, compare (rc 1 on drift), push
   fleet2 fleet-status                      — brain table: API / tunnel / check / authkey / version
@@ -53,7 +54,8 @@ flags:
                   version, rc, state check, state reconcile-files, upgrade --dry-run.
                   FLEET2_JSON=1 in the environment is equivalent wherever --json exists.
   --apply         actually act (reconcile, state reconcile-files, upgrade); default is dry-run
-  --dry-run       plan only (reconcile, rename)
+  --forget        retire: delete the row too, so the name is an ordinary candidate again
+  --dry-run       plan only (reconcile, rename, retire)
   --utc           tui: raw UTC timestamps instead of local time (FLEET_TUI_UTC=1 equivalent)
   --tty           ssh: force a pty (ssh -t) for programs that need one
   --no-stdin      ssh: close the child's stdin instead of inheriting it

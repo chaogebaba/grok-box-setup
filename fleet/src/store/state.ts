@@ -48,6 +48,35 @@ export interface BoxRow {
 const COUNTER_COLUMNS = ["checkfail", "seedfail", "cfgfail", "incoherent"] as const;
 type CounterColumn = (typeof COUNTER_COLUMNS)[number];
 
+/** The three membership phases (D4). */
+export type Phase = BoxRow["phase"];
+
+/** `transition` result: rc 1 names the phase the row ACTUALLY holds (D4). */
+export interface TransitionResult {
+  rc: 0 | 1;
+  /** the row's phase when the assertion failed (undefined when the row is absent). */
+  actual?: Phase;
+  message?: string;
+}
+
+/** One `enrolling` row, as the resume pass wants it (D5). */
+export interface EnrollingRow {
+  name: string;
+  stage: number;
+  streak: number;
+  warn: string | null;
+  created_at: number;
+}
+
+/** D5: the five external stages of the enrol saga, in `enroll.ts` order. */
+export const ENROL_STAGES = 5;
+
+/** D5: `enrol-stuck` fires at this many ATTEMPTED-and-failed stages. */
+export const ENROL_STUCK_STREAK = 3;
+
+/** D5: and then at most once per 24 h, throttled through the `alerts` table. */
+export const ENROL_STUCK_RENOTIFY_SECS = 86400;
+
 export interface StoreStateOptions {
   /** where the legacy export writes; omit to disable the export (tests). */
   paths?: ExportPaths;
@@ -83,6 +112,12 @@ export class StoreState implements ReconcileStateApi {
       this.exportErrors.push(msg);
       log(`state store: legacy export (${what}${box ? ` ${box}` : ""}) FAILED — ${msg}`);
     }
+  }
+
+  /** Re-export ONE box's key artefacts (retire drops the row, then calls this,
+   *  and the export REMOVES `<box>.expires` and `keys/<idx>.json`). */
+  exportKeysFor(box: string): void {
+    this.runExport("keys", box);
   }
 
   /** Export every legacy artefact (used after an import or a bulk change). */
@@ -162,8 +197,14 @@ export class StoreState implements ReconcileStateApi {
   }
 
   /**
-   * Record a box as ENROLLED (Phase A's only membership write; the staged enrol
-   * saga and `transition` are Phase B). Idempotent on the name. Exports.
+   * Record a box as ENROLLED — the enrol saga's STAGE 5 (D5). Idempotent on the
+   * name. Exports.
+   *
+   * When the row is `enrolling` this IS the `enrolling -> enrolled` transition:
+   * the phase change, the stage/streak/warn reset and the audit row all commit
+   * together, so a crash can never leave a member whose saga still says it is
+   * mid-enrolment. The audit row keeps Phase A's `enrolled` action name and
+   * carries the phase change in its detail rather than emitting a second row.
    */
   recordEnrolled(name: string, port: number, pubkey?: string): void {
     const at = this.store.now();
@@ -173,21 +214,231 @@ export class StoreState implements ReconcileStateApi {
       if (existing === undefined) {
         this.store.db
           .query(
-            `INSERT INTO boxes(name,idx,port,phase,created_at,enrolled_at,updated_at,pubkey)
-             VALUES(?,?,?,'enrolled',?,?,?,?)`,
+            `INSERT INTO boxes(name,idx,port,phase,enrol_stage,created_at,enrolled_at,updated_at,pubkey)
+             VALUES(?,?,?,'enrolled',?,?,?,?,?)`,
           )
-          .run(name, idx, port, at, at, at, pubkey ?? null);
+          .run(name, idx, port, ENROL_STAGES, at, at, at, pubkey ?? null);
       } else {
         this.store.db
           .query(
             `UPDATE boxes SET idx=?, port=?, phase='enrolled', enrolled_at=COALESCE(enrolled_at,?),
+                              retired_at=NULL, enrol_stage=?, enrol_fail_streak=0, enrol_warn=NULL,
                               updated_at=?, pubkey=COALESCE(?,pubkey) WHERE box_id=?`,
           )
-          .run(idx, port, at, at, pubkey ?? null, existing.box_id);
+          .run(idx, port, at, ENROL_STAGES, at, pubkey ?? null, existing.box_id);
       }
-      this.store.audit({ actor: "fleet2", action: "enrolled", box: name, rc: 0, at, detail: `port=${port}` });
+      const from = existing?.phase;
+      this.store.audit({
+        actor: "fleet2",
+        action: "enrolled",
+        box: name,
+        rc: 0,
+        at,
+        detail: from !== undefined && from !== "enrolled" ? `${from} -> enrolled port=${port}` : `port=${port}`,
+      });
     });
     this.runExport("membership");
+  }
+
+  // --- phase transitions (D4) -------------------------------------------------
+
+  /**
+   * `enrolling -> enrolled -> retired -> enrolling` (re-adoption). Asserts
+   * `from`, updates the row and writes the `audit` row IN THE SAME TRANSACTION;
+   * a wrong `from` is rc 1 with the phase the row actually holds in the message
+   * and NOTHING written.
+   *
+   * DEVIATION from the blueprint's `transition(box_id, …)`: the parameter is the
+   * box NAME. `box_id` is a surrogate key that exists so child tables survive a
+   * rename; every caller here (retire, enroll, reconcile-files) holds a name, and
+   * making each of them resolve the id first would only move the same lookup
+   * outward. `audit.box` records the name either way.
+   */
+  transition(name: string, from: Phase, to: Phase, actor: string, detail?: string): TransitionResult {
+    const row = this.boxRow(name);
+    if (row === undefined) {
+      return { rc: 1, message: `${name}: no store row — cannot transition ${from} -> ${to}` };
+    }
+    if (row.phase !== from) {
+      return {
+        rc: 1,
+        actual: row.phase,
+        message: `${name}: expected phase '${from}' but the row is '${row.phase}' — refusing the ${from} -> ${to} transition`,
+      };
+    }
+    const at = this.store.now();
+    this.store.tx(() => {
+      if (to === "retired") {
+        this.store.db
+          .query("UPDATE boxes SET phase='retired', retired_at=?, updated_at=? WHERE box_id=?")
+          .run(at, at, row.box_id);
+      } else if (to === "enrolling") {
+        // Re-adoption on the SAME row (D4): a fresh saga, counters reset and the
+        // key row dropped — the box will mint a new one.
+        this.store.db
+          .query(
+            `UPDATE boxes SET phase='enrolling', enrol_stage=0, enrol_fail_streak=0, enrol_warn=NULL,
+                              retired_at=NULL, enrolled_at=?, updated_at=? WHERE box_id=?`,
+          )
+          .run(at, at, row.box_id);
+        this.store.db.query("DELETE FROM box_keys WHERE box_id=?").run(row.box_id);
+        this.store.db
+          .query(
+            `UPDATE box_counters SET checkfail=0, seedfail=0, cfgfail=0, incoherent=0,
+                                     repair_pending_runs=0, repair_pending_tick=NULL,
+                                     hostkey_mismatch=0, asleep_since=NULL, asleep_last_alert=NULL
+             WHERE box_id=?`,
+          )
+          .run(row.box_id);
+      } else {
+        this.store.db
+          .query(
+            `UPDATE boxes SET phase='enrolled', enrolled_at=COALESCE(enrolled_at,?), retired_at=NULL,
+                              enrol_stage=?, enrol_fail_streak=0, enrol_warn=NULL, updated_at=? WHERE box_id=?`,
+          )
+          .run(at, ENROL_STAGES, at, row.box_id);
+      }
+      this.store.audit({
+        actor,
+        action: "phase",
+        box: name,
+        rc: 0,
+        at,
+        detail: detail === undefined ? `${from} -> ${to}` : `${from} -> ${to}: ${detail}`,
+      });
+    });
+    // A phase change moves the box in or out of membership, so both exports have
+    // to follow it. Retiring also drops the box's key artefacts.
+    this.runExport("membership");
+    if (to !== "enrolled") this.runExport("keys", name);
+    return { rc: 0 };
+  }
+
+  // --- the enrol saga (D5) ----------------------------------------------------
+
+  /**
+   * Open (or resume) the saga for `name` and return the stage already reached.
+   *
+   * - no row            ⇒ INSERT `phase='enrolling'`, `enrol_stage=0` ⇒ stage 0
+   * - `enrolling` row   ⇒ resume from its recorded stage
+   * - `retired` row     ⇒ `transition(retired -> enrolling)` on the SAME row
+   *                       (new `enrolled_at`, counters reset, key row deleted),
+   *                       then stage 0
+   * - `enrolled` row    ⇒ stage 0 and the phase UNCHANGED. This is the repair
+   *                       path: `discover` re-runs the whole enrol against an
+   *                       enrolled box to rewrite its artefacts, and moving it to
+   *                       `enrolling` would drop a healthy member out of
+   *                       membership for the rest of the tick.
+   */
+  beginEnrol(name: string, port: number, pubkey?: string): { stage: number } {
+    const at = this.store.now();
+    const idx = boxIndex(name) ?? null;
+    const row = this.boxRow(name);
+    if (row === undefined) {
+      this.store.tx(() => {
+        this.store.db
+          .query(
+            `INSERT INTO boxes(name,idx,port,phase,enrol_stage,created_at,enrolled_at,updated_at,pubkey)
+             VALUES(?,?,?,'enrolling',0,?,NULL,?,?)`,
+          )
+          .run(name, idx, port, at, at, pubkey ?? null);
+        this.store.audit({ actor: "fleet2", action: "enrol-begin", box: name, rc: 0, at, detail: `port=${port}` });
+      });
+      return { stage: 0 };
+    }
+    if (row.phase === "retired") {
+      this.transition(name, "retired", "enrolling", "fleet2", "re-adoption");
+      if (pubkey !== undefined) {
+        this.store.db.query("UPDATE boxes SET pubkey=?, port=?, updated_at=? WHERE box_id=?").run(pubkey, port, at, row.box_id);
+      }
+      return { stage: 0 };
+    }
+    if (row.phase === "enrolled") return { stage: 0 };
+    // An `enrolling` row: refresh the pubkey/port the probe just read and resume.
+    if (pubkey !== undefined || row.port !== port) {
+      this.store.db
+        .query("UPDATE boxes SET pubkey=COALESCE(?,pubkey), port=?, updated_at=? WHERE box_id=?")
+        .run(pubkey ?? null, port, at, row.box_id);
+    }
+    return { stage: row.enrol_stage };
+  }
+
+  /**
+   * A stage COMPLETED. Records the stage and RESETS `enrol_fail_streak` — the
+   * streak counts attempted-and-failed stages, and a stage that advanced is
+   * progress whatever else it reported.
+   *
+   * `warn` is stage 2's case: `recordEtcMapping` failing is a WARNING today and
+   * stays one, so the stage advances with the warning recorded (D5).
+   */
+  advanceStage(name: string, stage: number, warn?: string): void {
+    const id = this.boxId(name);
+    if (id === undefined) return;
+    this.store.db
+      .query("UPDATE boxes SET enrol_stage=?, enrol_fail_streak=0, enrol_warn=?, updated_at=? WHERE box_id=?")
+      .run(stage, warn ?? null, this.store.now(), id);
+  }
+
+  /**
+   * A stage was ATTEMPTED and FAILED: record the warning, bump the streak, do
+   * NOT advance. Returns the new streak. A budget deferral, a preflight skip or
+   * a lost mutation slot never reaches here — none of those attempted anything.
+   */
+  failStage(name: string, stage: number, warn: string): number {
+    const id = this.boxId(name);
+    if (id === undefined) return 0;
+    this.store.db
+      .query("UPDATE boxes SET enrol_fail_streak = enrol_fail_streak + 1, enrol_warn=?, updated_at=? WHERE box_id=?")
+      .run(`stage ${stage}: ${warn}`, this.store.now(), id);
+    return this.boxRow(name)?.enrol_fail_streak ?? 0;
+  }
+
+  /** The `enrolling` rows the resume pass owns, OLDEST `created_at` first (D5). */
+  enrollingRows(): EnrollingRow[] {
+    return (
+      this.store.db
+        .query(
+          `SELECT name, enrol_stage AS stage, enrol_fail_streak AS streak, enrol_warn AS warn, created_at
+           FROM boxes WHERE phase='enrolling' ORDER BY created_at ASC, name ASC`,
+        )
+        .all() as EnrollingRow[]
+    );
+  }
+
+  // --- alerts (D5's first consumer) -------------------------------------------
+
+  /**
+   * Is an alert of `kind` DUE for this box? Records the send when it is, so the
+   * throttle is state rather than a per-process memory: the first occurrence
+   * fires, and a repeat only once `renotifySecs` have passed.
+   *
+   * This is the `alerts` table's first writer. Alert POLICY at large (digests,
+   * repeat windows for the other twelve sites) is the alert-dedup blueprint's
+   * job; this is the one row D5 needs.
+   */
+  alertDue(box: string, kind: string, renotifySecs: number, now: number = this.store.now()): boolean {
+    const id = this.boxId(box);
+    if (id === undefined) return false;
+    const row = this.store.db
+      .query("SELECT first_seen, last_sent, count FROM alerts WHERE box_id=? AND kind=?")
+      .get(id, kind) as { first_seen: number; last_sent: number | null; count: number } | null;
+    if (row !== null && row.last_sent !== null && now - row.last_sent < renotifySecs) return false;
+    this.store.db
+      .query(
+        `INSERT INTO alerts(box_id,kind,first_seen,last_sent,count,cleared_at) VALUES(?,?,?,?,1,NULL)
+         ON CONFLICT(box_id,kind) DO UPDATE SET last_sent=excluded.last_sent, count=count+1, cleared_at=NULL`,
+      )
+      .run(id, kind, row?.first_seen ?? now, now);
+    return true;
+  }
+
+  /** Clear an alert row (the condition went away). */
+  alertClear(box: string, kind: string): void {
+    const id = this.boxId(box);
+    if (id === undefined) return;
+    this.store.db
+      .query("UPDATE alerts SET cleared_at=?, last_sent=NULL WHERE box_id=? AND kind=?")
+      .run(this.store.now(), id, kind);
   }
 
   /**
@@ -201,10 +452,16 @@ export class StoreState implements ReconcileStateApi {
     if (from === undefined || to === undefined) return;
     this.store.tx(() => {
       this.store.db.query("INSERT OR IGNORE INTO box_counters(box_id) VALUES(?)").run(to);
+      // COALESCE, because the OLD box may have no `box_counters` row at all:
+      // counter rows are created lazily on the first bump, so a box enrolled and
+      // renamed before its first failing tick has none, and the bare subselects
+      // returned NULL into two NOT NULL columns — which made `copyState` throw,
+      // which rename-wiring reported as "failed to copy brain state". Nothing
+      // inherits a count that was never recorded, so 0 is the right value.
       this.store.db
         .query(
-          `UPDATE box_counters SET checkfail = (SELECT checkfail FROM box_counters WHERE box_id = ?),
-                                   cfgfail   = (SELECT cfgfail   FROM box_counters WHERE box_id = ?)
+          `UPDATE box_counters SET checkfail = COALESCE((SELECT checkfail FROM box_counters WHERE box_id = ?), 0),
+                                   cfgfail   = COALESCE((SELECT cfgfail   FROM box_counters WHERE box_id = ?), 0)
            WHERE box_id = ?`,
         )
         .run(from, from, to);
@@ -451,6 +708,18 @@ export class StoreState implements ReconcileStateApi {
     }
     this.runExport("keys", box);
     return true;
+  }
+
+  /**
+   * Drop a box's key row WITHOUT exporting (D4/D6, the retire path). The caller
+   * exports afterwards, and with no key row `exportKeyFiles` REMOVES
+   * `<box>.expires` and `keys/<idx>.json` — which is what retiring a box should
+   * leave behind: no key material for a box that no longer has a key.
+   */
+  dropKeyRow(box: string): void {
+    const id = this.boxId(box);
+    if (id === undefined) return;
+    this.store.db.query("DELETE FROM box_keys WHERE box_id = ?").run(id);
   }
 
   private boxIdByIndex(index: number): number | undefined {

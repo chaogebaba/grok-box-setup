@@ -9,18 +9,21 @@
 //  - API: online/offline from the Tailscale devices endpoint; `?` when down.
 //  - AUTHKEY from `<box>.expires` field 2.
 // inventory NEVER fails on target resolution (F7.2): unresolvable ⇒ TARGET/DRIFT
-// `?`, one warn, exit 0. inventory.json rewritten after every pass (F7.6).
+// `?`, one warn, exit 0. `inventory.json` is RETIRED from 5.9.0 (state-store
+// D3/D7): the pass writes no file and renders from the store's `boxes` rows plus
+// the last tick's snapshot.
 
 import type { Runner } from "./runner.ts";
 import type { Env } from "./env.ts";
 import type { RolloutConfig } from "./config.ts";
-import type { FsSeam, Inventory, BoxEntry } from "./state.ts";
+import type { Inventory, BoxEntry } from "./state.ts";
 import { tunnelUp, tunnelSsh } from "./tunnel.ts";
 import { knownHostsFile } from "./hostkey.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "./remote.ts";
 import { parseCheck, parseStatusLine, type BoxStatus } from "./status.ts";
 import { resolveTarget, type Target } from "./stage.ts";
-import { inventoryPath, writeInventory } from "./state.ts";
+import { openReadHandle } from "./store/membership.ts";
+import { readLatestMeta } from "./store/snapshots.ts";
 import { log } from "./log.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
@@ -146,11 +149,37 @@ export interface InventoryDeps {
   runner: Runner;
   env: Env;
   rollout: RolloutConfig;
-  fs: FsSeam;
   api?: DevicesApi;
   /** Read `<box>.expires` field-2 date; undefined when absent. */
   readExpires?: (fleetState: string, box: string) => Promise<string | undefined>;
-  /** For --json vs table: caller controls stdout via the returned object. */
+  /**
+   * state-store D3/D7 (Phase B): the timestamp of the PREVIOUS pass, for the
+   * staleness header. `inventory.json` is retired, so the previous view of the
+   * fleet is the last tick's SNAPSHOT. Injected for tests; the production
+   * default reads the store.
+   */
+  previousTs?: (env: Env) => string | null;
+}
+
+/**
+ * The staleness header's "previous" timestamp: the newest snapshot's `ts`.
+ *
+ * Before 5.9.0 this came from `inventory.json`'s own `generatedAt`, i.e. from
+ * the last time an OPERATOR ran `fleet2 inventory`. The tick's snapshot is the
+ * better answer as well as the surviving one — it is what the fleet last looked
+ * like, refreshed every five minutes, rather than whenever somebody last typed
+ * the command.
+ */
+export function storePreviousTs(env: Env): string | null {
+  const h = openReadHandle(env);
+  try {
+    if (h.store === undefined || h.store.userVersion() < 2) return null;
+    return readLatestMeta(h.store)?.ts ?? null;
+  } catch {
+    return null;
+  } finally {
+    h.close();
+  }
 }
 
 /** Read `<box>.expires` (TSV, date is field 2 — F7.7). */
@@ -171,30 +200,30 @@ export interface InventoryResult {
   inventory: Inventory;
   rows: ProbeResult[];
   target: Target | null;
-  /** the ISO timestamp of a PREVIOUS inventory.json, for the staleness header. */
+  /** the PREVIOUS view's timestamp (the last tick's snapshot), for the
+   *  staleness header. null when the store holds no snapshot yet. */
   previousGeneratedAt: string | null;
 }
 
 /**
  * Run an inventory pass over `boxes`. Resolves the target best-effort (F7.2):
  * on failure TARGET/DRIFT are null and one warn is logged; the pass still
- * succeeds. Writes inventory.json atomically (F7.6).
+ * succeeds.
+ *
+ * state-store D3/D7 (Phase B): `inventory.json` is RETIRED. It was the second
+ * per-box view of the same fleet — written by this command, while the tick wrote
+ * a snapshot line, and readers picked one. The pass now renders from the store's
+ * `boxes` rows (the caller resolves membership) plus the last tick's snapshot
+ * for the staleness header, and writes no file at all. `--json` still prints the
+ * same `Inventory` object; nothing persists it.
  */
 export async function runInventory(boxes: string[], deps: InventoryDeps): Promise<InventoryResult> {
-  const { runner, env, rollout, fs } = deps;
+  const { runner, env, rollout } = deps;
   const api = deps.api ?? noApi;
   const readExpires = deps.readExpires ?? fsReadExpires;
 
-  // Previous inventory's generatedAt for the staleness header (F9/S-F).
-  const prev = await fs.readFile(inventoryPath(env.FLEET_STATE));
-  let previousGeneratedAt: string | null = null;
-  if (prev) {
-    try {
-      previousGeneratedAt = (JSON.parse(prev) as Inventory).generatedAt ?? null;
-    } catch {
-      previousGeneratedAt = null;
-    }
-  }
+  // The PREVIOUS view of the fleet, for the staleness header (F9/S-F).
+  const previousGeneratedAt = (deps.previousTs ?? storePreviousTs)(env);
 
   // Best-effort target resolution — never fails inventory (F7.2).
   let target: Target | null = null;
@@ -238,7 +267,6 @@ export async function runInventory(boxes: string[], deps: InventoryDeps): Promis
     boxes: boxesObj,
   };
 
-  await writeInventory(fs, inventoryPath(env.FLEET_STATE), inventory);
   return { inventory, rows, target, previousGeneratedAt };
 }
 

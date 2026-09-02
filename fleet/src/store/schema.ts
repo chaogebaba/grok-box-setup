@@ -17,10 +17,13 @@
 // `enrol_stage`, `retired_at`) so v2 adds only tables — see D2/D3.
 
 /** The highest schema this binary knows how to create and operate. */
-export const KNOWN_SCHEMA = 1;
+export const KNOWN_SCHEMA = 2;
 
 /** Timestamps everywhere in the store are integer epoch SECONDS, UTC. */
 export const AUDIT_RETENTION_DAYS = 92;
+
+/** D3 (v2): the same 92-day window for `snapshots` (children cascade). */
+export const SNAPSHOT_RETENTION_DAYS = 92;
 
 export interface Migration {
   /** the `user_version` this migration produces. */
@@ -152,7 +155,76 @@ const V1: string[] = [
    ) STRICT`,
 ];
 
-export const MIGRATIONS: Migration[] = [{ to: 1, minReader: 1, statements: V1 }];
+// --- v2 (Phase B, fleet2 5.9.0) ---------------------------------------------
+//
+// ADDITIVE ONLY: three new tables and two new indexes. `min_reader` therefore
+// stays 1, and a 5.8.0 binary opens a v2 file, ignores these tables and keeps
+// working — that IS the Phase B rollback (D2/D7). The v1 schema already carries
+// every COLUMN Phase B uses (`phase`, `enrol_stage`, `enrol_fail_streak`,
+// `enrol_warn`, `retired_at`), so no ALTER TABLE is needed anywhere.
+//
+// `snapshots` is `history/<day>.jsonl` as a table: field-for-field the
+// `SnapshotLine` wire shape (history/schema.ts) PLUS the three `target_*`
+// columns, which are NOT part of that line — they come from the tick's resolved
+// rollout target, exactly as `inventory.json` used to carry it, and are excluded
+// from the round-trip test on purpose (D3/r2-n3). There is no `mode` and no `rc`
+// column: neither had a source on the line.
+const V2: string[] = [
+  `CREATE TABLE IF NOT EXISTS snapshots(
+     tick                INTEGER PRIMARY KEY,
+     ts                  INTEGER NOT NULL,
+     apply               INTEGER NOT NULL,
+     canary              TEXT,
+     discover_candidates INTEGER,
+     discover_adopted    INTEGER,
+     discover_repaired   INTEGER,
+     target_ref          TEXT,
+     target_sha          TEXT,
+     target_version      TEXT
+   ) STRICT`,
+
+  // Keyed by NAME, not `box_id`, because history must OUTLIVE a rename or a
+  // `retire --forget`: a row here describes what the fleet looked like at tick
+  // T, and deleting a box must not rewrite the past.
+  //
+  // Every `SnapshotBox` field with its exact value set — three-valued `check`,
+  // nullable `config`, `expiry_days` as the number — plus `observed`, the D4
+  // liveness label. `observed` is deliberately NOT part of the SnapshotLine
+  // JSON: `GET /v1/fleet` and `GET /v1/history` reassemble the 5.8.0 shape
+  // byte-for-byte, and the label is served by `GET /v1/boxes/:name` instead.
+  `CREATE TABLE IF NOT EXISTS snapshot_boxes(
+     tick        INTEGER NOT NULL REFERENCES snapshots(tick) ON DELETE CASCADE,
+     name        TEXT NOT NULL,
+     tunnel      TEXT NOT NULL,
+     "check"     TEXT NOT NULL CHECK("check" IN ('OK','FAIL','-')),
+     ver         TEXT NOT NULL,
+     drift       TEXT NOT NULL,
+     config      TEXT,
+     checkfail   INTEGER NOT NULL,
+     asleep      INTEGER NOT NULL,
+     expiry_days INTEGER,
+     observed    TEXT NOT NULL,
+     PRIMARY KEY(tick,name)
+   ) STRICT`,
+
+  // The discover pass's `skipped[]` list.
+  `CREATE TABLE IF NOT EXISTS snapshot_skipped(
+     tick   INTEGER NOT NULL REFERENCES snapshots(tick) ON DELETE CASCADE,
+     name   TEXT NOT NULL,
+     reason TEXT NOT NULL
+   ) STRICT`,
+
+  // `snapshots(ts)` for the retention DELETE and the newest-first slice;
+  // `snapshot_boxes(name, tick)` for the per-box history slice `GET /v1/history`
+  // serves. `audit(at)` is created by migration 1.
+  `CREATE INDEX IF NOT EXISTS snapshots_ts ON snapshots(ts)`,
+  `CREATE INDEX IF NOT EXISTS snapshot_boxes_name_tick ON snapshot_boxes(name, tick)`,
+];
+
+export const MIGRATIONS: Migration[] = [
+  { to: 1, minReader: 1, statements: V1 },
+  { to: 2, minReader: 1, statements: V2 },
+];
 
 /** Every v1 table, in the order a full replay must DELETE them (children first). */
 export const V1_TABLES_CHILD_FIRST = [

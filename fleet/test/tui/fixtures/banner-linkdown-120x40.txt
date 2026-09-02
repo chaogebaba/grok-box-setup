@@ -6,9 +6,9 @@ LINK DOWN 45s — showing last-good data, retrying
 ◆ grok-box-002  up     OK    5.6.0   yes      in-sync 40d                 │drift no · config in-sync · expiry 40d      │
 ✖ grok-box-003  down   FAIL  5.3.0   no       in-sync 3d                  │checkfail no · asleep no · canary none      │
                                                                           │checkfail# — · expires —                    │
+                                                                          │phase — · observed —                        │
                                                                           │asleep since —                              │
-                                                                          │asleep last —                               │
-                                                                          │api backoff —                               │
+                                                                          │asleep last — · api backoff —               │
                                                                           │24h (loading…)                              │
                                                                           ╰────────────────────────────────────────────╯
 

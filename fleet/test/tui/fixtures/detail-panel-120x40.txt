@@ -5,9 +5,9 @@ fleet2 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link �
 > grok-box-002  up     OK    5.6.0   yes      in-sync 40d                 │drift yes · config in-sync · expiry 40d     │
 ✖ grok-box-003  down   FAIL  5.3.0   no       in-sync 3d                  │checkfail no · asleep no · canary none      │
                                                                           │checkfail# 3 · expires 2026-06-01 (40d)     │
+                                                                          │phase enrolled · observed drifted           │
                                                                           │asleep since Mar 20 09:46 UTC (41d ago)     │
-                                                                          │asleep last Mar 20 10:46 UTC (41d ago)      │
-                                                                          │api backoff 2 fails, retry Mar 20 12:33 UTC │
+                                                                          │asleep last Mar 20 10:46 UTC (41d ago) · api│
                                                                           │24h                                         │
                                                                           ╰────────────────────────────────────────────╯
 

@@ -45,7 +45,9 @@ import type { Store } from "../store/db.ts";
 import type { StoreState } from "../store/state.ts";
 import { checkDivergence } from "../store/divergence.ts";
 import { dailyMaintenance } from "../store/backup.ts";
-import { AUDIT_RETENTION_DAYS } from "../store/schema.ts";
+import { AUDIT_RETENTION_DAYS, SNAPSHOT_RETENTION_DAYS } from "../store/schema.ts";
+import { pruneSnapshots } from "../store/snapshots.ts";
+import { observe, type Observed } from "./observe.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
@@ -92,6 +94,12 @@ export interface ReconcileDeps {
    * adoptable and neither spends the mutation slot.
    */
   excluded?: Map<string, "retired" | "enrolling">;
+  /**
+   * state-store D5: the resume pass's view of the `enrolling` rows and the
+   * enrol-stuck alert. Omitted ⇒ no resume pass, which is the 5.8.0 behaviour
+   * and what keeps the box-free discover tests hermetic.
+   */
+  enrol?: import("./discover.ts").EnrolSurface;
   ctx: RunContext;
   notify: (level: NotifyLevel, msg: string) => Promise<void> | void;
   targetBoxes: string[];
@@ -108,14 +116,19 @@ export interface ReconcileDeps {
   nowSec?: number;
   keyExpirySecs?: number;
   /**
-   * TUI-D4 history hook — append one snapshot line per tick. Injected so the
-   * production tick (assembleTickDeps) writes to `${FLEET_STATE}/history/` and
-   * the box-free tests can assert the line WITHOUT touching disk. Omitted ⇒ no
-   * snapshot is written (the default keeps existing runReconcile tests
-   * hermetic). Runs on EVERY return path (early-return ticks still append,
-   * R2-A4); the writer itself must never throw (best-effort — see write.ts).
+   * TUI-D4 snapshot hook — ONE snapshot per tick. Injected so the production
+   * tick (assembleTickDeps) writes the three `snapshots` tables and the box-free
+   * tests can assert the line WITHOUT touching disk. Omitted ⇒ no snapshot is
+   * written (the default keeps existing runReconcile tests hermetic). Runs on
+   * EVERY return path (early-return ticks still record, R2-A4); the writer
+   * itself must never throw (best-effort).
+   *
+   * state-store D3/D4 (Phase B): the hook also receives the tick ordinal (the
+   * snapshot's primary key) and the per-box `observed` label, neither of which
+   * is part of the `SnapshotLine` wire shape — `GET /v1/fleet` and
+   * `GET /v1/history` reassemble that shape byte for byte.
    */
-  history?: (line: SnapshotLine) => void;
+  history?: (line: SnapshotLine, ctx: { tick: number; observed: Map<string, Observed> }) => void;
   /**
    * Zero-touch join (5.6.0). Present ⇒ the tick discovers, adopts and repairs;
    * omitted ⇒ no discovery at all, which is what keeps the existing box-free
@@ -226,6 +239,13 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
     // untouched and stays unbounded (operator logrotate).
     const pruned = deps.store.pruneAudit(AUDIT_RETENTION_DAYS, now(deps));
     if (pruned > 0) log(`reconcile: pruned ${pruned} audit row(s) older than ${AUDIT_RETENTION_DAYS} days`);
+    // D3 (v2): the same 92-day window for `snapshots`, once per tick. The child
+    // rows cascade, so this one DELETE is the whole retention rule — and it
+    // replaces the daily-file pruning the jsonl reader used to do lazily.
+    if (deps.store.userVersion() >= 2) {
+      const old = pruneSnapshots(deps.store, SNAPSHOT_RETENTION_DAYS, now(deps));
+      if (old > 0) log(`reconcile: pruned ${old} snapshot(s) older than ${SNAPSHOT_RETENTION_DAYS} days`);
+    }
   }
 
   // --- devices GET with D4/F5 backoff ---
@@ -285,6 +305,7 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
           apply: deps.apply,
           membership: deps.targetBoxes,
           excluded: deps.excluded,
+          enrol: deps.enrol,
           nowSec: nowS,
           nowMs: deps.nowMsFn ?? (() => Date.now()),
         });
@@ -293,10 +314,14 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   // --- target boxes ---
   if (deps.targetBoxes.length === 0) {
     log("reconcile: no enrolled boxes");
+    // state-store D5: an empty membership is exactly the fleet that can have
+    // `enrolling` rows waiting (a brand-new VPS whose first adoption failed
+    // mid-saga), so the resume pass runs BEFORE the early return.
+    await drun?.repairPass();
     drun?.finish();
-    // R2-A4: an early-return tick still appends a snapshot (empty boxes) so the
+    // R2-A4: an early-return tick still records a snapshot (empty boxes) so the
     // tick_age freshness signal / STALE banner works even for an empty fleet.
-    writeSnapshot(deps, [], null, drun?.summary);
+    writeSnapshot(deps, tick, [], new Map(), null, drun?.summary);
     return { rc: finishStore(deps, 0) };
   }
 
@@ -304,13 +329,15 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   let rc: 0 | 1 = 0;
   const drifted: DriftedBox[] = [];
   const snapshots: SnapshotBox[] = [];
+  /** D4: the liveness label per box, named once inside the loop. */
+  const observed = new Map<string, Observed>();
   // D11(c)/r12 note 2: `tunnelUp` may report an unverifiable listener owner
   // many times in one tick (once per box in the loop, again per box in the
   // config pass). tunnel.ts holds no module state, so the dedup lives HERE, for
   // exactly the scope of one tick.
   const tunnelDeps: TunnelDeps = { warnOnce: makeWarnOnce() };
   for (const box of deps.targetBoxes) {
-    const r = await reconcileOne(box, devs, deps, drifted, snapshots, tick, tunnelDeps);
+    const r = await reconcileOne(box, devs, deps, drifted, snapshots, observed, tick, tunnelDeps);
     if (r === 1) rc = 1;
   }
 
@@ -350,7 +377,14 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   for (const sb of snapshots) {
     sb.config = deps.managedFilesPresent ? (cpRes.perBox.get(sb.name) ?? null) : null;
   }
-  writeSnapshot(deps, snapshots, deps.managedFilesPresent ? (cpRes.canary ?? null) : null, drun?.summary);
+  writeSnapshot(
+    deps,
+    tick,
+    snapshots,
+    observed,
+    deps.managedFilesPresent ? (cpRes.canary ?? null) : null,
+    drun?.summary,
+  );
 
   log(`reconcile: done (${mode})`);
   return { rc: finishStore(deps, rc) };
@@ -363,7 +397,9 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
  */
 function writeSnapshot(
   deps: ReconcileDeps,
+  tick: number,
   boxes: SnapshotBox[],
+  observed: Map<string, Observed>,
   canary: string | null,
   discover?: DiscoverSummary,
 ): void {
@@ -379,7 +415,7 @@ function writeSnapshot(
     ...(discover === undefined ? {} : { discover }),
   };
   try {
-    deps.history(line);
+    deps.history(line, { tick, observed });
   } catch {
     /* the writer is best-effort; a snapshot failure never fails the tick */
   }
@@ -393,6 +429,7 @@ async function reconcileOne(
   deps: ReconcileDeps,
   drifted: DriftedBox[],
   snapshots: SnapshotBox[],
+  observedBy: Map<string, Observed>,
   tick: number,
   tunnelDeps: TunnelDeps = {},
 ): Promise<0 | 1> {
@@ -498,17 +535,6 @@ async function reconcileOne(
   const check: "OK" | "FAIL" | "-" =
     tunnel === "down" ? "-" : checkHealthy ? "OK" : "FAIL";
   const ver = checkVersion !== "unknown" && checkVersion !== "" ? checkVersion : "-";
-  snapshots.push({
-    name: box,
-    tunnel,
-    check,
-    ver,
-    drift,
-    config: null,
-    checkfail: deps.state.checkfailCount(box) > 0,
-    asleep: deps.state.readAsleep(box) !== undefined,
-    expiry_days: expiryDays === "unknown" ? null : expiryDays,
-  });
 
   const actions = decide({
     online,
@@ -541,6 +567,37 @@ async function reconcileOne(
 
   const rowE = actions.includes("alert-incident:incoherent-both-dead");
   const incoherent = rowE || hostkeyMismatch;
+
+  // state-store D4: name this box's liveness ONCE, from the tuple the tick has
+  // just finished computing, and record it beside the snapshot row. The push
+  // sits HERE — after `decide`, before the action loop — because `rowE` and
+  // `alert-asleep` are decision-table verdicts, and because the counters the
+  // row mirrors (`checkfail`, `asleep`) are not written until the loop runs.
+  // `observed` is a LABEL: nothing below branches on it.
+  observedBy.set(
+    box,
+    observe({
+      hostkeyMismatch,
+      incoherent: rowE,
+      asleep: actions.includes("alert-asleep"),
+      online,
+      tunnel,
+      check,
+      drift,
+    }),
+  );
+  snapshots.push({
+    name: box,
+    tunnel,
+    check,
+    ver,
+    drift,
+    config: null,
+    checkfail: deps.state.checkfailCount(box) > 0,
+    asleep: deps.state.readAsleep(box) !== undefined,
+    expiry_days: expiryDays === "unknown" ? null : expiryDays,
+  });
+
   let repairRuns = 0;
   if (incoherent) repairRuns = deps.state.bumpRepairPending(box, tick);
   else deps.state.resetRepairPending(box, tick);

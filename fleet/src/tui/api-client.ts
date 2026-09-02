@@ -40,6 +40,10 @@ export interface BoxDetail {
   asleep_last?: string | null;
   expires_at?: string | null;
   api_backoff?: { fails: number; next_retry: string | null } | null;
+  /** state-store D4: membership phase and the liveness label the last tick
+   *  recorded. A 5.8.0 engine omits both; the pane renders `—`. */
+  phase?: string | null;
+  observed?: string | null;
 }
 
 /** A discriminated result: ok payload, or a link-down/auth/other failure. */
@@ -175,6 +179,8 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
             ab !== null && ab !== undefined && typeof ab.fails === "number"
               ? { fails: ab.fails, next_retry: typeof ab.next_retry === "string" ? ab.next_retry : null }
               : null,
+          phase: typeof o.phase === "string" ? o.phase : null,
+          observed: typeof o.observed === "string" ? o.observed : null,
         };
       });
     },

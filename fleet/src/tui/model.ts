@@ -454,6 +454,32 @@ export function sparkline(lines: SnapshotLine[], box: string): string {
   return segText(sparkSegments(lines, box));
 }
 
+/** state-store D4: `enrolled` is the ordinary state; the other two are not. */
+function phaseTone(phase: string | null | undefined): Tone {
+  if (phase === "enrolled") return "ok";
+  if (phase === "enrolling") return "warn";
+  if (phase === "retired") return "muted";
+  return "muted";
+}
+
+/** The seven `observed` names, toned by how much they should worry the reader. */
+function observedTone(observed: string | null | undefined): Tone {
+  switch (observed) {
+    case "healthy":
+      return "ok";
+    case "drifted":
+    case "api_unknown":
+      return "warn";
+    case "unhealthy":
+    case "asleep":
+    case "incoherent":
+    case "hostkey_mismatch":
+      return "down";
+    default:
+      return "muted";
+  }
+}
+
 /** One `label value` pair of the detail card. */
 function field(label: string, value: string, tone: Tone): Seg[] {
   return [
@@ -532,19 +558,34 @@ export function detailLines(state: TuiState, width: number): DetailLine[] {
       field("expires", withDays(ts(f?.expires_at), b.expiry_days), "plain"),
     ]),
   );
+  // state-store D4: the membership PHASE and the liveness label the last tick
+  // named for this box — the two facts that used to exist nowhere at all, a
+  // box's state having been a tuple every reader re-derived for itself.
+  body.push(
+    joinFields([
+      field("phase", dashEm(f?.phase), phaseTone(f?.phase)),
+      field("observed", dashEm(f?.observed), observedTone(f?.observed)),
+    ]),
+  );
   body.push(field("asleep since", ts(f?.asleep_since), "plain"));
-  body.push(field("asleep last", ts(f?.asleep_last), "plain"));
+  // TUI-D4 row budget: the card is fixed at DETAIL_ROWS and the phase/observed
+  // line above needed one. `api backoff` rides on the `asleep last` row rather
+  // than costing the sparkline or a D1 fact — both are engine bookkeeping the
+  // operator reads at a glance, and both are `—` on a healthy box.
   const ab = f?.api_backoff;
   body.push(
-    ab === null || ab === undefined
-      ? field("api backoff", DASH, "muted")
-      : [
-          { text: "api backoff", tone: "muted" as Tone },
-          { text: " ", tone: "muted" as Tone },
-          { text: `${ab.fails} fails`, tone: (ab.fails > 0 ? "warn" : "muted") as Tone },
-          { text: ", retry ", tone: "muted" as Tone },
-          { text: ts(ab.next_retry), tone: "plain" as Tone },
-        ],
+    joinFields([
+      field("asleep last", ts(f?.asleep_last), "plain"),
+      ab === null || ab === undefined
+        ? field("api backoff", DASH, "muted")
+        : [
+            { text: "api backoff", tone: "muted" as Tone },
+            { text: " ", tone: "muted" as Tone },
+            { text: `${ab.fails} fails`, tone: (ab.fails > 0 ? "warn" : "muted") as Tone },
+            { text: ", retry ", tone: "muted" as Tone },
+            { text: ts(ab.next_retry), tone: "plain" as Tone },
+          ],
+    ]),
   );
   if (state.detail && state.detail.box === b.name) {
     body.push([
