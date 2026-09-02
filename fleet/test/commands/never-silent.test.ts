@@ -30,8 +30,14 @@ import { cmdInstallTimer, cmdRemoveTimer } from "../../src/commands/timers.ts";
 import { cmdEnroll } from "../../src/commands/enroll.ts";
 import { cmdRename } from "../../src/commands/rename.ts";
 import { cmdState } from "../../src/commands/state.ts";
+import { renderManaged } from "../../src/managed/render.ts";
+import { textSha256 } from "../../src/managed/remote-script.ts";
 
 const EMPTY_CFG = parseConfig(undefined, "/x");
+
+/** Fixtures for the one case that needs a healthy tunnel and a real diff(1). */
+const CFG_DIFF_FLEET_TOML = '[ssh]\npassword = "abc"\n';
+const SS_UP_20008 = 'LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:(("sshd",pid=41,fd=7))\n';
 
 /** Capture everything fleet2 sends to stderr, whichever channel it uses. */
 function capture<T>(fn: (out: (s: string) => void) => Promise<T> | T): Promise<{ rc: T; err: string; out: string }> {
@@ -185,6 +191,35 @@ const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string;
           write: out,
         }),
       ),
+  },
+  {
+    name: "config diff: DRIFT (rc 1 with the diff body on stdout)",
+    run: async () => {
+      // The one path where stdout legitimately carries data AND the rc is
+      // non-zero, so the reason has nowhere to go but stderr.
+      const text = renderManaged(CFG_DIFF_FLEET_TOML, undefined);
+      const want = await textSha256(text);
+      const onbox = text.replace(/\n$/, "") + '\nextra = "1"\n';
+      const dryFixture = `cur=stalesha want=${want} support=yes enabled=true\n---FILE---\n${onbox}`;
+      const runner = new FakeRunner((argv) => {
+        if (argv[0] === "ss") return result({ stdout: SS_UP_20008 });
+        if (argv[0] === "/usr/bin/diff") {
+          const r = Bun.spawnSync(argv);
+          return result({ code: r.exitCode ?? 0, stdout: r.stdout.toString() });
+        }
+        return result({ code: 0, stdout: dryFixture });
+      });
+      return capture((out) =>
+        cmdConfig(["diff", "grok-box-8"], {
+          runner,
+          env: testEnv(),
+          enrolled: ["grok-box-8"],
+          source: { fleetToml: () => CFG_DIFF_FLEET_TOML, boxToml: () => undefined },
+          whichDiff: async () => "/usr/bin/diff",
+          write: out,
+        }),
+      );
+    },
   },
   {
     name: "mint-key: empty box (usage)",
