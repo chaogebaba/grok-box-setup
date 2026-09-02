@@ -30,7 +30,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.3.1
+BOXUP_VERSION=5.3.2
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -2043,6 +2043,183 @@ recycle_offline_tailscaled() {
   recycle_tailscaled "online=${online} mapfail=${mapfail} after freeze"
 }
 
+# --- disk guard (blueprint boxup-disk-guard G1-G3) ---------------------------
+# The box platform's sandbox host writes /tmp/sand-host.log and never rotates
+# it. It reached 101 GB on grok-box-006 and filled the root overlay, which made
+# `install.sh` exit 1 and stalled the fleet rollout; 004 was at 96%. Nothing on
+# the box and nothing in the brain was watching disk usage. This is that watch.
+#
+# Shape: one cheap `df /` per tick (rate-limited to BOXUP_DISK_INTERVAL), two
+# thresholds, and — only at FAIL — truncation of an ALLOWLIST of platform logs.
+# Never a delete, never a path off the list, never a symlink. The result lands
+# in $RUN_DIR/disk for the operator, in the `disk=` status token, and in
+# check_reason, so the brain's existing "reachable-cannot-converge" alert fires
+# with no brain-side change at all (G4: no fleet2 code in this lane).
+#
+# Why truncation runs AS THE FILE'S OWNER: /tmp is sticky and world-writable,
+# and Linux's fs.protected_regular refuses an O_TRUNC open of a file in such a
+# directory when the opener is neither the file's owner nor the directory's —
+# root included. `truncate` as root gets EACCES on /tmp/sand-host.log. The
+# owner switch is not a hardening nicety, it is the only thing that makes the
+# guard work; deleting it turns every truncation into a silent failure.
+BOXUP_DISK_WARN_PCT="${BOXUP_DISK_WARN_PCT:-80}"
+BOXUP_DISK_FAIL_PCT="${BOXUP_DISK_FAIL_PCT:-90}"
+BOXUP_DISK_TRUNCATE_MIN_BYTES="${BOXUP_DISK_TRUNCATE_MIN_BYTES:-1073741824}"  # 1 GiB
+# Whitespace-separated allowlist of paths the guard may truncate at FAIL level.
+# Nothing outside it is ever touched. Env-overridable so the gate can point the
+# guard at a canary file instead of the real platform log.
+DISK_GUARD_TRUNCATE="${DISK_GUARD_TRUNCATE:-/tmp/sand-host.log}"
+# The tick is 15s; re-reading df four times a minute buys nothing.
+BOXUP_DISK_INTERVAL="${BOXUP_DISK_INTERVAL:-60}"
+DISK_STATE="$RUN_DIR/disk"                  # "<pct>% <level> <epoch>"
+DISK_STAMP="$RUN_DIR/last-disk-guard"       # rate-limit stamp
+DISK_WARN_STAMP="$RUN_DIR/last-disk-warn"   # once/hour WARN stamp (check)
+
+# disk_used_pct: root usage as a bare integer percent, or -1 when df is missing
+# or unparseable. Never fails — an unreadable df must not break a tick.
+disk_used_pct() {
+  local pct
+  pct=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
+  case "$pct" in ''|*[!0-9]*) echo -1 ;; *) echo "$pct" ;; esac
+}
+
+# disk_level <pct> -> ok | warn | fail | unknown.
+# BOTH comparisons are >=: a box sitting exactly ON the fail threshold is
+# already in trouble. (Mutant g3 flips these to > and the pct==FAIL_PCT case
+# must then report warn, not fail.)
+disk_level() {
+  local p="${1:--1}"
+  case "$p" in ''|*[!0-9-]*) echo unknown; return 0 ;; esac
+  [ "$p" -lt 0 ] && { echo unknown; return 0; }
+  if   [ "$p" -ge "$BOXUP_DISK_FAIL_PCT" ]; then echo fail
+  elif [ "$p" -ge "$BOXUP_DISK_WARN_PCT" ]; then echo warn
+  else                                          echo ok
+  fi
+}
+
+# disk_allowlisted <path>: 0 iff <path> is EXACTLY one of the whitespace-
+# separated entries of DISK_GUARD_TRUNCATE. Exact string match, never a prefix
+# or a glob, so `/tmp/sand-host.log.evil` is not on the list. It is its own
+# function so the mutator below has one auditable gate that a unit test can
+# drive directly (deleting the call is mutant g2).
+# shellcheck disable=SC2086  # word splitting is the point: the list is space-separated
+disk_allowlisted() {
+  local want="$1" p
+  for p in $DISK_GUARD_TRUNCATE; do
+    [ "$p" = "$want" ] && return 0
+  done
+  return 1
+}
+
+# disk_truncate_one <path> [<pct>]: the ONLY mutator in the guard. Every safety
+# gate lives inside it so no caller can bypass one:
+#   * the path must be on the allowlist;
+#   * a SYMLINK is refused outright and never followed — swapping a symlink
+#     under a log truncator is the classic way to turn it into an arbitrary
+#     file truncator;
+#   * only a REGULAR file, and only one LARGER than the min-bytes floor (a
+#     small log is not what fills a 100 GB overlay, and truncating it would
+#     just destroy evidence);
+#   * the write runs as the file's OWNER (see the section header).
+# Returns 0 iff it truncated. Never deletes and never creates: `truncate -c`
+# leaves a missing file missing.
+disk_truncate_one() {
+  local f="$1" pct="${2:--1}" owner size me rc
+  disk_allowlisted "$f" || return 1
+  # ORDER IS LOAD-BEARING: the symlink refusal must stay ABOVE the size floor.
+  # A symlink is rejected whatever its size, and neither line below can stand in
+  # for it: `-f` FOLLOWS the link (so it is true for a link to a regular file),
+  # and `stat -c %s` does NOT follow (so it reports the link's pathname length,
+  # ~26 bytes, which the floor then rejects for the wrong reason). The r1 gate
+  # caught exactly that masking: deleting this line survived because the floor
+  # happened to fire first. tests/test-boxup-disk-guard.sh (a6b) now drives this
+  # line directly with a floor below the pathname length, so nothing else can
+  # cover for it.
+  [ -L "$f" ] && return 1
+  [ -f "$f" ] || return 1
+  size=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  case "$size" in ''|*[!0-9]*) size=0 ;; esac
+  [ "$size" -gt "$BOXUP_DISK_TRUNCATE_MIN_BYTES" ] || return 1
+  owner=$(stat -c %U "$f" 2>/dev/null || echo "")
+  [ -n "$owner" ] || return 1
+  me=$(id -un 2>/dev/null || echo "")
+  rc=1
+  if [ "$owner" = "$me" ]; then
+    # We ARE the owner: no privilege switch at all. This is the branch a
+    # non-root unit test exercises, and on a box it is the branch that runs
+    # whenever the worker and the platform log share a user.
+    truncate -c -s 0 "$f" 2>/dev/null && rc=0
+  else
+    # Not the owner: drop to them. runuser first (no PAM session, no password,
+    # the right tool), then su. If runuser is absent on a stripped image, or
+    # refuses because we are not privileged enough to setuid, fall THROUGH to
+    # su rather than giving up — and if neither works, report the failure. We
+    # never fall back to truncating as root: that is precisely the operation
+    # fs.protected_regular denies, so it would fail anyway, silently.
+    if have runuser; then
+      runuser -u "$owner" -- truncate -c -s 0 "$f" 2>/dev/null && rc=0
+    fi
+    if [ "$rc" -ne 0 ] && have su; then
+      su -s /bin/sh "$owner" -c "truncate -c -s 0 '$f'" 2>/dev/null && rc=0
+    fi
+  fi
+  if [ "$rc" -eq 0 ]; then
+    log "disk-guard: truncated $f ($size B, root ${pct}%)"
+    return 0
+  fi
+  log "disk-guard: could not truncate $f ($size B, owner=$owner) as its owner — NOT retrying as root (fs.protected_regular would refuse it)" >&2
+  return 1
+}
+
+# disk_guard: the per-tick entry point (G1). Rate-limited, reads usage once,
+# and only at FAIL level walks the allowlist. It re-reads df afterwards so the
+# state it records is the POST-truncation truth, which is what makes the check
+# reason honest. ALWAYS returns 0 — a disk watcher that can break the self-heal
+# tick is worse than no disk watcher.
+disk_guard() {
+  local now last pct level f
+  now=$(date +%s)
+  last=0
+  [ -f "$DISK_STAMP" ] && last=$(tr -d '[:space:]' < "$DISK_STAMP" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$BOXUP_DISK_INTERVAL" ]; then
+    return 0
+  fi
+  echo "$now" > "$DISK_STAMP" 2>/dev/null || true
+
+  pct=$(disk_used_pct)
+  level=$(disk_level "$pct")
+  if [ "$level" = fail ]; then
+    # shellcheck disable=SC2086  # word splitting is the point (space-separated list)
+    for f in $DISK_GUARD_TRUNCATE; do
+      [ -n "$f" ] || continue
+      disk_truncate_one "$f" "$pct" || true
+    done
+    pct=$(disk_used_pct)
+    level=$(disk_level "$pct")
+  fi
+  echo "${pct}% $level $now" > "$DISK_STATE" 2>/dev/null || true
+  return 0
+}
+
+# disk_status_token: the `disk=` value for the status line (G3). Computed FRESH
+# from df rather than read back from $DISK_STATE — one df is ~1 ms, far cheaper
+# than the two tailscale calls check_reason already makes, and it means `boxup
+# status` on a box whose worker has not ticked yet still tells the truth. `ok`
+# prints bare (disk=22%); warn and fail carry the level (disk=93%/fail) so an
+# operator grepping a fleet's status lines sees the bad ones without knowing
+# the thresholds.
+disk_status_token() {
+  local pct level
+  pct=$(disk_used_pct)
+  level=$(disk_level "$pct")
+  case "$level" in
+    unknown) printf 'unknown' ;;
+    ok)      printf '%s%%' "$pct" ;;
+    *)       printf '%s%%/%s' "$pct" "$level" ;;
+  esac
+}
+
 # --- selfheal: worker --------------------------------------------------------
 # The actual tick body. Runs under the converge lock (via run_tick).
 do_tick() {
@@ -2130,6 +2307,12 @@ repair_fail_count() {
 # `boxup once` starves hb and the next tick spuriously recycles tailscaled).
 run_tick() {
   local rc
+  # boxup-disk-guard G1: the guard runs OUTSIDE the converge lock and BEFORE
+  # the tick body. Outside, because a tick that loses the lock to an in-progress
+  # converge returns early and must still be watching the disk. Before, because
+  # do_tick's check_reason should see the space the guard just freed instead of
+  # failing the box on a condition the same tick already fixed.
+  disk_guard || true
   run_with_converge_lock try do_tick
   rc=$?
   if [ "$rc" = 200 ]; then
@@ -2301,6 +2484,11 @@ print_status() {
   # from the status line, which is how the grok-box-005 stray went unnoticed.
   # `check` stays OK on tunnelfail alone; this is visibility, not a predicate.
   printf ' tunnel=%s tunnelfail=%s' "$(tunnel_state)" "$(tunnel_fail_count)"
+  # boxup-disk-guard G3: root-disk pressure, appended AFTER tunnel= so nothing
+  # that already parses this line moves. fleet2's status.ts tokenizes on `k=v`
+  # and drops unknown keys, and splitVersion only ever reads v=, so every
+  # existing consumer is untouched by construction.
+  printf ' disk=%s' "$(disk_status_token)"
   printf '\n'
 }
 
@@ -2443,6 +2631,32 @@ check_reason() {
       fi
     fi
   fi
+  # boxup-disk-guard G3: root-disk pressure.
+  # FAIL is a real health failure, not cosmetics — a full root overlay is what
+  # made install.sh exit 1 on grok-box-006 and stalled the rollout — so it flips
+  # the check rc like every other predicate here, and the brain's existing
+  # reachable-cannot-converge row raises the alert with no brain-side change.
+  # Placed after the service/exit-node predicates so a box that is ALSO offline
+  # still reports the more fundamental fault first.
+  # WARN is not a failure, but it is not silent either: once per hour, the same
+  # shape as the H11 unknown-expiry warn. The tick calls check_reason every 15s,
+  # so an unthrottled warn would be 240 lines an hour in the worker log.
+  local disk_pct disk_lvl
+  disk_pct=$(disk_used_pct)
+  disk_lvl=$(disk_level "$disk_pct")
+  if [ -z "$reason" ] && [ "$disk_lvl" = fail ]; then
+    reason="disk ${disk_pct}% (after truncation) want < ${BOXUP_DISK_FAIL_PCT}%"
+  fi
+  if [ "$disk_lvl" = warn ]; then
+    local dwnow dwlast
+    dwnow=$(date +%s); dwlast=0
+    [ -f "$DISK_WARN_STAMP" ] && dwlast=$(tr -d '[:space:]' < "$DISK_WARN_STAMP" 2>/dev/null || echo 0)
+    case "$dwlast" in ''|*[!0-9]*) dwlast=0 ;; esac
+    if [ $((dwnow - dwlast)) -ge 3600 ]; then
+      echo "$dwnow" > "$DISK_WARN_STAMP" 2>/dev/null || true
+      log "check: WARN disk ${disk_pct}% (>= ${BOXUP_DISK_WARN_PCT}% warn threshold; the guard truncates the allowlist at ${BOXUP_DISK_FAIL_PCT}%)" >&2
+    fi
+  fi
   # H11: an EXPIRED auth key means the box's only unattended recovery path is
   # dead — it is not healthy, it just hasn't needed to recover yet. Fail check.
   # (A key expiring soon is a WARNING surfaced in status, not a check failure.)
@@ -2468,6 +2682,48 @@ check_reason() {
   printf '%s' "$reason"
 }
 
+
+# ensure_path_symlink: keep /usr/local/bin/boxup pointing at $ROOT/boxup.
+#
+# install.sh creates this link (bug-triage (6)), but it lives in /usr and an
+# image swap wipes everything outside /workspace — so after a thaw the link is
+# gone while $ROOT/boxup is still there, and install.sh does not run again
+# until the next rollout. Without this step a swapped box spends hours or days
+# with no `boxup` on PATH. That is exactly why ensure_sshd and the host-key
+# restore live in converge too: converge is what rebuilds the parts of a box
+# that do not survive a swap.
+#
+# Idempotent and SILENT on the happy path — this runs on every converge, so a
+# link already aimed at the right target is left alone with no log line. It
+# acts only when the link is missing, points elsewhere, or is not a symlink at
+# all (an old copy sitting at that path is "points elsewhere" too; `ln -sfn`
+# replaces it, and -n keeps it from being created INSIDE an existing link's
+# directory). Always returns 0: a read-only /usr costs the convenience link,
+# never the converge.
+#
+# BOX_SETUP_PREFIX roots the LINK for tests. install.sh calls the same knob
+# PREFIX, mirroring vps/install-vps.sh; boxup namespaces it like every other
+# boxup knob (BOX_SETUP_ROOT/RUN/LOG/CONFIG) because boxup is a long-lived
+# daemon that inherits whatever an operator shell exports, and a bare PREFIX is
+# a common variable in build environments. The link TARGET is never prefixed.
+# It is honoured IN-PROCESS only: require_root does not forward it across the
+# sudo re-exec and the worker spawn does not carry it, so it cannot leak from
+# an operator's shell into a real converge. A test never needs root anyway.
+ensure_path_symlink() {
+  local dir link want
+  dir="${BOX_SETUP_PREFIX:-}/usr/local/bin"
+  link="$dir/boxup"
+  want="$ROOT/boxup"
+  if [ -L "$link" ] && [ "$(readlink "$link" 2>/dev/null || true)" = "$want" ]; then
+    return 0
+  fi
+  if mkdir -p "$dir" 2>/dev/null && ln -sfn "$want" "$link" 2>/dev/null; then
+    log "converge: linked $link -> $want"
+    return 0
+  fi
+  log "converge: could not link $link -> $want (read-only /usr?) — use $want directly" >&2
+  return 0
+}
 
 # --- converge ----------------------------------------------------------------
 # The converge body. Runs under the converge lock (via do_ensure).
@@ -2508,6 +2764,10 @@ do_ensure_body() {
   _ensure_step packages       ensure_packages
   _ensure_step tailscale-bin  ensure_tailscale_bin
   _ensure_step sshd           ensure_sshd
+  # bug-triage (6): /usr/local/bin/boxup does not survive an image swap, and
+  # install.sh only runs on a rollout. Restore it here, next to the other
+  # things a swap wipes.
+  _ensure_step path-link      ensure_path_symlink
   _ensure_step forwarding     ensure_forwarding
   _ensure_step tailscaled     start_tailscaled
   wait_for_socket || true
@@ -2654,6 +2914,18 @@ cmd_retag() {
   return 0
 }
 
+# require_root: re-exec under sudo when we are not root, carrying the knobs that
+# change behaviour with us. The disk-guard five are forwarded because they are a
+# DOCUMENTED env interface (README): without them here, `BOXUP_DISK_FAIL_PCT=1
+# boxup once` from a normal shell re-execs without the variable and silently
+# does nothing — the r1 gate flagged exactly that. They are forwarded as their
+# already-resolved values (the assignments run at load time, above), so an
+# operator's deliberate empty value survives instead of being re-defaulted.
+#
+# Security: this grants no new authority. Anyone who can run `sudo boxup` on
+# these boxes already has passwordless root and can truncate anything directly;
+# and the guard still truncates only allowlisted, non-symlink, regular files
+# over the floor, AS THEIR OWNER, never as root.
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
     if have sudo; then
@@ -2662,7 +2934,13 @@ require_root() {
         BOX_SETUP_RUN="${BOX_SETUP_RUN:-}" \
         BOX_SETUP_LOG="${BOX_SETUP_LOG:-}" \
         BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" \
-        BOXUP_FORCE_REFRESH="${BOXUP_FORCE_REFRESH:-}" bash "$SELF" "$@"
+        BOXUP_FORCE_REFRESH="${BOXUP_FORCE_REFRESH:-}" \
+        BOXUP_DISK_WARN_PCT="$BOXUP_DISK_WARN_PCT" \
+        BOXUP_DISK_FAIL_PCT="$BOXUP_DISK_FAIL_PCT" \
+        BOXUP_DISK_TRUNCATE_MIN_BYTES="$BOXUP_DISK_TRUNCATE_MIN_BYTES" \
+        BOXUP_DISK_INTERVAL="$BOXUP_DISK_INTERVAL" \
+        DISK_GUARD_TRUNCATE="$DISK_GUARD_TRUNCATE" \
+        bash "$SELF" "$@"
     fi
     log "boxup: need root" >&2
     exit 1

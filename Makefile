@@ -15,6 +15,8 @@ test:
 	bash tests/test-install-vps.sh
 	bash tests/test-boxup-config.sh
 	bash tests/test-boxup-tunnel-stray.sh
+	bash tests/test-boxup-disk-guard.sh
+	bash tests/test-install-boxup-symlink.sh
 	bash tests/test-makefile-targets.sh
 
 # --- fleet2 (bun+TS brain) ---------------------------------------------------
