@@ -7,14 +7,17 @@
 // upgrade. Dispatch decisions live in commands/dispatch.ts (F10); the engine
 // wiring is here.
 //
-// Exit codes (D9): 0 ok, 1 verified failure/abort, 2 usage, 3 target/staging,
-// 5 policy precheck refused (enroll; nothing written), 6 refused (VPS-only /
-// missing key / lock held / flock missing) — state-store D8 registers the
-// reconcile-lock timeout under this same code — and 7 "recorded; export failed"
-// (state-store D6/r6-B2): the store write COMMITTED and the mutation succeeded,
-// but the legacy export a rolled-back 5.7.1 would read is stale.
-// `fleet-reconcile.service` carries SuccessExitStatus=7 so a lagging export does
-// not park the oneshot unit in `failed` every five minutes.
+// Exit codes (D9): the table is NOT duplicated here. `RC` in upgrade.ts is the
+// one constant and `commands/rc.ts` renders it — run `fleet2 rc` (agent-ux U3).
+// Notable entries: 6 covers both the VPS-only refusal and the state-store D8
+// reconcile-lock timeout ("refused, nothing done"), and 7 is state-store
+// D6/r6-B2 "recorded; export failed" — the store write COMMITTED and the
+// mutation succeeded, but the legacy export a rolled-back 5.7.1 would read is
+// stale. `fleet-reconcile.service` carries SuccessExitStatus=7 so a lagging
+// export does not park the oneshot unit in `failed` every five minutes.
+//
+// For agents (agent-ux): stdout is DATA, stderr is diagnostics; every read
+// command takes `--json` (or FLEET2_JSON=1); no non-zero rc is silent.
 
 import { resolveEnv } from "./env.ts";
 import { BunRunner } from "./runner.ts";
@@ -49,6 +52,8 @@ import {
 } from "./commands/aliases.ts";
 import { makeEnrollSideEffects } from "./commands/enroll-wiring.ts";
 import { makeRenameDeps } from "./commands/rename-wiring.ts";
+import { renderRcTable, renderRcJson } from "./commands/rc.ts";
+import { wantsJson } from "./commands/json-flag.ts";
 
 const PKG_VERSION = "5.9.0"; // state-store Phase B: explicit phase, enrol saga, snapshots in the store.
 
@@ -93,10 +98,22 @@ async function main(argv: string[]): Promise<number> {
 
   if (decision.kind === "version") {
     const sha = await resolveGitSha(buildGitSha, gitShaFromGit);
+    // U2: `--json` (or FLEET2_JSON) ⇒ {name, version, sha, bun}.
+    if (wantsJson(args.slice(1))) {
+      stdout(JSON.stringify({ name: "fleet2", version: PKG_VERSION, sha, bun: Bun.version }, null, 2) + "\n");
+      return RC.OK;
+    }
     return emit(decision, versionString(PKG_VERSION, sha, Bun.version), stdout, stderr);
   }
   if (decision.kind === "help" || decision.kind === "unknown") {
     return emit(decision, "", stdout, stderr);
+  }
+  // `rc` (U3) is answered before any env/config resolution: it is a pure
+  // constant-renderer, and an agent must be able to look the table up on a host
+  // where the brain config does not exist.
+  if (decision.command === "rc") {
+    stdout(wantsJson(args.slice(1)) ? renderRcJson() : renderRcTable());
+    return RC.OK;
   }
 
   const env = resolveEnv();
@@ -111,7 +128,7 @@ async function main(argv: string[]): Promise<number> {
   switch (decision.command) {
     // --- laptop-runnable (M1): no locality guard ---
     case "list":
-      return cmdList(runner, stdout);
+      return cmdList(runner, stdout, wantsJson(rest));
     case "ssh":
       return cmdSsh(rest, { runner, cfg });
     case "remove-timer": {
@@ -202,6 +219,7 @@ async function main(argv: string[]): Promise<number> {
         env,
         runner,
         version: PKG_VERSION,
+        json: wantsJson(rest),
         notify: (level, msg) =>
           notifyFn(level, msg, {
             telegramEnvPath: env.FLEET_TELEGRAM_ENV,
@@ -212,7 +230,9 @@ async function main(argv: string[]): Promise<number> {
     }
   }
 
-  // Unreachable (decide() only routes KNOWN_COMMANDS), but keep the compiler happy.
+  // Unreachable (decide() only routes KNOWN_COMMANDS), but keep the compiler
+  // happy — and U4-compliant if a future command is ever routed without a case.
+  log(`${String(decision.command)}: routed but not wired in cli.ts (internal error)`);
   return RC.USAGE;
 }
 
@@ -239,12 +259,13 @@ function devicesBodySource(env: ReturnType<typeof resolveEnv>, cfg: ParsedConfig
 // --- inventory / status / check / upgrade / rollout wiring ------------------
 
 function parseBoxArgs(rest: string[], label: string): { boxes: string[]; json: boolean } | number {
-  let json = false;
+  // U2: FLEET2_JSON=1 is equivalent to --json wherever --json exists.
+  let json = wantsJson(rest);
   const explicit: string[] = [];
   for (const a of rest) {
     if (a === "--json") json = true;
     else if (a === "--help" || a === "-h") {
-      stdout("see `fleet2 help`\n");
+      stdout(`see \`fleet2 help\`\nexit codes: fleet2 rc\n`);
       return RC.OK;
     } else if (a.startsWith("--")) {
       log(`${label}: unknown flag ${a}`);
@@ -350,7 +371,8 @@ function parseUpgradeArgs(rest: string[], canaryDefault: string): {
   let to: string | undefined;
   let all = false;
   let apply = false;
-  let json = false;
+  // U2: FLEET2_JSON=1 is equivalent to --json here too.
+  let json = wantsJson(rest);
   let debugExec = false;
   let dirty = false;
   let canaryOverride: string | undefined;
@@ -411,6 +433,8 @@ async function runUpgradeCmd(
   };
 
   if (p.apply && !env.FLEET2_LOCKED) {
+    // U4: every arm of takeLockAndReexec that refuses already logs its reason,
+    // and the child that DID run owns its own diagnostics on inherited stderr.
     const lr = await takeLockAndReexec(deps, process.argv, p.debugExec);
     return lr.rc;
   }
@@ -429,6 +453,10 @@ async function runUpgradeCmd(
     }
     stdout(res.summary + "\n");
   }
+  // U4: the summary is DATA on stdout, so a non-zero rc still needs its one
+  // stderr line — otherwise `fleet2 upgrade --apply` fails silently for anyone
+  // reading only stderr (a systemd unit, an agent checking rc).
+  if (res.rc !== RC.OK) log(`${alias ? "rollout" : "upgrade"}: ${res.summary}`);
   return res.rc;
 }
 
@@ -478,14 +506,18 @@ async function runReconcileCmd(
     else if (a === "--dry-run") apply = false;
     else if (a === "--debug-exec") debugExec = true;
     else if (a === "--help" || a === "-h") {
-      stdout("see `fleet2 help`\n");
+      stdout("see `fleet2 help`\nexit codes: fleet2 rc\n");
       return RC.OK;
     } else {
       log(`reconcile: unknown arg '${a}'`);
       return RC.USAGE;
     }
   }
-  return cliReconcile({ env, cfg, rollout, apply, debugExec, argv, version: PKG_VERSION });
+  const rc = await cliReconcile({ env, cfg, rollout, apply, debugExec, argv, version: PKG_VERSION });
+  // U4: cliReconcile's own arms log, but a rc it invents without a line would
+  // otherwise be silent — name the code so the tick is never a mystery.
+  if (rc !== RC.OK) log(`reconcile: pass finished with rc ${rc} (see the lines above; fleet2 rc)`);
+  return rc;
 }
 
 if (import.meta.main) {

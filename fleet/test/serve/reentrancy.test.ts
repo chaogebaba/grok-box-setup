@@ -55,11 +55,11 @@ describe("R3-B1 rename re-entrancy", () => {
     expect(acquireCalls).toBe(1);
   });
 
-  test("proof of the hazard: a 'busy' acquireLock (what the UNINJECTED external flock would do) aborts rc 1", async () => {
+  test("proof of the hazard: a 'busy' acquireLock (what the UNINJECTED external flock would do) refuses rc 6", async () => {
     // If the API path did NOT inject the lock-held variant, the production
     // acquireLock (external `flock -w 90`) would see the handler's fd-held lock,
-    // block 90s, then refuse ⇒ "busy" ⇒ rc 1. This asserts that outcome so a
-    // regression that drops the injection is caught.
+    // block 90s, then refuse ⇒ "busy" ⇒ rc 6 ("refused … lock held"). This
+    // asserts that outcome so a regression that drops the injection is caught.
     const deps: RenameDeps = {
       store: okStore(),
       ops: {
@@ -77,7 +77,7 @@ describe("R3-B1 rename re-entrancy", () => {
       paths: { state: "/s", akDir: "/e/ak", etc: "/e", managedBoxDir: "/e/boxes" },
     };
     const rc = await cmdRename(["grok-box-3", "grok-box-003"], deps);
-    expect(rc).toBe(1); // self-deadlock outcome the injection PREVENTS
+    expect(rc).toBe(6); // self-deadlock outcome the injection PREVENTS
   });
 });
 

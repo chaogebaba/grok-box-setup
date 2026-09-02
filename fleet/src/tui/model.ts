@@ -255,7 +255,14 @@ export function headerText(state: TuiState, size: Size): string {
 // --- box table ---------------------------------------------------------------
 // DRIFT is 9, not 7: `unknown` is exactly 7 characters, so a 7-wide cell left no
 // gap at all and the fleet read `unknownskip` on screen (r2 fix 1).
-const TABLE_HEADER_COLS = { glyph: 2, name: 14, tunnel: 7, check: 6, ver: 10, drift: 9, config: 9, expiry: 8 };
+//
+// The widths through EXPIRY must sum to at most `tableWidth({cols:100})` = 60,
+// because `layout.ts` clips the header to the table pane once the Detail pane
+// appears at 100 columns. At ver:10/config:9 the header ran to 65 and EXPIRY
+// rendered as "EXP". ver:8 still fits a 5.x.y version with a gap and config:8
+// still fits "in-sync"; the header's own trailing pad absorbs the last 2 cells'
+// slack, so the visible header ends exactly at column 60.
+const TABLE_HEADER_COLS = { glyph: 2, name: 14, tunnel: 7, check: 6, ver: 8, drift: 9, config: 8, expiry: 8 };
 
 /** The filtered box list (case-insensitive substring on name). */
 export function filteredBoxes(state: TuiState): SnapshotBox[] {
@@ -330,6 +337,89 @@ function dashTs(v: string | number | null | undefined): string {
   if (v === null || v === undefined || v === "" || v === 0) return DASH;
   const s = String(v);
   return EPOCH_ZERO.test(s) ? DASH : s;
+}
+
+/** A DATE with no clock (`2026-06-01`, the key-expiry field): there is no wall
+ *  time to move into another zone, so it is printed as it arrives. */
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/** The expiry DATE carries no countdown; the table cell next to it already
+ *  knows one. `2026-06-01` becomes `2026-06-01 (40d)`. */
+function withDays(text: string, days: number | null): string {
+  if (text === DASH || days === null || text.includes("(")) return text;
+  return `${text} (${days}d)`;
+}
+
+/** The default zone when a state carries none. UTC, not the host's zone, so a
+ *  state built without one (every fixture) renders the same everywhere. */
+export const DEFAULT_TZ = "UTC";
+
+/**
+ * Seconds as a compact span with a DAY tier: `45s`, `12m`, `3h`, `9d`. `fmtAge`
+ * (header, banner) stops at hours because a tick is never old; a detail-card
+ * timestamp can be weeks back and `1248h ago` is not a reading.
+ */
+function fmtSpan(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+/** `2h ago` for a past instant, `in 12h` for a future one (a retry deadline). */
+export function fmtRelative(deltaMs: number): string {
+  const seconds = Math.floor(Math.abs(deltaMs) / 1000);
+  if (seconds < 1) return "now";
+  return deltaMs >= 0 ? `${fmtSpan(seconds)} ago` : `in ${fmtSpan(seconds)}`;
+}
+
+/** The timestamp shapes the engine hands the TUI: an ISO-8601 string, or a unix
+ *  epoch in SECONDS (what `api.next_retry` stores, as a number or as digits). */
+function tsMillis(v: string | number): number | undefined {
+  if (typeof v === "number") return Number.isFinite(v) ? v * 1000 : undefined;
+  if (/^\d+$/.test(v)) return Number(v) * 1000;
+  const ms = Date.parse(v);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/** `Mar 20 09:46 UTC` — the wall clock in `zone`, with its short zone name. An
+ *  unusable zone falls back to UTC rather than throwing inside a render. */
+function wallClock(ms: number, zone: string): string {
+  const opts: Intl.DateTimeFormatOptions = {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short",
+  };
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat("en-US", { ...opts, timeZone: zone }).formatToParts(new Date(ms));
+  } catch {
+    parts = new Intl.DateTimeFormat("en-US", { ...opts, timeZone: DEFAULT_TZ }).formatToParts(new Date(ms));
+  }
+  const get = (t: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("month")} ${get("day")} ${get("hour")}:${get("minute")} ${get("timeZoneName")}`;
+}
+
+/**
+ * A detail-card timestamp in the VIEWER's zone: `Sep 1 23:49 EDT (2h ago)`.
+ * A raw UTC ISO string is unreadable at a glance — nobody subtracts four hours
+ * and a date in their head while a box is asleep — so the card shows the local
+ * wall clock, its zone, and how long ago (or how far ahead) it is.
+ *
+ * Pure: `nowMs` and `zone` are injected, so the fixtures render one fixed frame
+ * and the DST cases are testable. Absent / empty / epoch-0 render `—` exactly as
+ * `dashTs` did; a DATE-only value and anything unparseable pass through
+ * unchanged rather than being guessed at.
+ */
+export function fmtLocalTs(v: string | number | null | undefined, nowMs: number, zone: string): string {
+  const raw = dashTs(v);
+  if (raw === DASH || DATE_ONLY.test(raw)) return raw;
+  const ms = tsMillis(v as string | number);
+  if (ms === undefined) return raw;
+  return `${wallClock(ms, zone)} (${fmtRelative(nowMs - ms)})`;
 }
 
 /** Health level per history sample: healthy=high, degraded=mid, incident=low. */
@@ -458,10 +548,14 @@ export function detailLines(state: TuiState, width: number): DetailLine[] {
   // switch the rows read `—`, never box A's numbers under box B's header.
   const f = state.detailFacts !== undefined && state.detailFacts.box === b.name ? state.detailFacts.facts : undefined;
   const cf = f?.checkfail_count;
+  // `--utc` / FLEET_TUI_UTC=1 keeps the raw UTC ISO strings, for a log paste or
+  // a screenshot that has to mean the same thing to a reader in another zone.
+  const ts = (v: string | number | null | undefined): string =>
+    state.utcRaw === true ? dashTs(v) : fmtLocalTs(v, state.nowMs, state.tz ?? DEFAULT_TZ);
   body.push(
     joinFields([
       field("checkfail#", dashEm(cf), typeof cf === "number" && cf > 0 ? "warn" : "muted"),
-      field("expires", dashTs(f?.expires_at), "plain"),
+      field("expires", withDays(ts(f?.expires_at), b.expiry_days), "plain"),
     ]),
   );
   // state-store D4: the membership PHASE and the liveness label the last tick
@@ -473,7 +567,7 @@ export function detailLines(state: TuiState, width: number): DetailLine[] {
       field("observed", dashEm(f?.observed), observedTone(f?.observed)),
     ]),
   );
-  body.push(field("asleep since", dashTs(f?.asleep_since), "plain"));
+  body.push(field("asleep since", ts(f?.asleep_since), "plain"));
   // TUI-D4 row budget: the card is fixed at DETAIL_ROWS and the phase/observed
   // line above needed one. `api backoff` rides on the `asleep last` row rather
   // than costing the sparkline or a D1 fact — both are engine bookkeeping the
@@ -481,7 +575,7 @@ export function detailLines(state: TuiState, width: number): DetailLine[] {
   const ab = f?.api_backoff;
   body.push(
     joinFields([
-      field("asleep last", dashTs(f?.asleep_last), "plain"),
+      field("asleep last", ts(f?.asleep_last), "plain"),
       ab === null || ab === undefined
         ? field("api backoff", DASH, "muted")
         : [
@@ -489,7 +583,7 @@ export function detailLines(state: TuiState, width: number): DetailLine[] {
             { text: " ", tone: "muted" as Tone },
             { text: `${ab.fails} fails`, tone: (ab.fails > 0 ? "warn" : "muted") as Tone },
             { text: ", retry ", tone: "muted" as Tone },
-            { text: dashTs(ab.next_retry), tone: "plain" as Tone },
+            { text: ts(ab.next_retry), tone: "plain" as Tone },
           ],
     ]),
   );

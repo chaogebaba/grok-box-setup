@@ -10,13 +10,17 @@
 // Mutant (m2) skips the export after the old row is deleted, and the "the export
 // no longer lists the old name" assertions are what kill it.
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { openStore, storePath } from "../../src/store/db.ts";
 import { StoreState } from "../../src/store/state.ts";
 import { parseEnrolled } from "../../src/boxes.ts";
 import { setLogSink } from "../../src/log.ts";
-import { cleanup, scratchDir, T0 } from "./helpers.ts";
+import { cleanup, suiteScratch, T0 } from "./helpers.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("rename");
+afterAll(() => SCRATCH.clean());
 
 const OLD = "grok-box-11";
 const NEW = "grok-box-011";
@@ -28,7 +32,7 @@ function fixture(): {
   etc: string;
   open: () => { store: ReturnType<typeof openStore>; st: StoreState };
 } {
-  const dir = scratchDir("rename");
+  const dir = SCRATCH.dir("rename");
   const state = `${dir}/state`;
   const etc = `${dir}/etc`;
   const open = (): { store: ReturnType<typeof openStore>; st: StoreState } => {

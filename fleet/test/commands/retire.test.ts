@@ -5,7 +5,7 @@
 // phase, the VPS authorized_keys rewrite, the /etc mapping line, the revoke, the
 // export and the exit code.
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import {
   cmdRetire,
@@ -20,9 +20,13 @@ import { StoreState } from "../../src/store/state.ts";
 import { selectCandidates } from "../../src/reconcile/discover.ts";
 import type { DiscoverRow } from "../../src/commands/list.ts";
 import { setLogSink } from "../../src/log.ts";
-import { cleanup, put, scratchDir, T0 } from "../store/helpers.ts";
+import { cleanup, put, suiteScratch, T0 } from "../store/helpers.ts";
 import { testEnv } from "../helpers.ts";
 import { FakeRunner } from "../fake-runner.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("retire");
+afterAll(() => SCRATCH.clean());
 
 const BOX = "grok-box-011";
 const PORT = 20011;
@@ -45,7 +49,7 @@ function fixture(over: { lock?: "ok" | "busy" | "open-fail"; akWritable?: boolea
   out: string[];
   st: () => StoreState;
 } {
-  const dir = scratchDir("retire");
+  const dir = SCRATCH.dir("retire");
   const state = `${dir}/state`;
   const etc = `${dir}/etc`;
   const env = testEnv({ FLEET_STATE: state, FLEET_ETC: etc });

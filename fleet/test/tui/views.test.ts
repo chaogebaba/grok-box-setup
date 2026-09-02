@@ -60,13 +60,28 @@ describe("D1 detail pane rows", () => {
     // TRUNCATES (it used to overflow and wrap into the next line).
     const pane = renderDetail(s, SIZE_300x50).join("\n");
     expect(pane).toContain("checkfail# 3");
-    expect(pane).toContain("expires 2026-06-01");
-    expect(pane).toContain("asleep since 2026-03-20T09:46:40Z");
-    expect(pane).toContain("asleep last 2026-03-20T10:46:40Z");
-    expect(pane).toContain("api backoff 2 fails, retry 2026-03-20T12:33:20Z");
+    expect(pane).toContain("expires 2026-06-01 (40d)");
+    // Timestamps are wall-clock readings in the state's zone (UTC in fixtures).
+    expect(pane).toContain("asleep since Mar 20 09:46 UTC (41d ago)");
+    expect(pane).toContain("asleep last Mar 20 10:46 UTC (41d ago)");
+    expect(pane).toContain("api backoff 2 fails, retry Mar 20 12:33 UTC (41d ago)");
     // state-store D4: the two facts a box's state used to be re-derived for.
     expect(pane).toContain("phase enrolled");
     expect(pane).toContain("observed healthy");
+  });
+
+  test("the same five facts under --utc, as raw UTC ISO strings", () => {
+    const s = state({ detailFacts: { box: "grok-box-1", facts: FACTS }, utcRaw: true });
+    // 300 columns, not 200: the asleep-last/api-backoff pair shares ONE row
+    // (state-store D4 row budget), and raw ISO strings make that row the widest
+    // the card paints. A narrower pane truncates it and this case is about the
+    // timestamp FORMAT, not the truncation.
+    const pane = renderDetail(s, SIZE_300x50).join("\n");
+    expect(pane).toContain("checkfail# 3");
+    expect(pane).toContain("expires 2026-06-01 (40d)");
+    expect(pane).toContain("asleep since 2026-03-20T09:46:40Z");
+    expect(pane).toContain("asleep last 2026-03-20T10:46:40Z");
+    expect(pane).toContain("api backoff 2 fails, retry 2026-03-20T12:33:20Z");
   });
 
   // V5's bug fix: nothing the pane paints may be wider than the pane.
@@ -78,7 +93,7 @@ describe("D1 detail pane rows", () => {
     // TUI-D4 row budget: `api backoff` rides on the `asleep last` row so the
     // new phase/observed line costs no rows (the card is fixed at DETAIL_ROWS).
     const backoff = rows.find((r) => r.includes("asleep last"))!;
-    expect(backoff.startsWith("│asleep last 2026-03-20T10:46:40Z · api backo")).toBe(true);
+    expect(backoff.startsWith("│asleep last Mar 20 10:46 UTC (41d ago) · api")).toBe(true);
     expect(backoff.endsWith("│")).toBe(true);
   });
 

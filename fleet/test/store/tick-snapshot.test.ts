@@ -7,7 +7,7 @@
 // proves is that the WIRING carries the tick ordinal and the `observed` label
 // through, and that the retention DELETE runs once per tick.
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { runReconcile, type ReconcileDeps } from "../../src/reconcile/run.ts";
 import { RunContext, TailscaleKeys, type KeyTransport } from "../../src/reconcile/tailscale-keys.ts";
 import type { ManagedSource } from "../../src/actions/config-push.ts";
@@ -20,7 +20,11 @@ import { handleBox, handleFleet, handleHistory } from "../../src/serve/handlers.
 import { FakeRunner, result } from "../fake-runner.ts";
 import { testEnv, testRollout } from "../helpers.ts";
 import { setLogSink } from "../../src/log.ts";
-import { cleanup, scratchDir } from "./helpers.ts";
+import { cleanup, suiteScratch } from "./helpers.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("tick-snapshot");
+afterAll(() => SCRATCH.clean());
 
 const NOW = 1_780_000_000;
 const dirs: string[] = [];
@@ -79,7 +83,7 @@ function tickDeps(
 }
 
 function fixture(): { dir: string; state: string; store: Store } {
-  const dir = scratchDir("tick-snap");
+  const dir = SCRATCH.dir("tick-snap");
   dirs.push(dir);
   const state = `${dir}/state`;
   const store = openStore({ path: storePath(state), dir: state, now: () => NOW });
@@ -216,7 +220,7 @@ describe("the API reads the store, and degrades to the 5.8.0 answer without one"
   });
 
   test("with NO store at all the readonly endpoints answer exactly as they did with an empty history/", async () => {
-    const dir = scratchDir("tick-snap-empty");
+    const dir = SCRATCH.dir("tick-snap-empty");
     dirs.push(dir);
     const fleet = (await handleFleet(ctxFor(dir), { scope: "readonly", name: "t" } as never).json()) as {
       snapshot_ts: string | null;

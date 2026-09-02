@@ -1,12 +1,16 @@
 // db.test.ts — schema, migrations, min_reader, file modes, WAL, integrity and
 // audit retention (blueprint fleet2-state-store D9 (a), (i), (j), (k), (n), (q)).
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { statSync, existsSync, chmodSync, writeFileSync, mkdirSync } from "node:fs";
 import { ConfigError, openStore, storePath } from "../../src/store/db.ts";
 import { KNOWN_SCHEMA, AUDIT_RETENTION_DAYS, MIGRATIONS } from "../../src/store/schema.ts";
-import { cleanup, memStore, scratchDir, T0 } from "./helpers.ts";
+import { cleanup, memStore, suiteScratch, T0 } from "./helpers.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("db");
+afterAll(() => SCRATCH.clean());
 
 describe("(a) migrations, user_version and min_reader", () => {
   test("v0 -> v2 creates every table and stamps the contract", () => {
@@ -51,7 +55,7 @@ describe("(a) migrations, user_version and min_reader", () => {
   });
 
   test("(a) v1 -> v2 is ADDITIVE: the v1 rows survive and min_reader stays 1", () => {
-    const dir = scratchDir("migrate-v2");
+    const dir = SCRATCH.dir("migrate-v2");
     try {
       const path = storePath(dir);
       // Build a file that stops at v1, the way a 5.8.0 binary left it.
@@ -83,7 +87,7 @@ describe("(a) migrations, user_version and min_reader", () => {
   });
 
   test("re-opening an already-migrated file runs nothing and keeps the version", () => {
-    const dir = scratchDir("migrate");
+    const dir = SCRATCH.dir("migrate");
     try {
       const path = storePath(dir);
       const a = openStore({ path, dir });
@@ -110,7 +114,7 @@ describe("(a) migrations, user_version and min_reader", () => {
   });
 
   test("a NEWER user_version with min_reader <= known OPENS (the Phase B rollback)", () => {
-    const dir = scratchDir("newer-ok");
+    const dir = SCRATCH.dir("newer-ok");
     try {
       const path = storePath(dir);
       const a = openStore({ path, dir });
@@ -134,7 +138,7 @@ describe("(a) migrations, user_version and min_reader", () => {
   });
 
   test("a NEWER user_version with min_reader > known REFUSES rc 3 naming both", () => {
-    const dir = scratchDir("newer-refuse");
+    const dir = SCRATCH.dir("newer-refuse");
     try {
       const path = storePath(dir);
       const a = openStore({ path, dir });
@@ -166,7 +170,7 @@ describe("(a) migrations, user_version and min_reader", () => {
 
 describe("(n) file modes", () => {
   test("fleet.db, -wal and -shm are all 0600 after the first write", () => {
-    const dir = scratchDir("modes");
+    const dir = SCRATCH.dir("modes");
     try {
       const path = storePath(dir);
       const s = openStore({ path, dir });
@@ -185,7 +189,7 @@ describe("(n) file modes", () => {
 
 describe("(q) an unwritable $FLEET_STATE is rc 3 naming the directory", () => {
   test("openStore throws ConfigError with the path and the errno", () => {
-    const parent = scratchDir("ro");
+    const parent = SCRATCH.dir("ro");
     const dir = `${parent}/state`;
     try {
       mkdirSync(dir, { recursive: true });
@@ -213,7 +217,7 @@ describe("(q) an unwritable $FLEET_STATE is rc 3 naming the directory", () => {
 
 describe("(i) WAL concurrent reader", () => {
   test("a second read-only handle sees committed rows while the writer stays open", () => {
-    const dir = scratchDir("wal");
+    const dir = SCRATCH.dir("wal");
     try {
       const path = storePath(dir);
       const w = openStore({ path, dir });
@@ -249,7 +253,7 @@ describe("(j) integrity", () => {
   });
 
   test("a truncated real file fails quick_check (or refuses to open) — never 'ok'", () => {
-    const dir = scratchDir("corrupt");
+    const dir = SCRATCH.dir("corrupt");
     try {
       const path = storePath(dir);
       const s = openStore({ path, dir });

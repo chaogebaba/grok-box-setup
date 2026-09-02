@@ -80,9 +80,24 @@ export async function discover(runner: Runner): Promise<DiscoverRow[]> {
   return parseDiscover(r.stdout);
 }
 
-/** cmd_list: print the table to stdout, rc 0 always. */
-export async function cmdList(runner: Runner, write: (s: string) => void): Promise<number> {
+/**
+ * The `--json` document (agent-ux U2): one object, key `boxes`, one entry per
+ * discovered peer. `online` is a real boolean here — the "yes"/"no" strings are
+ * a table-rendering detail, not data.
+ */
+export function renderListJson(rows: DiscoverRow[]): string {
+  return (
+    JSON.stringify(
+      { boxes: rows.map((r) => ({ index: r.index, name: r.name, ip: r.ip, online: r.online === "yes" })) },
+      null,
+      2,
+    ) + "\n"
+  );
+}
+
+/** cmd_list: print the table (or the JSON document) to stdout, rc 0 always. */
+export async function cmdList(runner: Runner, write: (s: string) => void, json = false): Promise<number> {
   const rows = await discover(runner);
-  write(renderList(rows) + "\n");
+  write(json ? renderListJson(rows) : renderList(rows) + "\n");
   return 0;
 }

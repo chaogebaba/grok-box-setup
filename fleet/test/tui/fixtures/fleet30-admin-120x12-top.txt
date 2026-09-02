@@ -1,35 +1,35 @@
 fleet2 30 boxes  ● 19  ◆ 5  ✖ 4  ☾ 2  apply off  tick 10s   admin  link ● up                                            
 
-  NAME          TUNNEL CHECK VER       DRIFT    CONFIG   EXPIRY                                                           ╭─ grok-box-001 ─────────────────────────────╮
-> grok-box-001  up     OK    5.3.0     no       in-sync  40d              │tunnel up · check OK · ver 5.3.0            │
-● grok-box-002  up     OK    5.3.0     no       in-sync  40d              │drift no · config in-sync · expiry 40d      │
-◆ grok-box-003  up     OK    5.3.0     yes      in-sync  40d              │checkfail no · asleep no · canary none      │
-✖ grok-box-004  down   FAIL  5.3.0     no       in-sync  40d              │checkfail# — · expires —                    │
-● grok-box-005  up     OK    5.3.0     no       in-sync  40d              │phase — · observed —                        │
-● grok-box-006  up     OK    5.3.0     no       in-sync  40d              │asleep since —                              │
-☾ grok-box-007  up     OK    5.3.0     no       in-sync  40d              │asleep last — · api backoff —               │
-◆ grok-box-008  up     OK    5.3.0     yes      in-sync  40d              │24h (loading…)                              │
-● grok-box-009  up     OK    5.3.0     no       in-sync  40d              ╰────────────────────────────────────────────╯
-● grok-box-010  up     OK    5.3.0     no       in-sync  40d
-✖ grok-box-011  down   FAIL  5.3.0     no       in-sync  40d
-● grok-box-012  up     OK    5.3.0     no       in-sync  40d
-◆ grok-box-013  up     OK    5.3.0     yes      in-sync  40d
-● grok-box-014  up     OK    5.3.0     no       in-sync  40d
-● grok-box-015  up     OK    5.3.0     no       in-sync  40d
-● grok-box-016  up     OK    5.3.0     no       in-sync  40d
-● grok-box-017  up     OK    5.3.0     no       in-sync  40d
-✖ grok-box-018  down   FAIL  5.3.0     no       in-sync  40d
-● grok-box-019  up     OK    5.3.0     no       in-sync  40d
-● grok-box-020  up     OK    5.3.0     no       in-sync  40d
-● grok-box-021  up     OK    5.3.0     no       in-sync  40d
-● grok-box-022  up     OK    5.3.0     no       in-sync  40d
-◆ grok-box-023  up     OK    5.3.0     yes      in-sync  40d
-● grok-box-024  up     OK    5.3.0     no       in-sync  40d
-✖ grok-box-025  down   FAIL  5.3.0     no       in-sync  40d
-● grok-box-026  up     OK    5.3.0     no       in-sync  40d
-● grok-box-027  up     OK    5.3.0     no       in-sync  40d
-◆ grok-box-028  up     OK    5.3.0     yes      in-sync  40d
-☾ grok-box-029  up     OK    5.3.0     no       in-sync  40d
-● grok-box-030  up     OK    5.3.0     no       in-sync  40d
+  NAME          TUNNEL CHECK VER     DRIFT    CONFIG  EXPIRY                                                              ╭─ grok-box-001 ─────────────────────────────╮
+> grok-box-001  up     OK    5.3.0   no       in-sync 40d                 │tunnel up · check OK · ver 5.3.0            │
+● grok-box-002  up     OK    5.3.0   no       in-sync 40d                 │drift no · config in-sync · expiry 40d      │
+◆ grok-box-003  up     OK    5.3.0   yes      in-sync 40d                 │checkfail no · asleep no · canary none      │
+✖ grok-box-004  down   FAIL  5.3.0   no       in-sync 40d                 │checkfail# — · expires —                    │
+● grok-box-005  up     OK    5.3.0   no       in-sync 40d                 │phase — · observed —                        │
+● grok-box-006  up     OK    5.3.0   no       in-sync 40d                 │asleep since —                              │
+☾ grok-box-007  up     OK    5.3.0   no       in-sync 40d                 │asleep last — · api backoff —               │
+◆ grok-box-008  up     OK    5.3.0   yes      in-sync 40d                 │24h (loading…)                              │
+● grok-box-009  up     OK    5.3.0   no       in-sync 40d                 ╰────────────────────────────────────────────╯
+● grok-box-010  up     OK    5.3.0   no       in-sync 40d
+✖ grok-box-011  down   FAIL  5.3.0   no       in-sync 40d
+● grok-box-012  up     OK    5.3.0   no       in-sync 40d
+◆ grok-box-013  up     OK    5.3.0   yes      in-sync 40d
+● grok-box-014  up     OK    5.3.0   no       in-sync 40d
+● grok-box-015  up     OK    5.3.0   no       in-sync 40d
+● grok-box-016  up     OK    5.3.0   no       in-sync 40d
+● grok-box-017  up     OK    5.3.0   no       in-sync 40d
+✖ grok-box-018  down   FAIL  5.3.0   no       in-sync 40d
+● grok-box-019  up     OK    5.3.0   no       in-sync 40d
+● grok-box-020  up     OK    5.3.0   no       in-sync 40d
+● grok-box-021  up     OK    5.3.0   no       in-sync 40d
+● grok-box-022  up     OK    5.3.0   no       in-sync 40d
+◆ grok-box-023  up     OK    5.3.0   yes      in-sync 40d
+● grok-box-024  up     OK    5.3.0   no       in-sync 40d
+✖ grok-box-025  down   FAIL  5.3.0   no       in-sync 40d
+● grok-box-026  up     OK    5.3.0   no       in-sync 40d
+● grok-box-027  up     OK    5.3.0   no       in-sync 40d
+◆ grok-box-028  up     OK    5.3.0   yes      in-sync 40d
+☾ grok-box-029  up     OK    5.3.0   no       in-sync 40d
+● grok-box-030  up     OK    5.3.0   no       in-sync 40d
 
 ↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history │ P push  M rotate  R rename  T check  C reconcile

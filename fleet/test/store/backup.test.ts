@@ -1,16 +1,20 @@
 // backup.test.ts — the once-a-day backup step and restore (blueprint D9 (o)).
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { openStore, storePath } from "../../src/store/db.ts";
 import { BACKUP_KEEP, backupDir, dailyMaintenance, restoreFile, utcDate } from "../../src/store/backup.ts";
-import { cleanup, scratchDir, T0 } from "./helpers.ts";
+import { cleanup, suiteScratch, T0 } from "./helpers.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("backup");
+afterAll(() => SCRATCH.clean());
 
 const DAY = 86400;
 
 describe("(o) backup and restore", () => {
   test("a same-day rerun REFRESHES the file rather than duplicating it", () => {
-    const dir = scratchDir("backup-refresh");
+    const dir = SCRATCH.dir("backup-refresh");
     try {
       const s = openStore({ path: storePath(dir), dir, now: () => T0 });
       s.db.run(`INSERT INTO boxes(name,phase,created_at,updated_at) VALUES('grok-box-001','enrolled',${T0},${T0})`);
@@ -39,7 +43,7 @@ describe("(o) backup and restore", () => {
   });
 
   test("the 8th backup prunes the oldest — 7 are kept", () => {
-    const dir = scratchDir("backup-prune");
+    const dir = SCRATCH.dir("backup-prune");
     try {
       const s = openStore({ path: storePath(dir), dir, now: () => T0 });
       s.db.run(`INSERT INTO boxes(name,phase,created_at,updated_at) VALUES('grok-box-001','enrolled',${T0},${T0})`);
@@ -60,7 +64,7 @@ describe("(o) backup and restore", () => {
   });
 
   test("restore reopens with the same row count and clears the integrity flag", () => {
-    const dir = scratchDir("restore");
+    const dir = SCRATCH.dir("restore");
     try {
       const path = storePath(dir);
       const s = openStore({ path, dir, now: () => T0 });
@@ -92,7 +96,7 @@ describe("(o) backup and restore", () => {
   });
 
   test("restore refuses a file that does not exist", () => {
-    const dir = scratchDir("restore-missing");
+    const dir = SCRATCH.dir("restore-missing");
     try {
       const r = restoreFile({ fleetState: dir, from: `${dir}/nope.db`, dbPath: storePath(dir) });
       expect(r.rc).toBe(3);
@@ -103,7 +107,7 @@ describe("(o) backup and restore", () => {
   });
 
   test("a FAILING quick_check sets the flag and takes NO backup", () => {
-    const dir = scratchDir("backup-corrupt");
+    const dir = SCRATCH.dir("backup-corrupt");
     try {
       const path = storePath(dir);
       const s = openStore({ path, dir, now: () => T0 });

@@ -6,7 +6,7 @@
 // loop; repair after the loop and BEFORE the snapshot; the summary reaching the
 // snapshot line and GET /v1/fleet.
 
-import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { runReconcile, type ReconcileDeps } from "../src/reconcile/run.ts";
@@ -21,7 +21,11 @@ import type { UpgradeDeps } from "../src/upgrade.ts";
 import type { SnapshotLine } from "../src/history/schema.ts";
 import { makeFetch } from "../src/serve/server.ts";
 import { fakeContext, getReq, seedSnapshots } from "./serve/helpers.ts";
-import { scratchDir } from "./store/helpers.ts";
+import { suiteScratch } from "./store/helpers.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("discover-tick");
+afterAll(() => SCRATCH.clean());
 
 let logs: string[] = [];
 let prevSink: (l: string) => void;
@@ -210,7 +214,7 @@ describe("D7 the summary reaches GET /v1/fleet", () => {
       boxes: [],
       discover: { candidates: 2, adopted: 1, repaired: 0, skipped: [{ name: "grok-box-004", reason: "unreachable" }] },
     };
-    const state = scratchDir("fleet2-disc");
+    const state = SCRATCH.dir("fleet2-disc");
     dirs.push(state);
     seedSnapshots(state, [withDiscover], { firstTick: 1 });
     const ctx = await fakeContext({ enrolled: [] });

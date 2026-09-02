@@ -4,14 +4,18 @@
 // snapshot copies, probe-derived fields (tunnel/check/ver/drift/config) come
 // from the snapshot ONLY. Uses a real FLEET_STATE under the worker scratch.
 
-import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { makeFetch } from "../../src/serve/server.ts";
 import { fakeContext, getReq, seedBoxRow, seedSnapshots } from "./helpers.ts";
-import { scratchDir } from "../store/helpers.ts";
+import { suiteScratch } from "../store/helpers.ts";
 import type { SnapshotLine } from "../../src/history/schema.ts";
 import { setLogSink } from "../../src/log.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("fleet-merge");
+afterAll(() => SCRATCH.clean());
 
 let dirs: string[] = [];
 let restore: (l: string) => void;
@@ -32,7 +36,7 @@ afterEach(() => {
  * both through the store.
  */
 function stateWith(line: SnapshotLine, markers: Record<string, Parameters<typeof seedBoxRow>[2]> = {}): string {
-  const s = scratchDir("fleet2-merge");
+  const s = SCRATCH.dir("fleet2-merge");
   dirs.push(s);
   for (const [name, m] of Object.entries(markers)) seedBoxRow(s, name, m);
   seedSnapshots(s, [line]);
@@ -120,7 +124,7 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
   });
 
   test("GET /v1/health with NO snapshot ⇒ tick_age_s null", async () => {
-    const s = scratchDir("fleet2-merge");
+    const s = SCRATCH.dir("fleet2-merge");
     dirs.push(s);
     const ctx = await ctxFor(s, []);
     const fetch = makeFetch(ctx);

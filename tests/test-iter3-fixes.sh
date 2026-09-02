@@ -372,7 +372,7 @@ INNER
 # H10 — .gitignore ignores auth-key patterns (belt-and-braces).
 # ---------------------------------------------------------------------------
 h10_ok=1
-for pat in auth_key.txt myauthkey tskey-abc123 node_auth_key; do
+for pat in auth_key.txt myauthkey tskey-abc123 node_auth_key auth-key.txt tskey.txt; do
   if ! git -C "$ROOT" check-ignore -q "$pat" 2>/dev/null; then h10_ok=0; echo "  not ignored: $pat" >&2; fi
 done
 if [ "$h10_ok" = 1 ]; then

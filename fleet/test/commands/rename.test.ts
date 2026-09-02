@@ -119,14 +119,26 @@ describe("T3 --dry-run (F4)", () => {
   });
 });
 
-describe("T3 lock + precheck aborts (rc 1)", () => {
-  test("lock busy ⇒ 'reconcile busy' rc 1 (m6)", async () => {
+describe("T3 lock refusals (rc 6) + precheck aborts (rc 1)", () => {
+  // The lock outcomes are REFUSALS, not verified failures: rc 6 per the cli.ts
+  // rc table ("refused … lock held") and upgrade.ts's RC.REFUSED precedent.
+  test("lock busy ⇒ 'reconcile busy' rc 6 (m6)", async () => {
     const rec: StoreRec = { copied: false, deleted: false };
     const cap = captureLog();
     const rc = await cmdRename(["grok-box-3", "grok-box-003"], { store: fakeStore(true, false, rec), ops: happyOps({ async acquireLock() { return "busy"; } }), paths: PATHS });
     cap.restore();
-    expect(rc).toBe(1);
+    expect(rc).toBe(6);
     expect(cap.lines.some((l) => l.includes("reconcile busy — could not acquire the reconcile lock within 90s"))).toBe(true);
+    expect(rec.copied).toBe(false);
+  });
+
+  test("lock open-fail ⇒ 'cannot open lock' rc 6", async () => {
+    const rec: StoreRec = { copied: false, deleted: false };
+    const cap = captureLog();
+    const rc = await cmdRename(["grok-box-3", "grok-box-003"], { store: fakeStore(true, false, rec), ops: happyOps({ async acquireLock() { return "open-fail"; } }), paths: PATHS });
+    cap.restore();
+    expect(rc).toBe(6);
+    expect(cap.lines.some((l) => l.includes("cannot open lock"))).toBe(true);
     expect(rec.copied).toBe(false);
   });
 

@@ -28,14 +28,18 @@
 // config instead of falling back; drop `apply_source` so a fallen-back (possibly
 // stale) value is indistinguishable from a live one.
 
-import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeFetch } from "../../src/serve/server.ts";
 import { fakeContext, getReq, seedSnapshots } from "./helpers.ts";
-import { scratchDir } from "../store/helpers.ts";
+import { suiteScratch } from "../store/helpers.ts";
 import type { SnapshotLine } from "../../src/history/schema.ts";
 import { setLogSink } from "../../src/log.ts";
+
+// This file's own scratch bucket; dropped whole when the file finishes.
+const SCRATCH = suiteScratch("fleet-apply-live");
+afterAll(() => SCRATCH.clean());
 
 let dirs: string[] = [];
 let restore: (l: string) => void;
@@ -61,7 +65,7 @@ const LINE = (apply: boolean): SnapshotLine => ({
 
 /** A tree with a stored snapshot and (optionally) a config.toml. */
 function treeWith(line: SnapshotLine, configText?: string): { state: string; config: string } {
-  const root = scratchDir("fleet2-applylive");
+  const root = SCRATCH.dir("fleet2-applylive");
   dirs.push(root);
   const state = join(root, "state");
   mkdirSync(state, { recursive: true });
@@ -181,7 +185,7 @@ describe("GET /v1/fleet reads apply LIVE from the config", () => {
   });
 
   test("UNREADABLE config (a directory at the path) ⇒ falls back, never 500s", async () => {
-    const root = scratchDir("fleet2-applylive-dir");
+    const root = SCRATCH.dir("fleet2-applylive-dir");
     dirs.push(root);
     const state = join(root, "state");
     mkdirSync(state, { recursive: true });
@@ -202,7 +206,7 @@ describe("GET /v1/fleet reads apply LIVE from the config", () => {
   });
 
   test("no snapshot at all + no config ⇒ apply null, not a crash", async () => {
-    const root = scratchDir("fleet2-applylive-empty");
+    const root = SCRATCH.dir("fleet2-applylive-empty");
     dirs.push(root);
     const { status, body } = await fleetBody({ state: root, config: join(root, "nope.toml") });
     expect(status).toBe(200);
