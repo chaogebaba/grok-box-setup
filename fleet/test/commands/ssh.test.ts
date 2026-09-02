@@ -1,7 +1,14 @@
 // ssh.test.ts — T-ssh usage + secret contract (D15/F15, m10/m18).
 
 import { describe, test, expect } from "bun:test";
-import { cmdSsh, resolveSshPassword, sshCmdArgv, type InteractiveSpawner } from "../../src/commands/ssh.ts";
+import {
+  cmdSsh,
+  resolveSshPassword,
+  sshCmdArgv,
+  type ExecChild,
+  type ExecSpawner,
+  type InteractiveSpawner,
+} from "../../src/commands/ssh.ts";
 import { parseConfig } from "../../src/config.ts";
 import { FakeRunner } from "../fake-runner.ts";
 import { setLogSink } from "../../src/log.ts";
@@ -21,7 +28,11 @@ describe("T-ssh usage + argv", () => {
     const rc = await cmdSsh([], { runner, cfg: EMPTY_CFG });
     cap.restore();
     expect(rc).toBe(2);
-    expect(cap.lines.some((l) => l.includes("usage: fleet2 ssh <box> [cmd...]"))).toBe(true);
+    // agent-ux U5 names the new flags in the usage line; the operand tail keeps
+    // its bash shape (main:696-699).
+    expect(cap.lines.some((l) => l.includes("usage: fleet2 ssh"))).toBe(true);
+    expect(cap.lines.some((l) => l.includes("<box> [cmd...]"))).toBe(true);
+    expect(cap.lines.some((l) => l.includes("--timeout <s>"))).toBe(true);
     expect(runner.calls.length).toBe(0);
   });
 
@@ -69,16 +80,32 @@ describe("T-ssh password resolution (main:108)", () => {
 
 describe("T-ssh secret contract (F15/m18)", () => {
   test("non-interactive: SSHPASS only in the child env, never argv/parent, rc = ssh's", async () => {
+    // agent-ux U1 moved this form off the capturing Runner and onto the
+    // streaming ExecSpawner. The CONTRACT is unchanged and asserted here on the
+    // new seam: the password reaches the child through env and nowhere else.
     const runner = new FakeRunner(() => ({ code: 0 }));
-    const rc = await cmdSsh(["grok-box-8", "echo", "hi"], { runner, cfg: EMPTY_CFG, envSource: { FLEET_SSH_PASSWORD: "sekret" } });
+    let seen: { argv: string[]; env: Record<string, string> } | undefined;
+    const exec: ExecSpawner = {
+      spawn(argv, env): ExecChild {
+        seen = { argv, env };
+        return { exited: Promise.resolve(0), kill: () => {} };
+      },
+    };
+    const rc = await cmdSsh(["grok-box-8", "echo", "hi"], {
+      runner,
+      cfg: EMPTY_CFG,
+      exec,
+      envSource: { FLEET_SSH_PASSWORD: "sekret" },
+    });
     expect(rc).toBe(0);
-    const call = runner.calls[0]!;
     // password ONLY in the child env, never argv, never the parent process.env.
-    expect(call.opts.env).toEqual({ SSHPASS: "sekret" });
-    expect(call.argv.join(" ")).not.toContain("sekret");
+    expect(seen!.env).toEqual({ SSHPASS: "sekret" });
+    expect(seen!.argv.join(" ")).not.toContain("sekret");
     expect(process.env.SSHPASS).toBeUndefined();
     // "$*" join: the command is the remaining args joined with a space.
-    expect(call.argv[call.argv.length - 1]).toBe("echo hi");
+    expect(seen!.argv[seen!.argv.length - 1]).toBe("echo hi");
+    // the Runner (which buffers and discards) is never involved.
+    expect(runner.calls.length).toBe(0);
   });
 
   test("interactive: inherited-stdio spawner gets SSHPASS in env, rc = ssh's; parent env clean", async () => {

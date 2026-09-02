@@ -88,6 +88,13 @@ export interface TuiState {
   modal?: ModalState;
   /** whether NO_COLOR is set. */
   noColor: boolean;
+  /** IANA zone the detail card's timestamps are rendered in (the viewer's own,
+   *  resolved at startup). Absent ⇒ UTC, so a state built without one — every
+   *  fixture — renders identically on any machine. */
+  tz?: string;
+  /** `--utc` / FLEET_TUI_UTC=1: print the raw UTC ISO strings instead of local
+   *  wall-clock time, for logs and screenshots that cross zones. */
+  utcRaw?: boolean;
   /** zero-touch join summary for the last tick (D7); null/absent ⇒ no row. */
   discover?: SnapshotDiscover | null;
 }
@@ -443,7 +450,7 @@ function specKeyFromLabel(label: string): string {
 }
 
 /** The initial state before the first poll. */
-export function initialState(nowMs: number, noColor: boolean): TuiState {
+export function initialState(nowMs: number, noColor: boolean, opts: { tz?: string; utcRaw?: boolean } = {}): TuiState {
   return {
     boxes: [],
     snapshotTs: null,
@@ -460,5 +467,7 @@ export function initialState(nowMs: number, noColor: boolean): TuiState {
     filtering: false,
     message: CONNECTING_MESSAGE,
     noColor,
+    tz: opts.tz,
+    utcRaw: opts.utcRaw,
   };
 }

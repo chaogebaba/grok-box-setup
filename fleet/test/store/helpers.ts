@@ -1,21 +1,46 @@
 // test/store/helpers.ts — shared fixtures for the state-store suite.
 //
-// Real-file tests live under /data/claude-scratch/worker-scratch/state-store-a/,
-// NEVER under /tmp: /tmp is a plain directory on this machine's root partition
-// and a runaway worker filling it fills `/`.
+// Real-file tests need a writable directory. The default is REPO-LOCAL —
+// `fleet/.test-scratch/`, gitignored, created on demand — so the suite runs on
+// any checkout: a machine-specific absolute path used to be the default, and
+// without FLEET_TEST_SCRATCH set every real-file test failed everywhere but the
+// original author's laptop. It is deliberately not /tmp, which on some of our
+// machines is a plain directory on a nearly-full root partition.
+//
+// FLEET_TEST_SCRATCH still overrides it — a grok box that would rather put the
+// files on /workspace, or a run that wants them on a bigger volume, sets it.
 
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { openStore, type Store } from "../../src/store/db.ts";
 
-// Overridable so the same suite runs on a grok box, where /data belongs to
-// another user and /workspace is the writable tree.
 export const SCRATCH_ROOT =
-  process.env.FLEET_TEST_SCRATCH ?? "/data/claude-scratch/worker-scratch/state-store-a";
+  process.env.FLEET_TEST_SCRATCH ?? resolve(import.meta.dir, "..", "..", ".test-scratch");
 
-/** A throwaway directory that the caller removes with `cleanup`. */
-export function scratchDir(prefix: string): string {
-  mkdirSync(SCRATCH_ROOT, { recursive: true });
-  return mkdtempSync(`${SCRATCH_ROOT}/${prefix}-`);
+/** One test FILE's bucket under SCRATCH_ROOT, so a file can drop everything it
+ *  made in a single `afterAll` even when a test threw before its own cleanup. */
+export interface SuiteScratch {
+  /** A throwaway directory inside this file's bucket. */
+  dir(prefix: string): string;
+  /** Remove this file's whole bucket. */
+  clean(): void;
+}
+
+export function suiteScratch(suite: string): SuiteScratch {
+  const root = resolve(SCRATCH_ROOT, suite);
+  return {
+    dir(prefix: string): string {
+      mkdirSync(root, { recursive: true });
+      return mkdtempSync(`${root}/${prefix}-`);
+    },
+    clean(): void {
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
+    },
+  };
 }
 
 export function cleanup(dir: string): void {

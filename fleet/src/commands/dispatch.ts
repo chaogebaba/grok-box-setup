@@ -37,6 +37,7 @@ export const KNOWN_COMMANDS = [
   "serve", // TUI-D11: the VPS-side admin API (VPS-only, locality-guarded)
   "tui", // TUI-D11: the laptop admin panel (lane B)
   "state", // state-store D8: check/backup/restore/import/reconcile-files
+  "rc", // agent-ux U3: print the exit-code table (no env, no config)
 ] as const;
 
 export type KnownCommand = (typeof KNOWN_COMMANDS)[number];

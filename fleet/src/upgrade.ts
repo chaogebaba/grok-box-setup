@@ -38,12 +38,28 @@ const INSTALL_TIMEOUT_MS = 300_000;
 const POLL_TIMEOUT_MS = 20_000;
 const CHECK_TIMEOUT_MS = 20_000;
 
-/** Exit codes (D9). */
+/**
+ * Exit codes (D9). THE table — `fleet2 rc` renders from this constant and
+ * `commands/rc.ts:RC_MEANING` must carry a line for every distinct number here
+ * (TypeScript enforces it), so the documented table cannot drift from the code
+ * (agent-ux U3).
+ */
 export const RC = {
   OK: 0,
   FAILURE: 1,
   USAGE: 2,
   TARGET: 3,
+  /**
+   * Command-specific failure. `enroll`: the reverse tunnel never came up inside
+   * ENROLL_TUNNEL_WAIT (commands/enroll.ts:waitTunnel). `config push`: the
+   * rendered managed.toml was REFUSED by D4 validation (actions/config-push.ts).
+   */
+  TUNNEL_TIMEOUT: 4,
+  /**
+   * Policy precheck refused, nothing written. `enroll`: sshd permitlisten
+   * DENIED. `config push`: the remote script failed with no status line.
+   */
+  POLICY: 5,
   REFUSED: 6,
   /**
    * The reconcile lock was held for the whole 90 s wait (state-store D8/r7-B2).
@@ -65,6 +81,17 @@ export const RC = {
    * minutes — the notify is the signal.
    */
   EXPORT_FAILED: 7,
+  /**
+   * `fleet2 ssh --timeout <s>` elapsed and fleet2 killed the child (SIGTERM,
+   * then SIGKILL after a grace window). The timeout(1) convention, so a shell
+   * wrapper already knows what 124 means (agent-ux U1).
+   */
+  TIMEOUT: 124,
+  /**
+   * ssh transport failure — the box was unreachable. Passed through from ssh(1)
+   * verbatim so `fleet2 ssh` is transparent: 255 is never a remote command's rc.
+   */
+  TRANSPORT: 255,
 } as const;
 
 export type BoxAction = "upgrade" | "in-sync" | "skip:tunnel-down";

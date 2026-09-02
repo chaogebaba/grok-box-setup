@@ -36,6 +36,8 @@ export interface StateCmdDeps {
   acquireLock?: () => Promise<"ok" | "busy" | "open-fail">;
   out?: (s: string) => void;
   now?: () => number;
+  /** agent-ux U2: emit ONE JSON document on stdout instead of the human table. */
+  json?: boolean;
 }
 
 function stdout(deps: StateCmdDeps): (s: string) => void {
@@ -89,9 +91,11 @@ export async function cmdState(rest: string[], deps: StateCmdDeps): Promise<numb
  */
 async function stateCheck(deps: StateCmdDeps): Promise<number> {
   const out = stdout(deps);
+  const json = deps.json === true;
   const path = storePath(deps.env.FLEET_STATE);
   if (!existsSync(path)) {
-    out(`state check: no store at ${path} (it is created by the first tick)\n`);
+    if (json) out(JSON.stringify({ store: path, present: false }, null, 2) + "\n");
+    else out(`state check: no store at ${path} (it is created by the first tick)\n`);
     return RC.OK;
   }
 
@@ -109,16 +113,49 @@ async function stateCheck(deps: StateCmdDeps): Promise<number> {
 
   const verdict = store.quickCheck();
   const flagged = store.integrityFailedAt();
-  out(`store         ${path}\n`);
-  out(`schema        user_version=${store.userVersion()} min_reader=${store.meta("min_reader") ?? "?"} (this fleet2 knows ${KNOWN_SCHEMA})\n`);
-  out(`legacy import ${store.meta("legacy_imported_at") ?? "never"} (source=${store.meta("legacy_import_source") ?? "-"})\n`);
-  out(`last backup   ${store.meta("last_backup_date") ?? "never"} (${countBackups(deps.env.FLEET_STATE)} kept)\n`);
-  out(`quick_check   ${verdict}\n`);
-  out(`integrity     ${flagged === undefined ? "ok" : `FAILED at ${new Date(flagged * 1000).toISOString()}`}\n`);
+  if (json) {
+    // ONE document, no trailing prose (U2). Same facts as the table.
+    out(
+      JSON.stringify(
+        {
+          store: path,
+          present: true,
+          schema: {
+            user_version: store.userVersion(),
+            min_reader: store.meta("min_reader") ?? null,
+            known: KNOWN_SCHEMA,
+          },
+          legacy_import: {
+            at: store.meta("legacy_imported_at") ?? null,
+            source: store.meta("legacy_import_source") ?? null,
+          },
+          last_backup: {
+            date: store.meta("last_backup_date") ?? null,
+            kept: countBackups(deps.env.FLEET_STATE),
+          },
+          quick_check: verdict,
+          integrity: flagged === undefined ? "ok" : "failed",
+          integrity_failed_at: flagged === undefined ? null : new Date(flagged * 1000).toISOString(),
+          boxes: boxRowsJson(store),
+          divergence: findingsJson(store),
+          warnings: portWarnings(store),
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+  } else {
+    out(`store         ${path}\n`);
+    out(`schema        user_version=${store.userVersion()} min_reader=${store.meta("min_reader") ?? "?"} (this fleet2 knows ${KNOWN_SCHEMA})\n`);
+    out(`legacy import ${store.meta("legacy_imported_at") ?? "never"} (source=${store.meta("legacy_import_source") ?? "-"})\n`);
+    out(`last backup   ${store.meta("last_backup_date") ?? "never"} (${countBackups(deps.env.FLEET_STATE)} kept)\n`);
+    out(`quick_check   ${verdict}\n`);
+    out(`integrity     ${flagged === undefined ? "ok" : `FAILED at ${new Date(flagged * 1000).toISOString()}`}\n`);
 
-  printRows(out, store);
-  printFindings(out, store);
-  printPortWarnings(out, store);
+    printRows(out, store);
+    printFindings(out, store);
+    printPortWarnings(out, store);
+  }
 
   if (verdict !== "ok") {
     store.close();
@@ -139,8 +176,11 @@ async function stateCheck(deps: StateCmdDeps): Promise<number> {
   const lock = deps.acquireLock ?? makeLockProbe(deps.env, deps.runner);
   const got = await lock();
   if (got !== "ok") {
-    out(`${RECONCILE_BUSY_LINE}\n`);
-    out("integrity flag left SET — re-run 'fleet2 state check' when the tick is idle\n");
+    // U4: a non-zero rc is never silent AND never explained on stdout — stdout
+    // is data (the report above, possibly JSON). Both lines go to the journal.
+    log(
+      `state check: ${RECONCILE_BUSY_LINE} — integrity flag left SET; re-run when the tick is idle`,
+    );
     return RC.LOCK_BUSY;
   }
   const rw = openStore({ path, dir: deps.env.FLEET_STATE, now: deps.now });
@@ -171,6 +211,66 @@ function printRows(out: (s: string) => void, store: Store): void {
     // ONLINE-ness: that is a Tailscale fact this local check does not have.
     out(`  ${r.phase.padEnd(9)} ${r.name}\tport=${r.port ?? "-"}\tstage=${r.enrol_stage}${r.enrol_warn ? `\twarn=${r.enrol_warn}` : ""}\n`);
   }
+}
+
+// --- the same facts as data (agent-ux U2) ------------------------------------
+
+interface BoxRowJson {
+  name: string;
+  idx: number | null;
+  port: number | null;
+  phase: string;
+  enrol_stage: number;
+  enrol_warn: string | null;
+}
+
+function allBoxRows(store: Store): BoxRowJson[] {
+  return store.db
+    .query("SELECT name, idx, port, phase, enrol_stage, enrol_warn FROM boxes ORDER BY phase, name")
+    .all() as BoxRowJson[];
+}
+
+function boxRowsJson(store: Store): {
+  enrolled: number;
+  enrolling: number;
+  retired: number;
+  rows: BoxRowJson[];
+} {
+  const rows = allBoxRows(store);
+  return {
+    enrolled: rows.filter((r) => r.phase === "enrolled").length,
+    enrolling: rows.filter((r) => r.phase === "enrolling").length,
+    retired: rows.filter((r) => r.phase === "retired").length,
+    rows,
+  };
+}
+
+function findingsJson(store: Store): Array<{ kind: string; name: string; first_seen: string; last_seen: string }> {
+  return currentFindings(store).map((r) => ({
+    kind: r.kind,
+    name: r.name,
+    first_seen: new Date(r.first_seen * 1000).toISOString(),
+    last_seen: new Date(r.last_seen * 1000).toISOString(),
+  }));
+}
+
+/** The two WARNING conditions `printPortWarnings` renders, as strings. */
+function portWarnings(store: Store): string[] {
+  const w: string[] = [];
+  const dup = store.db
+    .query(
+      `SELECT port, GROUP_CONCAT(name, ' ') AS names, COUNT(*) AS n
+       FROM boxes WHERE phase = 'enrolled' AND port IS NOT NULL GROUP BY port HAVING n > 1`,
+    )
+    .all() as Array<{ port: number; names: string; n: number }>;
+  for (const d of dup) {
+    w.push(`port ${d.port} is held by ${d.n} enrolled rows: ${d.names} (expected only inside a rename window)`);
+  }
+  const noPort = store.db
+    .query("SELECT name FROM boxes WHERE phase = 'enrolled' AND port IS NULL")
+    .all() as Array<{ name: string }>;
+  for (const r of noPort) w.push(`${r.name} has no port (unparseable index) — the tick skips it`);
+  return w;
 }
 
 function printFindings(out: (s: string) => void, store: Store): void {
@@ -328,9 +428,16 @@ async function stateImport(args: string[], deps: StateCmdDeps): Promise<number> 
  * automatic retirement is out of scope, deliberately.
  */
 async function stateReconcileFiles(args: string[], deps: StateCmdDeps): Promise<number> {
-  const out = stdout(deps);
+  const raw = stdout(deps);
+  const json = deps.json === true;
+  // U2: with --json the ONLY thing on stdout is the one document, so the human
+  // prose is suppressed at the sink rather than at every call site.
+  const out = (s: string): void => {
+    if (!json) raw(s);
+  };
+  const entries: Array<{ kind: string; name: string; port_column?: string | null; action: string }> = [];
   const apply = args.includes("--apply");
-  const unknown = args.find((a) => a.startsWith("--") && a !== "--apply");
+  const unknown = args.find((a) => a.startsWith("--") && a !== "--apply" && a !== "--json");
   if (unknown !== undefined) {
     log(`state reconcile-files: unknown flag ${unknown}`);
     return RC.USAGE;
@@ -348,6 +455,7 @@ async function stateReconcileFiles(args: string[], deps: StateCmdDeps): Promise<
   const findings = currentFindings(store);
   if (findings.length === 0) {
     out("state reconcile-files: no divergence findings\n");
+    if (json) raw(JSON.stringify({ apply, findings: [] }, null, 2) + "\n");
     store.close();
     return RC.OK;
   }
@@ -364,14 +472,16 @@ async function stateReconcileFiles(args: string[], deps: StateCmdDeps): Promise<
     if (f.kind === "store-only") {
       out(`store-only ${f.name} — the file lacks this enrolled row; the next export restores it.\n`);
       out(`           to remove the box instead:  fleet2 retire ${f.name}\n`);
+      entries.push({ kind: "store-only", name: f.name, action: "none" });
       continue;
     }
-    const raw = fileRows.get(f.name);
+    const rawPort = fileRows.get(f.name);
     if (!apply) {
-      out(`file-only  ${f.name} (port column ${JSON.stringify(raw ?? "")}) — would import into the store\n`);
+      out(`file-only  ${f.name} (port column ${JSON.stringify(rawPort ?? "")}) — would import into the store\n`);
+      entries.push({ kind: "file-only", name: f.name, port_column: rawPort ?? null, action: "would-import" });
       continue;
     }
-    const { port, warn } = resolvePort(f.name, raw);
+    const { port, warn } = resolvePort(f.name, rawPort);
     if (warn !== undefined) log(warn);
     const at = store.now();
     const existing = st.boxRow(f.name);
@@ -407,6 +517,7 @@ async function stateReconcileFiles(args: string[], deps: StateCmdDeps): Promise<
     });
     adopted += 1;
     out(`file-only  ${f.name} — imported (port=${port ?? "-"}, pubkey=${pubkeys.has(f.name) ? "from map" : "none"})\n`);
+    entries.push({ kind: "file-only", name: f.name, port_column: rawPort ?? null, action: "imported" });
   }
 
   if (apply && adopted > 0) {
@@ -415,6 +526,7 @@ async function stateReconcileFiles(args: string[], deps: StateCmdDeps): Promise<
   const errs = st.takeExportErrors();
   store.close();
   if (!apply) out("state reconcile-files: dry-run — re-run with --apply to act\n");
+  if (json) raw(JSON.stringify({ apply, findings: entries }, null, 2) + "\n");
   if (errs.length > 0) {
     const msg = `state reconcile-files: recorded; export failed: ${errs[0]}`;
     log(msg);

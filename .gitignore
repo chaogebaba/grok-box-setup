@@ -10,9 +10,13 @@ hostname
 # H10: auth keys must never land in the tree even if dropped OUTSIDE secrets/.
 # A live tailnet key was once left at the repo root as auth_key.txt (untracked
 # but not ignored). Belt-and-braces filename patterns — no hook, no scanner.
+# Underscore AND hyphen spellings both count: `auth-key.txt` / `tskey.txt` used
+# to fall through the underscore-only patterns.
 auth_key.txt
 *authkey*
 *auth_key*
+*auth-key*
+tskey*
 tskey-*
 *.authkey
 
@@ -44,6 +48,10 @@ Thumbs.db
 # tree; `git archive` must not carry it to boxes (blueprint S11).
 fleet/dist/
 fleet/node_modules/
+
+# The state-store suite's real-file scratch (test/store/helpers.ts). Repo-local
+# so the suite runs on any checkout; never committed.
+fleet/.test-scratch/
 
 # Local CAO orchestration hooks — session/seat wiring for the agent harness that
 # drives this repo, NOT project code. They are live on the operator's machine and

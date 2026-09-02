@@ -14,6 +14,8 @@ import {
   counts,
   detailLines,
   detailWidth,
+  fmtLocalTs,
+  fmtRelative,
   discoverText,
   expiryTone,
   footerLines,
@@ -336,9 +338,9 @@ describe("detail timestamps: epoch 0 reads as absent", () => {
     api_backoff: null,
     ...over,
   });
-  const pane = (over: Record<string, unknown>): string =>
+  const pane = (over: Record<string, unknown>, st: Record<string, unknown> = {}): string =>
     detailLines(
-      state({ boxes: [box("grok-box-1")], detailFacts: { box: "grok-box-1", facts: facts(over) as never } }),
+      state({ boxes: [box("grok-box-1")], detailFacts: { box: "grok-box-1", facts: facts(over) as never }, ...st }),
       160,
     )
       .map((l) => l.text)
@@ -371,13 +373,134 @@ describe("detail timestamps: epoch 0 reads as absent", () => {
     }
   });
 
-  test("a REAL timestamp is still shown verbatim", () => {
+  test("a REAL timestamp is still shown — as a local-zone reading, not a dash", () => {
     const p = pane({ asleep_last: "2026-09-02T05:10:27Z" });
+    expect(p).toContain("asleep last Sep 2 05:10 UTC (");
+    expect(p).not.toContain("asleep last —");
+  });
+
+  test("…and verbatim under --utc", () => {
+    const p = pane({ asleep_last: "2026-09-02T05:10:27Z" }, { utcRaw: true });
     expect(p).toContain("asleep last 2026-09-02T05:10:27Z");
   });
 
   test("an epoch-0 api-backoff retry renders — while the fail count stays", () => {
     const p = pane({ api_backoff: { fails: 2, next_retry: "1970-01-01T00:00:00Z" } });
     expect(p).toContain("api backoff 2 fails, retry —");
+  });
+});
+
+
+// --- local-time timestamps in the detail card --------------------------------
+
+describe("fmtLocalTs renders a timestamp in the viewer's zone", () => {
+  const at = (iso: string): number => Date.parse(iso);
+
+  test("America/New_York in summer is EDT, four hours behind UTC", () => {
+    // The blueprint's own example: 03:49Z is 23:49 the previous evening in EDT.
+    expect(fmtLocalTs("2026-09-02T03:49:40Z", at("2026-09-02T05:49:40Z"), "America/New_York")).toBe(
+      "Sep 1 23:49 EDT (2h ago)",
+    );
+  });
+
+  test("the SAME zone in winter is EST, five hours behind — the DST boundary is honoured", () => {
+    expect(fmtLocalTs("2026-01-15T03:49:40Z", at("2026-01-15T06:49:40Z"), "America/New_York")).toBe(
+      "Jan 14 22:49 EST (3h ago)",
+    );
+    // and the two readings of the same wall clock differ by exactly the offset.
+    const summer = fmtLocalTs("2026-09-02T03:49:40Z", at("2026-09-02T03:49:40Z"), "America/New_York");
+    const winter = fmtLocalTs("2026-01-15T03:49:40Z", at("2026-01-15T03:49:40Z"), "America/New_York");
+    expect(summer.startsWith("Sep 1 23:49 EDT")).toBe(true);
+    expect(winter.startsWith("Jan 14 22:49 EST")).toBe(true);
+  });
+
+  test("UTC renders the instant unshifted", () => {
+    expect(fmtLocalTs("2026-09-02T03:49:40Z", at("2026-09-02T05:49:40Z"), "UTC")).toBe("Sep 2 03:49 UTC (2h ago)");
+  });
+
+  test("a future instant reads as `in <span>`, a days-old one as `Nd ago`", () => {
+    expect(fmtLocalTs("2026-09-02T17:49:40Z", at("2026-09-02T05:49:40Z"), "UTC")).toBe("Sep 2 17:49 UTC (in 12h)");
+    expect(fmtLocalTs("2026-08-30T03:49:40Z", at("2026-09-02T05:49:40Z"), "UTC")).toBe("Aug 30 03:49 UTC (3d ago)");
+  });
+
+  test("a unix epoch in SECONDS is accepted, as number or digits (api.next_retry)", () => {
+    const want = "May 28 20:36 UTC (in 8h)";
+    expect(fmtLocalTs(1_780_000_600, at("2026-05-28T12:00:00Z"), "UTC")).toBe(want);
+    expect(fmtLocalTs("1780000600", at("2026-05-28T12:00:00Z"), "UTC")).toBe(want);
+  });
+
+  test("absent, empty and epoch-0 values still render the dash", () => {
+    for (const v of [null, undefined, "", 0, "1970-01-01T00:00:00Z"]) {
+      expect(fmtLocalTs(v, at("2026-09-02T05:49:40Z"), "America/New_York")).toBe("—");
+    }
+  });
+
+  test("a DATE with no clock, and anything unparseable, pass through unchanged", () => {
+    expect(fmtLocalTs("2026-06-01", at("2026-09-02T05:49:40Z"), "America/New_York")).toBe("2026-06-01");
+    expect(fmtLocalTs("not-a-time", at("2026-09-02T05:49:40Z"), "UTC")).toBe("not-a-time");
+  });
+
+  test("an unusable zone falls back to UTC rather than throwing inside a render", () => {
+    expect(fmtLocalTs("2026-09-02T03:49:40Z", at("2026-09-02T05:49:40Z"), "Not/AZone")).toBe(
+      "Sep 2 03:49 UTC (2h ago)",
+    );
+  });
+
+  test("fmtRelative spans seconds, minutes, hours and DAYS in both directions", () => {
+    expect(fmtRelative(0)).toBe("now");
+    expect(fmtRelative(45_000)).toBe("45s ago");
+    expect(fmtRelative(12 * 60_000)).toBe("12m ago");
+    expect(fmtRelative(2 * 3_600_000)).toBe("2h ago");
+    expect(fmtRelative(3 * 86_400_000)).toBe("3d ago");
+    expect(fmtRelative(-12 * 3_600_000)).toBe("in 12h");
+  });
+});
+
+describe("the detail card uses the state's zone, and --utc keeps the raw ISO", () => {
+  const FACTS = {
+    box: "grok-box-1",
+    facts: {
+      name: "grok-box-1",
+      checkfail_count: 3,
+      asleep_since: "2026-03-20T09:46:40Z",
+      asleep_last: "2026-03-20T10:46:40Z",
+      expires_at: "2026-06-01",
+      api_backoff: { fails: 2, next_retry: "2026-03-20T12:33:20Z" },
+    },
+  };
+  const NOW = Date.parse("2026-03-20T11:46:40Z");
+  const card = (over: Record<string, unknown>): string =>
+    detailLines(state({ detailFacts: FACTS, nowMs: NOW, ...over }), 200)
+      .map((l) => l.text)
+      .join("\n");
+
+  test("a New_York viewer sees local wall clock, zone and age", () => {
+    const text = card({ tz: "America/New_York" });
+    expect(text).toContain("asleep since Mar 20 05:46 EDT (2h ago)");
+    expect(text).toContain("asleep last Mar 20 06:46 EDT (1h ago)");
+    expect(text).toContain("retry Mar 20 08:33 EDT (in 46m)");
+  });
+
+  test("--utc (utcRaw) prints the raw UTC ISO strings, unchanged from before", () => {
+    const text = card({ tz: "America/New_York", utcRaw: true });
+    expect(text).toContain("asleep since 2026-03-20T09:46:40Z");
+    expect(text).toContain("asleep last 2026-03-20T10:46:40Z");
+    expect(text).toContain("retry 2026-03-20T12:33:20Z");
+    // the date-only expiry is the same either way, countdown included.
+    expect(text).toContain("expires 2026-06-01 (40d)");
+  });
+
+  test("the expiry DATE keeps its shape and gains the table's countdown", () => {
+    expect(card({ tz: "UTC" })).toContain("expires 2026-06-01 (40d)");
+    // a box with no expiry_days gets no parenthetical, and no facts gets a dash.
+    expect(card({ tz: "UTC", boxes: [box("grok-box-1", { expiry_days: null })] })).toContain("expires 2026-06-01");
+    expect(card({ tz: "UTC", boxes: [box("grok-box-1", { expiry_days: null })] })).not.toContain("2026-06-01 (");
+  });
+
+  test("a state with NO zone falls back to UTC, so a fixture renders the same anywhere", () => {
+    const noZone = detailLines(state({ detailFacts: FACTS, nowMs: NOW, tz: undefined }), 200)
+      .map((l) => l.text)
+      .join("\n");
+    expect(noZone).toContain("asleep since Mar 20 09:46 UTC (2h ago)");
   });
 });
