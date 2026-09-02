@@ -2126,6 +2126,15 @@ disk_allowlisted() {
 disk_truncate_one() {
   local f="$1" pct="${2:--1}" owner size me rc
   disk_allowlisted "$f" || return 1
+  # ORDER IS LOAD-BEARING: the symlink refusal must stay ABOVE the size floor.
+  # A symlink is rejected whatever its size, and neither line below can stand in
+  # for it: `-f` FOLLOWS the link (so it is true for a link to a regular file),
+  # and `stat -c %s` does NOT follow (so it reports the link's pathname length,
+  # ~26 bytes, which the floor then rejects for the wrong reason). The r1 gate
+  # caught exactly that masking: deleting this line survived because the floor
+  # happened to fire first. tests/test-boxup-disk-guard.sh (a6b) now drives this
+  # line directly with a floor below the pathname length, so nothing else can
+  # cover for it.
   [ -L "$f" ] && return 1
   [ -f "$f" ] || return 1
   size=$(stat -c %s "$f" 2>/dev/null || echo 0)
@@ -2905,6 +2914,18 @@ cmd_retag() {
   return 0
 }
 
+# require_root: re-exec under sudo when we are not root, carrying the knobs that
+# change behaviour with us. The disk-guard five are forwarded because they are a
+# DOCUMENTED env interface (README): without them here, `BOXUP_DISK_FAIL_PCT=1
+# boxup once` from a normal shell re-execs without the variable and silently
+# does nothing — the r1 gate flagged exactly that. They are forwarded as their
+# already-resolved values (the assignments run at load time, above), so an
+# operator's deliberate empty value survives instead of being re-defaulted.
+#
+# Security: this grants no new authority. Anyone who can run `sudo boxup` on
+# these boxes already has passwordless root and can truncate anything directly;
+# and the guard still truncates only allowlisted, non-symlink, regular files
+# over the floor, AS THEIR OWNER, never as root.
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
     if have sudo; then
@@ -2913,7 +2934,13 @@ require_root() {
         BOX_SETUP_RUN="${BOX_SETUP_RUN:-}" \
         BOX_SETUP_LOG="${BOX_SETUP_LOG:-}" \
         BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" \
-        BOXUP_FORCE_REFRESH="${BOXUP_FORCE_REFRESH:-}" bash "$SELF" "$@"
+        BOXUP_FORCE_REFRESH="${BOXUP_FORCE_REFRESH:-}" \
+        BOXUP_DISK_WARN_PCT="$BOXUP_DISK_WARN_PCT" \
+        BOXUP_DISK_FAIL_PCT="$BOXUP_DISK_FAIL_PCT" \
+        BOXUP_DISK_TRUNCATE_MIN_BYTES="$BOXUP_DISK_TRUNCATE_MIN_BYTES" \
+        BOXUP_DISK_INTERVAL="$BOXUP_DISK_INTERVAL" \
+        DISK_GUARD_TRUNCATE="$DISK_GUARD_TRUNCATE" \
+        bash "$SELF" "$@"
     fi
     log "boxup: need root" >&2
     exit 1

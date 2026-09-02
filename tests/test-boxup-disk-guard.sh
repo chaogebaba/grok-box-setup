@@ -36,6 +36,8 @@
 #   (a5) a NON-allowlisted path handed straight to disk_truncate_one is refused
 #        and left intact (mutant g2 `disk_allowlisted` removed dies here)
 #   (a6) a SYMLINK named on the allowlist is refused; its target is intact
+#  (a6b) the SAME refusal with the min-bytes floor set BELOW the symlink's own
+#        pathname length, so the `-L` line is the ONLY thing that can reject it
 #   (a7) a file at/below the min-bytes floor is left intact
 #   (a8) the 60s rate limit: a second disk_guard inside the window is a no-op
 #   (a9) df unavailable => level unknown, no truncation, no crash
@@ -46,6 +48,9 @@
 #   (b4) check_reason emits the once/hour `check: WARN disk NN%` line at warn
 #        and does NOT fail the check
 #   (b5) the owner switch is structurally present (runuser then su)
+#   (b7) require_root forwards the five documented disk knobs across its sudo
+#        re-exec, so `BOXUP_DISK_FAIL_PCT=1 boxup once` from a normal shell is
+#        not silently discarded
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -150,6 +155,17 @@ case "$scenario" in
   guard-symlink)
     DISK_GUARD_TRUNCATE="\$LINK"
     disk_guard; grc=\$?
+    ;;
+  truncate-one-symlink-lowfloor)
+    # The r1 gate's finding: with the floor at 1 MiB, deleting the \`-L\` refusal
+    # SURVIVED, because \`stat -c %s\` does not follow a symlink and reports the
+    # link's own pathname length (~26 bytes), which the floor then rejects for
+    # the wrong reason. Drop the floor below that length and the \`-L\` line is
+    # the only gate left: without it, \`-f\` (which DOES follow) passes, the size
+    # check passes, and \`truncate\` follows the link and zeroes the TARGET.
+    BOXUP_DISK_TRUNCATE_MIN_BYTES=4
+    DISK_GUARD_TRUNCATE="\$LINK"
+    disk_truncate_one "\$LINK" 93; grc=\$?
     ;;
   guard-small)
     DISK_GUARD_TRUNCATE="\$SMALL"
@@ -273,6 +289,22 @@ if printf '%s\n' "$(sizes "$o")" | grep -q "target=$((2 * MIB)) link=symlink"; t
   pass "(a6) allowlisted SYMLINK refused, target intact, link not replaced"
 else
   bad  "(a6) symlink was followed or clobbered: [$(sizes "$o")]"
+fi
+
+# ===========================================================================
+# (a6b) THE r1 GATE'S BLOCKER. Same refusal, but with the floor at 4 bytes —
+# below the symlink's own pathname length — so no other condition can mask a
+# missing `-L`. Deleting `[ -L "$f" ] && return 1` makes this truncate the
+# 2 MiB target through the link, and the assertion dies. With the floor at
+# 1 MiB (as (a6) has it) that same deletion survives, which is exactly what the
+# gate caught.
+# ===========================================================================
+o="$(run_case 93 truncate-one-symlink-lowfloor)"
+if [ "$(field "$(r1 "$o")" rc)" = 1 ] \
+   && printf '%s\n' "$(sizes "$o")" | grep -q "target=$((2 * MIB)) link=symlink"; then
+  pass "(a6b) symlink refused with the floor BELOW its pathname length — the -L line is the only gate  [reviewer mutant r2]"
+else
+  bad  "(a6b) symlink NOT refused on the -L line alone: [$(r1 "$o")] [$(sizes "$o")]"
 fi
 
 # ===========================================================================
@@ -489,6 +521,56 @@ if printf '%s\n' "$fn" | grep -q 'runuser -u "\$owner" -- truncate -c -s 0' \
   pass "(b5) owner switch present: owner==me => plain truncate, else runuser, else su  [mutant g1]"
 else
   bad  "(b5) owner switch missing or reshaped in disk_truncate_one"
+fi
+
+# ---------------------------------------------------------------------------
+# (b7) The knobs survive the sudo re-exec. `boxup once` needs root, so a
+# non-root invocation re-execs itself under `sudo env …` with an EXPLICIT
+# variable list. Anything not on that list is silently dropped — the r1 gate
+# found that `BOXUP_DISK_FAIL_PCT=1 boxup once` from a normal shell therefore
+# did nothing at all, while looking like it worked.
+#
+# This drives the REAL require_root with a fake `sudo` on PATH that prints its
+# argv instead of executing, so the forwarded environment is directly
+# observable. `id` is stubbed non-root to reach the re-exec at all.
+# ---------------------------------------------------------------------------
+reexec_argv() {
+  local inner; inner="$(mktemp)"
+  cat > "$inner" <<INNER
+set -u
+W="\$(mktemp -d)"; BIN="\$W/bin"; mkdir -p "\$BIN"
+printf '#!/bin/sh\nprintf "%%s\\n" "\$@"\n' > "\$BIN/sudo"
+chmod +x "\$BIN/sudo"
+PATH="\$BIN:\$PATH"
+ROOT="\$W/box-setup"; SELF="\$W/boxup"
+BOXUP_DISK_WARN_PCT=71
+BOXUP_DISK_FAIL_PCT=72
+BOXUP_DISK_TRUNCATE_MIN_BYTES=73
+BOXUP_DISK_INTERVAL=74
+DISK_GUARD_TRUNCATE=/tmp/canary-75.log
+log(){ :; }
+have(){ command -v "\$1" >/dev/null 2>&1; }
+id(){ case "\$*" in "-u") echo 1000 ;; *) command id "\$@" ;; esac; }
+eval "\$(awk '/^require_root\(\) \{/{i=1} i{print} i&&/^\}\$/{exit}' "$BOXUP")"
+( require_root once )
+rm -rf "\$W"
+INNER
+  timeout 30 bash "$inner"
+  rm -f "$inner"
+}
+argv="$(reexec_argv)"
+missing=""
+for kv in BOXUP_DISK_WARN_PCT=71 BOXUP_DISK_FAIL_PCT=72 \
+          BOXUP_DISK_TRUNCATE_MIN_BYTES=73 BOXUP_DISK_INTERVAL=74 \
+          DISK_GUARD_TRUNCATE=/tmp/canary-75.log; do
+  printf '%s\n' "$argv" | grep -qx "$kv" || missing="$missing $kv"
+done
+# the pre-existing forwards must not regress
+printf '%s\n' "$argv" | grep -q '^BOX_SETUP_ROOT=' || missing="$missing BOX_SETUP_ROOT"
+if [ -z "$missing" ]; then
+  pass "(b7) require_root forwards all five disk knobs (and BOX_SETUP_ROOT) across the sudo re-exec"
+else
+  bad  "(b7) knobs LOST at the sudo re-exec:$missing  — argv was: [$(printf '%s' "$argv" | tr '\n' ' ')]"
 fi
 
 # ---------------------------------------------------------------------------

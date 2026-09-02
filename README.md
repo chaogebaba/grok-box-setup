@@ -123,7 +123,13 @@ tick watches for that.
 | `BOXUP_DISK_TRUNCATE_MIN_BYTES` | `1073741824` (1 GiB) | only a file **larger** than this is truncated. A small log is not what fills a 100 GB overlay, and truncating it would only destroy evidence. |
 | `BOXUP_DISK_INTERVAL` | `60` | seconds between checks. The tick is 15s; four `df` calls a minute buy nothing. |
 
-A symlink named on the allowlist is refused outright, never followed.
+A symlink named on the allowlist is refused outright, never followed, whatever
+its size — the refusal sits above the size floor precisely so nothing else can
+stand in for it.
+
+All five knobs survive `boxup`'s privilege escalation: a non-root `boxup once`
+re-execs itself under `sudo`, and they are on the forwarded list, so
+`BOXUP_DISK_FAIL_PCT=1 boxup once` from an ordinary shell behaves as written.
 
 **Truncation runs as the file's owner, and that is the whole trick.** `/tmp` is
 sticky and world-writable, and Linux's `fs.protected_regular` refuses an
