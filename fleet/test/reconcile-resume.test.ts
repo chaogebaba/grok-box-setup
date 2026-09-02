@@ -256,6 +256,27 @@ describe("(s) only an ATTEMPTED stage that failed is a failure", () => {
     expect(ledger(state)).toEqual([]);
   });
 
+  // (m10): the resume pass stops consulting the backoff ledger. This is the ONE
+  // place where that is observable on its own — a tick with nothing to adopt, so
+  // the slot is free and only the backoff stands between the row and a retry.
+  // (The adopt YIELD's own backoff check is a different consultation, and mutant
+  // (m14) covers it.)
+  test("(m10) a row INSIDE its backoff window is skipped, not retried, even with the slot free", async () => {
+    const state = memState();
+    // 2 failures at tick 5 ⇒ wait 2 ticks; at tick 6 elapsed is 1, so the row is
+    // still inside the window.
+    state.writeDiscoverLedger([
+      { name: "grok-box-003", last_attempt: 1_000_000, failures: 2, reason: "enroll-rc1", last_tick: 5 },
+    ]);
+    const { deps, calls } = stubDeps({ async adopt(box) { calls.adopts.push(box); return { rc: 1 }; } });
+    const run = new DiscoverRun(deps, tickOpts(state, { tick: 6, enrol: enrolSurface([{ name: "grok-box-003" }]) }));
+    await run.repairPass();
+    expect(calls.adopts).toEqual([]);
+    run.finish();
+    // the ledger is untouched: no third failure, and the ladder is not restarted
+    expect(ledger(state)).toEqual([{ name: "grok-box-003", failures: 2, last_tick: 5 }]);
+  });
+
   test("an ATTEMPTED stage that FAILED records a ledger failure and asks about enrol-stuck", async () => {
     const state = memState();
     const { deps, calls } = stubDeps({ async adopt(box) { calls.adopts.push(box); return { rc: 1 }; } });
