@@ -1,15 +1,15 @@
 // fleet-merge.test.ts — §7 snapshot-vs-marker merge (mutant: drop the live-marker
-// override, or let probe fields be overridden). GET /v1/fleet = newest history
-// line + live markers; live markers (*.checkfail/*.asleep/*.expires) OVERRIDE
-// the snapshot copies, probe-derived fields (tunnel/check/ver/drift/config) come
-// from the snapshot ONLY. Uses a real tmp FLEET_STATE.
+// override, or let probe fields be overridden). GET /v1/fleet = the newest
+// SNAPSHOT + live markers; live markers (checkfail/asleep/expiry) OVERRIDE the
+// snapshot copies, probe-derived fields (tunnel/check/ver/drift/config) come
+// from the snapshot ONLY. Uses a real FLEET_STATE under the worker scratch.
 
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { makeFetch } from "../../src/serve/server.ts";
-import { fakeContext, getReq } from "./helpers.ts";
+import { fakeContext, getReq, seedBoxRow, seedSnapshots } from "./helpers.ts";
+import { scratchDir } from "../store/helpers.ts";
 import type { SnapshotLine } from "../../src/history/schema.ts";
 import { setLogSink } from "../../src/log.ts";
 
@@ -25,15 +25,17 @@ afterEach(() => {
   }
 });
 
-function stateWith(line: SnapshotLine, markers: Record<string, string> = {}): string {
-  const s = mkdtempSync(join(tmpdir(), "fleet2-merge-"));
+/**
+ * state-store D3: the snapshot lives in the STORE, and so do the "live markers"
+ * the fleet response merges over it — they have been store columns since 5.8.0.
+ * A test that used to drop a daily jsonl plus `<box>.checkfail` files now seeds
+ * both through the store.
+ */
+function stateWith(line: SnapshotLine, markers: Record<string, Parameters<typeof seedBoxRow>[2]> = {}): string {
+  const s = scratchDir("fleet2-merge");
   dirs.push(s);
-  const hist = join(s, "history");
-  mkdirSync(hist, { recursive: true });
-  writeFileSync(join(hist, `${line.ts.slice(0, 10)}.jsonl`), JSON.stringify(line) + "\n");
-  for (const [name, content] of Object.entries(markers)) {
-    writeFileSync(join(s, name), content);
-  }
+  for (const [name, m] of Object.entries(markers)) seedBoxRow(s, name, m);
+  seedSnapshots(s, [line]);
   return s;
 }
 
@@ -59,7 +61,9 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
       ],
     };
     // live markers say the box is now checkfailing AND asleep (snapshot said not).
-    const state = stateWith(line, { "grok-box-1.checkfail": "2\n", "grok-box-1.asleep": "1700000000 0\n" });
+    const state = stateWith(line, {
+      "grok-box-1": { checkfail: 2, asleep: { since: 1700000000, last: 0 } },
+    });
     const ctx = await ctxFor(state, ["grok-box-1"]);
     (ctx as { now?: () => Date }).now = () => new Date("2026-04-01T00:05:00Z");
     const fetch = makeFetch(ctx);
@@ -115,8 +119,8 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
     expect(body.tick_age_s).toBe(90);
   });
 
-  test("GET /v1/health with NO history ⇒ tick_age_s null", async () => {
-    const s = mkdtempSync(join(tmpdir(), "fleet2-merge-"));
+  test("GET /v1/health with NO snapshot ⇒ tick_age_s null", async () => {
+    const s = scratchDir("fleet2-merge");
     dirs.push(s);
     const ctx = await ctxFor(s, []);
     const fetch = makeFetch(ctx);

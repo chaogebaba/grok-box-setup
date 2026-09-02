@@ -9,6 +9,10 @@ import { AsyncMutex } from "../../src/serve/lock.ts";
 import { FakeRunner } from "../fake-runner.ts";
 import { testEnv, testRollout } from "../helpers.ts";
 import { loadConfig } from "../../src/config.ts";
+import { openStore, storePath } from "../../src/store/db.ts";
+import { writeSnapshot } from "../../src/store/snapshots.ts";
+import type { SnapshotLine } from "../../src/history/schema.ts";
+import type { Observed } from "../../src/reconcile/observe.ts";
 
 /** A TokenFs backed by an in-memory record; mode/uid default to a valid 600/self. */
 export function memTokenFs(
@@ -144,6 +148,83 @@ export async function fakeContext(opts: FakeCtxOpts = {}): Promise<ServerContext
     whichJournalctl: opts.whichJournalctl,
     now: opts.now,
   };
+}
+
+/**
+ * Seed a `$FLEET_STATE` with snapshots, the way the tick records them.
+ *
+ * state-store D3 (Phase B): `history/*.jsonl` is gone, so a test that used to
+ * write a daily file writes STORE rows instead. Lines are written in the order
+ * given, one tick each starting at `firstTick`, so "the newest line" is the last
+ * one — the same thing the last line of the newest daily file used to be.
+ *
+ * `observed` defaults to `healthy` for every box: these fixtures are about the
+ * `SnapshotLine` round-trip, and the label has its own tests.
+ */
+export function seedSnapshots(
+  fleetState: string,
+  lines: SnapshotLine[],
+  opts: { firstTick?: number; observed?: Map<string, Observed> } = {},
+): void {
+  const store = openStore({ path: storePath(fleetState), dir: fleetState });
+  try {
+    let tick = opts.firstTick ?? 1;
+    for (const line of lines) {
+      const observed = opts.observed ?? new Map(line.boxes.map((b) => [b.name, "healthy" as Observed]));
+      writeSnapshot(store, { tick: tick++, line, observed });
+    }
+  } finally {
+    store.close();
+  }
+}
+
+/**
+ * Seed one `boxes` row (and optionally its live markers) so the API has a phase
+ * to report and a marker mirror to override the snapshot with.
+ *
+ * From 5.8.0 the "live markers" the fleet response merges over a snapshot are
+ * STORE COLUMNS, not `<box>.checkfail` files — so a test that used to drop
+ * marker files beside a daily jsonl seeds them here instead.
+ */
+export function seedBoxRow(
+  fleetState: string,
+  name: string,
+  opts: {
+    phase?: string;
+    port?: number;
+    checkfail?: number;
+    asleep?: { since: number; last: number };
+    expires?: { keyId: string; raw: string; date: string };
+  } = {},
+): void {
+  const store = openStore({ path: storePath(fleetState), dir: fleetState });
+  try {
+    const at = 1_780_000_000;
+    const idx = Number.parseInt(name.replace(/^\D+/, ""), 10);
+    store.db
+      .query(
+        `INSERT OR REPLACE INTO boxes(name,idx,port,phase,created_at,enrolled_at,updated_at)
+         VALUES(?,?,?,?,?,?,?)`,
+      )
+      .run(name, Number.isNaN(idx) ? null : idx, opts.port ?? 20000 + (Number.isNaN(idx) ? 0 : idx), opts.phase ?? "enrolled", at, at, at);
+    const id = (store.db.query("SELECT box_id FROM boxes WHERE name = ?").get(name) as { box_id: number }).box_id;
+    store.db.query("INSERT OR IGNORE INTO box_counters(box_id) VALUES(?)").run(id);
+    if (opts.checkfail !== undefined) {
+      store.db.query("UPDATE box_counters SET checkfail = ? WHERE box_id = ?").run(opts.checkfail, id);
+    }
+    if (opts.asleep !== undefined) {
+      store.db
+        .query("UPDATE box_counters SET asleep_since = ?, asleep_last_alert = ? WHERE box_id = ?")
+        .run(opts.asleep.since, opts.asleep.last, id);
+    }
+    if (opts.expires !== undefined) {
+      store.db
+        .query("INSERT OR REPLACE INTO box_keys(box_id,key_id,expires_raw,expires_date,minted_at) VALUES(?,?,?,?,?)")
+        .run(id, opts.expires.keyId, opts.expires.raw, opts.expires.date, at);
+    }
+  } finally {
+    store.close();
+  }
 }
 
 /** Build a GET request with an optional bearer token. */

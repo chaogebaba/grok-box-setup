@@ -13,14 +13,16 @@ import { isValidBoxName } from "../boxes.ts";
 import { withReconcileLock } from "./lock.ts";
 import { writeAudit } from "./audit.ts";
 import { withCapture } from "./log-capture.ts";
-import { readLatest, readSlice } from "../history/read.ts";
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
+import { observedFor, readLatestSnapshot, readSnapshotSlice } from "../store/snapshots.ts";
+import type { Observed } from "../reconcile/observe.ts";
+import type { Phase } from "../store/state.ts";
 import { pushManaged } from "../actions/config-push.ts";
 import { fsManagedSource, cmdConfig } from "../commands/config.ts";
 import { mintKey } from "../actions/mint.ts";
 import { rotate } from "../actions/rotate.ts";
 import { ReconcileState, nodeStateFs } from "../reconcile/state.ts";
-import { integrityBlocked, openReadState, openWriteState, readMembership } from "../store/membership.ts";
+import { integrityBlocked, openReadHandle, openReadState, openWriteState, readMembership } from "../store/membership.ts";
 import { RunContext, TailscaleKeys } from "../reconcile/tailscale-keys.ts";
 import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { readJournal } from "./journal.ts";
@@ -32,7 +34,30 @@ import { existsSync, readFileSync } from "node:fs";
 const CHECK_TIMEOUT_MS = 20_000;
 
 /** The current version string source (kept in sync with cli.ts PKG_VERSION). */
-export const SERVE_VERSION = "5.8.0";
+export const SERVE_VERSION = "5.9.0";
+
+/**
+ * state-store D3/D7 (Phase B): every snapshot read is a STORE query.
+ *
+ * `history/*.jsonl` is no longer written, so the file readers are gone. The
+ * reassembled `SnapshotLine` is byte-identical in shape to the one 5.8.0 served
+ * from the daily files — that is the round-trip contract, and it is why these
+ * handlers did not otherwise change.
+ *
+ * A store that is absent (the window before the first tick) or still on schema
+ * v1 (a Phase A file, i.e. a rollback) yields `undefined`, and every caller
+ * renders the same "no snapshot yet" response it always did for an empty
+ * `history/` directory.
+ */
+function latestSnapshot(env: ServerContext["env"]): SnapshotLine | undefined {
+  const h = openReadHandle(env);
+  try {
+    if (h.store === undefined || h.store.userVersion() < 2) return undefined;
+    return readLatestSnapshot(h.store);
+  } finally {
+    h.close();
+  }
+}
 
 /** Live per-box marker mirror read from FLEET_STATE (TUI-D4 merge inputs). */
 function liveMarkers(env: ServerContext["env"], box: string): {
@@ -90,12 +115,25 @@ export interface BoxDetailFacts {
   asleep_last: string | null;
   expires_at: string | null;
   api_backoff: { fails: number; next_retry: string | null } | null;
+  /**
+   * state-store D4 (Phase B): the box's MEMBERSHIP phase and the liveness label
+   * the last tick recorded for it. Both are `null` when there is no store yet or
+   * the store is still on schema v1 (a Phase A rollback) — a client that
+   * predates them ignores them, and the TUI renders `—`.
+   */
+  phase: Phase | null;
+  observed: Observed | null;
 }
 
 export function boxDetailFacts(env: ServerContext["env"], box: string): BoxDetailFacts {
-  const h = openReadState(env);
+  const h = openReadHandle(env);
   try {
-    return boxDetailFactsFrom(h.state, box);
+    const facts = boxDetailFactsFrom(h.state, box);
+    if (h.store === undefined) return facts;
+    const row = h.store.db.query("SELECT phase FROM boxes WHERE name = ?").get(box) as { phase?: string } | null;
+    facts.phase = (row?.phase as Phase | undefined) ?? null;
+    if (h.store.userVersion() >= 2) facts.observed = observedFor(h.store, box) ?? null;
+    return facts;
   } finally {
     h.close();
   }
@@ -115,6 +153,8 @@ function boxDetailFactsFrom(st: ReturnType<typeof openReadState>["state"], box: 
     // null when there is no backoff state at all, so a client can tell "no
     // failures recorded" from "0 failures and a pending retry stamp".
     api_backoff: fails === 0 && nextRetry === undefined ? null : { fails, next_retry: isoFromEpochSec(nextRetry) },
+    phase: null,
+    observed: null,
   };
 }
 
@@ -196,14 +236,14 @@ export function tickAgeSeconds(latest: SnapshotLine | undefined, now: Date): num
 
 // --- GET /v1/health (no auth) ------------------------------------------------
 export function handleHealth(ctx: ServerContext): Response {
-  const latest = readLatest(ctx.env.FLEET_STATE, { today: nowIso(ctx).slice(0, 10) });
+  const latest = latestSnapshot(ctx.env);
   const now = ctx.now ? ctx.now() : new Date();
   return jsonOk({ ok: true, version: SERVE_VERSION, tick_age_s: tickAgeSeconds(latest, now) });
 }
 
 // --- GET /v1/fleet (readonly) ------------------------------------------------
 export function handleFleet(ctx: ServerContext, auth: RequestAuth): Response {
-  const latest = readLatest(ctx.env.FLEET_STATE, { today: nowIso(ctx).slice(0, 10) });
+  const latest = latestSnapshot(ctx.env);
   const boxes = (latest?.boxes ?? []).map((b) => mergeBox(ctx.env, b));
   // `apply` is read LIVE from the config; every OTHER field still comes from the
   // snapshot (and tick_age_s / staleness are unchanged).
@@ -224,7 +264,7 @@ export function handleFleet(ctx: ServerContext, auth: RequestAuth): Response {
 
 // --- GET /v1/boxes/:name (readonly, NO ssh) ----------------------------------
 export function handleBox(ctx: ServerContext, box: string): Response {
-  const latest = readLatest(ctx.env.FLEET_STATE, { today: nowIso(ctx).slice(0, 10) });
+  const latest = latestSnapshot(ctx.env);
   const snap = latest?.boxes.find((b) => b.name === box);
   const merged = snap ? mergeBox(ctx.env, snap) : undefined;
   const m = liveMarkers(ctx.env, box);
@@ -242,11 +282,15 @@ export function handleBox(ctx: ServerContext, box: string): Response {
 // --- GET /v1/history?box=&hours= (readonly) ----------------------------------
 export function handleHistory(ctx: ServerContext, box: string | null, hours: number): Response {
   const clamped = Number.isFinite(hours) && hours > 0 ? Math.min(Math.floor(hours), 2160) : 24;
-  const lines = readSlice(ctx.env.FLEET_STATE, {
-    hours: clamped,
-    box: box ?? undefined,
-    nowIso: nowIso(ctx),
-  });
+  const h = openReadHandle(ctx.env);
+  let lines: SnapshotLine[] = [];
+  try {
+    if (h.store !== undefined && h.store.userVersion() >= 2) {
+      lines = readSnapshotSlice(h.store, { hours: clamped, box: box ?? undefined, nowIso: nowIso(ctx) });
+    }
+  } finally {
+    h.close();
+  }
   return jsonOk({ hours: clamped, box: box ?? null, lines });
 }
 

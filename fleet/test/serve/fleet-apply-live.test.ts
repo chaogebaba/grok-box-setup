@@ -29,11 +29,11 @@
 // stale) value is indistinguishable from a live one.
 
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeFetch } from "../../src/serve/server.ts";
-import { fakeContext, getReq } from "./helpers.ts";
+import { fakeContext, getReq, seedSnapshots } from "./helpers.ts";
+import { scratchDir } from "../store/helpers.ts";
 import type { SnapshotLine } from "../../src/history/schema.ts";
 import { setLogSink } from "../../src/log.ts";
 
@@ -59,14 +59,13 @@ const LINE = (apply: boolean): SnapshotLine => ({
   ],
 });
 
-/** A tmp tree with a history snapshot and (optionally) a config.toml. */
+/** A tree with a stored snapshot and (optionally) a config.toml. */
 function treeWith(line: SnapshotLine, configText?: string): { state: string; config: string } {
-  const root = mkdtempSync(join(tmpdir(), "fleet2-applylive-"));
+  const root = scratchDir("fleet2-applylive");
   dirs.push(root);
   const state = join(root, "state");
-  const hist = join(state, "history");
-  mkdirSync(hist, { recursive: true });
-  writeFileSync(join(hist, `${line.ts.slice(0, 10)}.jsonl`), JSON.stringify(line) + "\n");
+  mkdirSync(state, { recursive: true });
+  seedSnapshots(state, [line]);
   // NEVER a real path: absent unless the case writes one.
   const config = join(root, "config.toml");
   if (configText !== undefined) writeFileSync(config, configText);
@@ -182,13 +181,11 @@ describe("GET /v1/fleet reads apply LIVE from the config", () => {
   });
 
   test("UNREADABLE config (a directory at the path) ⇒ falls back, never 500s", async () => {
-    const root = mkdtempSync(join(tmpdir(), "fleet2-applylive-dir-"));
+    const root = scratchDir("fleet2-applylive-dir");
     dirs.push(root);
     const state = join(root, "state");
-    const hist = join(state, "history");
-    mkdirSync(hist, { recursive: true });
-    const line = LINE(true);
-    writeFileSync(join(hist, `${line.ts.slice(0, 10)}.jsonl`), JSON.stringify(line) + "\n");
+    mkdirSync(state, { recursive: true });
+    seedSnapshots(state, [LINE(true)]);
     const config = join(root, "config.toml");
     mkdirSync(config); // readFileSync ⇒ EISDIR
     const { status, body } = await fleetBody({ state, config });
@@ -205,7 +202,7 @@ describe("GET /v1/fleet reads apply LIVE from the config", () => {
   });
 
   test("no snapshot at all + no config ⇒ apply null, not a crash", async () => {
-    const root = mkdtempSync(join(tmpdir(), "fleet2-applylive-empty-"));
+    const root = scratchDir("fleet2-applylive-empty");
     dirs.push(root);
     const { status, body } = await fleetBody({ state: root, config: join(root, "nope.toml") });
     expect(status).toBe(200);

@@ -11,40 +11,27 @@ import {
   RC,
   type UpgradeArgs,
   type UpgradeDeps,
+  type UpgradeRecord,
 } from "../src/upgrade.ts";
 import { CHECK_COMMAND, POLL_COMMAND, renderInstallCommand } from "../src/remote.ts";
 import type { Spawner, ReexecOptions, ReexecResult } from "../src/reexec.ts";
 import { FakeRunner, result, isSs, isScp } from "./fake-runner.ts";
 import { testEnv, testRollout } from "./helpers.ts";
-import type { FsSeam, Inventory } from "../src/state.ts";
 import type { StageFs, Target } from "../src/stage.ts";
 
 const KEY = "/etc/grok-fleet/box_access_ed25519";
 const TARGET: Target = { ref: "main", sha: "abc1234", version: "5.3.0" };
 
-/** A memFs that exposes its backing store so tests can read what was written. */
-function memFsWithStore(): { fs: FsSeam; store: Map<string, string> } {
-  const store = new Map<string, string>();
-  const fs: FsSeam = {
-    async writeFile(p, d) { store.set(p, d); },
-    async chmod() {},
-    async rename(f, t) { const v = store.get(f); if (v !== undefined) { store.set(t, v); store.delete(f); } },
-    async readFile(p) { return store.get(p); },
-  };
-  return { fs, store };
-}
-
-function readInv(store: Map<string, string>): Inventory {
-  return JSON.parse(store.get("/var/lib/grok-fleet/inventory.json")!) as Inventory;
-}
-
-function memFs(): FsSeam {
-  const store = new Map<string, string>();
+/**
+ * state-store D3/D7: `inventory.json` is retired, so an applied pass records its
+ * per-box outcome through the `recordOutcomes` seam (production: one `audit` row
+ * each). This captures those rows without a store.
+ */
+function outcomeSink(): { recordOutcomes: (rows: UpgradeRecord[]) => void; rows: () => Map<string, UpgradeRecord> } {
+  const seen: UpgradeRecord[] = [];
   return {
-    async writeFile(p, d) { store.set(p, d); },
-    async chmod() {},
-    async rename(f, t) { const v = store.get(f); if (v !== undefined) { store.set(t, v); store.delete(f); } },
-    async readFile(p) { return store.get(p); },
+    recordOutcomes: (rows) => seen.push(...rows),
+    rows: () => new Map(seen.map((r) => [r.box, r])),
   };
 }
 
@@ -59,7 +46,7 @@ function baseDeps(runner: FakeRunner, over: Partial<UpgradeDeps> = {}): UpgradeD
     runner,
     env: testEnv({ FLEET_BOX_KEY: KEY, FLEET2_LOCKED: true }),
     rollout: testRollout(),
-    fs: memFs(),
+    recordOutcomes: () => {},
     stageFs: fakeStageFs,
     sleep: async () => {},
     notifyDeps: { telegramEnvPath: "/x", source: { async read() { return undefined; } } },
@@ -674,8 +661,8 @@ describe("T13 (H1): truncate is inside the install command, which precedes the p
 });
 
 
-describe("gate-r1 fix 2: --apply persists inventory.json with lastUpgrade (F7.6/S-E)", () => {
-  test("every deployed box records lastUpgrade{target,result:ok,at,detail} and sha=target", async () => {
+describe("gate-r1 fix 2: --apply records a per-box outcome (F7.6/S-E, state-store D3)", () => {
+  test("every deployed box records {target,result:ok,at,detail} and sha=target", async () => {
     const r = new FakeRunner(
       responder({
         "grok-box-008": { sha: "old" },
@@ -683,20 +670,18 @@ describe("gate-r1 fix 2: --apply persists inventory.json with lastUpgrade (F7.6/
         "grok-box-011": { sha: "old" },
       }),
     );
-    const { fs, store } = memFsWithStore();
-    const res = await runUpgradePass(baseDeps(r, { fs }), args({ apply: true }));
+    const sink = outcomeSink();
+    const res = await runUpgradePass(baseDeps(r, { recordOutcomes: sink.recordOutcomes }), args({ apply: true }));
     expect(res.rc).toBe(RC.OK);
 
-    const inv = readInv(store);
-    // written after the applied pass, with the target recorded
-    expect(inv.target).toEqual({ ref: "main", sha: "abc1234", version: "5.3.0" });
+    const rows = sink.rows();
     for (const box of ["grok-box-008", "grok-box-009", "grok-box-011"]) {
-      const e = inv.boxes[box]!;
-      expect(e.lastUpgrade).toBeDefined();
-      expect(e.lastUpgrade!.target).toBe("abc1234");
-      expect(e.lastUpgrade!.result).toBe("ok");
-      expect(e.lastUpgrade!.detail).toBe("verified");
-      expect(typeof e.lastUpgrade!.at).toBe("string");
+      const e = rows.get(box)!;
+      expect(e).toBeDefined();
+      expect(e.target).toBe("abc1234");
+      expect(e.result).toBe("ok");
+      expect(e.detail).toBe("verified");
+      expect(typeof e.at).toBe("string");
       // a converged box's sha is the target sha
       expect(e.sha).toBe("abc1234");
     }
@@ -713,9 +698,9 @@ describe("gate-r1 fix 2: --apply persists inventory.json with lastUpgrade (F7.6/
         "grok-box-011": { sha: "old" }, // never reached
       }),
     );
-    const { fs, store } = memFsWithStore();
+    const sink = outcomeSink();
     const res = await runUpgradePass(
-      baseDeps(r, { fs }),
+      baseDeps(r, { recordOutcomes: sink.recordOutcomes }),
       args({
         apply: true,
         boxes: ["grok-box-008", "grok-box-009", "grok-box-010", "grok-box-011"],
@@ -724,14 +709,14 @@ describe("gate-r1 fix 2: --apply persists inventory.json with lastUpgrade (F7.6/
     );
     expect(res.rc).toBe(RC.FAILURE);
 
-    const inv = readInv(store);
-    expect(inv.boxes["grok-box-008"]!.lastUpgrade!.result).toBe("ok");
-    expect(inv.boxes["grok-box-009"]!.lastUpgrade!.result).toBe("skipped");
-    expect(inv.boxes["grok-box-009"]!.lastUpgrade!.detail).toBe("in-sync");
-    expect(inv.boxes["grok-box-010"]!.lastUpgrade!.result).toBe("failed");
+    const rows = sink.rows();
+    expect(rows.get("grok-box-008")!.result).toBe("ok");
+    expect(rows.get("grok-box-009")!.result).toBe("skipped");
+    expect(rows.get("grok-box-009")!.detail).toBe("in-sync");
+    expect(rows.get("grok-box-010")!.result).toBe("failed");
     // 011 was never reached (loop stopped at 010's failure)
-    expect(inv.boxes["grok-box-011"]!.lastUpgrade!.result).toBe("skipped");
-    expect(inv.boxes["grok-box-011"]!.lastUpgrade!.detail).toBe("not-reached (pass aborted)");
+    expect(rows.get("grok-box-011")!.result).toBe("skipped");
+    expect(rows.get("grok-box-011")!.detail).toBe("not-reached (pass aborted)");
   });
 
   test("canary abort records aborted for the canary and not-reached for the rest", async () => {
@@ -742,20 +727,23 @@ describe("gate-r1 fix 2: --apply persists inventory.json with lastUpgrade (F7.6/
         "grok-box-011": { sha: "old" },
       }),
     );
-    const { fs, store } = memFsWithStore();
-    const res = await runUpgradePass(baseDeps(r, { fs }), args({ apply: true }));
+    const sink = outcomeSink();
+    const res = await runUpgradePass(baseDeps(r, { recordOutcomes: sink.recordOutcomes }), args({ apply: true }));
     expect(res.rc).toBe(RC.FAILURE);
 
-    const inv = readInv(store);
-    expect(inv.boxes["grok-box-008"]!.lastUpgrade!.result).toBe("aborted");
-    expect(inv.boxes["grok-box-009"]!.lastUpgrade!.result).toBe("skipped");
-    expect(inv.boxes["grok-box-009"]!.lastUpgrade!.detail).toBe("not-reached (pass aborted)");
+    const rows = sink.rows();
+    expect(rows.get("grok-box-008")!.result).toBe("aborted");
+    expect(rows.get("grok-box-009")!.result).toBe("skipped");
+    expect(rows.get("grok-box-009")!.detail).toBe("not-reached (pass aborted)");
   });
 
-  test("dry-run does NOT write inventory.json", async () => {
+  test("dry-run records NOTHING", async () => {
     const r = new FakeRunner(responder({ "grok-box-008": { sha: "old" } }));
-    const { fs, store } = memFsWithStore();
-    await runUpgradePass(baseDeps(r, { fs }), args({ apply: false, boxes: ["grok-box-008"], canary: "grok-box-008" }));
-    expect(store.has("/var/lib/grok-fleet/inventory.json")).toBe(false);
+    const sink = outcomeSink();
+    await runUpgradePass(
+      baseDeps(r, { recordOutcomes: sink.recordOutcomes }),
+      args({ apply: false, boxes: ["grok-box-008"], canary: "grok-box-008" }),
+    );
+    expect(sink.rows().size).toBe(0);
   });
 });

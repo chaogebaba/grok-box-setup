@@ -1,9 +1,14 @@
 // discover-line.test.ts — D7: the optional `discover` object on a snapshot
-// line, its overflow ORDER, and every reader's tolerance of its absence.
+// line, and every reader's tolerance of its absence.
+//
+// state-store D3 (Phase B): the snapshot is a STORE row, so the line's own
+// serialisation and its =<2KB cap are gone with `history/write.ts`. What the
+// `discover` block round-trips through now is `snapshots` +
+// `snapshot_skipped`, covered in test/store/snapshots.test.ts. What remains
+// here is the READER half — the TUI row — which is unchanged.
 
 import { test, expect, describe } from "bun:test";
-import { serializeLine, MAX_LINE_BYTES } from "../../src/history/write.ts";
-import type { SnapshotBox, SnapshotLine } from "../../src/history/schema.ts";
+import type { SnapshotBox } from "../../src/history/schema.ts";
 import { discoverText as renderDiscover } from "../../src/tui/model.ts";
 import type { TuiState } from "../../src/tui/state.ts";
 import { frameOf } from "../tui/ink-harness.ts";
@@ -21,56 +26,6 @@ function box(name: string): SnapshotBox {
     expiry_days: 42,
   };
 }
-
-function line(over: Partial<SnapshotLine> = {}): SnapshotLine {
-  return {
-    v: 1,
-    ts: "2026-09-01T12:00:00Z",
-    apply: true,
-    canary: null,
-    boxes: [box("grok-box-008")],
-    ...over,
-  };
-}
-
-describe("D7 snapshot line", () => {
-  test("`discover` is OPTIONAL — a line without it round-trips unchanged", () => {
-    const s = serializeLine(line());
-    expect(JSON.parse(s).discover).toBeUndefined();
-    expect(JSON.parse(s).v).toBe(1); // no `v` bump for the new field
-  });
-
-  test("a small discover object rides along on the line", () => {
-    const s = serializeLine(
-      line({ discover: { candidates: 1, adopted: 1, repaired: 0, skipped: [] } }),
-    );
-    expect(JSON.parse(s).discover).toEqual({ candidates: 1, adopted: 1, repaired: 0, skipped: [] });
-  });
-
-  test("overflow order: `discover` is dropped FIRST and `boxes` survives", () => {
-    // A skip list long enough to blow the 2 KB cap on its own.
-    const skipped = Array.from({ length: 200 }, (_, i) => ({
-      name: `grok-box-${100 + i}`,
-      reason: "unreachable",
-    }));
-    const l = line({ boxes: [box("grok-box-008"), box("grok-box-009")], discover: { candidates: 200, adopted: 0, repaired: 0, skipped } });
-    const s = serializeLine(l);
-    expect(Buffer.byteLength(s, "utf8")).toBeLessThanOrEqual(MAX_LINE_BYTES);
-    const parsed = JSON.parse(s);
-    expect(parsed.discover).toBeUndefined(); // sacrificed
-    expect(parsed.boxes.map((b: SnapshotBox) => b.name)).toEqual(["grok-box-008", "grok-box-009"]); // kept
-    expect(parsed.boxes_dropped).toBeUndefined(); // the stub was not needed
-  });
-
-  test("when the BOXES alone overflow, the existing boxes_dropped stub still applies", () => {
-    const many = Array.from({ length: 400 }, (_, i) => box(`grok-box-${100 + i}`));
-    const s = serializeLine(line({ boxes: many, discover: { candidates: 0, adopted: 0, repaired: 0, skipped: [] } }));
-    expect(Buffer.byteLength(s, "utf8")).toBeLessThanOrEqual(MAX_LINE_BYTES);
-    const parsed = JSON.parse(s);
-    expect(parsed.boxes).toEqual([]);
-    expect(parsed.boxes_dropped).toBe(400);
-  });
-});
 
 function tuiState(over: Partial<TuiState> = {}): TuiState {
   return {

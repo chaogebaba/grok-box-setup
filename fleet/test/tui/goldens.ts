@@ -110,6 +110,9 @@ export const GOLDENS: Golden[] = [
           asleep_last: "2026-03-20T10:46:40Z",
           expires_at: "2026-06-01",
           api_backoff: { fails: 2, next_retry: "2026-03-20T12:33:20Z" },
+          // state-store D4: the two facts the pane gained in 5.9.0.
+          phase: "enrolled",
+          observed: "drifted",
         },
       },
     }),

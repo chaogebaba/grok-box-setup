@@ -2,36 +2,15 @@
 //  - unhealthy box (check rc 1) triggers a SECOND `boxup status` ssh that fills
 //    VERSION/SHA (G4/S-C); m19 = second call dropped ⇒ VERSION `?`.
 //  - tunnel-down ⇒ CHECK/VERSION/SHA render `-` (F7.3), no ssh issued.
-//  - API unavailable ⇒ API `?` and still writes inventory.json (T8).
+//  - API unavailable ⇒ API `?`; `inventory.json` is retired (state-store D3/D7).
 
 import { test, expect, describe } from "bun:test";
 import { probeBox, runInventory, driftCell, type DevicesApi } from "../src/inventory.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../src/remote.ts";
 import { FakeRunner, result, isSs } from "./fake-runner.ts";
 import { testEnv, testRollout, FULL_STATUS_LINE } from "./helpers.ts";
-import type { FsSeam, Inventory } from "../src/state.ts";
 import type { Target } from "../src/stage.ts";
 
-function memFs(): { fs: FsSeam; store: Map<string, string> } {
-  const store = new Map<string, string>();
-  const fs: FsSeam = {
-    async writeFile(p, d) {
-      store.set(p, d);
-    },
-    async chmod() {},
-    async rename(from, to) {
-      const v = store.get(from);
-      if (v !== undefined) {
-        store.set(to, v);
-        store.delete(from);
-      }
-    },
-    async readFile(p) {
-      return store.get(p);
-    },
-  };
-  return { fs, store };
-}
 
 // A responder that maps ssh calls to scripted outputs based on the remote cmd.
 function sshResponder(map: {
@@ -105,42 +84,41 @@ describe("probeBox", () => {
 });
 
 describe("runInventory", () => {
-  test("API unavailable → API '?' and inventory.json still written (T8)", async () => {
+  test("API unavailable → API '?' and the returned view still carries the box (T8)", async () => {
     const r = new FakeRunner(
       sshResponder({
         ssListens: [20008],
         onCheck: () => ({ code: 0, stdout: "check=OK " + FULL_STATUS_LINE }),
       }),
     );
-    const { fs, store } = memFs();
     const target: Target = { ref: "main", sha: "abc1234", version: "5.3.0" };
     const res = await runInventory(["grok-box-008"], {
       runner: r,
       env: testEnv(),
       rollout: testRollout(),
-      fs,
       api: { async probe() { return undefined; } } as DevicesApi,
       readExpires: async () => undefined,
+      previousTs: () => null,
       // inject target via a stub resolve by pre-writing? runInventory calls
       // resolveTarget internally; here git will fail → target null. Assert '?'
     });
     // git fetch/rev-parse fail against a fake runner → target null (F7.2)
     expect(res.rows[0]!.api).toBe("?");
-    const written = store.get("/var/lib/grok-fleet/inventory.json");
-    expect(written).toBeDefined();
-    const parsed = JSON.parse(written!) as Inventory;
+    // state-store D3/D7: `inventory.json` is RETIRED. The same view is RETURNED
+    // and printed by `--json`; nothing on disk holds it any more.
+    const parsed = res.inventory;
     expect(parsed.boxes["grok-box-008"]!.api).toBeNull();
+    expect(res.previousGeneratedAt).toBeNull();
     void target;
   });
 
-  test("API lastSeen threads into inventory.json for a probed box", async () => {
+  test("API lastSeen threads into the returned view for a probed box", async () => {
     const r = new FakeRunner(
       sshResponder({
         ssListens: [20008],
         onCheck: () => ({ code: 0, stdout: "check=OK " + FULL_STATUS_LINE }),
       }),
     );
-    const { fs, store } = memFs();
     const api: DevicesApi = {
       async probe() {
         return new Map([["grok-box-008", { online: true, lastSeen: "2026-08-30T00:40:00Z" }]]);
@@ -150,14 +128,16 @@ describe("runInventory", () => {
       runner: r,
       env: testEnv(),
       rollout: testRollout(),
-      fs,
       api,
       readExpires: async () => undefined,
+      // The staleness header now comes from the last TICK's snapshot, not from
+      // whenever an operator last ran this command (state-store D3/D7).
+      previousTs: () => "2026-09-01T12:00:00Z",
     });
     expect(res.rows[0]!.api).toBe("online");
     expect(res.rows[0]!.lastSeen).toBe("2026-08-30T00:40:00Z");
-    const parsed = JSON.parse(store.get("/var/lib/grok-fleet/inventory.json")!) as Inventory;
-    expect(parsed.boxes["grok-box-008"]!.lastSeen).toBe("2026-08-30T00:40:00Z");
+    expect(res.inventory.boxes["grok-box-008"]!.lastSeen).toBe("2026-08-30T00:40:00Z");
+    expect(res.previousGeneratedAt).toBe("2026-09-01T12:00:00Z");
   });
 });
 

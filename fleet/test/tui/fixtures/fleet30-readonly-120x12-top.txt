@@ -5,9 +5,9 @@ fleet2 30 boxes  ● 19  ◆ 5  ✖ 4  ☾ 2  apply off  tick 10s   readonly  li
 ● grok-box-002  up     OK    5.3.0     no       in-sync  40d              │drift no · config in-sync · expiry 40d      │
 ◆ grok-box-003  up     OK    5.3.0     yes      in-sync  40d              │checkfail no · asleep no · canary none      │
 ✖ grok-box-004  down   FAIL  5.3.0     no       in-sync  40d              │checkfail# — · expires —                    │
-● grok-box-005  up     OK    5.3.0     no       in-sync  40d              │asleep since —                              │
-● grok-box-006  up     OK    5.3.0     no       in-sync  40d              │asleep last —                               │
-☾ grok-box-007  up     OK    5.3.0     no       in-sync  40d              │api backoff —                               │
+● grok-box-005  up     OK    5.3.0     no       in-sync  40d              │phase — · observed —                        │
+● grok-box-006  up     OK    5.3.0     no       in-sync  40d              │asleep since —                              │
+☾ grok-box-007  up     OK    5.3.0     no       in-sync  40d              │asleep last — · api backoff —               │
 ◆ grok-box-008  up     OK    5.3.0     yes      in-sync  40d              │24h (loading…)                              │
 ● grok-box-009  up     OK    5.3.0     no       in-sync  40d              ╰────────────────────────────────────────────╯
 ● grok-box-010  up     OK    5.3.0     no       in-sync  40d

@@ -54,12 +54,26 @@ export function readMembership(env: Env): string[] {
  * between install and the first tick) so no read path has to special-case it.
  */
 export function openReadState(env: Env): { state: ReconcileStateApi; close(): void } {
+  return openReadHandle(env);
+}
+
+/**
+ * The same read-only handle, with the raw `Store` exposed when there IS one.
+ *
+ * The API's snapshot readers need it: from 5.9.0 `GET /v1/fleet`,
+ * `GET /v1/history` and `GET /v1/boxes/:name` read the `snapshots` tables rather
+ * than `history/*.jsonl`, and `phase`/`observed` come from the store or not at
+ * all. `store` is undefined in exactly the window before the first tick creates
+ * the file, and on a v1 file (a Phase A store that has not been migrated yet),
+ * where those readers report `null` instead of guessing.
+ */
+export function openReadHandle(env: Env): { state: ReconcileStateApi; store?: Store; close(): void } {
   const path = storePath(env.FLEET_STATE);
   if (existsSync(path)) {
     try {
       const store = openStore({ path, dir: env.FLEET_STATE, readonly: true });
       if (store.userVersion() >= 1) {
-        return { state: new StoreState(store), close: () => store.close() };
+        return { state: new StoreState(store), store, close: () => store.close() };
       }
       store.close();
     } catch (e) {

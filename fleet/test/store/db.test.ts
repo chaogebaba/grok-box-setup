@@ -5,13 +5,15 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { statSync, existsSync, chmodSync, writeFileSync, mkdirSync } from "node:fs";
 import { ConfigError, openStore, storePath } from "../../src/store/db.ts";
-import { KNOWN_SCHEMA, AUDIT_RETENTION_DAYS } from "../../src/store/schema.ts";
+import { KNOWN_SCHEMA, AUDIT_RETENTION_DAYS, MIGRATIONS } from "../../src/store/schema.ts";
 import { cleanup, memStore, scratchDir, T0 } from "./helpers.ts";
 
 describe("(a) migrations, user_version and min_reader", () => {
-  test("v0 -> v1 creates every v1 table and stamps the contract", () => {
+  test("v0 -> v2 creates every table and stamps the contract", () => {
     const s = memStore();
-    expect(s.userVersion()).toBe(1);
+    expect(s.userVersion()).toBe(KNOWN_SCHEMA);
+    // Every migration is ADDITIVE, so `min_reader` never moves off 1 — that is
+    // what lets a 5.8.0 binary open this file after a Phase B rollback (D2).
     expect(s.meta("min_reader")).toBe("1");
     expect(s.meta("schema_created_at")).toBe(String(T0));
 
@@ -28,6 +30,10 @@ describe("(a) migrations, user_version and min_reader", () => {
       "divergence_findings",
       "engine",
       "meta",
+      // v2 (Phase B), additive:
+      "snapshots",
+      "snapshot_boxes",
+      "snapshot_skipped",
     ]) {
       expect(tables).toContain(t);
     }
@@ -38,7 +44,42 @@ describe("(a) migrations, user_version and min_reader", () => {
       s.db.query("SELECT name FROM sqlite_master WHERE type='index' ORDER BY name").all() as Array<{ name: string }>
     ).map((r) => r.name);
     expect(idx).toContain("audit_at");
+    // v2 indexes (r3-n2): the retention scan and the per-box history slice.
+    expect(idx).toContain("snapshots_ts");
+    expect(idx).toContain("snapshot_boxes_name_tick");
     s.close();
+  });
+
+  test("(a) v1 -> v2 is ADDITIVE: the v1 rows survive and min_reader stays 1", () => {
+    const dir = scratchDir("migrate-v2");
+    try {
+      const path = storePath(dir);
+      // Build a file that stops at v1, the way a 5.8.0 binary left it.
+      const v1 = new Database(path, { create: true });
+      v1.run("PRAGMA foreign_keys = ON");
+      for (const stmt of MIGRATIONS[0]!.statements) v1.run(stmt);
+      v1.run("PRAGMA user_version = 1");
+      v1.run("INSERT INTO meta(key,value) VALUES('min_reader','1')");
+      v1.run(
+        `INSERT INTO boxes(name,idx,port,phase,created_at,updated_at) VALUES('grok-box-008',8,20008,'enrolled',${T0},${T0})`,
+      );
+      v1.run(`INSERT INTO audit(at,actor,action) VALUES(${T0},'fleet2','legacy-import')`);
+      v1.close();
+
+      const s = openStore({ path, dir, now: () => T0 });
+      expect(s.userVersion()).toBe(2);
+      expect(s.meta("min_reader")).toBe("1");
+      // Nothing v1 held was rewritten.
+      expect((s.db.query("SELECT name FROM boxes").get() as { name: string }).name).toBe("grok-box-008");
+      expect((s.db.query("SELECT COUNT(*) AS n FROM audit").get() as { n: number }).n).toBe(1);
+      // ...and the three v2 tables are now there and empty.
+      for (const t of ["snapshots", "snapshot_boxes", "snapshot_skipped"]) {
+        expect((s.db.query(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n).toBe(0);
+      }
+      s.close();
+    } finally {
+      cleanup(dir);
+    }
   });
 
   test("re-opening an already-migrated file runs nothing and keeps the version", () => {

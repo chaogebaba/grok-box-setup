@@ -1,6 +1,6 @@
 // test/store/helpers.ts — shared fixtures for the state-store suite.
 //
-// Real-file tests live under /data/claude-scratch/worker-scratch/state-store-a/,
+// Real-file tests live under /data/claude-scratch/worker-scratch/state-store-b/,
 // NEVER under /tmp: /tmp is a plain directory on this machine's root partition
 // and a runaway worker filling it fills `/`.
 
@@ -10,7 +10,7 @@ import { openStore, type Store } from "../../src/store/db.ts";
 // Overridable so the same suite runs on a grok box, where /data belongs to
 // another user and /workspace is the writable tree.
 export const SCRATCH_ROOT =
-  process.env.FLEET_TEST_SCRATCH ?? "/data/claude-scratch/worker-scratch/state-store-a";
+  process.env.FLEET_TEST_SCRATCH ?? "/data/claude-scratch/worker-scratch/state-store-b";
 
 /** A throwaway directory that the caller removes with `cleanup`. */
 export function scratchDir(prefix: string): string {
