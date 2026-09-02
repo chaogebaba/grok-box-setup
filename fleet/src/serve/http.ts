@@ -33,6 +33,15 @@ export const err = {
   lockBusy: (msg = "reconcile lock held — tick in progress") => jsonError(423, "lock_busy", msg),
   jobRunning: (msg = "a reconcile job is already running") => jsonError(409, "job_running", msg),
   internal: (msg = "internal error") => jsonError(500, "internal", msg),
+  /**
+   * state-store D8: the store failed `quick_check` and the flag is set. MUTATION
+   * endpoints refuse — they share the reconcile lock and would otherwise write
+   * to a database that has declared itself corrupt. READONLY endpoints keep
+   * serving the last data, so the TUI stays useful while an operator runs
+   * `fleet2 state check` or `fleet2 state restore`.
+   */
+  integrityFailed: (msg = "state store failed quick_check — run 'fleet2 state check'") =>
+    jsonError(503, "integrity_failed", msg),
 };
 
 /** An operation-ran 200 body: {rc, log}. */

@@ -35,8 +35,37 @@ import {
   fsEnrolledBoxes,
 } from "./handlers.ts";
 import { log } from "../log.ts";
+import { openStore, storePath } from "../store/db.ts";
+import { existsSync } from "node:fs";
 
 export const DEFAULT_PORT = 9891;
+
+/**
+ * Run `PRAGMA quick_check` once at startup; on failure SET `integrity_failed_at`
+ * and log it. Never throws — a store that will not open is logged and serve
+ * carries on with the readonly surface it can still serve.
+ */
+export function startupIntegrityCheck(env: Env): void {
+  const path = storePath(env.FLEET_STATE);
+  if (!existsSync(path)) return;
+  try {
+    const store = openStore({ path, dir: env.FLEET_STATE });
+    try {
+      if (store.userVersion() < 1) return;
+      const verdict = store.quickCheck();
+      if (verdict === "ok") {
+        log("serve: state store quick_check ok");
+        return;
+      }
+      store.setIntegrityFailed();
+      log(`serve: state store quick_check FAILED (${verdict}) — starting with mutations refused (503); run 'fleet2 state check'`);
+    } finally {
+      store.close();
+    }
+  } catch (e) {
+    log(`serve: state store could not be checked (${e instanceof Error ? e.message : String(e)}) — starting anyway`);
+  }
+}
 
 /** Resolve the tailnet bind IPv4 (TUI-D2). `tailscale ip -4` first line; binary
  *  absent/empty/error ⇒ undefined (caller refuses rc 6). `--bind` overrides. */
@@ -262,9 +291,19 @@ export function buildContext(env: Env, cfg: ParsedConfig, rollout: RolloutConfig
   const tick: TickRunner = {
     async run(opts) {
       // R3-B1: runReconcile(assembleTickDeps(...)) DIRECTLY, never cliReconcile.
-      const deps = await assembleTickDeps(env, cfg, rollout, { apply: opts.apply, runner });
-      const res = await runReconcile(deps);
-      return res.rc;
+      const deps = await assembleTickDeps(env, cfg, rollout, {
+        apply: opts.apply,
+        runner,
+        version: SERVE_VERSION,
+      });
+      try {
+        const res = await runReconcile(deps);
+        return res.rc;
+      } finally {
+        // state-store D1: one handle per tick; the API keeps its own read-only
+        // handles for the GET endpoints.
+        deps.store?.close();
+      }
     },
   };
   return {
@@ -277,7 +316,7 @@ export function buildContext(env: Env, cfg: ParsedConfig, rollout: RolloutConfig
     auditSink: nodeAuditSink,
     lockPath,
     tick,
-    enrolledBoxes: () => fsEnrolledBoxes(env.FLEET_STATE),
+    enrolledBoxes: () => fsEnrolledBoxes(env),
   };
 }
 
@@ -369,6 +408,14 @@ export async function cmdServe(rest: string[], deps: ServeDeps): Promise<number>
     log(`serve: refusing — ${msg}`);
     return 6;
   }
+
+  // state-store D8: `quick_check` at serve start. A FAILURE sets the flag and
+  // serve STARTS in the flagged mode — mutations 503, readonly endpoints and the
+  // TUI keep serving. It deliberately does NOT refuse: the unit is
+  // Restart=on-failure with StartLimitIntervalSec=0 (vps/install-vps.sh), so a
+  // refusing serve would be an unbounded restart loop of full scans that never
+  // parks in `failed`.
+  startupIntegrityCheck(deps.env);
 
   installCapture();
   const port = parsed.port ?? DEFAULT_PORT;

@@ -20,6 +20,7 @@ import { fsManagedSource, cmdConfig } from "../commands/config.ts";
 import { mintKey } from "../actions/mint.ts";
 import { rotate } from "../actions/rotate.ts";
 import { ReconcileState, nodeStateFs } from "../reconcile/state.ts";
+import { integrityBlocked, openReadState, openWriteState, readMembership } from "../store/membership.ts";
 import { RunContext, TailscaleKeys } from "../reconcile/tailscale-keys.ts";
 import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { readJournal } from "./journal.ts";
@@ -31,7 +32,7 @@ import { existsSync, readFileSync } from "node:fs";
 const CHECK_TIMEOUT_MS = 20_000;
 
 /** The current version string source (kept in sync with cli.ts PKG_VERSION). */
-export const SERVE_VERSION = "5.7.1";
+export const SERVE_VERSION = "5.8.0";
 
 /** Live per-box marker mirror read from FLEET_STATE (TUI-D4 merge inputs). */
 function liveMarkers(env: ServerContext["env"], box: string): {
@@ -39,18 +40,26 @@ function liveMarkers(env: ServerContext["env"], box: string): {
   asleep: boolean;
   expiry_days: number | null;
 } {
-  const st = new ReconcileState(env.FLEET_STATE, nodeStateFs);
-  const expires = st.readExpiresDate(box);
-  let expiry_days: number | null = null;
-  if (expires !== undefined) {
-    const ms = Date.parse(`${expires}T00:00:00Z`);
-    if (!Number.isNaN(ms)) expiry_days = Math.floor((ms - Date.now()) / 86400_000);
+  // state-store D7: a READ-ONLY store handle, closing survey §4e — these three
+  // values used to be read straight off marker files that a tick could be
+  // mid-write on. WAL gives the reader a consistent snapshot instead.
+  const h = openReadState(env);
+  try {
+    const st = h.state;
+    const expires = st.readExpiresDate(box);
+    let expiry_days: number | null = null;
+    if (expires !== undefined) {
+      const ms = Date.parse(`${expires}T00:00:00Z`);
+      if (!Number.isNaN(ms)) expiry_days = Math.floor((ms - Date.now()) / 86400_000);
+    }
+    return {
+      checkfail: st.checkfailCount(box) > 0,
+      asleep: st.readAsleep(box) !== undefined,
+      expiry_days,
+    };
+  } finally {
+    h.close();
   }
-  return {
-    checkfail: st.checkfailCount(box) > 0,
-    asleep: st.readAsleep(box) !== undefined,
-    expiry_days,
-  };
 }
 
 /** epoch seconds → ISO8601Z, or null for a NaN/absent/non-finite input. */
@@ -84,7 +93,15 @@ export interface BoxDetailFacts {
 }
 
 export function boxDetailFacts(env: ServerContext["env"], box: string): BoxDetailFacts {
-  const st = new ReconcileState(env.FLEET_STATE, nodeStateFs);
+  const h = openReadState(env);
+  try {
+    return boxDetailFactsFrom(h.state, box);
+  } finally {
+    h.close();
+  }
+}
+
+function boxDetailFactsFrom(st: ReturnType<typeof openReadState>["state"], box: string): BoxDetailFacts {
   const asleep = st.readAsleep(box);
   // READ-ONLY: apiFails(), never recordApiFailure (B3).
   const fails = st.apiFails();
@@ -282,6 +299,7 @@ export async function handleCheck(ctx: ServerContext, box: string, auth: Request
 
 // --- POST /v1/boxes/:name/config-push (admin+confirm) ------------------------
 export async function handleConfigPush(ctx: ServerContext, box: string, auth: RequestAuth): Promise<Response> {
+  if (integrityBlocked(ctx.env)) return err.integrityFailed();
   const outcome = await withReconcileLock(
     ctx.lockPath,
     () =>
@@ -304,11 +322,19 @@ export async function handleConfigPush(ctx: ServerContext, box: string, auth: Re
 
 // --- POST /v1/boxes/:name/rotate-key (admin+confirm) -------------------------
 export async function handleRotate(ctx: ServerContext, box: string, auth: RequestAuth): Promise<Response> {
+  // state-store D8: a MUTATION must not run against a store that declared itself
+  // corrupt. Readonly endpoints are deliberately NOT gated.
+  if (integrityBlocked(ctx.env)) return err.integrityFailed();
+  let exportError: string | undefined;
   const outcome = await withReconcileLock(
     ctx.lockPath,
     () =>
       withCapture(async () => {
-        const state = new ReconcileState(ctx.env.FLEET_STATE, nodeStateFs);
+        // The rotate WRITES key material, so it takes a read-write store handle
+        // (the reconcile lock is already held). Its export runs inside
+        // `recordKey`; a failure is recorded, never thrown.
+        const w = openWriteState(ctx.env, SERVE_VERSION);
+        const state = w?.state ?? new ReconcileState(ctx.env.FLEET_STATE, nodeStateFs);
         const rctx = new RunContext();
         const tokenFile = resolveTokenFile(ctx.env, ctx.cfg);
         let token: string | undefined;
@@ -324,19 +350,30 @@ export async function handleRotate(ctx: ServerContext, box: string, auth: Reques
           token ?? "",
           rctx,
         );
-        const r = await rotate(box, { runner: ctx.runner, env: ctx.env, keys, state });
-        return r.rc;
+        try {
+          const r = await rotate(box, { runner: ctx.runner, env: ctx.env, keys, state });
+          return r.rc;
+        } finally {
+          exportError = w?.state.takeExportErrors()[0];
+          w?.close();
+        }
       }),
     ctx.lockDeps,
   );
   if (!outcome.ok) return err.lockBusy();
   const { value: rc, log } = outcome.value;
   writeAudit(ctx.env.FLEET_STATE, { token: auth.name, action: "rotate-key", box, rc }, ctx.auditSink, ctx.now);
-  return opResult(rc, log);
+  // state-store D6/r6-n3: a committed mutation is a SUCCESS. A lagging legacy
+  // export is reported as a warning in the 200 body (the TUI shows it in the
+  // message line), never as an error status.
+  return exportError === undefined
+    ? opResult(rc, log)
+    : opResult(rc, log, { warnings: [{ code: "export_failed", detail: exportError }] });
 }
 
 // --- POST /v1/reconcile (admin+confirm, async job) ---------------------------
 export function handleReconcile(ctx: ServerContext, auth: RequestAuth): Response {
+  if (integrityBlocked(ctx.env)) return err.integrityFailed();
   const outcome = ctx.jobs.start(async () => {
     // Runs under the SAME lock (TUI-D3). runReconcile is invoked DIRECTLY via
     // ctx.tick (assembleTickDeps), never cliReconcile (R3-B1).
@@ -389,6 +426,7 @@ export async function handleRename(
   auth: RequestAuth,
 ): Promise<Response> {
   if (typeof to !== "string" || to === "") return err.badBody("rename requires a non-empty 'to'");
+  if (integrityBlocked(ctx.env)) return err.integrityFailed();
   const outcome = await withReconcileLock(
     ctx.lockPath,
     () =>
@@ -417,13 +455,12 @@ export async function handleRename(
 }
 
 /** Read enrolled.tsv membership from FLEET_STATE (production ctx.enrolledBoxes). */
-export function fsEnrolledBoxes(fleetState: string): string[] {
+export function fsEnrolledBoxes(env: ServerContext["env"]): string[] {
+  // state-store D4: membership is `phase='enrolled'` from the store; the
+  // exported `enrolled.tsv` is the rollback artefact, consulted only in the
+  // window before the first tick creates the store.
   try {
-    const f = `${fleetState}/enrolled.tsv`;
-    if (!existsSync(f)) return [];
-    // reuse parseEnrolled semantics via a light import to avoid a cycle.
-    const { parseEnrolled } = require("../boxes.ts") as typeof import("../boxes.ts");
-    return parseEnrolled(readFileSync(f, "utf8"));
+    return readMembership(env);
   } catch {
     return [];
   }

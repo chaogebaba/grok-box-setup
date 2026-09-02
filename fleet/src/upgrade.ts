@@ -45,6 +45,26 @@ export const RC = {
   USAGE: 2,
   TARGET: 3,
   REFUSED: 6,
+  /**
+   * The reconcile lock was held for the whole 90 s wait (state-store D8/r7-B2).
+   * Same NUMBER as REFUSED — 6 has always meant "refused, nothing was done", and
+   * lock-busy is that. Named separately because the reason differs.
+   *
+   * `fleet2 rename` returns 1 for the same condition (commands/rename.ts:163-166):
+   * an existing inconsistency, named here and deliberately left alone.
+   */
+  LOCK_BUSY: 6,
+  /**
+   * "Recorded; export failed" (state-store D6/r6-B2). The store write COMMITTED
+   * and the mutation is a success; the legacy export a rolled-back 5.7.1 would
+   * read is stale. 5 was already `enroll`'s policy-precheck refusal, where
+   * nothing was written, so 7 is the first free code.
+   *
+   * `fleet-reconcile.service` carries `SuccessExitStatus=7` (vps/install-vps.sh)
+   * so a lagging export does not park the oneshot unit in `failed` every five
+   * minutes — the notify is the signal.
+   */
+  EXPORT_FAILED: 7,
 } as const;
 
 export type BoxAction = "upgrade" | "in-sync" | "skip:tunnel-down";
