@@ -1,4 +1,4 @@
-fleet2 3 boxes  ●1 !1 ✕1 ◌0  apply=off  tick=10s   admin  link=up                                                       
+fleet2 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ● up                                              
 
 ── journal grok-box-002 ──  rows 1–35 of 200                                                                            
 Apr 30 12:00:00 box grok-agent[1]: line 0
@@ -37,4 +37,4 @@ Apr 30 12:32:00 box grok-agent[1]: line 32
 Apr 30 12:33:00 box grok-agent[1]: line 33
 Apr 30 12:34:00 box grok-agent[1]: line 34
 
-↑/↓ select  / filter  r refresh  q quit  D diff  J journal  H history  P push  M rotate  R rename  T check  C reconcile 
+↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history │ P push  M rotate  R rename  T check  C reconcile

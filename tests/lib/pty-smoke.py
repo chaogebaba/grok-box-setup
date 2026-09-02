@@ -11,7 +11,16 @@ It waits up to <expect-timeout-s> for the child to paint something, then sends
 KEY=VALUE line per fact for the shell to assert on. The raw pty bytes are
 written to <raw-out-path>.
 """
-import fcntl, os, pty, select, struct, sys, termios, time
+import fcntl, os, pty, re, select, struct, sys, termios, time
+
+# The TUI paints its header in per-cell colours since 5.7.2, so `fleet2` and the
+# box count are separated by SGR bytes on the wire. Match the TEXT the terminal
+# would show, not the raw stream — the raw stream is still what the alt-screen
+# and cursor assertions below read.
+SGR = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
+
+def visible(b):
+    return SGR.sub(b"", b)
 
 timeout = float(sys.argv[1])
 send = sys.argv[2]
@@ -42,7 +51,7 @@ while True:
             break
         out += d
     now = time.time()
-    if not sent and (b"fleet2 0 boxes" in out and b"LINK DOWN" in out) and send != "":
+    if not sent and (b"fleet2 0 boxes" in visible(out) and b"LINK DOWN" in visible(out)) and send != "":
         os.write(fd, send.encode())
         sent = True
         deadline = now + timeout
@@ -98,8 +107,8 @@ alt_on, alt_off = idx(b"\x1b[?1049h"), idx(b"\x1b[?1049l")
 cursor_on = out.find(b"\x1b[?25h", alt_off) if alt_off >= 0 else -1
 print("RC=%d" % rc)
 print("SENT=%d" % (1 if sent else 0))
-print("SAW_HEADER=%d" % (1 if b"fleet2 0 boxes" in out else 0))
-print("SAW_LINKDOWN=%d" % (1 if b"LINK DOWN" in out else 0))
+print("SAW_HEADER=%d" % (1 if b"fleet2 0 boxes" in visible(out) else 0))
+print("SAW_LINKDOWN=%d" % (1 if b"LINK DOWN" in visible(out) else 0))
 print("ALT_ON=%d" % alt_on)
 print("ALT_OFF=%d" % alt_off)
 print("CURSOR_ON=%d" % cursor_on)

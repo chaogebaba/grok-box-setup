@@ -8,36 +8,37 @@
 
 import type { TuiState } from "./state.ts";
 import {
+  DETAIL_GAP,
   DETAIL_ROWS,
   bannerText,
+  clipSegments,
   detailLines,
+  detailWidth,
   discoverText,
   filteredBoxes,
+  fitSegments,
   footerLines,
   messageText,
   modalLines,
   rowsIndicator,
+  segText,
   tableLines,
+  tableWidth,
   viewportWindow,
   type Size,
   type TableLine,
   type Viewport,
 } from "./model.ts";
 
-/** The gap between the table column and the Detail column. The old painter
- *  composed `padVisible(left, leftW) + "  " + right`, so Detail text starts at
- *  column `leftW + DETAIL_GAP` (74 at 120 columns). */
-export const DETAIL_GAP = 2;
+// The column geometry moved to `model.ts` when `detailLines` started framing its
+// card to the pane width; re-exported here because layout.ts has always been
+// where the components import it from.
+export { DETAIL_GAP, tableWidth, detailWidth } from "./model.ts";
 
 /** The table's own column-header row (`NAME TUNNEL CHECK …`). It is a fixed
  *  cost of the table region, not a box row, so the window arithmetic below
  *  subtracts it before deciding how many box rows fit. */
 export const TABLE_HEADER_ROWS = 1;
-
-/** The width of the table column when the Detail pane is shown. */
-export function tableWidth(size: Size): number {
-  return Math.max(40, Math.floor(size.cols * 0.6));
-}
 
 /**
  * The chrome the TABLE frame spends, in the order the frame emits it: header,
@@ -101,15 +102,25 @@ export function tableViewLines(state: TuiState, size: Size): TableLine[] {
   // it the table column is narrower, so clip to the pane — otherwise Ink
   // truncates the padding and leaves a stray ellipsis in the header.
   const width = showDetail(state, size) ? tableWidth(size) : size.cols;
-  const clip = (l: TableLine): TableLine => (l.text.length > width ? { ...l, text: l.text.slice(0, width) } : l);
+  const clip = (l: TableLine): TableLine =>
+    l.text.length > width
+      ? { ...l, text: l.text.slice(0, width), segments: l.segments === undefined ? undefined : clipSegments(l.segments, width) }
+      : l;
   const all = tableLines(state, size).map(clip);
   const head = all[0]!;
   const body = all.slice(1);
   if (filteredBoxes(state).length === 0) return [head, ...body]; // the "(no boxes)" line
   const win = tableWindow(state, size);
-  const out: TableLine[] = [head, ...body.slice(win.start, win.end)];
+  // V1: the selected row is a BAR, so its segments run the full width of the
+  // table column rather than stopping at the last cell's text.
+  const bar = (l: TableLine): TableLine => {
+    if (l.selected !== true || l.segments === undefined) return l;
+    const segments = fitSegments(l.segments, width);
+    return { ...l, segments, text: segText(segments) };
+  };
+  const out: TableLine[] = [head, ...body.slice(win.start, win.end).map(bar)];
   if (hasMore(state, size)) {
-    out.push({ text: rowsIndicator(win, filteredBoxes(state).length), tone: "dim" });
+    out.push({ text: rowsIndicator(win, filteredBoxes(state).length), tone: "muted" });
   }
   return out;
 }
@@ -118,7 +129,7 @@ export function tableViewLines(state: TuiState, size: Size): TableLine[] {
  *  clipped: below 100 columns (the long-standing cutoff) and whenever the row
  *  budget cannot hold its fixed height. */
 export function showDetail(state: TuiState, size: Size): boolean {
-  return size.cols >= 100 && tableRows(state, size) >= DETAIL_ROWS && detailLines(state).length > 0;
+  return size.cols >= 100 && tableRows(state, size) >= DETAIL_ROWS && detailLines(state, detailWidth(size)).length > 0;
 }
 
 /** The height of the side-by-side row region: the taller of the two columns,

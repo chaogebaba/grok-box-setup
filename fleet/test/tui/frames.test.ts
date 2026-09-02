@@ -10,7 +10,7 @@ import { test, expect, describe } from "bun:test";
 import { readFileSync } from "node:fs";
 import { frameOf, mount, settle } from "./ink-harness.ts";
 import { GOLDENS, type Golden } from "./goldens.ts";
-import { detailLines, footerLines, tableLines, type Size } from "../../src/tui/model.ts";
+import { detailLines, detailWidth, footerLines, tableLines, type Size } from "../../src/tui/model.ts";
 import { DETAIL_GAP, showDetail, tableViewLines, tableWindow, hasMore, tableWidth } from "../../src/tui/layout.ts";
 import type { TuiState } from "../../src/tui/state.ts";
 
@@ -48,7 +48,7 @@ function strip(frame: string): string[] {
 function composeOldRowRegion(state: TuiState, size: Size): string[] {
   const leftW = tableWidth(size);
   const table = tableLines(state, size).map((l) => l.text);
-  const detail = detailLines(state).map((l) => l.text);
+  const detail = detailLines(state, detailWidth(size)).map((l) => l.text);
   const n = Math.max(table.length, detail.length);
   const out: string[] = [];
   for (let i = 0; i < n; i++) {
@@ -93,7 +93,7 @@ describe("frame goldens", () => {
         // … and the mounted frame carries the same strings in ONE column each.
         const leftW = tableWidth(g.size);
         const tableText = tableViewLines(g.state, g.size).map((l) => l.text);
-        const detailText = detailLines(g.state).map((l) => l.text);
+        const detailText = detailLines(g.state, detailWidth(g.size)).map((l) => l.text);
         const start = painted.indexOf("") + 1;
         for (const [i, t] of tableText.entries()) {
           expect(lines[start + i]!.slice(0, leftW).replace(/[ \t]+$/, "")).toBe(t.replace(/[ \t]+$/, ""));
@@ -140,7 +140,7 @@ describe("frame goldens", () => {
         // The row budget cannot hold the pane's fixed height, so it is omitted
         // ENTIRELY rather than clipped: not one Detail line is in the frame.
         expect(showDetail(g.state, g.size)).toBe(false);
-        for (const d of detailLines(g.state)) expect(frame).not.toContain(d.text);
+        for (const d of detailLines(g.state, detailWidth(g.size))) expect(frame).not.toContain(d.text);
       }
     });
   }
@@ -187,10 +187,10 @@ test("a resize re-lays out the frame and drops the Detail pane below 100 columns
   const g = GOLDENS.find((x) => x.name === "healthy-120x40")!;
   const m = mount(g.state, { size: g.size });
   await settle(40);
-  expect(m.lastFrame()).toContain("── grok-box-001 ─────");
+  expect(m.lastFrame()).toContain("╭─ grok-box-001 ");
   await m.resize(80, 20);
   const frame = m.lastFrame();
-  expect(frame).not.toContain("── grok-box-001 ─────");
+  expect(frame).not.toContain("╭─ grok-box-001 ");
   expect(frame.split("\n").length).toBeLessThanOrEqual(20);
   expect(frame).toContain("grok-box-001  up"); // the table is still there
   m.unmount();
