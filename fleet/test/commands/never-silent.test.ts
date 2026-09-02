@@ -103,9 +103,22 @@ function handTimers(): { seam: TimerSeam; fireAll: () => void } {
 }
 
 /** Every NAMED non-zero path the walker can reach without a real box. */
-const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string; out: string }> }> = [
+const CASES: Array<{
+  name: string;
+  /**
+   * The distinctive text this path MUST put on stderr. gate-r1 found mutant (d)
+   * surviving on a box because the walker only asserted that stderr was
+   * non-empty: an unrelated log line emitted somewhere in the same call (a
+   * tunnel probe, a store migration) satisfied that even with the real line
+   * deleted. Naming the expected text makes each case kill exactly its own line
+   * and nothing else's, on any host.
+   */
+  expect: string;
+  run: () => Promise<{ rc: number; err: string; out: string }>;
+}> = [
   {
     name: "dispatch: unknown command",
+    expect: "unknown command: frobnicate",
     run: () =>
       capture(() => {
         let err = "";
@@ -115,25 +128,34 @@ const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string;
         return rc;
       }),
   },
-  { name: "rollout: bare rollout refusal", run: () => capture(() => rolloutRefusal()) },
+  {
+    name: "rollout: bare rollout refusal",
+    expect: "refusing to guess targets",
+    run: () => capture(() => rolloutRefusal()),
+  },
   {
     name: "locality: VPS-only refusal",
+    expect: "VPS-only in fleet2",
     run: () => capture(() => (refuseVpsOnly("status", false) ? RC.REFUSED : RC.OK)),
   },
   {
     name: "ssh: no box (usage)",
+    expect: "usage: fleet2 ssh",
     run: () => capture(() => cmdSsh([], { runner: new FakeRunner(), cfg: EMPTY_CFG })),
   },
   {
     name: "ssh: bad --timeout value",
+    expect: "is not a positive number of seconds",
     run: () => capture(() => cmdSsh(["grok-box-001", "x", "--timeout", "nope"], { runner: new FakeRunner(), cfg: EMPTY_CFG })),
   },
   {
     name: "ssh: unknown flag before the box",
+    expect: "unknown flag --wat",
     run: () => capture(() => cmdSsh(["--wat", "grok-box-001"], { runner: new FakeRunner(), cfg: EMPTY_CFG })),
   },
   {
     name: "ssh: --timeout elapsed (rc 124)",
+    expect: "timed out after 1s",
     run: () =>
       capture(() => {
         const ex = stuckExec();
@@ -150,14 +172,17 @@ const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string;
   },
   {
     name: "config: bad subcommand",
+    expect: "usage: config render|diff|push",
     run: () => capture((out) => cmdConfig(["frob", "grok-box-001"], { runner: new FakeRunner(), env: testEnv(), write: out })),
   },
   {
     name: "config: missing box name",
+    expect: "need a box name",
     run: () => capture((out) => cmdConfig(["diff"], { runner: new FakeRunner(), env: testEnv(), write: out })),
   },
   {
     name: "config: box not enrolled",
+    expect: "is not enrolled",
     run: () =>
       capture((out) =>
         cmdConfig(["diff", "grok-box-001"], { runner: new FakeRunner(), env: testEnv(), enrolled: [], write: out }),
@@ -165,6 +190,7 @@ const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string;
   },
   {
     name: "config diff: diff(1) missing",
+    expect: "diff(1) not found",
     run: () =>
       capture((out) =>
         cmdConfig(["diff", "grok-box-001"], {
@@ -179,6 +205,7 @@ const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string;
   },
   {
     name: "config diff: tunnel down",
+    expect: "tunnel down",
     run: () =>
       capture((out) =>
         cmdConfig(["diff", "grok-box-001"], {
@@ -194,6 +221,7 @@ const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string;
   },
   {
     name: "config diff: DRIFT (rc 1 with the diff body on stdout)",
+    expect: "DRIFTS from the rendered config",
     run: async () => {
       // The one path where stdout legitimately carries data AND the rc is
       // non-zero, so the reason has nowhere to go but stderr.
@@ -223,15 +251,22 @@ const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string;
   },
   {
     name: "mint-key: empty box (usage)",
+    expect: "usage: fleet2 mint-key",
     run: () => capture(() => cmdMintKey("", { env: testEnv(), cfg: EMPTY_CFG, runner: new FakeRunner() })),
   },
   {
     name: "mint-key: non-grok box",
+    expect: "refusing non-grok box",
     run: () => capture(() => cmdMintKey("laptop", { env: testEnv(), cfg: EMPTY_CFG, runner: new FakeRunner() })),
   },
-  { name: "install-timer: retired", run: () => capture(() => cmdInstallTimer()) },
+  {
+    name: "install-timer: retired",
+    expect: "install-timer was retired",
+    run: () => capture(() => cmdInstallTimer()),
+  },
   {
     name: "remove-timer: systemctl absent",
+    expect: "systemctl not found",
     run: () =>
       capture(() =>
         cmdRemoveTimer({
@@ -244,6 +279,7 @@ const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string;
   },
   {
     name: "enroll: no box (usage)",
+    expect: "usage: fleet2 enroll",
     run: () =>
       capture(async () => {
         const r = await cmdEnroll([], stubEnrollSideEffects());
@@ -252,30 +288,37 @@ const CASES: Array<{ name: string; run: () => Promise<{ rc: number; err: string;
   },
   {
     name: "enroll: non-grok box",
+    expect: "refusing non-grok box",
     run: () => capture(() => cmdEnroll(["laptop"], stubEnrollSideEffects())),
   },
   {
     name: "rename: usage (missing operands)",
+    expect: "usage: rename",
     run: () => capture(() => cmdRename([], stubRenameDeps())),
   },
   {
     name: "rename: non-canonical <new>",
+    expect: "is not canonical grok-box-NNN",
     run: () => capture(() => cmdRename(["grok-box-3", "grok-box-x"], stubRenameDeps())),
   },
   {
     name: "state: unknown subcommand (usage)",
+    expect: "usage: fleet2 state",
     run: () => capture((out) => cmdState(["nonsense"], stubStateDeps(out))),
   },
   {
     name: "state restore: missing file operand",
+    expect: "usage: fleet2 state restore",
     run: () => capture((out) => cmdState(["restore"], stubStateDeps(out))),
   },
   {
     name: "state import: unknown flag",
+    expect: "state import: unknown flag",
     run: () => capture((out) => cmdState(["import", "--wat"], stubStateDeps(out))),
   },
   {
     name: "state reconcile-files: unknown flag",
+    expect: "state reconcile-files: unknown flag",
     run: () => capture((out) => cmdState(["reconcile-files", "--wat"], stubStateDeps(out))),
   },
 ];
@@ -338,9 +381,10 @@ describe("U4 never a silent non-zero (mutant (d))", () => {
     test(`${c.name} — rc≠0 carries a stderr line`, async () => {
       const { rc, err, out } = await c.run();
       expect(rc).not.toBe(RC.OK);
-      // the killer: a deleted stderr line leaves this empty, and the test name
-      // says exactly which path went quiet.
-      expect(err.trim().length).toBeGreaterThan(0);
+      // the killer: the path's OWN line must be there. Asserting only that
+      // stderr is non-empty let an unrelated log line stand in for it, which is
+      // how mutant (d) survived the r1 gate on a box.
+      expect(err).toContain(c.expect);
       // stdout is DATA: no error prose there.
       expect(out).not.toMatch(/refus|error|failed|usage:/i);
     });
