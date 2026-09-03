@@ -32,7 +32,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.5.1
+BOXUP_VERSION=5.5.2
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -2917,6 +2917,12 @@ jobs_slot_claim() {
   if [ -d "$JOBS_SLOT" ]; then
     jobs_slot_held && return 1
   fi
+  # A BARE mkdir, deliberately: this is the mutual-exclusion primitive and it
+  # must stay atomic. Its parent $JOBS_RUN_DIR is guaranteed by both callers —
+  # jobs_cmd_start creates it before it ever gets here, and jobs_guard creates
+  # it once at the top of every pass. That guarantee is load-bearing: 5.5.1
+  # shipped without it and this mkdir failed with ENOENT on precisely the image
+  # swap the claim exists to recover from, which blocked the restart entirely.
   mkdir "$JOBS_SLOT" 2>/dev/null || return 1
   echo "$id" > "$JOBS_SLOT/id" 2>/dev/null || true
   date +%s > "$JOBS_SLOT/at" 2>/dev/null || true
@@ -3119,6 +3125,12 @@ jobs_prune() {
 # ALWAYS returns 0.
 jobs_guard() {
   [ -d "$JOBS_DIR" ] || return 0
+  # $JOBS_RUN_DIR holds every piece of liveness state this pass writes — the
+  # slot, the markers, the restart counters — and the swap this guard exists to
+  # recover from is exactly what deletes it. Re-create it here, once, so no
+  # consumer below has to care. It is a directory, not state: creating it empty
+  # changes no derivation, because `status` keys on the MARKER, not the dir.
+  mkdir -p "$JOBS_RUN_DIR" 2>/dev/null || true
   jobs_supervise || true
   jobs_bound_logs || true
   jobs_prune || true
