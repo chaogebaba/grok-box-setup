@@ -453,18 +453,22 @@ INNER
 }
 
 # ---------------------------------------------------------------------------
-# (b1)/(b2) the status token: present, LAST, after tunnel=/tunnelfail=, bare at
-# ok and level-suffixed at fail. "Last" is the contract that keeps fleet2 and
-# every legacy reader unaffected (G3).
+# (b1)/(b2) the status token: present, immediately after tunnel=/tunnelfail=,
+# bare at ok and level-suffixed at fail. APPEND-ONLY is the contract that keeps
+# fleet2 and every legacy reader unaffected (G3) — disk= must never MOVE, but a
+# later feature may append after it, and boxup 5.4.0's keepawake tokens do
+# exactly that. (b2) below still anchors disk=93%/fail at end-of-line because
+# print_status prints the keepawake tokens only through keepawake_status_tokens,
+# which this scenario does not extract.
 # ---------------------------------------------------------------------------
 o="$(run_line 22 status)"; line="$(r1 "$o")"
-if printf '%s\n' "$line" | grep -Eq ' tunnel=up tunnelfail=[0-9]+ disk=22%$'; then
-  pass "(b1) status: disk=22% is the LAST token, immediately after tunnelfail="
+if printf '%s\n' "$line" | grep -Eq ' tunnel=up tunnelfail=[0-9]+ disk=22%( |$)'; then
+  pass "(b1) status: disk=22% comes immediately after tunnelfail="
 else
   bad  "(b1) status token missing/misplaced: [$line]"
 fi
 o="$(run_line 93 status)"; line="$(r1 "$o")"
-if printf '%s\n' "$line" | grep -q ' disk=93%/fail$'; then
+if printf '%s\n' "$line" | grep -Eq ' disk=93%/fail( |$)'; then
   pass "(b2) status: disk=93%/fail carries the level at fail"
 else
   bad  "(b2) status fail token wrong: [$line]"
@@ -548,6 +552,11 @@ BOXUP_DISK_FAIL_PCT=72
 BOXUP_DISK_TRUNCATE_MIN_BYTES=73
 BOXUP_DISK_INTERVAL=74
 DISK_GUARD_TRUNCATE=/tmp/canary-75.log
+# boxup 5.4.0 forwards the two keepawake gateway seams on the same list; the
+# extracted require_root runs under `set -u`, so they must exist here. Their own
+# forwarding assertion lives in tests/test-boxup-keepawake.sh (14).
+BOXUP_GATEWAY_URL=http://127.0.0.1:1340
+BOXUP_GATEWAY_JSON=/home/box/sand-data/gateway.json
 log(){ :; }
 have(){ command -v "\$1" >/dev/null 2>&1; }
 id(){ case "\$*" in "-u") echo 1000 ;; *) command id "\$@" ;; esac; }

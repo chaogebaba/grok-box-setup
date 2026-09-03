@@ -30,7 +30,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.3.2
+BOXUP_VERSION=5.4.0
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -2220,6 +2220,376 @@ disk_status_token() {
   esac
 }
 
+# --- keep-awake guard (blueprint boxup-keepawake K1-K6) ----------------------
+# The platform pauses a box after an idle window keyed to AGENT TURNS, and the
+# box is charged nothing while it sleeps but is also unreachable — the VPS brain
+# cannot converge, cannot alert, cannot even see it. The platform's own hourly
+# `keep-alive` automation is too slow (003 slept 51 m 50 s inside an hourly gap)
+# and gets parked on Auto-review approval widgets. This guard drives the SAME
+# mechanism the hourly automation uses — one minimal agent turn — at a
+# 20-minute cadence, from the box itself.
+#
+# K1 — the turn: POST $BOXUP_GATEWAY_URL/api/sendPrompt with the bearer token
+# from $BOXUP_GATEWAY_JSON and agentId = the gateway's CURRENT `activeAgentId`
+# read from GET /health. The agent id is NEVER hard-coded: the gateway restarts
+# and the id changes (it changed at 01:41Z during the probe). A request carrying
+# an `Origin` header is refused 403, so we send none. Success is HTTP 200 with
+# `"accepted":true`.
+#
+# K2 — the delivery: this box has NO systemd and NO cron (tini is PID 1) and
+# only /workspace survives an image swap, so there is nothing to schedule with.
+# keepawake_guard is a tick-driven action in the disk_guard shape, called from
+# run_tick, rate-limited by a stamp file exactly like DISK_STAMP. The worker's
+# own 15 s cadence is the clock; a paused box simply resumes ticking when the
+# platform resumes it. No unit files, nothing outside /workspace and $RUN_DIR.
+#
+# K3 — it is skip-first and MEASURED. Every attempt appends one line to
+# $KEEPAWAKE_LOG, including skips and unreachables: that log is the DENOMINATOR
+# of the 48 h fleet experiment (acceptance 3), so a skip that is not logged is a
+# measurement defect, not a saving.
+#
+# COST: one minimal model turn per fire — 72 per box per day at 20 minutes, 792
+# a day across eleven boxes. That is the whole reason the shipped step carries
+# its own measurement: the experiment decides KEEP or ABANDON, and ABANDON is
+# `[keepawake] interval_min = 0` fleet-wide.
+#
+# MEASUREMENT CAVEAT (read this before believing the readout): a paused box
+# writes nothing, so a sleep ERASES the slots it covers, and the readout
+# attributes absent slots to sleep as an approximation. A stopped worker, an
+# image swap, or a crashed gateway produce absent slots too. Every one of those
+# alternative causes pushes the verdict toward ABANDON, which is the CHEAP
+# error — abandoning costs us a mechanism we can re-enable with one config key,
+# while keeping a mechanism that does not work costs 792 model turns a day
+# forever. The bias is deliberate and it is the safe direction.
+#
+# Gateway endpoint + discovery file. Both are env seams (K6) so the test suite
+# can drive the real functions against a stub `curl` with no listening port, and
+# so a gate can point the guard at a canary gateway.
+BOXUP_GATEWAY_URL="${BOXUP_GATEWAY_URL:-http://127.0.0.1:1340}"
+BOXUP_GATEWAY_JSON="${BOXUP_GATEWAY_JSON:-/home/box/sand-data/gateway.json}"
+# The cadence knob's baked default, its floor, and the dedicated unreachable
+# retry floor (K3). interval_min comes from [keepawake].interval_min via
+# config_get (managed.toml > config.toml > this default); 0 turns the guard off.
+KEEPAWAKE_DEFAULT_MIN=20
+KEEPAWAKE_FLOOR_MIN=10
+KEEPAWAKE_RETRY_S=90
+# How long we watch /health after an accepted send before calling the fire
+# inert. The probe saw isBusy flip within ~2 s and hold ~20 s.
+KEEPAWAKE_POLL_S=10
+KEEPAWAKE_PROMPT="Reply with only the word: ok"
+# $RUN_DIR state (ephemeral by design: an image swap loses it and the first tick
+# after the swap fires at once, which is acceptable — K5).
+KEEPAWAKE_STAMP="$RUN_DIR/last-keepawake"                   # main cadence stamp
+KEEPAWAKE_UNREACH_STAMP="$RUN_DIR/last-keepawake-unreach"   # 90 s retry floor
+KEEPAWAKE_UNREACH_WARN="$RUN_DIR/last-keepawake-unreach-warn"
+KEEPAWAKE_WARN_STAMP="$RUN_DIR/last-keepawake-warn"         # parked-approval WARN
+KEEPAWAKE_OFF_STAMP="$RUN_DIR/last-keepawake-off"           # `off` notice
+KEEPAWAKE_RC_FILE="$RUN_DIR/keepawake"                      # "<rc> <epoch>"
+# /workspace state: SURVIVES an image swap. The attempt log is the experiment's
+# raw data and the baseline is what makes the `jumps` token a per-install count
+# rather than the box's lifetime total.
+KEEPAWAKE_LOG="${BOXUP_KEEPAWAKE_LOG:-/workspace/boxup-keepawake.log}"
+KEEPAWAKE_BASELINE="${BOXUP_KEEPAWAKE_BASELINE:-/workspace/.boxup-keepawake-baseline}"
+
+# keepawake_interval_min: the resolved cadence in MINUTES.
+#   unset / unparseable -> KEEPAWAKE_DEFAULT_MIN (20)
+#   0                   -> 0 (off; the guard becomes a no-op)
+#   1..floor-1          -> KEEPAWAKE_FLOOR_MIN (10)
+# The floor exists because the cost is one model turn per fire: a fat-fingered
+# `interval_min = 1` would be 1440 turns a box a day.
+keepawake_interval_min() {
+  local v
+  v="$(config_get keepawake interval_min 2>/dev/null || true)"
+  v="$(printf '%s' "$v" | tr -d '[:space:]')"
+  case "$v" in ''|*[!0-9]*) echo "$KEEPAWAKE_DEFAULT_MIN"; return 0 ;; esac
+  if [ "$v" = 0 ]; then echo 0; return 0; fi
+  if [ "$v" -lt "$KEEPAWAKE_FLOOR_MIN" ]; then echo "$KEEPAWAKE_FLOOR_MIN"; return 0; fi
+  echo "$v"
+}
+
+# keepawake_json_get <json> <key>: the value of a TOP-LEVEL scalar key, empty
+# when absent. Deliberately not a JSON parser — the box image has no jq, and the
+# four fields we read (activeAgentId, isBusy, busyOnlyAwaitingApproval,
+# lastBusyAtMs) are all top-level scalars in the gateway's /health object.
+keepawake_json_get() {
+  printf '%s' "$1" \
+    | tr ',{}' '\n\n\n' \
+    | sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*//p" \
+    | head -1 \
+    | sed -e 's/^"//' -e 's/"[[:space:]]*$//' -e 's/[[:space:]]*$//'
+}
+
+# keepawake_health: GET /health (no auth — the gateway does not require it on
+# this route). Prints the body; non-zero rc means UNREACHABLE, which is never
+# a tick failure.
+keepawake_health() {
+  curl -sS --max-time 5 "$BOXUP_GATEWAY_URL/health" 2>/dev/null
+}
+
+# keepawake_gateway_token: the bearer from the discovery file.
+keepawake_gateway_token() {
+  local j=""
+  [ -f "$BOXUP_GATEWAY_JSON" ] && j="$(cat "$BOXUP_GATEWAY_JSON" 2>/dev/null || true)"
+  keepawake_json_get "$j" token
+}
+
+# keepawake_fire <agentId>: the one request that costs money. NO Origin header
+# (the gateway 403s any request that carries one) and the agent id comes from
+# the caller, which read it from /health this very tick.
+keepawake_fire() {
+  local agent="$1" tok
+  tok="$(keepawake_gateway_token)"
+  curl -sS --max-time 15 -X POST \
+    -H "Authorization: Bearer $tok" \
+    -H 'content-type: application/json' \
+    -d "{\"agentId\":\"$agent\",\"prompt\":\"$KEEPAWAKE_PROMPT\",\"directAddressedAcceptance\":true}" \
+    "$BOXUP_GATEWAY_URL/api/sendPrompt" 2>/dev/null
+}
+
+# keepawake_hourly <stampfile> <now>: 0 (and stamps) iff an hour has passed.
+# The DISK_WARN_STAMP shape — the tick calls this every 15 s, so an unthrottled
+# line would be 240 an hour in the worker log.
+keepawake_hourly() {
+  local f="$1" now="$2" last=0
+  [ -f "$f" ] && last=$(tr -d '[:space:]' < "$f" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $((now - last)) -ge 3600 ] || return 1
+  echo "$now" > "$f" 2>/dev/null || true
+  return 0
+}
+
+# keepawake_record <rc> <epoch>: the last outcome, for the status tokens.
+keepawake_record() {
+  echo "$1 $2" > "$KEEPAWAKE_RC_FILE" 2>/dev/null || true
+}
+
+# keepawake_log_attempt <rc> <before> <after>: ONE line per guard ATTEMPT into
+# the /workspace attempt log — skips and unreachables INCLUDED. This log is the
+# denominator of the fleet experiment; tests/keepawake-readout.sh reads exactly
+# this format. `-` means "the endpoint was not read at that moment", so an
+# unreachable line is `before=- after=-` and a skip carries `before` only.
+# Rotated at 1 MB to .1 (a year of 20-minute lines is ~1.5 MB).
+keepawake_log_attempt() {
+  local rc="$1" before="${2:--}" after="${3:--}" sz
+  [ -n "$before" ] || before=-
+  [ -n "$after" ] || after=-
+  # `[ -f ]` first, deliberately: a bare `wc -c < "$f" 2>/dev/null` on a file
+  # that does not exist yet still prints a shell REDIRECTION error (the input
+  # redirect is resolved before 2>/dev/null is applied), so the very first
+  # attempt on a fresh box would spit a spurious error into the worker log.
+  sz=0
+  [ -f "$KEEPAWAKE_LOG" ] && sz=$(wc -c < "$KEEPAWAKE_LOG" 2>/dev/null || echo 0)
+  case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+  if [ "$sz" -gt 1048576 ]; then
+    mv -f "$KEEPAWAKE_LOG" "$KEEPAWAKE_LOG.1" 2>/dev/null || true
+  fi
+  printf '%s rc=%s before=%s after=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" "$before" "$after" \
+    >> "$KEEPAWAKE_LOG" 2>/dev/null || true
+}
+
+# keepawake_jumps_raw: the box's LIFETIME count of tailscaled time jumps — the
+# marker a sleep leaves behind. Honours BOX_SETUP_LOG through TAILSCALED_LOG so
+# the suite can point it at a scratch tree.
+keepawake_jumps_raw() {
+  local n
+  n=$(grep -c 'time jump detected' "$TAILSCALED_LOG" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
+
+# keepawake_jumps: jumps SINCE the install baseline. Subtracting is the whole
+# point (acceptance 3 has ONE baseline, this one): without it every box reports
+# its lifetime total and a fresh install looks like a box that has slept eight
+# times. Clamped at 0 — a truncated tailscaled.log must not go negative.
+keepawake_jumps() {
+  local raw base n
+  raw=$(keepawake_jumps_raw)
+  base=0
+  [ -f "$KEEPAWAKE_BASELINE" ] && base=$(tr -d '[:space:]' < "$KEEPAWAKE_BASELINE" 2>/dev/null || echo 0)
+  case "$base" in ''|*[!0-9]*) base=0 ;; esac
+  n=$((raw - base))
+  [ "$n" -lt 0 ] && n=0
+  echo "$n"
+}
+
+# keepawake_converge (K5): the ONLY install step, and it is idempotent — write
+# the jumps baseline the first time we ever converge on this box and never
+# again. Rewriting it on every converge would silently reset the experiment's
+# numerator every time the engine rolled a build out.
+keepawake_converge() {
+  [ -f "$KEEPAWAKE_BASELINE" ] && return 0
+  keepawake_jumps_raw > "$KEEPAWAKE_BASELINE" 2>/dev/null || true
+  log "keepawake: wrote jumps baseline $(tr -d '[:space:]' < "$KEEPAWAKE_BASELINE" 2>/dev/null || echo '?') to $KEEPAWAKE_BASELINE"
+  return 0
+}
+
+# keepawake_guard: the per-tick entry point (K2/K3). ALWAYS returns 0 — a
+# keep-awake helper that can break the self-heal tick is far worse than a box
+# that sleeps. The seven outcomes it can record are exactly the seven values of
+# the `keepawake_rc` status token:
+#   ok              accepted AND a turn started within KEEPAWAKE_POLL_S
+#   inert           accepted but no turn appeared  (NOT a success: the K4
+#                   evidence rule excludes an inert window from the denominator)
+#   refused         HTTP error, or a body without "accepted":true
+#   skip            a REAL turn was already running (the platform's own activity
+#                   already refreshed the idle clock; firing would waste a turn)
+#   unreachable     /health did not answer
+#   parked-ok       fired into a parked approval and the clock DID advance
+#   parked-blocked  fired into a parked approval and the clock did NOT advance
+keepawake_guard() {
+  local now last interval_min interval_s ulast health agent busy parked
+  local before after body rc i sawbusy advanced
+
+  now=$(date +%s)
+  interval_min="$(keepawake_interval_min)"
+
+  # OFF: a no-op with a once-an-hour breadcrumb, so an operator reading the
+  # worker log can tell "configured off" from "silently broken".
+  if [ "$interval_min" = 0 ]; then
+    keepawake_hourly "$KEEPAWAKE_OFF_STAMP" "$now" && \
+      log "keepawake: off ([keepawake] interval_min = 0)"
+    return 0
+  fi
+  interval_s=$((interval_min * 60))
+
+  # The main cadence stamp. Nothing at all happens inside the window — not even
+  # a /health read, which is why an idle tick costs nothing.
+  last=0
+  [ -f "$KEEPAWAKE_STAMP" ] && last=$(tr -d '[:space:]' < "$KEEPAWAKE_STAMP" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$interval_s" ]; then
+    return 0
+  fi
+
+  # The DEDICATED unreachable retry floor (K3). Its own stamp, because the main
+  # stamp is deliberately NOT advanced on an unreachable tick — the first
+  # reachable tick after the floor must fire. Without this floor a gateway that
+  # is restarting, or a box that resumes and ticks before the gateway listens,
+  # would hit /health every 15 s: 240 requests an hour instead of 40. The
+  # refresh backoff (refresh_backoff_window) is the precedent — outcome-
+  # independent, bounded, and cheap.
+  ulast=0
+  [ -f "$KEEPAWAKE_UNREACH_STAMP" ] && ulast=$(tr -d '[:space:]' < "$KEEPAWAKE_UNREACH_STAMP" 2>/dev/null || echo 0)
+  case "$ulast" in ''|*[!0-9]*) ulast=0 ;; esac
+  if [ "$ulast" -gt 0 ] && [ $((now - ulast)) -lt "$KEEPAWAKE_RETRY_S" ]; then
+    return 0
+  fi
+
+  health="$(keepawake_health)"
+  if [ -z "$health" ]; then
+    echo "$now" > "$KEEPAWAKE_UNREACH_STAMP" 2>/dev/null || true
+    keepawake_record unreachable "$now"
+    keepawake_log_attempt unreachable - -
+    keepawake_hourly "$KEEPAWAKE_UNREACH_WARN" "$now" && \
+      log "keepawake: gateway unreachable ($BOXUP_GATEWAY_URL/health) — retrying no faster than every ${KEEPAWAKE_RETRY_S}s"
+    return 0
+  fi
+  rm -f "$KEEPAWAKE_UNREACH_STAMP" 2>/dev/null || true
+
+  agent="$(keepawake_json_get "$health" activeAgentId)"
+  busy="$(keepawake_json_get "$health" isBusy)"
+  parked="$(keepawake_json_get "$health" busyOnlyAwaitingApproval)"
+  before="$(keepawake_json_get "$health" lastBusyAtMs)"
+  [ -n "$before" ] || before=-
+
+  # SKIP-FIRST. A genuinely running turn already refreshed lastBusyAtMs on the
+  # platform's side; firing beside it would buy nothing and cost a model turn.
+  # The `parked` exception below is the whole point of the feature.
+  if [ "$busy" = true ] && [ "$parked" != true ]; then
+    echo "$now" > "$KEEPAWAKE_STAMP" 2>/dev/null || true
+    keepawake_record skip "$now"
+    keepawake_log_attempt skip "$before" -
+    log "keepawake: skip busy"
+    return 0
+  fi
+
+  # From here we FIRE, so the main stamp advances whatever happens — a refused
+  # or inert fire must not turn into a tight retry loop against a sick gateway.
+  echo "$now" > "$KEEPAWAKE_STAMP" 2>/dev/null || true
+
+  body="$(keepawake_fire "$agent")"; rc=$?
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$body" | grep -q '"accepted"[[:space:]]*:[[:space:]]*true'; then
+    keepawake_record refused "$now"
+    keepawake_log_attempt refused "$before" -
+    log "keepawake: fired but the gateway REFUSED it (curl rc=$rc, body=$(printf '%s' "$body" | tr -d '\n' | cut -c1-120))" >&2
+    return 0
+  fi
+
+  # Watch /health for up to KEEPAWAKE_POLL_S. Two different questions, because
+  # the two cases have two different definitions of success:
+  #   normal  -> did a turn START?              (isBusy true)
+  #   parked  -> did the idle CLOCK advance?    (lastBusyAtMs moved)
+  # The parked case is the one the probe never exercised: a turn parked on an
+  # approval widget sets busyOnlyAwaitingApproval and does NOT refresh
+  # lastBusyAtMs, so whether a new prompt runs BESIDE it or queues BEHIND it
+  # decides whether this whole mechanism works on a box with a stuck widget.
+  after=-; sawbusy=0; advanced=0; i=0
+  while [ "$i" -lt "$KEEPAWAKE_POLL_S" ]; do
+    sleep 1
+    i=$((i + 1))
+    health="$(keepawake_health)"
+    [ -n "$health" ] || continue
+    [ "$(keepawake_json_get "$health" isBusy)" = true ] && sawbusy=1
+    after="$(keepawake_json_get "$health" lastBusyAtMs)"
+    [ -n "$after" ] || after=-
+    if [ "$before" != - ] && [ "$after" != - ] && [ "$after" != "$before" ]; then
+      advanced=1
+    fi
+    if [ "$parked" = true ]; then
+      [ "$advanced" = 1 ] && break
+    else
+      [ "$sawbusy" = 1 ] && break
+    fi
+  done
+
+  if [ "$parked" = true ]; then
+    if [ "$advanced" = 1 ]; then
+      keepawake_record parked-ok "$now"
+      keepawake_log_attempt parked-ok "$before" "$after"
+      log "keepawake: fired through parked approval — clock refreshed"
+    else
+      keepawake_record parked-blocked "$now"
+      keepawake_log_attempt parked-blocked "$before" "$after"
+      keepawake_hourly "$KEEPAWAKE_WARN_STAMP" "$now" && \
+        log "check: WARN keepawake: agent has a parked approval widget — clear it in the GUI" >&2
+      log "keepawake: fired but clock NOT refreshed — parked approval blocks keep-awake"
+    fi
+    return 0
+  fi
+
+  if [ "$sawbusy" = 1 ]; then
+    keepawake_record ok "$now"
+    keepawake_log_attempt ok "$before" "$after"
+    log "keepawake: fired ok"
+  else
+    keepawake_record inert "$now"
+    keepawake_log_attempt inert "$before" "$after"
+    log "keepawake: fired but not busy after ${KEEPAWAKE_POLL_S} s"
+  fi
+  return 0
+}
+
+# keepawake_status_tokens (K4): the four tokens appended to the status line.
+# `keepawake_last`/`keepawake_rc` come from the run-dir record (so they reset on
+# an image swap, like every other $RUN_DIR fact) and `jumps` is the baseline-
+# subtracted sleep count, which is THE metric of the 48 h experiment.
+keepawake_status_tokens() {
+  local on=off rc=- lastiso=never line ts
+  [ "$(keepawake_interval_min)" = 0 ] || on=on
+  if [ -f "$KEEPAWAKE_RC_FILE" ]; then
+    line="$(tr -d '\n' < "$KEEPAWAKE_RC_FILE" 2>/dev/null || true)"
+    rc="${line%% *}"; ts="${line##* }"
+    [ -n "$rc" ] || rc=-
+    case "$ts" in
+      ''|*[!0-9]*) ;;
+      *) lastiso="$(date -u -d "@$ts" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo never)" ;;
+    esac
+  fi
+  printf 'keepawake=%s keepawake_last=%s keepawake_rc=%s jumps=%s' \
+    "$on" "$lastiso" "$rc" "$(keepawake_jumps)"
+}
+
 # --- selfheal: worker --------------------------------------------------------
 # The actual tick body. Runs under the converge lock (via run_tick).
 do_tick() {
@@ -2313,6 +2683,11 @@ run_tick() {
   # do_tick's check_reason should see the space the guard just freed instead of
   # failing the box on a condition the same tick already fixed.
   disk_guard || true
+  # boxup-keepawake K2: the keep-awake guard runs in the same place and for the
+  # same reason — outside the converge lock (a tick that skips on contention
+  # must still keep the box awake) and before the tick body. It is rate-limited
+  # to [keepawake].interval_min internally, so calling it every 15 s is free.
+  keepawake_guard || true
   run_with_converge_lock try do_tick
   rc=$?
   if [ "$rc" = 200 ]; then
@@ -2489,6 +2864,11 @@ print_status() {
   # and drops unknown keys, and splitVersion only ever reads v=, so every
   # existing consumer is untouched by construction.
   printf ' disk=%s' "$(disk_status_token)"
+  # boxup-keepawake K4: four tokens appended AFTER disk=, for the same reason
+  # disk= was appended after tunnel= — nothing that already parses this line
+  # moves. fleet2's status.ts tokenizes on `k=v` and drops unknown keys, so
+  # every existing consumer is untouched by construction.
+  printf ' %s' "$(keepawake_status_tokens)"
   printf '\n'
 }
 
@@ -2781,6 +3161,9 @@ do_ensure_body() {
   # unaffected.
   _ensure_step tunnel-key     ensure_tunnel_key
   _ensure_step tunnel         supervise_tunnel
+  # boxup-keepawake K5: nothing to install — the only converge-time act is
+  # writing the jumps baseline ONCE, when it is absent.
+  _ensure_step keepawake      keepawake_converge
   # Visibility only — does NOT change the return code (callers depend on a tick
   # not being failed by a degraded converge). A clean pass clears the marker.
   if [ "$_degraded" = 1 ]; then
@@ -2921,6 +3304,10 @@ cmd_retag() {
 # does nothing — the r1 gate flagged exactly that. They are forwarded as their
 # already-resolved values (the assignments run at load time, above), so an
 # operator's deliberate empty value survives instead of being re-defaulted.
+# BOXUP_GATEWAY_URL/BOXUP_GATEWAY_JSON (boxup-keepawake K6) ride along for the
+# same reason: they are the documented seams a gate points at a canary gateway,
+# and losing them at the re-exec would silently aim the guard back at the real
+# one.
 #
 # Security: this grants no new authority. Anyone who can run `sudo boxup` on
 # these boxes already has passwordless root and can truncate anything directly;
@@ -2940,6 +3327,8 @@ require_root() {
         BOXUP_DISK_TRUNCATE_MIN_BYTES="$BOXUP_DISK_TRUNCATE_MIN_BYTES" \
         BOXUP_DISK_INTERVAL="$BOXUP_DISK_INTERVAL" \
         DISK_GUARD_TRUNCATE="$DISK_GUARD_TRUNCATE" \
+        BOXUP_GATEWAY_URL="$BOXUP_GATEWAY_URL" \
+        BOXUP_GATEWAY_JSON="$BOXUP_GATEWAY_JSON" \
         bash "$SELF" "$@"
     fi
     log "boxup: need root" >&2
