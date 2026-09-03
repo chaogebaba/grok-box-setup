@@ -14,8 +14,8 @@ import { filteredBoxes, viewContent, viewRowsAvailable, viewportWindow, type Siz
 
 export const POLL_INTERVAL_MS = 5000; // TUI-D7
 
-/** The three full-frame views (D2/D3/D4). */
-export type ViewKind = "diff" | "journal" | "history";
+/** The full-frame views: D2/D3/D4, plus O5's fleet-wide leases list. */
+export type ViewKind = "diff" | "journal" | "history" | "leases";
 
 /**
  * An OPEN full-frame view. Everything here is a COPY captured at open (D6): the
@@ -25,7 +25,9 @@ export type ViewKind = "diff" | "journal" | "history";
  */
 export interface ViewState {
   kind: ViewKind;
-  /** the box captured at OPEN — NOT the current selection. */
+  /** the box captured at OPEN — NOT the current selection. O5's `leases` view
+   *  is fleet-wide and carries `""` here, in the effect and in the result, so
+   *  `applyViewResult`'s box guard is satisfied trivially. */
   box: string;
   /** scroll offset in content rows; clamped at paint time (D5b). */
   offset: number;
@@ -78,6 +80,9 @@ export interface TuiState {
   filter: string;
   /** true while the filter input is active. */
   filtering: boolean;
+  /** occupancy O4: show ONLY boxes an operator could take right now. ANDed with
+   *  `filter` inside `filteredBoxes`, so every derived reader follows. */
+  freeOnly: boolean;
   /** the detail pane's 24h history for the selected box (newest-first). */
   detail?: { box: string; lines: SnapshotLine[] };
   /** the D1 detail facts, stored WITH the box name they were fetched for. */
@@ -295,6 +300,21 @@ export function handleKey(state: TuiState, key: string, size: Size = DEFAULT_SIZ
       return { state: { ...state, message: "refreshing…" }, effect: { type: "refresh" } };
     case "/":
       return { state: { ...state, filtering: true, filter: "" }, effect: { type: "none" } };
+    case "f":
+      // O4: a VIEW, not an action — it works under a readonly token. `Esc`
+      // below is the other way out.
+      return { state: recoverSelection({ ...state, freeOnly: !state.freeOnly }), effect: { type: "none" } };
+    case "\x1b":
+      if (!state.freeOnly) return { state, effect: { type: "none" } };
+      return { state: recoverSelection({ ...state, freeOnly: false }), effect: { type: "none" } };
+    case "L": {
+      // O5: fleet-wide, so the captured box is `""` at every point the view
+      // machine checks one.
+      return {
+        state: { ...state, message: undefined, view: { kind: "leases", box: "", offset: 0, loading: true } },
+        effect: { type: "load-view", kind: "leases", box: "" },
+      };
+    }
     case "j":
     case "\x1b[B": {
       // the detail effect is driven by the NAME CHANGE from the app (B4), not
@@ -467,6 +487,7 @@ export function initialState(nowMs: number, noColor: boolean, opts: { tz?: strin
     selected: 0,
     filter: "",
     filtering: false,
+    freeOnly: false,
     message: CONNECTING_MESSAGE,
     noColor,
     tz: opts.tz,

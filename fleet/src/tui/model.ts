@@ -14,7 +14,7 @@
 // concatenation of `segments`, which the model tests pin.
 
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
-import type { BoxLease, FleetBox } from "./api-client.ts";
+import type { BoxLease, FleetBox, Lease } from "./api-client.ts";
 import type { TuiState } from "./state.ts";
 import type { Tone } from "./tone.ts";
 
@@ -107,6 +107,39 @@ function stripToWidth(s: string, cols: number): string {
   return s.length > cols ? s.slice(0, cols) : s;
 }
 
+// --- O2: relative time, ONE function and ONE grammar -------------------------
+/**
+ * occupancy O2: how much time is LEFT until `iso`, in the panel's one relative
+ * grammar — `<1m` under a minute either way (the past form of under-a-minute is
+ * also `<1m`), `42m` in minutes, `1h05` in hours with the minutes always two
+ * digits so the width is stable, `2d3h` from a day out, and a `-` prefix on the
+ * minute/hour/day forms when the instant is already past (the CALL SITE tones
+ * that WARN). An absent or unparseable value is `-`.
+ *
+ * Pure: `nowMs` is `TuiState.nowMs`, the clock the golden helper fixes — there
+ * is deliberately no `Date.now()` in this file.
+ */
+export function left(nowMs: number, iso: string | null | undefined): string {
+  if (iso === null || iso === undefined || iso === "") return "-";
+  const ms = tsMillis(iso);
+  if (ms === undefined) return "-";
+  const delta = ms - nowMs;
+  const abs = Math.abs(delta);
+  if (abs < 60_000) return "<1m";
+  const sign = delta < 0 ? "-" : "";
+  const mins = Math.floor(abs / 60_000);
+  if (mins < 60) return `${sign}${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${sign}${hours}h${String(mins % 60).padStart(2, "0")}`;
+  return `${sign}${Math.floor(hours / 24)}d${hours % 24}h`;
+}
+
+/** O2: `left` with the sign stripped — how long ago `iso` was. */
+export function age(nowMs: number, iso: string | null | undefined): string {
+  const s = left(nowMs, iso);
+  return s.startsWith("-") ? s.slice(1) : s;
+}
+
 /** The plain text of a segment list — always what the line's `text` is. */
 export function segText(segs: Seg[]): string {
   let out = "";
@@ -178,6 +211,31 @@ export function leasedCount(boxes: FleetBox[]): number {
   return n;
 }
 
+/**
+ * occupancy O3: can I TAKE this box right now — the panel's one `free`
+ * predicate, called by the WHO cell, the header count, the `f` filter and the
+ * detail card so the four can never disagree. Awake and healthy (`●`) and
+ * holding no lease, whatever that lease's state (the L3 rule; the field is
+ * optional on `FleetBox`, so the test is falsy-ness exactly as `leasedCount`
+ * reads it).
+ *
+ * This is DELIBERATELY coarser than the API's acquire eligibility
+ * (`serve/lease-eligibility.ts`: the rollout canary under `service`, a stale
+ * snapshot, drift under `no_drift`, the boxup floor). The panel's `free` is the
+ * human's answer; the 409 `reasons` map stays the authority, and the detail card
+ * says so.
+ */
+export function isFree(state: TuiState, b: FleetBox): boolean {
+  return boxHealth(state, b).glyph === GLYPH.healthy && !b.lease;
+}
+
+/** How many boxes an operator could take right now (O3). */
+export function freeCount(state: TuiState, boxes: FleetBox[]): number {
+  let n = 0;
+  for (const b of boxes) if (isFree(state, b)) n++;
+  return n;
+}
+
 /** Count fleet health for the header. */
 export function counts(boxes: FleetBox[]): { total: number; healthy: number; degraded: number; down: number; asleep: number } {
   let healthy = 0;
@@ -243,6 +301,7 @@ export function messageTone(text: string): Tone {
 export function headerSegments(state: TuiState, size: Size): Seg[] {
   const c = counts(state.boxes);
   const leased = leasedCount(state.boxes);
+  const free = freeCount(state, state.boxes);
   const stale = state.tickAgeS !== null && state.tickAgeS >= STALE_SECONDS;
   const applyText =
     state.apply === null ? "apply ?" : `apply ${state.apply ? "ON" : "off"}${state.applySource === "config" ? "" : "?"}`;
@@ -258,17 +317,27 @@ export function headerSegments(state: TuiState, size: Size): Seg[] {
     { text: `${GLYPH.down} ${c.down}`, tone: "down" },
     { text: "  ", tone: "plain" },
     { text: `${GLYPH.asleep} ${c.asleep}`, tone: "muted" },
-    { text: "  ", tone: "plain" },
+    // occupancy O3: the header answers "can I take one". `free n` is ALWAYS
+    // printed — a deliberate exception to V3's zero-suppression, because
+    // `free 0` is the ONE zero an operator acts on, and it is WARN when it is
+    // zero rather than quiet.
+    { text: " · ", tone: "muted" },
+    { text: `free ${free}`, tone: free === 0 ? "warn" : "ok" },
     // lease-api L5: the leased count, computed from the `lease` field on the
     // `/v1/fleet` per-box entries — the poll stays SINGLE-ENDPOINT (r10-B1).
     // Rendered only when there is something to say: an all-zero counter on a
     // fleet nobody is using is noise, and `quiet is the goal state` (V3).
+    //
+    // O3: below 120 columns the word `leased` goes and the count stays. The
+    // count is the information; the word costs 7 columns of a bar that has to
+    // end in `link ● up` at 100.
     ...(leased > 0
       ? ([
-          { text: `${GLYPH.leased} ${leased} leased`, tone: "accent" as Tone },
-          { text: "  ", tone: "plain" as Tone },
+          { text: " · ", tone: "muted" as Tone },
+          { text: size.cols >= 120 ? `${GLYPH.leased} ${leased} leased` : `${GLYPH.leased} ${leased}`, tone: "accent" as Tone },
         ] as Seg[])
       : []),
+    { text: "  ", tone: "plain" },
     { text: applyText, tone: applyTone },
     { text: "  ", tone: "plain" },
     { text: state.tickAgeS === null ? "tick ?" : `tick ${fmtAge(state.tickAgeS)}`, tone: stale ? "warn" : "muted" },
@@ -296,13 +365,65 @@ export function headerText(state: TuiState, size: Size): string {
 // rendered as "EXP". ver:8 still fits a 5.x.y version with a gap and config:8
 // still fits "in-sync"; the header's own trailing pad absorbs the last 2 cells'
 // slack, so the visible header ends exactly at column 60.
-const TABLE_HEADER_COLS = { glyph: 2, name: 14, tunnel: 7, check: 6, ver: 8, drift: 9, config: 8, expiry: 8 };
+//
+// occupancy O1: the row gains WHO and loses TUNNEL and CHECK. The V2 glyph
+// already carries exactly what those two said (`●` = tunnel up ∧ check OK,
+// `✖` = check FAIL, `◆` = degraded, `☾` asleep, `○` = down/never probed), and
+// the detail card's first line still prints `tunnel up · check OK · ver`. The
+// one state the glyph does not distinguish is a `◆` box whose tunnel is down;
+// the card shows it, the row does not, and that is accepted.
+//
+// EVERY cell is budgeted at its longest REAL value plus one column of gap:
+// DRIFT 8 holds `unknown` (7) + 1 and CONFIG 8 holds `in-sync` (7) + 1. EXPIRY's
+// domain is `-` or `<integer>d` from `expiry_days`, and the integer can be
+// negative for an expired key: `-365d` is 5 and fills the cell with NO gap,
+// tolerable only because EXPIRY is the last data column and the `C` cell brings
+// its own two leading spaces. The header label is `EXP`, because
+// pad("EXPIRY", 5) would print `EXPIR`.
+const TABLE_HEADER_COLS = { glyph: 2, name: 14, who: 12, ver: 8, drift: 8, config: 8, expiry: 5 };
 
-/** The filtered box list (case-insensitive substring on name). */
+/** WHO's holder budget: 12 = `⚑` 1 + space 1 + holder ≤ 9 + trailing gap 1. */
+const WHO_HOLDER = 9;
+
+/** O1: a holder longer than the cell is cut to 8 + `…`, so `ci:runner-3`
+ *  renders `ci:runne…` and there is ALWAYS a gap before VER. Measured on
+ *  `.length` like every other cell (`pad`) — holders are declared single-width
+ *  exactly as box names are, and `string-width` stays out of `src/`. */
+function holderCell(holder: string): string {
+  return holder.length <= WHO_HOLDER ? holder : `${holder.slice(0, WHO_HOLDER - 1)}…`;
+}
+
+/**
+ * O1: the WHO cell — who is holding this box. `-` (MUTED) when nothing is, else
+ * `⚑ <holder>` with both the glyph and the holder in the lease's tone (L3:
+ * active MAIN, expired WARN, lost DOWN).
+ *
+ * The countdown deliberately lives in the detail card and the leases view, not
+ * here: 12 columns cannot hold both honestly, and the row's job is `who` while
+ * the card's is `how long`. Reserved for 5.12.0: `▶ <job>` for a running job
+ * with no lease and `⚑▶ <holder>` for both; 5.11.1 never emits `▶`.
+ */
+export function whoSegment(b: FleetBox): Seg {
+  const l = b.lease;
+  if (l === null || l === undefined) return { text: pad("-", TABLE_HEADER_COLS.who), tone: "muted" };
+  return { text: pad(`${GLYPH.leased} ${holderCell(l.holder)}`, TABLE_HEADER_COLS.who), tone: leaseTone(l) };
+}
+
+/**
+ * The filtered box list: the case-insensitive name substring, and then O4's
+ * free filter. The conjunction lives HERE on purpose — every derived reader
+ * follows for free, the window and its bounds and the `rows a–b of N`
+ * indicator, the table body and its empty line, the detail card's subject and
+ * the whole selection machinery.
+ */
 export function filteredBoxes(state: TuiState): FleetBox[] {
-  if (state.filter === "") return state.boxes;
-  const f = state.filter.toLowerCase();
-  return state.boxes.filter((b) => b.name.toLowerCase().includes(f));
+  let list = state.boxes;
+  if (state.filter !== "") {
+    const f = state.filter.toLowerCase();
+    list = list.filter((b) => b.name.toLowerCase().includes(f));
+  }
+  if (state.freeOnly) list = list.filter((b) => isFree(state, b));
+  return list;
 }
 
 /**
@@ -315,9 +436,9 @@ export function tableLines(state: TuiState, size: Size): TableLine[] {
   const showCanaryCol = state.canary !== null; // C glyph only when snapshot canary non-null
   const head =
     `${pad("", TABLE_HEADER_COLS.glyph)}${pad("NAME", TABLE_HEADER_COLS.name)}` +
-    `${pad("TUNNEL", TABLE_HEADER_COLS.tunnel)}${pad("CHECK", TABLE_HEADER_COLS.check)}` +
-    `${pad("VER", TABLE_HEADER_COLS.ver)}${pad("DRIFT", TABLE_HEADER_COLS.drift)}` +
-    `${pad("CONFIG", TABLE_HEADER_COLS.config)}${pad("EXPIRY", TABLE_HEADER_COLS.expiry)}${showCanaryCol ? "  C" : ""}`;
+    `${pad("WHO", TABLE_HEADER_COLS.who)}${pad("VER", TABLE_HEADER_COLS.ver)}` +
+    `${pad("DRIFT", TABLE_HEADER_COLS.drift)}${pad("CONFIG", TABLE_HEADER_COLS.config)}` +
+    `${pad("EXP", TABLE_HEADER_COLS.expiry)}${showCanaryCol ? "  C" : ""}`;
   const headText = pad(head, size.cols);
   rows.push({ text: headText, tone: "main", bold: true, segments: [{ text: headText, tone: "main", bold: true }] });
 
@@ -329,17 +450,13 @@ export function tableLines(state: TuiState, size: Size): TableLine[] {
     const dash = (v: string | null | undefined): string => (v === null || v === undefined || v === "" ? "-" : String(v));
     const isCanary = state.canary !== null && b.name === state.canary;
     const selected = i === state.selected;
-    // lease-api L5: the `⚑` sits INSIDE the NAME cell (NAME is 14 and names are
-    // 12, so it fits) and carries its OWN tone — the name keeps the row's health
-    // tone, the flag says who is using the box.
-    const flag = b.lease === null || b.lease === undefined ? "" : ` ${GLYPH.leased}`;
-    const nameText = pad(b.name, Math.max(0, TABLE_HEADER_COLS.name - flag.length));
+    // occupancy O1: the `⚑` moved OUT of the NAME cell and into WHO, which
+    // carries the flag and the holder in the lease's tone. The name keeps the
+    // row's health tone and its full 14 columns.
     const segs: Seg[] = [
       { text: `${health.glyph} `, tone: health.tone },
-      { text: nameText, tone: health.tone, bold: selected },
-      ...(flag === "" ? [] : ([{ text: flag, tone: leaseTone(b.lease) }] as Seg[])),
-      { text: pad(dash(b.tunnel), TABLE_HEADER_COLS.tunnel), tone: b.tunnel === null || b.tunnel === undefined ? "muted" : t.tunnel },
-      { text: pad(dash(b.check), TABLE_HEADER_COLS.check), tone: b.check === null || b.check === undefined ? "muted" : t.check },
+      { text: pad(b.name, TABLE_HEADER_COLS.name), tone: health.tone, bold: selected },
+      whoSegment(b),
       { text: pad(dash(b.ver), TABLE_HEADER_COLS.ver), tone: t.ver },
       { text: pad(dash(b.drift), TABLE_HEADER_COLS.drift), tone: t.drift },
       { text: pad(dash(b.config), TABLE_HEADER_COLS.config), tone: t.config },
@@ -352,7 +469,10 @@ export function tableLines(state: TuiState, size: Size): TableLine[] {
     rows.push({ text: segText(segs), tone: health.tone, selected, segments: segs });
   }
   if (list.length === 0) {
-    const text = pad(state.filter !== "" ? "(no boxes match filter)" : "(no boxes)", size.cols);
+    // O4: the free filter's empty result is its OWN sentence — `no free boxes`
+    // is an answer, `(no boxes)` would read as a broken link.
+    const empty = state.freeOnly ? "no free boxes" : state.filter !== "" ? "(no boxes match filter)" : "(no boxes)";
+    const text = pad(empty, size.cols);
     rows.push({ text, tone: "muted", segments: [{ text, tone: "muted" }] });
   }
   return rows;
@@ -538,24 +658,88 @@ function joinFields(groups: Seg[][]): Seg[] {
   return out;
 }
 
-/** The detail card's `lease …` row (or `lease —` when the box is free). */
-function leaseFields(l: BoxLease | null | undefined, ts: (v: string | null | undefined) => string): Seg[] {
-  if (l === null || l === undefined) return field("lease", DASH, "muted");
+/** `14:32` — the wall clock only, for the card's lease countdown line, which
+ *  has no room for a date and already carries the relative form beside it. */
+function clockHM(v: string | null | undefined, zone: string): string {
+  const raw = dashTs(v);
+  if (raw === DASH) return DASH;
+  const ms = tsMillis(v as string | number);
+  if (ms === undefined) return raw;
+  const opts: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat("en-US", { ...opts, timeZone: zone }).formatToParts(new Date(ms));
+  } catch {
+    parts = new Intl.DateTimeFormat("en-US", { ...opts, timeZone: DEFAULT_TZ }).formatToParts(new Date(ms));
+  }
+  const get = (t: Intl.DateTimeFormatPartTypes): string => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("hour")}:${get("minute")}`;
+}
+
+/**
+ * occupancy O6, the card's lease line 1: `lease ⚑ <holder> · <kind> · <purpose>`
+ * for an open lease (toned by state), `free` for a box `isFree` says can be
+ * taken, and `no lease` otherwise. Kind comes BEFORE purpose because kind is
+ * fixed-width and purpose is the one that gets cut by the 46-column pane. This
+ * supersedes lease L5's `holder · purpose · kind · expires` text.
+ *
+ * "free" is never said about an asleep or a failing box: an unleased box that
+ * is not `●` reads `no lease`, which is true, instead of an invitation.
+ */
+function leaseLine1(state: TuiState, b: FleetBox): Seg[] {
+  const l = b.lease;
+  if (l === null || l === undefined) {
+    return isFree(state, b) ? [{ text: "free", tone: "ok" }] : [{ text: "no lease", tone: "muted" }];
+  }
   const tone = leaseTone(l);
-  const segs: Seg[] = [
+  return [
     { text: "lease", tone: "muted" },
     { text: " ", tone: "muted" },
-    { text: l.holder, tone },
-    { text: SEP, tone: "muted" },
-    { text: l.purpose, tone: "plain" },
+    { text: `${GLYPH.leased} ${l.holder}`, tone },
     { text: SEP, tone: "muted" },
     { text: l.kind, tone: "muted" },
+    { text: SEP, tone: "muted" },
+    { text: l.purpose, tone: "plain" },
   ];
-  if (l.expires_at !== null) {
-    segs.push({ text: SEP, tone: "muted" }, { text: `expires ${ts(l.expires_at)}`, tone: "plain" });
+}
+
+/**
+ * O6, the card's lease line 2 — the LIVE countdown, most important token first
+ * so the 46-column truncation cuts the least important:
+ *
+ *   active   `  in 1h12 · expires 14:32`
+ *   expired  `  grace 17m · expired`
+ *   lost     `  grace ≤17m · lost`      (`≤`: `grace_ends_at` is an upper bound
+ *                                        for a lost lease, which may end early)
+ *
+ * `since <created_at>` is NOT here: `BoxLeaseField` does not carry `created_at`,
+ * and this card shows no field the endpoint lacks. (Recorded so nobody re-adds
+ * it; the API-side fold F2 is where it comes from.)
+ *
+ * For a free box the line is the honesty note — the panel's `free` is coarser
+ * than the API's eligibility, and `POST /v1/leases` may still answer 409.
+ */
+function leaseLine2(state: TuiState, b: FleetBox, zone: string): Seg[] {
+  const l = b.lease;
+  if (l === null || l === undefined) {
+    return isFree(state, b) ? [{ text: "  acquire may still refuse: /v1/leases 409 reasons", tone: "muted" }] : [];
   }
-  if (l.state !== "active") segs.push({ text: SEP, tone: "muted" }, { text: l.state, tone });
-  return segs;
+  const tone = leaseTone(l);
+  if (l.state === "expired" || l.state === "lost") {
+    const bound = l.state === "lost" ? "≤" : "";
+    return [
+      { text: `  grace ${bound}${left(state.nowMs, l.grace_ends_at)}`, tone },
+      { text: SEP, tone: "muted" },
+      { text: l.state, tone },
+    ];
+  }
+  // A `service` lease carries no expiry at all; saying so beats `in - · expires —`.
+  if (l.expires_at === null) return [{ text: "  no expiry", tone: "muted" }];
+  return [
+    { text: `  in ${left(state.nowMs, l.expires_at)}`, tone },
+    { text: SEP, tone: "muted" },
+    { text: `expires ${clockHM(l.expires_at, zone)}`, tone: "plain" },
+  ];
 }
 
 /**
@@ -627,22 +811,27 @@ export function detailLines(state: TuiState, width: number): DetailLine[] {
       field("observed", dashEm(f?.observed), observedTone(f?.observed)),
     ]),
   );
-  // lease-api L5: who is holding this box, if anyone. Same rule as everywhere
-  // else — the row with `released_at IS NULL`, whatever its state.
-  body.push(leaseFields(b.lease, ts));
-  body.push(field("asleep since", ts(f?.asleep_since), "plain"));
-  // TUI-D4 row budget: the card is fixed at DETAIL_ROWS and the phase/observed
-  // line above needed one. `api backoff` rides on the `asleep last` row rather
-  // than costing the sparkline or a D1 fact — both are engine bookkeeping the
-  // operator reads at a glance, and both are `—` on a healthy box.
+  // lease-api L5 / occupancy O6: who is holding this box, if anyone, and for
+  // how much longer. Same "in use" rule as everywhere else — the row with
+  // `released_at IS NULL`, whatever its state. TWO lines: the card gets the
+  // second one by MERGING the two asleep lines below, so DETAIL_ROWS is
+  // untouched and the body is still 9 lines.
+  body.push(leaseLine1(state, b));
+  body.push(leaseLine2(state, b, state.utcRaw === true ? DEFAULT_TZ : (state.tz ?? DEFAULT_TZ)));
+  // TUI-D4 row budget: the card is fixed at DETAIL_ROWS. `asleep since`,
+  // `asleep last` and `api backoff` share ONE row (O6) — all three are engine
+  // bookkeeping the operator reads at a glance, and all three are `—` on a
+  // healthy box, so the backoff tail is the right thing for `fitSegments` to
+  // truncate at a 46-column pane.
   const ab = f?.api_backoff;
   body.push(
     joinFields([
-      field("asleep last", ts(f?.asleep_last), "plain"),
+      field("asleep since", ts(f?.asleep_since), "plain"),
+      field("last", ts(f?.asleep_last), "plain"),
       ab === null || ab === undefined
-        ? field("api backoff", DASH, "muted")
+        ? field("backoff", DASH, "muted")
         : [
-            { text: "api backoff", tone: "muted" as Tone },
+            { text: "backoff", tone: "muted" as Tone },
             { text: " ", tone: "muted" as Tone },
             { text: `${ab.fails} fails`, tone: (ab.fails > 0 ? "warn" : "muted") as Tone },
             { text: ", retry ", tone: "muted" as Tone },
@@ -737,9 +926,49 @@ export function bannerText(state: TuiState, size: Size): { text: string; tone: T
   return undefined;
 }
 
-// --- the transient status/action line ----------------------------------------
-export function messageText(state: TuiState): string | undefined {
-  return state.message;
+// --- the status line (O4a) ---------------------------------------------------
+/**
+ * occupancy O4a: the one transient row under the table, and the home for the
+ * things that describe the table the operator is looking at.
+ *
+ * It REPLACES `messageText`: same slot, same row cost (a blank spacer plus one
+ * row when non-null, nothing otherwise). The content, in priority order, joined
+ * with two spaces:
+ *
+ *   1. `/<filter>▏` (ACCENT) while `filtering` — the prompt shows from the
+ *      FIRST keystroke, when `filter` is still `""` — or `/<filter>` with no
+ *      cursor once the filter is committed. Before this, `state.filter` was
+ *      never rendered anywhere and the operator could not see what they typed.
+ *   2. `[free]` (ACCENT) while the O4 filter is on. It lives HERE and never in
+ *      the header, which has no columns to spare at 100.
+ *   3. `state.message`, in the tone `messageTone` gives it.
+ *
+ * Under a full-screen VIEW (`opts.view`) only the message shows: the filter and
+ * the badge describe a table that is not on screen, and keeping them out leaves
+ * every view's row budget independent of the table's state.
+ *
+ * All three parts are derived from state on every frame, so an action message
+ * can never wipe the filter or the badge — they show side by side.
+ *
+ * Not width-fitted: unlike `headerSegments` this takes no `Size`, so an
+ * over-wide line would be truncated by Ink in the frame but written full-length
+ * into a fixture. The realistic maximum is 58 columns (`/grok-box-0▏` + `[free]`
+ * + the longest message this TUI emits), so it cannot bite at 100.
+ */
+export function statusLine(state: TuiState, opts: { view?: boolean } = {}): Seg[] | null {
+  const segs: Seg[] = [];
+  const push = (s: Seg): void => {
+    if (segs.length > 0) segs.push({ text: "  ", tone: "plain" });
+    segs.push(s);
+  };
+  if (opts.view !== true) {
+    if (state.filtering || state.filter !== "") {
+      push({ text: `/${state.filter}${state.filtering ? "▏" : ""}`, tone: "accent" });
+    }
+    if (state.freeOnly) push({ text: "[free]", tone: "accent" });
+  }
+  if (state.message !== undefined) push({ text: state.message, tone: messageTone(state.message) });
+  return segs.length === 0 ? null : segs;
 }
 
 // --- footer keys (scope-aware, TUI-D7/R3-A1, V6) -----------------------------
@@ -752,8 +981,12 @@ export function messageText(state: TuiState): string | undefined {
  * V6: the key letter is ACCENT and its word MUTED, and the three groups are
  * separated by a MAIN `│` so the footer is not one unbroken run of letters.
  */
-const NAV_KEYS: [string, string][] = [["↑↓", "select"], ["/", "filter"], ["r", "refresh"], ["q", "quit"]];
-const VIEW_KEYS: [string, string][] = [["D", "diff"], ["J", "journal"], ["H", "history"]];
+// occupancy O4/O5: `f free` and `L leases`. The admin one-line footer was
+// EXACTLY 120 characters, so these +18 make it two lines at 120 columns and one
+// line only at ≥ 138 — which costs every 120-wide admin frame one table row and
+// collapses the `fleet30-admin-120x12` windows onto the readonly ones.
+const NAV_KEYS: [string, string][] = [["↑↓", "select"], ["/", "filter"], ["f", "free"], ["r", "refresh"], ["q", "quit"]];
+const VIEW_KEYS: [string, string][] = [["D", "diff"], ["J", "journal"], ["H", "history"], ["L", "leases"]];
 const ACTION_KEYS: [string, string][] = [
   ["P", "push"],
   ["M", "rotate"],
@@ -824,7 +1057,9 @@ export function viewChromeRows(state: TuiState, size: Size): number {
   if (bannerText(state, size) !== undefined) n += 1; // LINK DOWN / STALE / UNKNOWN
   n += 1; // blank spacer after the header/banner
   n += 1; // the view title (carries the `rows a–b of N` indicator)
-  if (messageText(state) !== undefined) n += 2; // blank spacer + the message line
+  // O4a: under a full-screen view the status line carries ONLY the message, so
+  // a view's row budget stays independent of the table's filter and badge.
+  if (statusLine(state, { view: true }) !== null) n += 2; // blank spacer + the status line
   n += 1; // blank spacer before the footer
   n += footerLines(state, size).length;
   return n;
@@ -890,14 +1125,77 @@ export function viewLines(state: TuiState, size: Size): ToneLine[] {
   const from = content.length === 0 ? 0 : win.start + 1;
   const indicator = `rows ${from}–${win.end} of ${content.length}`;
   const rows: ToneLine[] = [];
+  // O5: the leases view is FLEET-WIDE, so its `box` is `""` and the title says
+  // just `── leases ──` rather than the double space `${kind} ${box}` gives.
+  const title = v.kind === "leases" ? "── leases ──" : `── ${v.kind} ${v.box} ──`;
   rows.push({
-    text: pad(stripToWidth(`── ${v.kind} ${v.box} ──  ${indicator}`, size.cols), size.cols),
+    text: pad(stripToWidth(`${title}  ${indicator}`, size.cols), size.cols),
     tone: "main",
     bold: true,
   });
   for (const line of content.slice(win.start, win.end)) rows.push({ text: stripToWidth(line, size.cols), tone: "plain" });
   return rows;
 }
+
+// --- the leases view's rows (O5) ---------------------------------------------
+/** O5's fixed widths: 79 columns, so the whole row fits a 120-wide view and the
+ *  existing view clip handles anything narrower. Gap rule as O1 — KIND 10 holds
+ *  `ephemeral` (9) + 1, and every text cell whose value would fill its column is
+ *  cut to width−2 + `…` so one column of gap always remains. */
+const LEASE_COLS = { box: 14, who: 12, kind: 10, purpose: 22, age: 6, left: 7, state: 8 };
+
+/** Cut to `w−2` + `…` when a value would leave no gap (WHO and PURPOSE are the
+ *  two that need it), then `pad` to the column. */
+function cut(s: string, w: number): string {
+  return s.length > w - 1 ? `${s.slice(0, w - 2)}…` : s;
+}
+
+/** The trailing box index, for the sort. A name without one sorts last, by name. */
+function boxIndex(name: string): number {
+  const m = /(\d+)\s*$/.exec(name);
+  return m === null ? Number.MAX_SAFE_INTEGER : Number(m[1]);
+}
+
+/**
+ * O5: the leases view's content rows — the header line, then one row per OPEN
+ * lease, sorted by box index. Formatted ONCE, when the response lands, and
+ * frozen into `ViewState.lines` exactly as the journal's rows are; AGE and LEFT
+ * are therefore static until `r` refetches, which is the same contract every
+ * other view already has. The detail card's own lease line (O6) is the live
+ * countdown.
+ *
+ * `LEFT` is time left on the lease for `active`; for `expired` it is the grace
+ * remaining, and for `lost` the grace remaining prefixed `≤`, because
+ * `grace_ends_at` is only an UPPER bound once a box is lost — it may end early
+ * when the box comes back. No `grace` word: the STATE column beside it already
+ * says `expired` or `lost`.
+ */
+export function leaseRows(leases: Lease[], nowMs: number): string[] {
+  const head =
+    `${pad("BOX", LEASE_COLS.box)}${pad("WHO", LEASE_COLS.who)}${pad("KIND", LEASE_COLS.kind)}` +
+    `${pad("PURPOSE", LEASE_COLS.purpose)}${pad("AGE", LEASE_COLS.age)}${pad("LEFT", LEASE_COLS.left)}` +
+    `${pad("STATE", LEASE_COLS.state)}`;
+  const sorted = [...leases].sort((a, b) => boxIndex(a.box) - boxIndex(b.box) || a.box.localeCompare(b.box));
+  const rows = [head];
+  for (const l of sorted) {
+    const leftCell =
+      l.state === "active"
+        ? left(nowMs, l.expires_at)
+        : l.state === "lost"
+          ? `≤${left(nowMs, l.grace_ends_at)}`
+          : left(nowMs, l.grace_ends_at);
+    rows.push(
+      `${pad(cut(l.box, LEASE_COLS.box), LEASE_COLS.box)}${pad(cut(l.holder, LEASE_COLS.who), LEASE_COLS.who)}` +
+        `${pad(cut(l.kind, LEASE_COLS.kind), LEASE_COLS.kind)}${pad(cut(l.purpose, LEASE_COLS.purpose), LEASE_COLS.purpose)}` +
+        `${pad(age(nowMs, l.created_at), LEASE_COLS.age)}${pad(leftCell, LEASE_COLS.left)}` +
+        `${pad(l.state, LEASE_COLS.state)}`,
+    );
+  }
+  return rows;
+}
+
+/** O5: an empty leases list is an ANSWER, not an empty screen. */
+export const NO_OPEN_LEASES = "no open leases";
 
 // --- modal -------------------------------------------------------------------
 export function modalLines(state: TuiState): ToneLine[] {

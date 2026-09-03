@@ -127,13 +127,17 @@ describe("V3 cell tones", () => {
     expect(expiryTone(null)).toBe("muted");
     expect(expiryTone(undefined)).toBe("muted");
   });
+  // occupancy O1 took TUNNEL and CHECK out of the row, so the OK cells this
+  // used to name are gone. The rule it exists for is unchanged: the row's
+  // health does not repaint the cells that are quiet.
   test("a degraded box does NOT paint its whole row warn", () => {
-    const s = state({ boxes: [box("grok-box-1", { drift: "yes" })], noColor: false });
+    const s = state({ boxes: [box("grok-box-1", { drift: "yes", config: "in-sync" })], noColor: false });
     const row = tableLines(s, SIZE_120x40)[1]!;
     expect(row.tone).toBe("warn"); // the row's health…
     const tones = row.segments!.map((x) => x.tone);
-    expect(tones).toContain("ok"); // …but the healthy tunnel/check cells stay OK
-    expect(tones).toContain("muted"); // …and the quiet cells stay muted
+    expect(tones).toContain("warn"); // …the drifted VER and DRIFT cells glow…
+    expect(tones).toContain("muted"); // …and the quiet CONFIG/EXPIRY/WHO cells stay muted
+    expect(tones).not.toContain("down");
   });
 });
 
@@ -307,7 +311,10 @@ describe("table column gaps", () => {
       SIZE_120x40,
     ).map((l) => l.text);
     const row = rows.find((r) => r.includes("grok-box-1"))!;
-    expect(row).toContain("unknown  skip");
+    // O1 budgets every cell at its longest real value PLUS one column of gap,
+    // so `unknown` (7) in an 8-wide DRIFT leaves exactly one space — never none,
+    // which is the `unknownskip` bug this test was written for.
+    expect(row).toContain("unknown skip");
     expect(row).not.toContain("unknownskip");
   });
 
@@ -316,7 +323,8 @@ describe("table column gaps", () => {
       const row = tableLines(state({ boxes: [box("b", { drift, config: "in-sync" })] }), SIZE_120x40)
         .map((l) => l.text)
         .find((r) => r.includes(" b "))!;
-      expect(/(yes|no|unknown) {2,}in-sync/.test(row)).toBe(true);
+      expect(/(yes|no|unknown) +in-sync/.test(row)).toBe(true);
+      expect(/(yes|no|unknown)in-sync/.test(row)).toBe(false);
     }
   });
 
@@ -346,14 +354,14 @@ describe("detail timestamps: epoch 0 reads as absent", () => {
       .map((l) => l.text)
       .join("\n");
 
-  test("the zero time renders — on asleep since / asleep last / expires", () => {
+  test("the zero time renders — on asleep since / last / expires", () => {
     const p = pane({
       asleep_since: "1970-01-01T00:00:00Z",
       asleep_last: "1970-01-01T00:00:00Z",
       expires_at: "1970-01-01T00:00:00Z",
     });
     expect(p).toContain("asleep since —");
-    expect(p).toContain("asleep last —");
+    expect(p).toContain("last —");
     expect(p).toContain("expires —");
     expect(p).not.toContain("1970");
   });
@@ -369,24 +377,24 @@ describe("detail timestamps: epoch 0 reads as absent", () => {
       null,
       undefined,
     ]) {
-      expect(pane({ asleep_last: v })).toContain("asleep last —");
+      expect(pane({ asleep_last: v })).toContain("· last —");
     }
   });
 
   test("a REAL timestamp is still shown — as a local-zone reading, not a dash", () => {
     const p = pane({ asleep_last: "2026-09-02T05:10:27Z" });
-    expect(p).toContain("asleep last Sep 2 05:10 UTC (");
-    expect(p).not.toContain("asleep last —");
+    expect(p).toContain("last Sep 2 05:10 UTC (");
+    expect(p).not.toContain("· last —");
   });
 
   test("…and verbatim under --utc", () => {
     const p = pane({ asleep_last: "2026-09-02T05:10:27Z" }, { utcRaw: true });
-    expect(p).toContain("asleep last 2026-09-02T05:10:27Z");
+    expect(p).toContain("last 2026-09-02T05:10:27Z");
   });
 
   test("an epoch-0 api-backoff retry renders — while the fail count stays", () => {
     const p = pane({ api_backoff: { fails: 2, next_retry: "1970-01-01T00:00:00Z" } });
-    expect(p).toContain("api backoff 2 fails, retry —");
+    expect(p).toContain("backoff 2 fails, retry —");
   });
 });
 
@@ -477,14 +485,14 @@ describe("the detail card uses the state's zone, and --utc keeps the raw ISO", (
   test("a New_York viewer sees local wall clock, zone and age", () => {
     const text = card({ tz: "America/New_York" });
     expect(text).toContain("asleep since Mar 20 05:46 EDT (2h ago)");
-    expect(text).toContain("asleep last Mar 20 06:46 EDT (1h ago)");
+    expect(text).toContain("last Mar 20 06:46 EDT (1h ago)");
     expect(text).toContain("retry Mar 20 08:33 EDT (in 46m)");
   });
 
   test("--utc (utcRaw) prints the raw UTC ISO strings, unchanged from before", () => {
     const text = card({ tz: "America/New_York", utcRaw: true });
     expect(text).toContain("asleep since 2026-03-20T09:46:40Z");
-    expect(text).toContain("asleep last 2026-03-20T10:46:40Z");
+    expect(text).toContain("last 2026-03-20T10:46:40Z");
     expect(text).toContain("retry 2026-03-20T12:33:20Z");
     // the date-only expiry is the same either way, countdown included.
     expect(text).toContain("expires 2026-06-01 (40d)");

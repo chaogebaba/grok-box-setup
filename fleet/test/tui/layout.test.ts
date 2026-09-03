@@ -16,7 +16,7 @@ import {
   detailWidth,
   discoverText,
   footerLines,
-  messageText,
+  statusLine,
   modalLines,
   tableLines,
   tableWidth,
@@ -50,7 +50,7 @@ describe("chrome arithmetic agrees with what the components emit", () => {
       if (discoverText(g.state, g.size) !== undefined) counted += 1;
       counted += 1; // the spacer
       if (g.state.modal !== undefined) counted += 1 + modalLines(g.state).length;
-      else if (messageText(g.state) !== undefined) counted += 2;
+      else if (statusLine(g.state) !== null) counted += 2;
       counted += 1; // the spacer before the footer
       counted += footerLines(g.state, g.size).length;
 
@@ -83,13 +83,15 @@ describe("the table's row budget", () => {
   const thirty = Array.from({ length: 30 }, (_, i) => box(`grok-box-${String(i + 1).padStart(3, "0")}`));
 
   test("the column-header row is a fixed cost of the region, not a box row", () => {
+    // occupancy O7: the admin footer takes two lines at 120 columns now, so the
+    // region is 7 rows rather than 8 at either scope.
     const s = state({ boxes: thirty, scope: "admin" });
     const size = { cols: 120, rows: 12 };
-    expect(tableRows(s, size)).toBe(8);
-    expect(boxRowsAvailable(s, size)).toBe(8 - TABLE_HEADER_ROWS);
+    expect(tableRows(s, size)).toBe(7);
+    expect(boxRowsAvailable(s, size)).toBe(7 - TABLE_HEADER_ROWS);
     expect(hasMore(s, size)).toBe(true);
-    expect(tableContentRows(s, size)).toBe(6); // one more line goes to the indicator
-    expect(tableViewLines(s, size).length).toBe(8); // header + 6 rows + indicator
+    expect(tableContentRows(s, size)).toBe(5); // one more line goes to the indicator
+    expect(tableViewLines(s, size).length).toBe(7); // header + 5 rows + indicator
   });
 
   test("a fleet that FITS gets no indicator and loses no row to one", () => {
@@ -114,17 +116,21 @@ describe("the table's row budget", () => {
   });
 
   // At 100 columns the Detail pane appears and layout.ts clips the header to
-  // tableWidth(100) = 60. The column widths through EXPIRY used to sum to 65, so
-  // the last header cell rendered as "EXP".
+  // tableWidth(100) = 60. The occupancy row sums to 57, or 60 with the canary
+  // column — exactly the pane, with nothing clipped away.
   test("the column header fits the table pane at the 100-column cutoff", () => {
     const size = { cols: 100, rows: 40 };
     const s = state({ boxes: thirty });
     expect(showDetail(s, size)).toBe(true);
     const head = tableViewLines(s, size)[0]!.text;
     expect(head.trimEnd().length).toBeLessThanOrEqual(tableWidth(size));
-    expect(head).toContain("EXPIRY");
-    // …and nothing before it was dropped either.
-    for (const label of ["NAME", "TUNNEL", "CHECK", "VER", "DRIFT", "CONFIG"]) expect(head).toContain(label);
+    // occupancy O1: EXPIRY became EXP (pad("EXPIRY", 5) would print "EXPIR"),
+    // and TUNNEL/CHECK left the row for the WHO column.
+    expect(head).toContain("EXP");
+    expect(head).not.toContain("TUNNEL");
+    expect(head).not.toContain("CHECK");
+    // …and nothing else was dropped either.
+    for (const label of ["NAME", "WHO", "VER", "DRIFT", "CONFIG"]) expect(head).toContain(label);
   });
 
   test("the unclipped header is the same row, just padded to the terminal", () => {

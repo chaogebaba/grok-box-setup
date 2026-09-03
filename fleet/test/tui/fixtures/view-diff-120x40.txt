@@ -1,6 +1,6 @@
-grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ● up                                           
+grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0 · free 1  apply off  tick 10s   admin  link ● up                                  
 
-── diff grok-box-001 ──  rows 21–55 of 200                                                                              
+── diff grok-box-001 ──  rows 21–54 of 200                                                                              
 --- diff line 20 for the config push
 --- diff line 21 for the config push
 --- diff line 22 for the config push
@@ -35,6 +35,6 @@ grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link
 --- diff line 51 for the config push
 --- diff line 52 for the config push
 --- diff line 53 for the config push
---- diff line 54 for the config push
 
-↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history │ P push  M rotate  R rename  T check  C reconcile
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases                                 
+P push  M rotate  R rename  T check  C reconcile                                                                        

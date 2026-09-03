@@ -23,7 +23,9 @@ import {
   detailLines,
   discoverSegments,
   footerSegmentLines,
-  messageText,
+  leaseRows,
+  NO_OPEN_LEASES,
+  statusLine,
   modalLines,
   viewLines,
   type Size,
@@ -156,6 +158,21 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
           break;
         }
         case "load-view": {
+          if (effect.kind === "leases") {
+            // O5: the DEFAULT listing is already exactly "in use" — the server
+            // adds `released_at IS NULL` on its own — so no `all` param and no
+            // client-side filter. The server rule stays the one definition.
+            const r = await d.client.listLeases();
+            dispatch({
+              type: "view-result",
+              kind: effect.kind,
+              box: "",
+              payload: r.ok
+                ? { lines: r.value.length === 0 ? [NO_OPEN_LEASES] : leaseRows(r.value, d.now()) }
+                : { error: viewError(r, effect.kind) },
+            });
+            break;
+          }
           if (effect.kind === "history") {
             // D4: view-scoped `r` — one request for the CAPTURED box; the
             // shared `state.detail` is deliberately left alone.
@@ -247,7 +264,9 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
   const noColor = state.noColor;
   const banner = bannerText(state, size);
   const discover = discoverSegments(state, size);
-  const message = messageText(state);
+  // O4a: composed ONCE; the view branch gets the message-only form.
+  const status = statusLine(state);
+  const viewStatus = statusLine(state, { view: true });
   const footer = footerSegmentLines(state, size);
   const detailOn = showDetail(state, size);
   const leftW = tableWidth(size);
@@ -261,10 +280,10 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
       {viewOpen ? (
         <>
           <View lines={viewLines(state, size)} noColor={noColor} />
-          {message !== undefined ? (
+          {viewStatus !== null ? (
             <>
               <Box flexShrink={0} height={1} />
-              <Message text={message} noColor={noColor} />
+              <Message segs={viewStatus} noColor={noColor} />
             </>
           ) : null}
           <Box flexShrink={0} height={1} />
@@ -282,11 +301,11 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
               </Box>
             ) : null}
           </Box>
-          {state.modal !== undefined || message !== undefined ? <Box flexShrink={0} height={1} /> : null}
+          {state.modal !== undefined || status !== null ? <Box flexShrink={0} height={1} /> : null}
           {state.modal !== undefined ? (
             <Modal lines={modalLines(state)} noColor={noColor} />
-          ) : message !== undefined ? (
-            <Message text={message} noColor={noColor} />
+          ) : status !== null ? (
+            <Message segs={status} noColor={noColor} />
           ) : null}
           <Box flexShrink={0} height={1} />
           <Footer lines={footer} noColor={noColor} />

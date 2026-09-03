@@ -1,0 +1,17 @@
+grokfleet 11 boxes  ● 7  ◆ 1  ✖ 1  ☾ 2 · free 4 · ⚑ 3  apply off  tick 10s   admin  link ● up       
+
+  NAME          WHO         VER     DRIFT   CONFIG  EXP    C                                          ╭─ grok-box-001 ─────────────────────╮
+> grok-box-001  ⚑ ci:runne… 5.3.0   no      in-sync 40d       │tunnel up · check OK · ver 5.3.0    │
+● grok-box-002  -           5.3.0   no      in-sync 40d    ★  │drift no · config in-sync · expiry 4│
+● grok-box-003  -           5.3.0   unknown in-sync 40d       │checkfail no · asleep no · canary gr│
+● grok-box-004  -           5.3.0   no      in-sync -365d     │checkfail# — · expires —            │
+☾ grok-box-005  -           5.3.0   no      in-sync 40d       │phase — · observed —                │
+✖ grok-box-006  -           5.3.0   no      in-sync 40d       │lease ⚑ ci:runner-3 · ephemeral · ga│
+● grok-box-007  ⚑ svc:brain 5.3.0   no      in-sync 40d       │  in 1h11 · expires 01:12           │
+● grok-box-008  ⚑ dev       5.3.0   no      in-sync 40d       │asleep since — · last — · backoff — │
+● grok-box-009  -           5.3.0   no      in-sync 40d       │24h (loading…)                      │
+☾ grok-box-010  -           5.3.0   no      in-sync 40d       ╰────────────────────────────────────╯
+◆ grok-box-011  -           5.3.0   yes     in-sync 40d
+
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases             
+P push  M rotate  R rename  T check  C reconcile                                                    

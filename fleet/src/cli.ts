@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.11.0"; // 5.11.0: box leases (workload layer step 1) + the 5.10.0 compat layer removed.
+const PKG_VERSION = "5.11.1"; // 5.11.1: TUI occupancy — the WHO column, the free filter and the leases view.
 
 async function gitShaFromGit(): Promise<string> {
   try {
