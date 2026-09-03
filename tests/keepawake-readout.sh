@@ -92,6 +92,7 @@ MIN_BOXES=5
 
 ROWS="$(mktemp)"
 trap 'rm -f "$ROWS"' EXIT
+REFUSED=0
 
 # ---------------------------------------------------------------------------
 # One awk pass per box. Emits one row per day:
@@ -148,11 +149,20 @@ function iso2epoch(s,   y, mo, d, h, mi, se) {
   h = substr(s, 12, 2) + 0; mi = substr(s, 15, 2) + 0; se = substr(s, 18, 2) + 0
   return days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se
 }
-# rank: the slot-collapse precedence. Higher wins.
+# rank: the slot-collapse precedence. Higher wins. EVERY one of the guard
+# seven rc tokens must appear here — rank 0 means "unknown token", and an
+# unknown token is dropped from the slot map, which would silently delete a
+# real attempt from the denominator of the experiment. The r1 empirical gate caught
+# exactly that: `parked-blocked` was missing, so a day made of parked-blocked
+# fires produced no row at all.
+#
+# `parked-blocked` ranks WITH inert/refused, not with parked-ok: the fire was
+# accepted but the idle clock did not move, so the mechanism demonstrably did
+# NOT keep the box awake in that slot. It is unexercised evidence.
 function rank(rc) {
   if (rc == "ok" || rc == "parked-ok") return 4
   if (rc == "skip") return 3
-  if (rc == "inert" || rc == "refused") return 2
+  if (rc == "inert" || rc == "refused" || rc == "parked-blocked") return 2
   if (rc == "unreachable") return 1
   return 0
 }
@@ -186,7 +196,13 @@ BEGIN {
   ev_ts[lines] = ts; ev_rc[lines] = rc
 }
 END {
-  if (lines == 0) exit 0
+  if (lines == 0) {
+    # Still say so: a log whose every line was unparseable is a measurement
+    # defect, and exiting silently makes it look like an empty window.
+    if (malformed > 0)
+      printf "%s MALFORMED %d lines could not be parsed (no usable attempts)\n", box, malformed > "/dev/stderr"
+    exit 0
+  }
   # Slot origin: the install time when the operator recorded one, else the
   # first attempt line. The origin only shifts slot BOUNDARIES; it never
   # changes which day a line falls in.
@@ -239,6 +255,20 @@ END {
     # THE ORDERED CLASSIFIER. Do not reorder: (2) before (3) keeps a day whose
     # measurement was broken out of the denominator; (3) before (4) keeps a day
     # with 36 real fires from being written off as mere platform activity.
+    # RULE 1, and the one input the readout does not derive itself. `off-days`
+    # is operator-supplied, so it is checked against the evidence rather than
+    # trusted over it (r1 empirical gate, finding 2): a day the box actually
+    # attempted anything on was NOT off, and letting the input win there would
+    # let a real box-day — possibly an abandon-ward one — be deleted from the
+    # denominator by hand. A conflict is REFUSED, not silently ignored, because
+    # an operator who wrote the wrong date must fix the input rather than read a
+    # verdict computed around it.
+    if ((off_all || (d in offday)) && cov > 0) {
+      printf "keepawake-readout: REFUSED off-days for %s %s: the day has %d attempt line(s) (ok=%d skip=%d inert=%d refused=%d unreachable=%d parked-ok=%d parked-blocked=%d), so it was not off for the whole day\n", \
+        box, d, cov, ok, ski, ine, ref, unr, pok, pbl > "/dev/stderr"
+      conflict = 1
+      continue
+    }
     if (off_all || (d in offday))              cls = "off"
     else if (ine + ref >= slots_per_day / 4)   cls = "defect"
     else if (ok + pok  >= slots_per_day / 2)   cls = "exercised"
@@ -249,9 +279,21 @@ END {
     n_out++
   }
   if (malformed > 0) printf "%s MALFORMED %d lines could not be parsed\n", box, malformed > "/dev/stderr"
+  if (conflict) exit 3
 }
 ' "$log" >> "$ROWS"
+  [ "$?" = 3 ] && REFUSED=1
 done
+
+# An off-days conflict aborts the WHOLE run rather than printing a table around
+# it: the operator asserted a box-day was off that the box itself recorded
+# attempts on, so one of the two is wrong and no verdict computed from that
+# mixture is worth reading. The awk pass already named the offending day and its
+# counts on stderr.
+if [ "$REFUSED" = 1 ]; then
+  echo "keepawake-readout: no table and no verdict — fix the off-days input(s) named above and re-run" >&2
+  exit 3
+fi
 
 sort -k1,1 -k2,2 -o "$ROWS" "$ROWS"
 

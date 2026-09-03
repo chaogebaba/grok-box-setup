@@ -2533,8 +2533,19 @@ keepawake_guard() {
     [ "$(keepawake_json_get "$health" isBusy)" = true ] && sawbusy=1
     after="$(keepawake_json_get "$health" lastBusyAtMs)"
     [ -n "$after" ] || after=-
-    if [ "$before" != - ] && [ "$after" != - ] && [ "$after" != "$before" ]; then
-      advanced=1
+    # STRICTLY GREATER, not merely different (empirical gate r1, finding 3).
+    # lastBusyAtMs is a wall-clock millisecond stamp on the gateway's side, and
+    # it can go BACKWARDS: a gateway restart re-initialises it, and the boxes
+    # take real time jumps (that is the very thing we are measuring). A `!=`
+    # test would read a clock that jumped backwards as "the turn refreshed it"
+    # and report parked-ok — a false success in exactly the parked-approval path
+    # this feature exists to diagnose. Non-numeric on either side proves
+    # nothing, so it is not an advance either.
+    if [ "$before" != - ] && [ "$after" != - ]; then
+      case "$before$after" in
+        ''|*[!0-9]*) ;;
+        *) [ "$after" -gt "$before" ] && advanced=1 ;;
+      esac
     fi
     if [ "$parked" = true ]; then
       [ "$advanced" = 1 ] && break

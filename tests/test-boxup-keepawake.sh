@@ -37,6 +37,7 @@
 #   (3)   busyOnlyAwaitingApproval with a static lastBusyAtMs => it FIRES,
 #         records parked-blocked, and WARNs once an hour            [mutant m3]
 #   (3b)  the same with lastBusyAtMs advancing => parked-ok, no WARN
+#   (3c)  the same with lastBusyAtMs going BACKWARDS => parked-blocked  [m16]
 #   (4)   /health unreachable => rc 0, `unreachable`, the MAIN stamp is NOT
 #         advanced, the RETRY stamp is                         [mutants m5, m6]
 #   (4b)  the 90 s retry floor: a tick 15 s later makes no curl call, a tick
@@ -49,8 +50,9 @@
 #   (10)  a 500 / "accepted":false => `refused`, main stamp advanced [mutant m9]
 #   (11)  EVERY outcome appends exactly one rc= line to the attempt log,
 #         skips and unreachables included                          [mutant m10]
-#   (12)  tests/keepawake-readout.sh classifies the seven fixture days
-#                                                   [mutants m11, m12, m13]
+#   (12)  tests/keepawake-readout.sh classifies the fixture days, counts ALL
+#         seven rc tokens, and refuses a contradicted off-days input
+#                                    [mutants m11, m12, m13, m14, m15]
 #   (13)  keepawake_guard is wired into run_tick outside the converge lock, and
 #         converge writes the jumps baseline
 #   (14)  the two gateway seams survive require_root's sudo re-exec
@@ -363,6 +365,24 @@ else
 fi
 
 # ===========================================================================
+# (3c) The r1 empirical gate's finding 3. lastBusyAtMs is a wall-clock stamp on
+# the gateway's side and it can go BACKWARDS — a gateway restart re-initialises
+# it, and these boxes take real time jumps, which is the very thing the feature
+# measures. A clock that moved from 4000 to 3000 did NOT get refreshed by our
+# turn, so this must be parked-blocked. Testing `!=` instead of `>` reports it as
+# parked-ok: a false success in exactly the path the feature exists to diagnose.
+# ===========================================================================
+o="$(run_case "$(h_parked 4000)
+$(h_parked 3000)" guard)"
+if [ "$(field "$(r1 "$o")" record)" = parked-blocked ] \
+   && attempts "$o" | grep -q 'rc=parked-blocked before=4000 after=3000' \
+   && printf '%s\n' "$(logs "$o")" | grep -q 'clock NOT refreshed'; then
+  pass "(3c) a lastBusyAtMs that moved BACKWARDS is parked-blocked, not parked-ok  [mutant m16]"
+else
+  bad  "(3c) a regressed clock was read as a refresh: [$(r1 "$o")] attempts=[$(attempts "$o")]"
+fi
+
+# ===========================================================================
 # (4) MUTANTS m5 and m6. curl exits 7 (connection refused): the tick must NOT
 # fail (m5), the MAIN cadence stamp must NOT advance (m6 — otherwise a gateway
 # that was down for one tick costs a whole 20-minute window), and the DEDICATED
@@ -656,6 +676,16 @@ mkfixture b4 2026-09-03 36:ok 36:skip                           # => exercised
 mkfixture b5 2026-09-03 20:ok 20:skip 10:inert 22:unreachable   # => unclassified
 mkfixture b6 2026-09-03 40:ok                                   # => exercised (32 absent)
 mkfixture b7 2026-09-03 20:ok                                   # => unclassified (52 absent)
+# b8: two sparse days with a completely ABSENT day between them. 2026-09-04 has
+# no attempt line at all, which is the ONLY shape an `off` day can legitimately
+# take — an off guard writes nothing.
+mkfixture b8 2026-09-03 5:ok                                    # => unclassified
+mkfixture b8 2026-09-05 5:ok                                    # => unclassified
+printf '2026-09-04\n' > "$FIX/b8/off-days"
+# b9: a whole day of parked-blocked fires. The r1 empirical gate found the
+# readout DROPPED this token outright — no row, no warning, rc 0 — so a real
+# box-day of blocked fires vanished from the evidence entirely.
+mkfixture b9 2026-09-03 72:parked-blocked                       # => unclassified
 # an unreachable line in its real `before=- after=-` shape must parse too
 printf '2026-09-03T23:50:05Z rc=unreachable before=- after=-\n' >> "$FIX/b5/boxup-keepawake.log"
 mkjump b1 2026-09-03    # exercised day  => IN the numerator
@@ -672,6 +702,7 @@ want=""
 [ "$(cls b5)" = unclassified ] || want="$want b5=$(cls b5)"
 [ "$(cls b6)" = exercised    ] || want="$want b6=$(cls b6)"
 [ "$(cls b7)" = unclassified ] || want="$want b7=$(cls b7)"
+[ "$(cls b9)" = unclassified ] || want="$want b9=$(cls b9)"
 if [ -z "$want" ]; then
   pass "(12a) the seven fixture days classify exactly as the blueprint states  [mutants m12, m13]"
 else
@@ -683,23 +714,68 @@ if printf '%s\n' "$ro" | grep -q 'exercised box-days: 3  (boxes: 3)' \
 else
   bad  "(12b) denominator/numerator wrong: [$(printf '%s\n' "$ro" | grep -E 'exercised box-days|jumps in')]"
 fi
-if printf '%s\n' "$ro" | awk '$1 == "b6" { exit !($11 == 32 && $4 == 40) }'; then
+# NOTE the row-existence guard on this and (12f): `awk '$1 == "b6" {...}'` on a
+# table with NO b6 row matches nothing and exits 0, so the assertion would pass
+# vacuously exactly when the readout had dropped the box entirely. That is not
+# hypothetical — it is how mutant m14 first slipped past (12f).
+b6row="$(printf '%s\n' "$ro" | grep '^b6 ' || true)"
+if [ -n "$b6row" ] && printf '%s\n' "$b6row" | awk '{ exit !($11 == 32 && $4 == 40) }'; then
   pass "(12c) absent slots are counted as missing (b6: 40 ok, 32 missing) and the day still counts"
 else
-  bad  "(12c) missing-slot accounting wrong: [$(printf '%s\n' "$ro" | grep '^b6')]"
+  bad  "(12c) missing-slot accounting wrong: [${b6row:-NO-ROW}]"
 fi
 if printf '%s\n' "$ro" | grep -q 'verdict: INSUFFICIENT'; then
   pass "(12d) 3 exercised box-days is below the 20-day / 5-box floor => INSUFFICIENT, no verdict"
 else
   bad  "(12d) a verdict was issued on 3 box-days: [$(printf '%s\n' "$ro" | grep verdict)]"
 fi
-# off-days: the one classification that cannot come from the attempt log.
-printf 'all\n' > "$FIX/b7/off-days"
-ro2="$(bash "$READOUT" "$FIX" 2>/dev/null)"
-if [ "$(printf '%s\n' "$ro2" | awk '$1 == "b7" { print $NF }')" = off ]; then
-  pass "(12e) a day recorded in off-days classifies as off (rule 1 precedes everything)"
+# ---------------------------------------------------------------------------
+# (12f) THE r1 EMPIRICAL GATE'S FINDING 1. Every one of the seven rc tokens must
+# be counted and must reach the table. `parked-blocked` was missing from the
+# readout's rank function, so a day of blocked fires was rejected as an unknown
+# outcome and disappeared: no row, no warning, rc 0, zero days — a real box-day
+# of evidence deleted. It must appear, with its 72 slots accounted for, and it
+# must NOT be exercised (the fire was accepted but the idle clock never moved).
+# ---------------------------------------------------------------------------
+b9row="$(printf '%s\n' "$ro" | grep '^b9 ' || true)"
+if [ -n "$b9row" ] && printf '%s\n' "$b9row" | awk '{ exit !($10 == 72 && $11 == 0 && $NF == "unclassified") }'; then
+  pass "(12f) parked-blocked lines are counted, land in the table, and are NOT exercised  [mutant m14]"
 else
-  bad  "(12e) off-days ignored: [$(printf '%s\n' "$ro2" | grep '^b7')]"
+  bad  "(12f) parked-blocked dropped or miscounted: [${b9row:-NO-ROW}]"
+fi
+# the memo's exact repro: a log holding ONE parked-blocked line must still row.
+SOLO="$(mktemp -d)"; mkdir -p "$SOLO/solo"
+printf '2026-09-03T04:20:11Z rc=parked-blocked before=1000 after=1000\n' > "$SOLO/solo/boxup-keepawake.log"
+if [ "$(bash "$READOUT" "$SOLO" 2>/dev/null | awk '$1 == "solo" { print $10 }')" = 1 ]; then
+  pass "(12f-ii) a log of a SINGLE parked-blocked line still produces a box-day row"
+else
+  bad  "(12f-ii) a lone parked-blocked line produced no row: [$(bash "$READOUT" "$SOLO" 2>&1 | tail -3)]"
+fi
+rm -rf "$SOLO"
+
+# ---------------------------------------------------------------------------
+# (12e) THE r1 EMPIRICAL GATE'S FINDING 2. `off-days` is the one input the
+# readout cannot derive, and it is operator-supplied, so it is checked against
+# the evidence instead of trusted over it. A day the box recorded attempts on
+# was NOT off, and letting the input win there would let a hand-written date
+# delete a real — possibly abandon-ward — box-day from the denominator.
+#   (i)  a day WITH attempts listed as off => the whole run is REFUSED, rc 3,
+#        no table and no verdict
+#   (ii) a day with NO attempt lines at all => off, as rule 1 intends
+# ---------------------------------------------------------------------------
+if [ "$(printf '%s\n' "$ro" | awk '$1 == "b8" && $2 == "2026-09-04" { print $NF }')" = off ]; then
+  pass "(12e-i) a fully ABSENT day listed in off-days classifies as off (rule 1)"
+else
+  bad  "(12e-i) an absent off-day was not honoured: [$(printf '%s\n' "$ro" | grep '^b8')]"
+fi
+printf 'all\n' > "$FIX/b7/off-days"
+ro2="$(bash "$READOUT" "$FIX" 2>"$FIX/err")"; rc2=$?
+if [ "$rc2" = 3 ] \
+   && grep -q 'REFUSED off-days for b7 2026-09-03: the day has 20 attempt line(s)' "$FIX/err" \
+   && ! printf '%s\n' "$ro2" | grep -q 'verdict:'; then
+  pass "(12e-ii) off-days on a day WITH attempts is refused (rc 3, no table, no verdict)  [mutant m15]"
+else
+  bad  "(12e-ii) an off-days conflict was applied instead of refused: rc=$rc2 err=[$(cat "$FIX/err")]"
 fi
 rm -rf "$FIX"
 
