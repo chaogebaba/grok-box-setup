@@ -207,6 +207,58 @@ toward abandoning the mechanism, which is the cheap error: abandoning costs one
 config key to reverse, while keeping a mechanism that does not work costs 792
 model turns a day across the fleet.
 
+## Job runner
+
+Since 5.5.0 a box can run a **job**: a detached process started by one short
+ssh, recorded durably, and supervised by the worker tick. There are two kinds
+and one runner. `run` is ad-hoc CI — a wall-clock cap enforced on the box, the
+rc recorded on exit, `124` on the cap. `service` is long-lived — no cap, and the
+tick restarts it whenever it is not live, including after an image swap.
+
+```
+boxup job start <id> [--kind run|service] [--cap <s>] [--keep-alive] \
+                     [--cwd <dir>] [--no-restart-on-swap] -- <cmd...>
+boxup job status <id>          # one key=value line, the brain's whole channel
+boxup job log <id> [<offset>]  # raw bytes from that offset, <=1 MiB per call
+boxup job stop <id>            # TERM the process group, KILL after 10 s
+boxup job ls
+boxup job prune
+```
+
+A box runs **one job at a time**. The slot is an atomic `mkdir` under
+`$RUN_DIR/jobs/`; a second start returns **rc 75**. Durable state lives in
+`/workspace/jobs/<id>/` (`cmd`, `cwd`, `kind`, `cap`, `pgid`, `started`, `rc`,
+`ended`, `log`, `truncations`, `truncated_total`) and survives an image swap.
+**Liveness** lives in `$RUN_DIR/jobs/` and does not: a swap clears it, which is
+how a swap is detected without asking the kernel anything. A job is live iff its
+marker exists, the pid in it is alive, and that pid's `/proc` cmdline is the
+job's own wrapper. The recorded `pgid` is only ever used to signal — after a
+swap pids restart from 1, so a recorded number can belong to anything.
+
+`status` derives its state from those files:
+
+| state | how |
+|---|---|
+| `done` / `failed` / `timeout` | an `rc` file: 0, non-zero, or 124 from the cap |
+| `stopped` | `boxup job stop` (rc 143) |
+| `crashloop` | 5 keep-alive restarts inside 10 minutes; the guard gives up |
+| `running` | the marker is live and is this job's wrapper |
+| `lost:died` | the marker is there, the process is not |
+| `lost:image-swap` | the marker is gone and no `rc` was ever written |
+
+Logs are bounded at **64 MiB** by truncation **in place** — never by rename,
+because the wrapper holds one append descriptor across the whole job and a
+rename would leave it writing into a file nobody reads. The truncation is the
+disk guard's own single-syscall mutator, so it inherits every safety gate,
+including the symlink refusal that a job's own command can make reachable. Each
+event bumps `truncations` and `truncated_total`, which `status` reports: the
+brain detects a truncation from the counter, never from a size. `/workspace/jobs`
+records are pruned 7 days after a terminal state and bounded to the 20 most
+recent, and `disk_guard` can reclaim a job log under disk pressure through a
+built-in allowlist entry that a `DISK_GUARD_TRUNCATE` override cannot remove.
+
+The status line gains `job=<id|-> job_state=<state|->`, appended last.
+
 ## Fleet operations (laptop)
 
 `boxup` runs on a box; [`grokfleet`](fleet/) runs on the operator's laptop and

@@ -13,15 +13,23 @@ jobs:
       - name: syntax
         run: |
           set -e
+          # Keep this list in step with the Makefile `lint` target. It named
+          # the retired bash `fleetctl` (deleted in the phase-3 cutover, so this
+          # step could only fail) and omitted vps/install-vps.sh and the two
+          # release scripts that the Makefile already covers.
           bash -n boxup
-          bash -n fleetctl
           bash -n install.sh
           bash -n box-bootstrap.sh
+          bash -n vps/install-vps.sh
+          bash -n fleet/scripts/release-build.sh
+          bash -n fleet/scripts/release-publish.sh
+          bash -n tests/test-rename-allowlist.sh
       - name: shellcheck
         run: |
           set -e
           sudo apt-get install -y -qq shellcheck
-          shellcheck -S warning boxup fleetctl install.sh box-bootstrap.sh
+          shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh \
+            fleet/scripts/release-build.sh fleet/scripts/release-publish.sh
       - name: version match
         run: |
           set -e

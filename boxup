@@ -14,6 +14,8 @@
 #   boxup stop      stop the selfheal worker (tailscaled stays up)
 #   boxup update    fresh clone from GitHub + reinstall (never git pull)
 #   boxup worker    internal: the selfheal loop
+#   boxup job       start|status|log|stop|ls|prune an ad-hoc or long-lived job
+#   boxup job-wrapper  internal: the supervised body of ONE job
 #
 # Environment contract (see docs/DESIGN.md): Debian in a Cursor sand container,
 # PID 1 is tini, no systemd, no cron. The box sleeps when idle and the whole
@@ -30,7 +32,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.4.0
+BOXUP_VERSION=5.5.0
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -2069,6 +2071,19 @@ BOXUP_DISK_TRUNCATE_MIN_BYTES="${BOXUP_DISK_TRUNCATE_MIN_BYTES:-1073741824}"  # 
 # Nothing outside it is ever touched. Env-overridable so the gate can point the
 # guard at a canary file instead of the real platform log.
 DISK_GUARD_TRUNCATE="${DISK_GUARD_TRUNCATE:-/tmp/sand-host.log}"
+# grokfleet-jobs J6 (r9-B1/r10-B1): a SECOND allowlist that is BUILT IN and
+# deliberately NOT env-overridable. Job logs are bounded by truncation through
+# disk_truncate_one, whose FIRST gate is disk_allowlisted — so with only the
+# overridable list an operator override that dropped this entry would silently
+# disable the 64 MiB per-job bound as well as the pressure reclaim. Both
+# CONSUMERS of the allowlist walk this list after the overridable one: the
+# checker disk_allowlisted() and, separately, disk_guard()'s candidate loop
+# (they are two consumers of the same variable, and changing only the checker
+# leaves the reclaim broken). The value is a GLOB PATTERN and both loops expand
+# it UNQUOTED — word splitting AND pathname expansion are the point; quoting it
+# leaves the pattern literal and makes every exact comparison fail silently,
+# which is why the SC2086 suppression rides along.
+DISK_GUARD_BUILTIN_TRUNCATE="${BOX_SETUP_JOBS:-/workspace/jobs}/*/log"
 # The tick is 15s; re-reading df four times a minute buys nothing.
 BOXUP_DISK_INTERVAL="${BOXUP_DISK_INTERVAL:-60}"
 DISK_STATE="$RUN_DIR/disk"                  # "<pct>% <level> <epoch>"
@@ -2108,6 +2123,10 @@ disk_allowlisted() {
   for p in $DISK_GUARD_TRUNCATE; do
     [ "$p" = "$want" ] && return 0
   done
+  # ... then the BUILT-IN list, which an override cannot remove (J6, r9-B1).
+  for p in $DISK_GUARD_BUILTIN_TRUNCATE; do
+    [ "$p" = "$want" ] && return 0
+  done
   return 1
 }
 
@@ -2123,8 +2142,27 @@ disk_allowlisted() {
 #   * the write runs as the file's OWNER (see the section header).
 # Returns 0 iff it truncated. Never deletes and never creates: `truncate -c`
 # leaves a missing file missing.
+#
+# grokfleet-jobs J6 adds TWO optional parameters and changes NOTHING about the
+# gates or their order (r8-B1/r9-n1; the pre-existing optional parameter is the
+# percentage):
+#   <floor_bytes>  the size floor for THIS call. The default,
+#                  BOXUP_DISK_TRUNCATE_MIN_BYTES, is 1 GiB — sized for
+#                  disk-pressure reclaim, not for the per-job log bound sixteen
+#                  times smaller, against which every call would return 1 and
+#                  nothing would ever truncate.
+#   <log_prefix>   the log-line prefix. The job bound is a routine per-job
+#                  event, not a disk emergency, so it must not print under
+#                  `disk-guard:` with a percentage of minus one.
+# It also owns the job-log truncation COUNTERS: bumping them here, after the
+# gates pass and the truncation succeeds, is what makes `disk_guard`'s pressure
+# reclaim of a job log move the same counters as the per-job bound (r7-B1). One
+# mutator, both properties — a job-specific helper beside it would have skipped
+# the symlink refusal, which a job's own `cmd` can make reachable by replacing
+# its log with a link.
 disk_truncate_one() {
-  local f="$1" pct="${2:--1}" owner size me rc
+  local f="$1" pct="${2:--1}" floor="${3:-$BOXUP_DISK_TRUNCATE_MIN_BYTES}" \
+        prefix="${4:-disk-guard}" owner size me rc
   disk_allowlisted "$f" || return 1
   # ORDER IS LOAD-BEARING: the symlink refusal must stay ABOVE the size floor.
   # A symlink is rejected whatever its size, and neither line below can stand in
@@ -2139,7 +2177,8 @@ disk_truncate_one() {
   [ -f "$f" ] || return 1
   size=$(stat -c %s "$f" 2>/dev/null || echo 0)
   case "$size" in ''|*[!0-9]*) size=0 ;; esac
-  [ "$size" -gt "$BOXUP_DISK_TRUNCATE_MIN_BYTES" ] || return 1
+  case "$floor" in ''|*[!0-9]*) floor="$BOXUP_DISK_TRUNCATE_MIN_BYTES" ;; esac
+  [ "$size" -gt "$floor" ] || return 1
   owner=$(stat -c %U "$f" 2>/dev/null || echo "")
   [ -n "$owner" ] || return 1
   me=$(id -un 2>/dev/null || echo "")
@@ -2164,10 +2203,17 @@ disk_truncate_one() {
     fi
   fi
   if [ "$rc" -eq 0 ]; then
-    log "disk-guard: truncated $f ($size B, root ${pct}%)"
+    # The counters live here so BOTH callers move them (r7-B1/j34).
+    case "$f" in
+      "$JOBS_DIR"/*/log) jobs_record_truncation "${f%/log}" "$size" ;;
+    esac
+    case "$pct" in
+      ''|-*|*[!0-9]*) log "$prefix: truncated $f ($size B)" ;;
+      *)              log "$prefix: truncated $f ($size B, root ${pct}%)" ;;
+    esac
     return 0
   fi
-  log "disk-guard: could not truncate $f ($size B, owner=$owner) as its owner — NOT retrying as root (fs.protected_regular would refuse it)" >&2
+  log "$prefix: could not truncate $f ($size B, owner=$owner) as its owner — NOT retrying as root (fs.protected_regular would refuse it)" >&2
   return 1
 }
 
@@ -2191,7 +2237,11 @@ disk_guard() {
   level=$(disk_level "$pct")
   if [ "$level" = fail ]; then
     # shellcheck disable=SC2086  # word splitting is the point (space-separated list)
-    for f in $DISK_GUARD_TRUNCATE; do
+    # BOTH lists (J6, r10-B1): disk_allowlisted is the checker, this is the
+    # CANDIDATE loop — two separate consumers of the same variable. Walking the
+    # built-in list only in the checker would leave the pressure reclaim unable
+    # to name a job log at all under an override.
+    for f in $DISK_GUARD_TRUNCATE $DISK_GUARD_BUILTIN_TRUNCATE; do
       [ -n "$f" ] || continue
       disk_truncate_one "$f" "$pct" || true
     done
@@ -2601,6 +2651,690 @@ keepawake_status_tokens() {
     "$on" "$lastiso" "$rc" "$(keepawake_jumps)"
 }
 
+# --- job runner (blueprint grokfleet-jobs J1/J2/J6/J9) -----------------------
+# A job is a detached process on THIS box, started by ONE short ssh, recorded
+# DURABLY under $JOBS_DIR/<id>/ and supervised by the tick. The brain never
+# holds a long ssh open: it starts, polls `job status`, fetches `job log` by
+# offset, and stops. Consequences that are the point (J1):
+#   * a paused box FREEZES a job and it resumes with the box;
+#   * a VPS/API restart loses nothing (the record is here, on /workspace);
+#   * an image swap kills the process but keeps the record, and the swap is
+#     detected with NO kernel identity at all — $RUN_DIR is cleared by the swap
+#     for free, exactly as WORKER_PID/TUNNEL_PID already rely on (boxup:1785,
+#     :2280). A record with no `rc` and no $RUN_DIR marker IS the swap case.
+#
+# TWO KINDS, ONE RUNNER (J2). `kind=run` is ad-hoc CI: a wall-clock cap enforced
+# BOX-SIDE by the wrapper's own watchdog, rc recorded on exit, 124 on the cap.
+# `kind=service` is long-lived: no cap, `keep_alive=1` so this guard restarts it
+# whenever it is not LIVE and no `rc` exists, and `restart_on_swap=1` so it comes
+# back after an image swap. Both kinds write the same files.
+#
+# THE ONE LIVENESS RULE (J2, r2-B1). A job is LIVE iff
+#   (a) its marker $JOBS_RUN_DIR/<id>.pid exists, AND
+#   (b) the pid in that marker is alive, AND
+#   (c) is_job_wrapper_proc <pid> <id> holds.
+# EVERY liveness question — `status`, the slot stale-break, the keep-alive
+# restart, `stop`'s post-kill check — asks exactly this. The durable `pgid` is
+# for SIGNALLING ONLY (`stop` and the crashloop kill) and is NEVER read as
+# liveness: after a swap pids restart from 1 in a fresh namespace, so a recorded
+# pgid in the low thousands is a plausible number for an unrelated process.
+# BOX_SETUP_JOBS is a documented seam in the shape of BOX_SETUP_RUN/BOX_SETUP_LOG
+# (and it is forwarded across require_root's sudo re-exec for the same reason):
+# it lets a gate point the whole runner at a scratch tree. It relocates the jobs
+# ROOT, and DISK_GUARD_BUILTIN_TRUNCATE below is derived FROM it, so the job-log
+# allowlist entry moves with the tree instead of being lost — which is the
+# property r9-B1 asked for. It grants no authority: `boxup job` is root-only on a
+# box where root is already passwordless.
+JOBS_DIR="${BOX_SETUP_JOBS:-/workspace/jobs}"   # durable records (survive a swap)
+JOBS_RUN_DIR="$RUN_DIR/jobs"        # liveness: the slot + per-job pid markers
+JOBS_SLOT="$JOBS_RUN_DIR/.slot"     # atomic mkdir; ONE job per box (box-run.sh)
+JOBS_LOG_MAX_BYTES=67108864         # 64 MiB, the per-job log bound (J6)
+JOBS_LOG_FETCH_MAX=1048576          # 1 MiB, the per-`job log` call bound
+JOBS_DEFAULT_CAP=2400               # box-run.sh's default wall-clock cap
+JOBS_STOP_GRACE_S=10                # SIGTERM -> SIGKILL window
+JOBS_RETAIN_DAYS=7                  # age prune of terminal records
+JOBS_RETAIN_COUNT=20                # count prune of terminal records (r1-B3)
+JOBS_SLOT_AGE_BACKSTOP_S=86400      # 24 h: the second stale-slot discriminator
+JOBS_CRASHLOOP_N=5                  # 5 restarts ...
+JOBS_CRASHLOOP_WINDOW_S=600         # ... within 10 min => rc=crashloop
+
+# is_job_wrapper_proc <pid> <id>: true iff /proc/<pid>/cmdline is EXACTLY the
+# job wrapper for <id> — the fields `*boxup`, `job-wrapper` and `<id>` all
+# present as WHOLE argv fields, and NO `-c` field anywhere.
+#
+# This is is_worker_proc (below) extended, and the discipline comes with it:
+# read the cmdline NUL-separated and compare whole fields, never a substring of
+# the flattened line. The house rule at the top of this file was learned the
+# hard way ("never pkill -f"), and this design re-creates the same hazard on
+# purpose — the brain runs `boxup job status <id>` and `boxup job log <id> <n>`
+# against the very id being scanned, so a substring match on <id> would find the
+# brain's own poll, conclude the wrapper is alive, and never restart the service
+# (r3-B1). The `-c` rejection excludes the job's own `sh -c "$cmd"` child and the
+# `timeout ... sh -c` watchdog, which carry the command text and may mention the
+# id inside it. `job status <id>` is excluded because its subcommand field is
+# `status`, not `job-wrapper` — which is why the wrapper gets an argv shape of
+# its own instead of being launched through a shell (r3-B1, mutants j28/j29).
+is_job_wrapper_proc() {
+  local pid="$1" id="$2" arg have_script=0 have_wrapper=0 have_id=0 have_c=0
+  [ -n "$id" ] || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  while IFS= read -r -d '' arg; do
+    case "$arg" in
+      -c) have_c=1 ;;
+    esac
+    [ "$arg" = job-wrapper ] && have_wrapper=1
+    [ "$arg" = "$id" ] && have_id=1
+    case "$arg" in
+      *boxup) have_script=1 ;;
+    esac
+  done < "/proc/$pid/cmdline" 2>/dev/null || return 1
+  [ "$have_c" = 0 ] && [ "$have_script" = 1 ] && \
+    [ "$have_wrapper" = 1 ] && [ "$have_id" = 1 ]
+}
+
+# jobs_rec <id> -> the durable record directory. Never creates it.
+jobs_rec() {
+  printf '%s/%s' "$JOBS_DIR" "$1"
+}
+
+# jobs_marker <id> -> the EPHEMERAL liveness marker under $RUN_DIR.
+jobs_marker() {
+  printf '%s/%s.pid' "$JOBS_RUN_DIR" "$1"
+}
+
+# jobs_read <recdir> <file> [default]: trimmed content, or the default.
+jobs_read() {
+  local v=""
+  [ -f "$1/$2" ] && v=$(tr -d '[:space:]' < "$1/$2" 2>/dev/null || true)
+  [ -n "$v" ] || v="${3:-}"
+  printf '%s' "$v"
+}
+
+# jobs_read_raw <recdir> <file>: content WITHOUT whitespace stripping (cmd/cwd).
+jobs_read_raw() {
+  [ -f "$1/$2" ] || return 1
+  cat "$1/$2" 2>/dev/null
+}
+
+# jobs_valid_id <id>: base64url only. A job id may legitimately start with `-`,
+# so nothing here may treat it as an option; it may never contain `/` or `.`,
+# which is what keeps it a single path component.
+jobs_valid_id() {
+  case "${1:-}" in
+    '') return 1 ;;
+    *[!A-Za-z0-9_-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# jobs_live <id>: THE ONE LIVENESS RULE (J2). See the section header.
+jobs_live() {
+  local id="$1" m pid
+  m="$(jobs_marker "$id")"
+  [ -f "$m" ] || return 1
+  pid=$(tr -d '[:space:]' < "$m" 2>/dev/null || true)
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  is_job_wrapper_proc "$pid" "$id" || return 1
+  return 0
+}
+
+# jobs_scan_wrapper <id>: print the pid of a live wrapper for <id>, or nothing.
+# ONLY `start` and the keep-alive restart path scan; `status` never does — it is
+# a TARGETED check on the marker's own pid, so a concurrent poll cannot fool it
+# (r3-n1). The scan closes the duplicate-service case: a live wrapper whose
+# marker was lost must have its marker RE-CREATED, not a second instance
+# launched beside it (mutant j27).
+jobs_scan_wrapper() {
+  local id="$1" d pid
+  for d in /proc/[0-9]*; do
+    pid="${d##*/}"
+    is_job_wrapper_proc "$pid" "$id" || continue
+    printf '%s' "$pid"
+    return 0
+  done
+  return 1
+}
+
+# jobs_terminal <recdir>: true iff an `rc` file exists (the terminal marker).
+jobs_terminal() {
+  [ -f "$1/rc" ]
+}
+
+# jobs_state <id>: the derived state, from the FILES (J9). Order is
+# load-bearing:
+#   rc present                                        -> terminal
+#   marker present, pid alive, IS the <id> wrapper     -> running
+#   marker present, pid dead OR not the wrapper, no rc -> lost:died
+#   marker ABSENT, no rc                               -> lost:image-swap
+# A missing `rc` file is NEVER `done` (mutant j15): a job that was killed before
+# it could record anything is lost, not successful.
+jobs_state() {
+  local id="$1" rec rc m
+  rec="$(jobs_rec "$id")"
+  [ -d "$rec" ] || { printf 'unknown'; return 1; }
+  if [ -f "$rec/rc" ]; then
+    rc="$(jobs_read "$rec" rc)"
+    if [ -f "$rec/stopped" ]; then printf 'stopped'; return 0; fi
+    case "$rc" in
+      crashloop) printf 'crashloop' ;;
+      0)         printf 'done' ;;
+      124)       if [ "$(jobs_read "$rec" kind run)" = run ]; then
+                   printf 'timeout'
+                 else
+                   printf 'failed'
+                 fi ;;
+      *)         printf 'failed' ;;
+    esac
+    return 0
+  fi
+  m="$(jobs_marker "$id")"
+  if [ -f "$m" ]; then
+    if jobs_live "$id"; then printf 'running'; else printf 'lost:died'; fi
+  else
+    printf 'lost:image-swap'
+  fi
+  return 0
+}
+
+# --- the one-job-per-box slot ------------------------------------------------
+# $JOBS_RUN_DIR/.slot is an ATOMIC mkdir, and it lives under $RUN_DIR so an
+# image swap clears it for free (r1-B1) — the wedged-box failure of a durable
+# lock with no way to break it cannot happen here. It records the job id, not a
+# pid: staleness is decided by the ONE liveness rule, never by a recorded pgid
+# (mutant j26), with the 24 h age check as a second discriminator for a slot so
+# corrupt it names no readable id (mutant j2 makes the break age-only).
+
+jobs_slot_id() {
+  [ -d "$JOBS_SLOT" ] || return 1
+  local id
+  id=$(tr -d '[:space:]' < "$JOBS_SLOT/id" 2>/dev/null || true)
+  [ -n "$id" ] || return 1
+  printf '%s' "$id"
+}
+
+jobs_slot_release() {
+  rm -rf "$JOBS_SLOT" 2>/dev/null || true
+}
+
+# jobs_slot_held: 0 iff the slot is genuinely occupied. Held while the job it
+# names is LIVE, or has a live wrapper whose marker was lost, or is a keep-alive
+# job that has not reached a terminal state (the guard still owns it and will
+# restart it — releasing the slot in that window would let another job take it
+# and strand the service).
+jobs_slot_held() {
+  local id rec age at now
+  [ -d "$JOBS_SLOT" ] || return 1
+  if ! id="$(jobs_slot_id)"; then
+    # A slot naming no id is corrupt. Break it only past the age backstop, so a
+    # start racing its own slot-write is never robbed of it.
+    now=$(date +%s); at=0
+    [ -f "$JOBS_SLOT/at" ] && at=$(tr -d '[:space:]' < "$JOBS_SLOT/at" 2>/dev/null || echo 0)
+    case "$at" in ''|*[!0-9]*) at=0 ;; esac
+    age=$((now - at))
+    if [ "$at" -gt 0 ] && [ "$age" -ge "$JOBS_SLOT_AGE_BACKSTOP_S" ]; then
+      log "jobs_guard: WARN breaking a corrupt job slot (no id, age=${age}s)" >&2
+      jobs_slot_release
+      return 1
+    fi
+    return 0
+  fi
+  jobs_live "$id" && return 0
+  jobs_scan_wrapper "$id" >/dev/null 2>&1 && return 0
+  rec="$(jobs_rec "$id")"
+  if [ -d "$rec" ] && ! jobs_terminal "$rec" && \
+     [ "$(jobs_read "$rec" keep_alive 0)" = 1 ]; then
+    return 0
+  fi
+  now=$(date +%s); at=0
+  [ -f "$JOBS_SLOT/at" ] && at=$(tr -d '[:space:]' < "$JOBS_SLOT/at" 2>/dev/null || echo 0)
+  case "$at" in ''|*[!0-9]*) at=0 ;; esac
+  age=$((now - at))
+  log "jobs: WARN breaking a STALE job slot id=$id (no live wrapper, age=${age}s)" >&2
+  jobs_slot_release
+  return 1
+}
+
+# --- log bound (J6) ----------------------------------------------------------
+# The wrapper's stdout+stderr is ONE append descriptor, opened once by
+# spawn_detached and inherited across the exec. So the log is bounded by
+# IN-PLACE TRUNCATION and NEVER by rename-rotation: a rename would leave the
+# wrapper writing into the renamed inode and the visible log empty forever
+# (r4-B1 — the rename form used for $KEEPAWAKE_LOG is correct only because
+# every write there reopens the file). Mutant j30 does exactly that.
+#
+# The truncation goes through disk_truncate_one, the guard's SOLE mutator, so it
+# inherits EVERY gate — above all the symlink refusal, which is load-bearing
+# here specifically: a job's own `cmd` runs on this box and can replace its log
+# with a symlink, which is the classic way to turn a log truncator into an
+# arbitrary-file truncator (r7-B1, mutant j35). The explicit floor argument is
+# required because the mutator's default floor is 1 GiB, sized for disk-pressure
+# reclaim, not for a per-job bound sixteen times smaller (r8-B1, mutant j36).
+jobs_bound_logs() {
+  local d id sz
+  for d in "$JOBS_DIR"/*; do
+    [ -d "$d" ] || continue
+    [ -f "$d/log" ] || continue
+    # -L DEREFERENCES on purpose. `stat -c %s` on a symlink reports the LINK's
+    # own size (~26-70 bytes, its pathname), which is below the bound — so a job
+    # that replaced its log with a link to a huge file would slip past this
+    # pre-check and the mutator's symlink refusal would never be reached. That
+    # is the same masking the disk guard's r1 gate caught between its `-L` line
+    # and its size floor. Dereferencing here means the link IS offered to the
+    # mutator, which refuses it, and the refusal is WARNed below.
+    sz=$(stat -Lc %s "$d/log" 2>/dev/null || echo 0)
+    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    [ "$sz" -gt "$JOBS_LOG_MAX_BYTES" ] || continue
+    id="${d##*/}"
+    # A REFUSAL is never silent. The mutator returns 1 for a symlink, a
+    # non-regular file, or a path off both allowlists — and a job's own command
+    # can create the first of those under its own record directory, so an
+    # operator has to be able to see why a log stopped being bounded.
+    disk_truncate_one "$d/log" -1 "$JOBS_LOG_MAX_BYTES" "jobs_guard: job=$id" || \
+      log "jobs_guard: WARN job=$id log is over the bound ($sz B) and the guard REFUSED to truncate it (symlink, not a regular file, or not allowlisted)" >&2
+  done
+}
+
+# jobs_record_truncation <recdir> <bytes>: the TWO durable counters, bumped from
+# INSIDE disk_truncate_one after its gates pass and the truncation succeeds, so
+# `disk_guard`'s pressure reclaim of a job log moves them exactly as the per-job
+# bound does — one mutator, both properties (r7-B1, mutant j34). Both counters
+# are REPORTED on the status line: the brain must never infer a truncation from
+# sizes, because a fast writer's new generation can already be larger than the
+# brain's old offset by the next poll (r6-B1, mutant j33).
+jobs_record_truncation() {
+  local rec="$1" bytes="$2" n t
+  [ -d "$rec" ] || return 0
+  n=$(jobs_read "$rec" truncations 0); case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  t=$(jobs_read "$rec" truncated_total 0); case "$t" in ''|*[!0-9]*) t=0 ;; esac
+  case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+  echo $((n + 1)) > "$rec/truncations" 2>/dev/null || true
+  echo $((t + bytes)) > "$rec/truncated_total" 2>/dev/null || true
+  printf '[log truncated on box at %s after %s bytes]\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$bytes" >> "$rec/log" 2>/dev/null || true
+}
+
+# --- supervision (J2/J9) -----------------------------------------------------
+# Restart bookkeeping is EPHEMERAL, under $RUN_DIR: an image swap legitimately
+# resets it, because a swap-restart is not a crashloop.
+jobs_restart_state() {
+  printf '%s/%s.restarts' "$JOBS_RUN_DIR" "$1"
+}
+
+# jobs_restart_one <id>: relaunch the wrapper for a keep-alive job, honouring the
+# backoff ladder and the crashloop cutoff. Returns 0 iff it launched.
+jobs_restart_one() {
+  local id="$1" rec st n first last now window pid
+  rec="$(jobs_rec "$id")"
+  st="$(jobs_restart_state "$id")"
+  now=$(date +%s)
+  n=0; first=0; last=0
+  if [ -f "$st" ]; then
+    read -r n first last < "$st" 2>/dev/null || true
+  fi
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  case "$first" in ''|*[!0-9]*) first=0 ;; esac
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  # Crashloop: N restarts inside the window and the guard STOPS restarting,
+  # recording rc=crashloop (mutant j6 never crashloops).
+  if [ "$n" -ge "$JOBS_CRASHLOOP_N" ] && [ "$first" -gt 0 ] && \
+     [ $((now - first)) -lt "$JOBS_CRASHLOOP_WINDOW_S" ]; then
+    log "jobs_guard: job=$id CRASHLOOP ($n restarts in $((now - first))s) — not restarting" >&2
+    echo crashloop > "$rec/rc" 2>/dev/null || true
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$rec/ended" 2>/dev/null || true
+    rm -f "$(jobs_marker "$id")" 2>/dev/null || true
+    [ "$(jobs_slot_id 2>/dev/null || true)" = "$id" ] && jobs_slot_release
+    return 1
+  fi
+  # Backoff: the SAME 20->60->180->600 s ladder the tick-repair path uses
+  # (refresh_backoff_window). Mutant j5 restarts with no backoff at all.
+  window=$(refresh_backoff_window "$n")
+  if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$window" ]; then
+    return 1
+  fi
+  # The duplicate-service closure: a live wrapper with no marker gets its marker
+  # RE-CREATED; a second instance is never launched (mutant j27). The scan is
+  # whole-field, so an in-flight `boxup job status <id>` poll is NOT a match.
+  if pid="$(jobs_scan_wrapper "$id")"; then
+    echo "$pid" > "$(jobs_marker "$id")" 2>/dev/null || true
+    log "jobs_guard: job=$id wrapper already live pid=$pid — marker re-created, not restarting"
+    return 1
+  fi
+  [ "$first" -gt 0 ] && [ $((now - first)) -ge "$JOBS_CRASHLOOP_WINDOW_S" ] && { n=0; first=0; }
+  [ "$first" -gt 0 ] || first="$now"
+  n=$((n + 1))
+  echo "$n $first $now" > "$st" 2>/dev/null || true
+  log "jobs_guard: job=$id restarting (attempt=$n window=${window}s)"
+  jobs_launch_wrapper "$id"
+}
+
+# jobs_supervise: the reap + restart pass. There is nothing to `wait` on — the
+# wrapper is fully detached and tini (PID 1) reaps it — so "reaping" here is
+# what actually leaks otherwise: a slot still held by a job that is terminal or
+# can never be restarted. jobs_slot_held does that release as its stale break.
+jobs_supervise() {
+  local d id rec keep swap
+  jobs_slot_held >/dev/null 2>&1 || true
+  for d in "$JOBS_DIR"/*; do
+    [ -d "$d" ] || continue
+    id="${d##*/}"
+    jobs_valid_id "$id" || continue
+    rec="$d"
+    jobs_terminal "$rec" && continue
+    jobs_live "$id" && continue
+    keep="$(jobs_read "$rec" keep_alive 0)"
+    [ "$keep" = 1 ] || continue
+    # An ABSENT marker with no rc is the image-swap case (r1-B1). A service is
+    # restarted after a swap only when restart_on_swap=1; otherwise it stays
+    # `lost:image-swap` for the brain to record.
+    swap=0
+    [ -f "$(jobs_marker "$id")" ] || swap=1
+    if [ "$swap" = 1 ] && [ "$(jobs_read "$rec" restart_on_swap 1)" != 1 ]; then
+      continue
+    fi
+    jobs_restart_one "$id" || true
+  done
+}
+
+# jobs_prune: terminal records are bounded by AGE *and* COUNT (r1-B3, mutant
+# j25 prunes by age only). Count first — twenty 64 MiB logs is already 1.3 GB on
+# a box whose disk pressure needed its own guard.
+jobs_prune() {
+  local d id now cutoff ended ts keep n line
+  [ -d "$JOBS_DIR" ] || return 0
+  now=$(date +%s)
+  cutoff=$((now - JOBS_RETAIN_DAYS * 86400))
+  keep="$(mktemp 2>/dev/null || echo "")"
+  [ -n "$keep" ] || return 0
+  for d in "$JOBS_DIR"/*; do
+    [ -d "$d" ] || continue
+    id="${d##*/}"
+    jobs_valid_id "$id" || continue
+    jobs_terminal "$d" || continue
+    ts=$(stat -c %Y "$d/rc" 2>/dev/null || echo 0)
+    case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+    ended="$(jobs_read "$d" ended_epoch)"
+    case "$ended" in ''|*[!0-9]*) ;; *) ts="$ended" ;; esac
+    printf '%s %s\n' "$ts" "$id" >> "$keep"
+  done
+  n=0
+  while IFS=' ' read -r ts id; do
+    [ -n "$id" ] || continue
+    n=$((n + 1))
+    if [ "$n" -gt "$JOBS_RETAIN_COUNT" ] || [ "$ts" -lt "$cutoff" ]; then
+      log "jobs_guard: pruning terminal record job=$id (rank=$n ended=$ts)"
+      rm -rf "${JOBS_DIR:?}/$id" 2>/dev/null || true
+      rm -f "$(jobs_marker "$id")" "$(jobs_restart_state "$id")" 2>/dev/null || true
+    fi
+  done < <(sort -rn "$keep")
+  rm -f "$keep" 2>/dev/null || true
+  return 0
+}
+
+# jobs_guard: the per-tick entry point (J9). Runs in run_tick right after
+# keepawake_guard, OUTSIDE the converge lock and for the same reason: a tick
+# that loses the lock to an in-progress converge must still supervise jobs.
+# ALWAYS returns 0.
+jobs_guard() {
+  [ -d "$JOBS_DIR" ] || return 0
+  jobs_supervise || true
+  jobs_bound_logs || true
+  jobs_prune || true
+  return 0
+}
+
+# jobs_status_tokens: the `job=` / `job_state=` pair for the status line. The
+# active job is whatever holds the one slot; a terminal job has released it.
+jobs_status_tokens() {
+  local id
+  if id="$(jobs_slot_id)"; then
+    printf 'job=%s job_state=%s' "$id" "$(jobs_state "$id" || true)"
+  else
+    printf 'job=- job_state=-'
+  fi
+}
+
+# --- the wrapper -------------------------------------------------------------
+# jobs_launch_wrapper <id>: the ONLY launch site. spawn_detached is the one
+# detachment primitive in this file (a lint rule enforces that), and it already
+# opens the log ONCE with `>>` and execs the child under it — which is exactly
+# the single inherited O_APPEND descriptor the whole log-bounding design rests
+# on. The argv is `bash <path>/boxup job-wrapper <id>`: an INTERNAL subcommand,
+# never `sh -c`, so is_job_wrapper_proc can identify it (r3-B1, mutant j29).
+jobs_launch_wrapper() {
+  local id="$1" rec
+  rec="$(jobs_rec "$id")"
+  mkdir -p "$JOBS_RUN_DIR" 2>/dev/null || true
+  : >> "$rec/log" 2>/dev/null || true
+  spawn_detached "$rec/log" bash "$SELF" job-wrapper "$id"
+}
+
+# job_wrapper_main <id>: runs AS the detached job. It records its pgid (for
+# SIGNALLING only), plants the liveness marker, runs the command under the
+# box-side watchdog, and records the outcome.
+#
+# A keep-alive job deliberately does NOT write `rc` when its command exits: the
+# absence of `rc` is precisely what tells the guard to restart it. It leaves the
+# marker in place too, so `status` reports `lost:died` (the process died) rather
+# than `lost:image-swap` (the run dir was cleared) in the window before the
+# restart. Only `stop`, the crashloop cutoff, or a non-keep-alive exit write a
+# terminal `rc`.
+job_wrapper_main() {
+  local id="$1" rec cmd cwd cap kind keep pgid rc
+  jobs_valid_id "$id" || { echo "boxup: job-wrapper: invalid id" >&2; return 2; }
+  rec="$(jobs_rec "$id")"
+  [ -d "$rec" ] || { echo "boxup: job-wrapper: no record for $id" >&2; return 2; }
+  mkdir -p "$JOBS_RUN_DIR" 2>/dev/null || true
+  pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]')
+  case "$pgid" in ''|*[!0-9]*) pgid=$$ ;; esac
+  echo "$pgid" > "$rec/pgid" 2>/dev/null || true
+  echo $$ > "$(jobs_marker "$id")" 2>/dev/null || true
+  [ -f "$rec/started" ] || date -u +%Y-%m-%dT%H:%M:%SZ > "$rec/started" 2>/dev/null || true
+  cmd="$(jobs_read_raw "$rec" cmd || true)"
+  cwd="$(jobs_read "$rec" cwd /workspace)"
+  cap="$(jobs_read "$rec" cap "$JOBS_DEFAULT_CAP")"
+  kind="$(jobs_read "$rec" kind run)"
+  keep="$(jobs_read "$rec" keep_alive 0)"
+  [ -d "$cwd" ] || cwd=/workspace
+  cd "$cwd" 2>/dev/null || cd / || true
+  rc=0
+  if [ "$kind" = run ]; then
+    # The cap is enforced BOX-SIDE, inside the pgid, so it holds even when the
+    # brain is down, rolled back, or has forgotten the job (J2/J10). --foreground
+    # so the signal reaches the command, -k 30 so a wedged child still dies.
+    timeout --foreground -k 30 "$cap" sh -c "$cmd"
+    rc=$?
+  else
+    # A service has NO cap (mutant j20 gives it one, which test (6) kills).
+    sh -c "$cmd"
+    rc=$?
+  fi
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$rec/last_exit" 2>/dev/null || true
+  echo "$rc" > "$rec/last_rc" 2>/dev/null || true
+  if [ "$keep" = 1 ]; then
+    return "$rc"
+  fi
+  echo "$rc" > "$rec/rc" 2>/dev/null || true
+  date +%s > "$rec/ended_epoch" 2>/dev/null || true
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$rec/ended" 2>/dev/null || true
+  # rc BEFORE the marker: at no instant is (marker absent, no rc) true for a job
+  # that actually finished, so `status` can never mistake a clean exit for an
+  # image swap.
+  rm -f "$(jobs_marker "$id")" 2>/dev/null || true
+  [ "$(jobs_slot_id 2>/dev/null || true)" = "$id" ] && jobs_slot_release
+  return "$rc"
+}
+
+# --- the `boxup job` subcommands --------------------------------------------
+jobs_usage() {
+  cat >&2 <<'EOF'
+boxup job start <id> [--kind run|service] [--cap <s>] [--keep-alive]
+                     [--cwd <dir>] [--no-restart-on-swap] -- <cmd...>
+boxup job status <id>
+boxup job log <id> [<offset>]
+boxup job stop <id>
+boxup job ls
+boxup job prune
+EOF
+}
+
+# rc 75 (EX_TEMPFAIL) = the box's one job slot is taken. Chosen so the brain can
+# distinguish "busy" from every usage/IO error (mutant j1 drops the check).
+jobs_cmd_start() {
+  local id="$1"; shift
+  local kind=run cap="$JOBS_DEFAULT_CAP" keep=0 cwd=/workspace swap=1 rec
+  jobs_valid_id "$id" || { echo "boxup: job start: invalid id" >&2; return 2; }
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kind)   kind="${2:-run}"; shift 2 ;;
+      --cap)    cap="${2:-$JOBS_DEFAULT_CAP}"; shift 2 ;;
+      --cwd)    cwd="${2:-/workspace}"; shift 2 ;;
+      --keep-alive) keep=1; shift ;;
+      --no-restart-on-swap) swap=0; shift ;;
+      --restart-on-swap)    swap=1; shift ;;
+      --) shift; break ;;
+      *) echo "boxup: job start: unknown option: $1" >&2; jobs_usage; return 2 ;;
+    esac
+  done
+  [ $# -gt 0 ] || { echo "boxup: job start: no command" >&2; jobs_usage; return 2; }
+  case "$kind" in run|service) ;; *) echo "boxup: job start: bad kind: $kind" >&2; return 2 ;; esac
+  case "$cap" in ''|*[!0-9]*) echo "boxup: job start: bad cap: $cap" >&2; return 2 ;; esac
+  [ "$kind" = service ] && keep=1
+  ensure_dirs
+  mkdir -p "$JOBS_RUN_DIR" "$JOBS_DIR" 2>/dev/null || true
+  # The slot: an ATOMIC mkdir. A held slot is rc 75; a stale one is broken with
+  # a WARN by jobs_slot_held, and the retry then succeeds.
+  if ! mkdir "$JOBS_SLOT" 2>/dev/null; then
+    if jobs_slot_held; then
+      echo "job=busy holder=$(jobs_slot_id 2>/dev/null || echo unknown)" >&2
+      return 75
+    fi
+    mkdir "$JOBS_SLOT" 2>/dev/null || { echo "boxup: job start: cannot take the slot" >&2; return 75; }
+  fi
+  echo "$id" > "$JOBS_SLOT/id" 2>/dev/null || true
+  date +%s > "$JOBS_SLOT/at" 2>/dev/null || true
+  rec="$(jobs_rec "$id")"
+  mkdir -p "$rec" 2>/dev/null || { jobs_slot_release; echo "boxup: job start: cannot create $rec" >&2; return 1; }
+  printf '%s' "$*" > "$rec/cmd" 2>/dev/null || true
+  printf '%s' "$cwd" > "$rec/cwd" 2>/dev/null || true
+  echo "$kind" > "$rec/kind"; echo "$cap" > "$rec/cap"
+  echo "$keep" > "$rec/keep_alive"; echo "$swap" > "$rec/restart_on_swap"
+  echo 0 > "$rec/truncations"; echo 0 > "$rec/truncated_total"
+  rm -f "$rec/rc" "$rec/ended" "$rec/ended_epoch" "$rec/stopped" 2>/dev/null || true
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$rec/started" 2>/dev/null || true
+  date +%s > "$rec/started_epoch" 2>/dev/null || true
+  : > "$rec/log" 2>/dev/null || true
+  jobs_launch_wrapper "$id"
+  log "job: started id=$id kind=$kind cap=${cap}s keep_alive=$keep cwd=$cwd"
+  printf 'job=%s state=starting\n' "$id"
+  return 0
+}
+
+# ONE key=value line — the brain's whole channel (J9/J5). `truncations` and
+# `truncated_total` ride here because the brain must NEVER infer a truncation
+# from sizes (r6-B1).
+jobs_cmd_status() {
+  local id="$1" rec pid m
+  jobs_valid_id "$id" || { echo "boxup: job status: invalid id" >&2; return 2; }
+  rec="$(jobs_rec "$id")"
+  [ -d "$rec" ] || { printf 'state=unknown\n'; return 1; }
+  m="$(jobs_marker "$id")"
+  pid="-"
+  [ -f "$m" ] && pid=$(tr -d '[:space:]' < "$m" 2>/dev/null || echo -)
+  [ -n "$pid" ] || pid=-
+  printf 'state=%s pid=%s pgid=%s rc=%s started=%s ended=%s log_bytes=%s truncations=%s truncated_total=%s\n' \
+    "$(jobs_state "$id" || true)" \
+    "$pid" \
+    "$(jobs_read "$rec" pgid -)" \
+    "$(jobs_read "$rec" rc -)" \
+    "$(jobs_read "$rec" started -)" \
+    "$(jobs_read "$rec" ended -)" \
+    "$(stat -c %s "$rec/log" 2>/dev/null || echo 0)" \
+    "$(jobs_read "$rec" truncations 0)" \
+    "$(jobs_read "$rec" truncated_total 0)"
+  return 0
+}
+
+# `log <id> [<offset>]`: raw bytes from <offset>, bounded to 1 MiB per call.
+# `tail -c +N` is 1-BASED, so byte offset 0 is `+1` (mutant j8 is the off-by-one).
+jobs_cmd_log() {
+  local id="$1" off="${2:-0}" rec
+  jobs_valid_id "$id" || { echo "boxup: job log: invalid id" >&2; return 2; }
+  case "$off" in ''|*[!0-9]*) echo "boxup: job log: bad offset: $off" >&2; return 2 ;; esac
+  rec="$(jobs_rec "$id")"
+  [ -f "$rec/log" ] || return 0
+  tail -c +$((off + 1)) "$rec/log" 2>/dev/null | head -c "$JOBS_LOG_FETCH_MAX"
+  return 0
+}
+
+# `stop <id>`: SIGTERM the process GROUP, wait, then SIGKILL (mutant j7 skips
+# the KILL). The durable pgid is used HERE and only here — signalling, never
+# liveness. Idempotent on a terminal record.
+jobs_cmd_stop() {
+  local id="$1" rec pgid i
+  jobs_valid_id "$id" || { echo "boxup: job stop: invalid id" >&2; return 2; }
+  rec="$(jobs_rec "$id")"
+  [ -d "$rec" ] || { echo "boxup: job stop: no record for $id" >&2; return 1; }
+  if jobs_terminal "$rec"; then
+    printf 'job=%s state=%s rc=%s\n' "$id" "$(jobs_state "$id" || true)" "$(jobs_read "$rec" rc -)"
+    return 0
+  fi
+  pgid="$(jobs_read "$rec" pgid)"
+  case "$pgid" in
+    ''|*[!0-9]*) ;;
+    *) kill -TERM -- "-$pgid" 2>/dev/null || true ;;
+  esac
+  i=0
+  while [ "$i" -lt "$JOBS_STOP_GRACE_S" ]; do
+    jobs_live "$id" || break
+    sleep 1
+    i=$((i + 1))
+  done
+  if jobs_live "$id"; then
+    case "$pgid" in
+      ''|*[!0-9]*) ;;
+      *) kill -KILL -- "-$pgid" 2>/dev/null || true ;;
+    esac
+  fi
+  echo 1 > "$rec/stopped" 2>/dev/null || true
+  echo 143 > "$rec/rc" 2>/dev/null || true
+  date +%s > "$rec/ended_epoch" 2>/dev/null || true
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$rec/ended" 2>/dev/null || true
+  rm -f "$(jobs_marker "$id")" "$(jobs_restart_state "$id")" 2>/dev/null || true
+  [ "$(jobs_slot_id 2>/dev/null || true)" = "$id" ] && jobs_slot_release
+  log "job: stopped id=$id rc=143"
+  printf 'job=%s state=stopped rc=143\n' "$id"
+  return 0
+}
+
+jobs_cmd_ls() {
+  local d id
+  [ -d "$JOBS_DIR" ] || return 0
+  for d in "$JOBS_DIR"/*; do
+    [ -d "$d" ] || continue
+    id="${d##*/}"
+    jobs_valid_id "$id" || continue
+    printf 'id=%s state=%s kind=%s rc=%s started=%s ended=%s\n' \
+      "$id" "$(jobs_state "$id" || true)" "$(jobs_read "$d" kind -)" \
+      "$(jobs_read "$d" rc -)" "$(jobs_read "$d" started -)" "$(jobs_read "$d" ended -)"
+  done
+  return 0
+}
+
+cmd_job() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    start)  [ $# -ge 1 ] || { jobs_usage; return 2; }; jobs_cmd_start "$@" ;;
+    status) [ $# -ge 1 ] || { jobs_usage; return 2; }; jobs_cmd_status "$1" ;;
+    log)    [ $# -ge 1 ] || { jobs_usage; return 2; }; jobs_cmd_log "$1" "${2:-0}" ;;
+    stop)   [ $# -ge 1 ] || { jobs_usage; return 2; }; jobs_cmd_stop "$1" ;;
+    ls)     jobs_cmd_ls ;;
+    prune)  jobs_prune ;;
+    *)      jobs_usage; return 2 ;;
+  esac
+}
+
 # --- selfheal: worker --------------------------------------------------------
 # The actual tick body. Runs under the converge lock (via run_tick).
 do_tick() {
@@ -2699,6 +3433,11 @@ run_tick() {
   # must still keep the box awake) and before the tick body. It is rate-limited
   # to [keepawake].interval_min internally, so calling it every 15 s is free.
   keepawake_guard || true
+  # grokfleet-jobs J9: the job supervisor runs in the SAME place and for the
+  # same reason — outside the converge lock, because a tick that skips on
+  # contention must still restart a dead service, bound a runaway log and reap
+  # a stale slot. It always returns 0.
+  jobs_guard || true
   run_with_converge_lock try do_tick
   rc=$?
   if [ "$rc" = 200 ]; then
@@ -2880,6 +3619,11 @@ print_status() {
   # moves. grokfleet's status.ts tokenizes on `k=v` and drops unknown keys, so
   # every existing consumer is untouched by construction.
   printf ' %s' "$(keepawake_status_tokens)"
+  # grokfleet-jobs J9: two tokens appended LAST, for the same reason disk= and
+  # the keepawake four were appended after what came before them — nothing that
+  # already parses this line moves, and grokfleet's status.ts tokenizes on `k=v`
+  # and drops unknown keys.
+  printf ' %s' "$(jobs_status_tokens)"
   printf '\n'
 }
 
@@ -3330,6 +4074,7 @@ require_root() {
       exec sudo env BOX_SETUP_ROOT="$ROOT" \
         BOX_SETUP_CONFIG="${BOX_SETUP_CONFIG:-}" \
         BOX_SETUP_RUN="${BOX_SETUP_RUN:-}" \
+        BOX_SETUP_JOBS="${BOX_SETUP_JOBS:-}" \
         BOX_SETUP_LOG="${BOX_SETUP_LOG:-}" \
         BOX_SSH_PASSWORD="${BOX_SSH_PASSWORD:-}" \
         BOXUP_FORCE_REFRESH="${BOXUP_FORCE_REFRESH:-}" \
@@ -3347,7 +4092,7 @@ require_root() {
   fi
 }
 
-usage() { sed -n '4,16p' "$0"; }
+usage() { sed -n '4,18p' "$0"; }
 
 cmd="${1:-up}"
 case "$cmd" in
@@ -3403,6 +4148,24 @@ case "$cmd" in
     ;;
   worker|--worker)
     worker_loop
+    ;;
+  job|--job)
+    # grokfleet-jobs J9. Needs root: the wrapper is a detached root process and
+    # the marker lives under $RUN_DIR.
+    require_root "$@"
+    shift
+    cmd_job "$@"; exit $?
+    ;;
+  job-wrapper)
+    # INTERNAL, like `boxup worker`. NEVER invoked by a human and never through
+    # a shell: this argv shape is what is_job_wrapper_proc identifies, and it is
+    # the only reason the brain's own `boxup job status <id>` poll for the SAME
+    # id cannot be mistaken for the job itself.
+    if [ $# -lt 2 ]; then
+      echo "boxup: job-wrapper: need a job id" >&2
+      exit 2
+    fi
+    job_wrapper_main "$2"; exit $?
     ;;
   version|--version)
     echo "boxup $BOXUP_VERSION"
