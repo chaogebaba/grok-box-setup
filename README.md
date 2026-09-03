@@ -29,7 +29,7 @@ than failing over a convenience link.
 (`grok-box-001` … `grok-box-999`). `boxup` picks the lowest free index and
 zero-pads it; the reverse-tunnel port is `20000 + index` (parsed as decimal, so
 `grok-box-008` → port 20008). Legacy unpadded names are still recognised; to
-convert one in place use `fleet2 rename grok-box-8 grok-box-008` (see
+convert one in place use `grokfleet rename grok-box-8 grok-box-008` (see
 docs/AGENT.md → "Rename a box").
 
 Before the first `boxup once`, create the Tailscale auth key as **reusable +
@@ -63,7 +63,7 @@ open it, approve the node, run `boxup once` again. With a reusable auth key in
 under a `grok-box-NNN` name; the fleet brain does the rest. Its next reconcile
 tick discovers the unenrolled box, enrols it, writes its `[fleet]` block, and
 keeps those artefacts repaired after an image swap. Nobody runs
-`fleet2 enroll` by hand. The brain needs the box ssh password once, installed
+`grokfleet enroll` by hand. The brain needs the box ssh password once, installed
 with `BOX_PASSWD=... bash vps/install-vps.sh` on the VPS — see
 [docs/FLEET-BRAIN.md](docs/FLEET-BRAIN.md) → "Zero-touch join".
 
@@ -148,28 +148,29 @@ Observations land in three places: the worker log
 
 ## Fleet operations (laptop)
 
-`boxup` runs on a box; [`fleet2`](fleet2) runs on the operator's laptop and
+`boxup` runs on a box; [`grokfleet`](fleet/) runs on the operator's laptop and
 drives all the boxes at once over the tailnet (needs `tailscale`, `ssh`,
 `sshpass` — `sudo dnf install sshpass` / `sudo apt install sshpass`). It
 discovers every `grok-box-NNN` peer; it never touches other machines.
 
-> **fleet2 (bun + TypeScript brain, phase 1).** The VPS-side brain is moving to
-> bun + TypeScript. `fleet2` adds fleet **inventory** and batch **upgrade**
-> (canary/verify/abort) alongside the bash `fleet2`. See
+> **grokfleet (bun + TypeScript brain).** The VPS-side brain is bun +
+> TypeScript. It was called `fleet2` up to and including 5.9.0 and is
+> `grokfleet` from 5.10.0 on; 5.10.0 keeps the old unit names, the `fleet2`
+> command and the `FLEET2_*` variables working for that one release. See
 > [`fleet/README.md`](fleet/README.md) and
-> [`docs/FLEET-BRAIN.md`](docs/FLEET-BRAIN.md) §"Upgrades and inventory (fleet2)".
+> [`docs/FLEET-BRAIN.md`](docs/FLEET-BRAIN.md) §"Upgrades and inventory (grokfleet)".
 
 ```bash
-./fleet2 list                 # name, tailscale IP, online — all grok-box-NNN peers
-./fleet2 status               # boxup status line per online box + sha/drift (read-only)
-./fleet2 check                # quiet health gate; exit 1 + prints only problems
-./fleet2 rollout grok-box-003 # deploy current git HEAD to explicit boxes
-./fleet2 rollout --all        # deploy to the whole fleet (canary first, then batch)
-./fleet2 ssh grok-box-003 [cmd] # ssh wrapper
+./grokfleet list                 # name, tailscale IP, online — all grok-box-NNN peers
+./grokfleet status               # boxup status line per online box + sha/drift (read-only)
+./grokfleet check                # quiet health gate; exit 1 + prints only problems
+./grokfleet rollout grok-box-003 # deploy current git HEAD to explicit boxes
+./grokfleet rollout --all        # deploy to the whole fleet (canary first, then batch)
+./grokfleet ssh grok-box-003 [cmd] # ssh wrapper
 ```
 
 `rollout` requires a target: one or more explicit `grok-box-NNN`, or `--all` for
-the whole fleet. A bare `fleet2 rollout` is a usage error (it will not guess).
+the whole fleet. A bare `grokfleet rollout` is a usage error (it will not guess).
 `--all` deploys to a canary first (default `grok-box-005`, override with
 `--canary <box>`), verifies it with `boxup check`, and only then rolls the rest
 at 2-concurrency. The first box that fails verification trips an **abort**: no
@@ -179,26 +180,26 @@ no auto-rollback — on abort the exact redeploy command is printed. An
 unreachable canary aborts (pick another with `--canary`); unreachable
 non-canary boxes are skipped, never failures. `--dirty` allows a dirty tree.
 
-`fleet2 status` appends `sha=<sha> drift=yes|no` per box (comparing the box's
+`grokfleet status` appends `sha=<sha> drift=yes|no` per box (comparing the box's
 installed git sha to the laptop's HEAD) and logs a summary when the fleet is
 mixed-version; a box running an older boxup renders `sha=unknown drift=unknown`
 (informational, never a failure).
 
-`fleet2 check` delegates to `boxup check` on each box and trusts its exit
+`grokfleet check` delegates to `boxup check` on each box and trusts its exit
 code; a box running an older boxup (no `check` subcommand) falls back to the
 laptop-side `boxup status` parse so it is never wrongly reported as failing.
 
-Password precedence: `FLEET_SSH_PASSWORD` > `~/.config/fleet2/config.toml`
-`[ssh].password` > `12345678` (never stored in git). `FLEET_BOXES="grok-box-1
+Password precedence: `FLEET_SSH_PASSWORD` > the config file `$FLEET_CONFIG`
+points at (default `/opt/grok-fleet/config.toml`) `[ssh].password` > `12345678` (never stored in git). `FLEET_BOXES="grok-box-1
 grok-box-2"` bypasses discovery for a fixed list.
 
-The laptop **user** timer is retired (since 5.4.0): the VPS `fleet-reconcile.timer`
-does the scheduled health checks and alerts now. `fleet2 install-timer` prints a
+The laptop **user** timer is retired (since 5.4.0): the VPS `grokfleet-reconcile.timer`
+does the scheduled health checks and alerts now. `grokfleet install-timer` prints a
 retirement notice (rc 2). If you set up the old timer on a laptop, tear it down
 once:
 
 ```bash
-./fleet2 remove-timer         # removes the retired fleetctl-check.{timer,service}
+./grokfleet remove-timer         # removes the retired fleetctl-check.{timer,service}
 ```
 
 ## House rules

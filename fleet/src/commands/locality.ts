@@ -3,10 +3,10 @@
 //
 // F2: the phase-1 status/check/rollout re-base changed LOCALITY (laptop-or-VPS
 // ⇒ VPS-only). On a host with no FLEET_BOX_KEY these commands print
-//   `<cmd>: VPS-only in fleet2 — this command now runs over the reverse tunnels (docs/FLEET-BRAIN.md §retirement)`
+//   `<cmd>: VPS-only in grokfleet — this command now runs over the reverse tunnels (docs/FLEET-BRAIN.md §retirement)`
 // and exit rc 6 (the house "refused" code), instead of per-box ssh noise.
-// M2: the guard lives ONCE here; `fleet2 upgrade` refuses the same as
-// `fleet2 rollout` (the rollout alias adds NO guard of its own).
+// M2: the guard lives ONCE here; `grokfleet upgrade` refuses the same as
+// `grokfleet rollout` (the rollout alias adds NO guard of its own).
 //
 // `list` and `ssh` (and `remove-timer`) are laptop-runnable (M1) and do NOT call
 // this guard.
@@ -14,7 +14,7 @@
 import { log } from "../log.ts";
 
 const VPS_ONLY_SUFFIX =
-  "VPS-only in fleet2 — this command now runs over the reverse tunnels (docs/FLEET-BRAIN.md §retirement)";
+  "VPS-only in grokfleet — this command now runs over the reverse tunnels (docs/FLEET-BRAIN.md §retirement)";
 
 /**
  * Refuse (rc 6) with the VPS-only line for `cmd` when the box access key is

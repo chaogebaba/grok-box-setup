@@ -1,4 +1,4 @@
-fleet2 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ✖ DOWN                                            
+grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ✖ DOWN                                            
 LINK DOWN 45s — showing last-good data, retrying                                                                        
 
   NAME          TUNNEL CHECK VER     DRIFT    CONFIG  EXPIRY                                                              ╭─ grok-box-001 ─────────────────────────────╮

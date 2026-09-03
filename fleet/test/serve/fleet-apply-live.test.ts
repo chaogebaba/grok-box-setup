@@ -65,7 +65,7 @@ const LINE = (apply: boolean): SnapshotLine => ({
 
 /** A tree with a stored snapshot and (optionally) a config.toml. */
 function treeWith(line: SnapshotLine, configText?: string): { state: string; config: string } {
-  const root = SCRATCH.dir("fleet2-applylive");
+  const root = SCRATCH.dir("grokfleet-applylive");
   dirs.push(root);
   const state = join(root, "state");
   mkdirSync(state, { recursive: true });
@@ -185,7 +185,7 @@ describe("GET /v1/fleet reads apply LIVE from the config", () => {
   });
 
   test("UNREADABLE config (a directory at the path) ⇒ falls back, never 500s", async () => {
-    const root = SCRATCH.dir("fleet2-applylive-dir");
+    const root = SCRATCH.dir("grokfleet-applylive-dir");
     dirs.push(root);
     const state = join(root, "state");
     mkdirSync(state, { recursive: true });
@@ -206,7 +206,7 @@ describe("GET /v1/fleet reads apply LIVE from the config", () => {
   });
 
   test("no snapshot at all + no config ⇒ apply null, not a crash", async () => {
-    const root = SCRATCH.dir("fleet2-applylive-empty");
+    const root = SCRATCH.dir("grokfleet-applylive-empty");
     dirs.push(root);
     const { status, body } = await fleetBody({ state: root, config: join(root, "nope.toml") });
     expect(status).toBe(200);

@@ -49,7 +49,7 @@ describe("T6 status summary (F2 Q1 addendum, main:303/306)", () => {
   });
 
   test("same version, different shas ⇒ no MIXED line", () => {
-    // The empirical case at the status call site: after any fleet2-only commit
+    // The empirical case at the status call site: after any grokfleet-only commit
     // to main every box runs the same boxup version but carries a fresh stamped
     // repo sha. That is neither mixed nor drifted, and the summary must be silent.
     const r = res([row("grok-box-3", "aaa"), row("grok-box-5", "bbb")], "aaa");

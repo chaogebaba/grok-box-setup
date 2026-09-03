@@ -378,7 +378,7 @@ describe("an open view replaces the table, under the banners", () => {
   test("LINK DOWN still renders ABOVE the view (existing precedence)", async () => {
     const s = state({ view, link: { up: false, sinceMs: Date.parse("2026-05-01T00:00:00Z") }, nowMs: Date.parse("2026-05-01T00:00:45Z") });
     const frame = (await frameOf(s, SIZE_120x40)).split("\n");
-    expect(frame[0]).toContain("fleet2"); // header
+    expect(frame[0]).toContain("grokfleet"); // header
     expect(frame[1]).toContain("LINK DOWN 45s"); // banner, still first
     expect(frame.join("\n")).toContain("── diff grok-box-1");
   });

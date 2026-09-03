@@ -103,7 +103,7 @@ describe("T11 wrap_test — managed_remote_script through a REAL sh -c", () => {
     // dd15bf79…d83ff4 = printf '%s\n' "$(render)" | sha256sum (render body + ONE
     // trailing \n). renderManaged already ends in one \n, so textSha256 must
     // hash it AS-IS (no extra \n) to match — and that must equal what the box
-    // hashes from the STDIN bytes fleet2 sends (also `text` as-is).
+    // hashes from the STDIN bytes grokfleet sends (also `text` as-is).
     const fleetToml =
       "# fleet-wide managed config (config-truth Phase 2). Behaviour-neutral seed:\n" +
       "# [update].repo = boxup DEFAULT_REPO_URL. Created 2026-08-29 by supervisor.\n" +
@@ -124,7 +124,7 @@ describe("T11 wrap_test — managed_remote_script through a REAL sh -c", () => {
   test("matching sha writes the file; status line printed", async () => {
     const { mkdtempSync, writeFileSync, rmSync, readFileSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
-    const dir = mkdtempSync(`${tmpdir()}/fleet2-mrs-`);
+    const dir = mkdtempSync(`${tmpdir()}/grokfleet-mrs-`);
     const mf = `${dir}/managed.toml`;
     const bx = `${dir}/boxup`;
     // fake boxup with a MANAGED_FILE= line + config-get managed enabled ⇒ true
@@ -154,7 +154,7 @@ describe("T11 wrap_test — managed_remote_script through a REAL sh -c", () => {
   test("sha mismatch ⇒ exit 3, MANAGED_SHA_MISMATCH, nothing written", async () => {
     const { mkdtempSync, existsSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
-    const dir = mkdtempSync(`${tmpdir()}/fleet2-mrs2-`);
+    const dir = mkdtempSync(`${tmpdir()}/grokfleet-mrs2-`);
     const mf = `${dir}/managed.toml`;
     const script = managedRemoteScript("WRONGSHA", 0).replace(
       "mf=/workspace/box-setup/managed.toml",
@@ -320,7 +320,7 @@ describe("T11 config pass canary routing (F1/F2)", () => {
     expect(lines.some((l) => l.includes("config: canary policy="))).toBe(false);
   });
 
-  test("F3: dynamic policy KEEPS the 'config: canary policy=dynamic' line (fleet2-only mode)", async () => {
+  test("F3: dynamic policy KEEPS the 'config: canary policy=dynamic' line (grokfleet-only mode)", async () => {
     const { fs } = memState();
     const lines = await withLogs(async () => {
       await configPass({

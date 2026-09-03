@@ -1,12 +1,12 @@
-// config.ts — `fleet2 config render|diff|push <box>` (D12/F12), the operator
+// config.ts — `grokfleet config render|diff|push <box>` (D12/F12), the operator
 // managed-config surface. Ports cmd_config (main:3326-3404); reuses the phase-2
 // managed/* render/validate/remote-script and actions/config-push.ts:pushManaged
 // (D1 REUSE clause). NO JS diff library (Q5/F12): `diff` shells out to diff(1).
 //
-// usage/refusal rc 2 lines VERBATIM (fleetctl → fleet2):
-//   bad sub          `fleet2 config: usage: config render|diff|push <box>`  (main:3331)
-//   missing box      `fleet2 config <sub>: need a box name`                 (main:3333)
-//   not enrolled     `fleet2 config <sub>: <box> is not enrolled (not in enrolled.tsv) — refusing` (main:3335)
+// usage/refusal rc 2 lines VERBATIM (fleetctl → grokfleet):
+//   bad sub          `grokfleet config: usage: config render|diff|push <box>`  (main:3331)
+//   missing box      `grokfleet config <sub>: need a box name`                 (main:3333)
+//   not enrolled     `grokfleet config <sub>: <box> is not enrolled (not in enrolled.tsv) — refusing` (main:3335)
 //
 // render: renderManaged to stdout, rc 0.
 // push:   pushManaged(box, dry=false), rc = its E2 rc map (0/3/4/5/6/…).
@@ -77,17 +77,17 @@ export async function cmdConfig(args: string[], deps: ConfigDeps): Promise<numbe
   const write = deps.write ?? ((s: string) => process.stdout.write(s));
 
   if (sub !== "render" && sub !== "diff" && sub !== "push") {
-    process.stderr.write("fleet2 config: usage: config render|diff|push <box>\n");
+    process.stderr.write("grokfleet config: usage: config render|diff|push <box>\n");
     return 2;
   }
   if (box === "") {
-    process.stderr.write(`fleet2 config ${sub}: need a box name\n`);
+    process.stderr.write(`grokfleet config ${sub}: need a box name\n`);
     return 2;
   }
   const membership = deps.enrolled ?? enrolledBoxes(deps.env);
   if (!membership.includes(box)) {
     process.stderr.write(
-      `fleet2 config ${sub}: ${box} is not enrolled (not in enrolled.tsv) — refusing\n`,
+      `grokfleet config ${sub}: ${box} is not enrolled (not in enrolled.tsv) — refusing\n`,
     );
     return 2;
   }
@@ -109,14 +109,14 @@ export async function cmdConfig(args: string[], deps: ConfigDeps): Promise<numbe
   const text = renderManaged(source.fleetToml(), source.boxToml(box));
   const v = validateManaged(text);
   if (!v.ok) {
-    process.stderr.write(`fleet2 config diff: ${box} render REFUSED by D4 — ${v.reasons[0]}\n`);
+    process.stderr.write(`grokfleet config diff: ${box} render REFUSED by D4 — ${v.reasons[0]}\n`);
     return 2;
   }
 
   const whichDiff = deps.whichDiff ?? defaultWhichDiff;
   const diffPath = await whichDiff();
   if (diffPath === undefined) {
-    process.stderr.write("fleet2 config diff: diff(1) not found\n");
+    process.stderr.write("grokfleet config diff: diff(1) not found\n");
     return 2;
   }
 
@@ -125,7 +125,7 @@ export async function cmdConfig(args: string[], deps: ConfigDeps): Promise<numbe
   // every path, CLI included — otherwise this human-invoked diff would hand a
   // foreign listener the rendered managed config on stdin.
   if (!(await tunnelUp(deps.runner, box))) {
-    process.stderr.write(`fleet2 config diff: ${box} tunnel down\n`);
+    process.stderr.write(`grokfleet config diff: ${box} tunnel down\n`);
     return 2;
   }
 
@@ -137,7 +137,7 @@ export async function cmdConfig(args: string[], deps: ConfigDeps): Promise<numbe
     knownHosts: knownHostsFile(deps.env),
   });
   if (dry.code !== 0) {
-    process.stderr.write(`fleet2 config diff: ${box} unreachable/failed (rc=${dry.code ?? "killed"})\n`);
+    process.stderr.write(`grokfleet config diff: ${box} unreachable/failed (rc=${dry.code ?? "killed"})\n`);
     return 2;
   }
 
@@ -159,7 +159,7 @@ export async function cmdConfig(args: string[], deps: ConfigDeps): Promise<numbe
   // bash captures both operands via `$(...)` — which STRIPS all trailing
   // newlines — then re-adds exactly ONE via `printf '%s\n'`. So each operand is
   // normalised to EXACTLY one trailing newline regardless of how many the raw
-  // body carried. fleet2's old `onboxBody + "\n"` double-newlined a remote body
+  // body carried. grokfleet's old `onboxBody + "\n"` double-newlined a remote body
   // that already ended in `\n`, emitting a spurious trailing blank line on every
   // real box. Normalise both operands the bash way: drop trailing \n, add one.
   const oneTrailingNl = (s: string): string => s.replace(/\n+$/, "") + "\n";
@@ -189,7 +189,7 @@ export async function cmdConfig(args: string[], deps: ConfigDeps): Promise<numbe
   // non-zero exit is a diagnostic and belongs on stderr, or `config diff` looks
   // like a silent failure to anything reading only the rc.
   process.stderr.write(
-    `fleet2 config diff: ${box} DRIFTS from the rendered config (cur=${cur || "?"} want=${wantSha} enabled=${enabled || "?"} support=${support || "?"})\n`,
+    `grokfleet config diff: ${box} DRIFTS from the rendered config (cur=${cur || "?"} want=${wantSha} enabled=${enabled || "?"} support=${support || "?"})\n`,
   );
   return 1;
 }
@@ -214,7 +214,7 @@ async function runDiff(
   const { mkdtempSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
   const { tmpdir } = require("node:os") as typeof import("node:os");
   const { join } = require("node:path") as typeof import("node:path");
-  const dir = mkdtempSync(join(tmpdir(), "fleet2-diff-"));
+  const dir = mkdtempSync(join(tmpdir(), "grokfleet-diff-"));
   const onboxFile = join(dir, "onbox");
   const rendFile = join(dir, "rendered");
   try {

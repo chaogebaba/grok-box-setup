@@ -144,7 +144,7 @@ export interface ReconcileResult {
   /**
    * 0 ok, 1 a verified per-box failure, 3 the store declared itself corrupt and
    * the tick refused (state-store D8), 7 every write committed but the legacy
-   * export lagged (D6/r6-B2 — `fleet-reconcile.service` treats 7 as success).
+   * export lagged (D6/r6-B2 — `grokfleet-reconcile.service` treats 7 as success).
    */
   rc: number;
 }
@@ -159,7 +159,7 @@ function now(deps: ReconcileDeps): number {
  *
  * A lagging export is NOT a failure of the tick: the store write committed, so
  * the mutation succeeded and the store is authoritative. rc 7 says exactly that
- * — "recorded; export failed" — and `fleet-reconcile.service` carries
+ * — "recorded; export failed" — and `grokfleet-reconcile.service` carries
  * `SuccessExitStatus=7` so it does not park the oneshot unit in `failed` every
  * five minutes. The notify is the signal; the next tick's divergence check
  * reports the lag until it clears.
@@ -173,7 +173,7 @@ function finishStore(deps: ReconcileDeps, rc: number): number {
   if (r.integrityFailed !== undefined) {
     void deps.notify(
       "warn",
-      `state store: quick_check FAILED (${r.integrityFailed}) — the next tick will refuse; run 'fleet2 state check'`,
+      `state store: quick_check FAILED (${r.integrityFailed}) — the next tick will refuse; run 'grokfleet state check'`,
     );
     // The tick that DISCOVERS the corruption reports it too, so the signal does
     // not depend on the flag having been writable on a damaged file.
@@ -208,14 +208,14 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   // trust its own state must not write to it, so it refuses BEFORE the tick
   // ordinal is bumped: one log line, no writes, and NO backup step (the seven
   // existing backups are the recovery material). The flag is cleared only by a
-  // passing `fleet2 state check` or by `fleet2 state restore <file>`.
+  // passing `grokfleet state check` or by `grokfleet state restore <file>`.
   if (deps.store !== undefined) {
     const flagged = deps.store.integrityFailedAt();
     if (flagged !== undefined) {
       log(
         `reconcile: REFUSING — the state store failed quick_check at ` +
-          `${new Date(flagged * 1000).toISOString()}; run 'fleet2 state check' or ` +
-          `'fleet2 state restore <backup>' (no writes this tick)`,
+          `${new Date(flagged * 1000).toISOString()}; run 'grokfleet state check' or ` +
+          `'grokfleet state restore <backup>' (no writes this tick)`,
       );
       return { rc: 3 };
     }
@@ -230,7 +230,7 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   // --- state-store D6 divergence check (ADVISORY, tick-only) ---
   // After membership is read (the caller resolved `targetBoxes` from the store)
   // and BEFORE any action. It never writes membership: it records findings and
-  // notifies, and `fleet2 state reconcile-files` is how an operator resolves
+  // notifies, and `grokfleet state reconcile-files` is how an operator resolves
   // one. A missing or unreadable file is "cannot compare" and is INERT.
   if (deps.store !== undefined) {
     const div = checkDivergence(deps.store, { enrolledPath: `${deps.env.FLEET_STATE}/enrolled.tsv`, now: now(deps) });
@@ -489,10 +489,10 @@ async function reconcileOne(
   if (d !== undefined) expiryDays = daysUntil(d, nowS);
 
   // Drift (D5): tunnel up && target VERSION resolved ⇒ box boxup VERSION vs
-  // target VERSION. NOT the stamped repo sha: every fleet2-only commit to main
+  // target VERSION. NOT the stamped repo sha: every grokfleet-only commit to main
   // (release pins, docs, fleet/ code) moves the target sha without changing the
   // box payload, and a sha comparison therefore marked the WHOLE fleet drifted
-  // and — with auto=true — re-installed boxup everywhere after every fleet2
+  // and — with auto=true — re-installed boxup everywhere after every grokfleet
   // release. That is a fleet-wide write for a no-op (empirical r1 FAIL).
   //
   // Tri-state is unchanged: either side unknown ⇒ "unknown", and unknown never

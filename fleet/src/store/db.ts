@@ -1,4 +1,4 @@
-// db.ts — the ONLY module in fleet2 that imports `bun:sqlite` (blueprint
+// db.ts — the ONLY module in grokfleet that imports `bun:sqlite` (blueprint
 // fleet2-state-store D1). Everything else goes through `Store`.
 //
 // D1 open sequence, IN THIS ORDER:
@@ -46,7 +46,7 @@ export interface OpenOptions {
   dir?: string;
   /**
    * Open READ-ONLY: no migrations, no writes, no divergence check (D8 — this is
-   * what `fleet2 state check` and the readonly API endpoints use).
+   * what `grokfleet state check` and the readonly API endpoints use).
    */
   readonly?: boolean;
   /** epoch-seconds clock, injected by tests. */
@@ -282,7 +282,7 @@ export function openStore(opts: OpenOptions): Store {
       store.close();
       throw new ConfigError(
         `state store: ${opts.path} is schema user_version=${current} min_reader=${minReaderRaw ?? "unknown"}; ` +
-          `this fleet2 knows schema ${KNOWN_SCHEMA} and must not operate it — install a newer fleet2`,
+          `this grokfleet knows schema ${KNOWN_SCHEMA} and must not operate it — install a newer grokfleet`,
       );
     }
     log(`state store: ${opts.path} user_version=${current} min_reader=${minReaderRaw} — opening as a schema-${KNOWN_SCHEMA} reader`);

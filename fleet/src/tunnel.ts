@@ -6,7 +6,7 @@
 //       -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8
 //       box@127.0.0.1 <remoteCommand>
 // The remote command is appended VERBATIM as the LAST argv element (no `--`,
-// F6/SHOULD-4); fleet2 performs no shell quoting anywhere.
+// F6/SHOULD-4); grokfleet performs no shell quoting anywhere.
 //
 // D11(a): the four KNOWN_HOSTS_OPTS sit immediately BEFORE
 // StrictHostKeyChecking and point ssh at `$FLEET_STATE/known_hosts`, the file
@@ -122,7 +122,7 @@ export function scpArgv(box: string, boxKey: string, local: string, remote: stri
  *   absent                       ⇒ down (as before);
  *   owned by an accepted sshd    ⇒ up;
  *   owned by anything else       ⇒ DOWN + a log line (a squatter is never dialled);
- *   owner unverifiable, non-root ⇒ up  (a non-root `fleet2 fleet-status` must not
+ *   owner unverifiable, non-root ⇒ up  (a non-root `grokfleet fleet-status` must not
  *                                       read every tunnel as down);
  *   owner unverifiable, as root  ⇒ DOWN + a log line — the exception is bound to
  *                                 its PREMISE, not to the symptom, so an ss

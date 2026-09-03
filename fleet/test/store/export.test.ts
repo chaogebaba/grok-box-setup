@@ -49,7 +49,7 @@ describe("(g) export round-trip", () => {
       // and it parses back to the store's own membership order.
       expect(parseEnrolled(raw)).toEqual(f.st.membership());
       // no tmp file left behind by the atomic write.
-      expect(readdirSync(f.state).filter((n) => n.startsWith(".fleet2-export."))).toEqual([]);
+      expect(readdirSync(f.state).filter((n) => n.startsWith(".grokfleet-export."))).toEqual([]);
       store_close(f);
     } finally {
       cleanup(f.dir);

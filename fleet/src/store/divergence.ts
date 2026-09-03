@@ -4,7 +4,7 @@
 // The store is authoritative. The exported `enrolled.tsv` is what a rolled-back
 // 5.7.1 reads and writes, so after a rollback-and-adopt cycle the FILE can hold a
 // row the store does not. This check REPORTS that; it NEVER writes membership.
-// Resolution is the operator's, through `fleet2 state reconcile-files`.
+// Resolution is the operator's, through `grokfleet state reconcile-files`.
 //
 // Where it runs: on the TICK path only, under the reconcile lock, after
 // membership is read and before any action. Readonly opens (CLI queries,
@@ -160,6 +160,6 @@ export function checkDivergence(store: Store, deps: DivergenceDeps): DivergenceR
 
 function divergenceMessage(name: string, kind: FindingKind, path: string): string {
   return kind === "file-only"
-    ? `${name}: membership divergence — ${path} has a row the state store does not; run 'fleet2 state reconcile-files' (advisory, nothing changed)`
+    ? `${name}: membership divergence — ${path} has a row the state store does not; run 'grokfleet state reconcile-files' (advisory, nothing changed)`
     : `${name}: membership divergence — the state store has an enrolled row missing from ${path}; the next export will restore it (advisory, nothing changed)`;
 }

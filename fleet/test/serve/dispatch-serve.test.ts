@@ -16,8 +16,8 @@ describe("§7.2 registration", () => {
     expect(decide("tui")).toEqual({ kind: "route", command: "tui" });
   });
   test("USAGE documents serve + tui", () => {
-    expect(USAGE).toContain("fleet2 serve");
-    expect(USAGE).toContain("fleet2 tui");
+    expect(USAGE).toContain("grokfleet serve");
+    expect(USAGE).toContain("grokfleet tui");
   });
 });
 

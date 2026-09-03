@@ -1,11 +1,11 @@
-// mint-key.ts — `fleet2 mint-key <grok-box-N>` (F1), a THIN CLI WRAPPER over the
+// mint-key.ts — `grokfleet mint-key <grok-box-N>` (F1), a THIN CLI WRAPPER over the
 // phase-2 actions/mint.ts:mintKey. NO second mint path — reconcile row-c and
 // this command call the SAME function (F1). The wrapper adds ONLY argument
 // handling + the process rc; every failure arm is mintKey's.
 //
 // F1 usage split (fixes actions/mint.ts:50-53 which emits the non-grok line for
 // a MISSING arg where bash emits a usage line, main:1651):
-//   empty     ⇒ `usage: fleet2 mint-key <grok-box-N>`            rc 2
+//   empty     ⇒ `usage: grokfleet mint-key <grok-box-N>`            rc 2
 //   non-grok  ⇒ `mint-key: refusing non-grok box '<box>'`        rc 2
 // (mutant m15: arms collapsed ⇒ killed.)
 
@@ -35,7 +35,7 @@ export async function cmdMintKey(box: string, deps: MintKeyCliDeps): Promise<num
   // F1 usage split — BEFORE mintKey (whose own guard cannot tell empty from
   // non-grok). Empty arg ⇒ usage rc 2; a non-empty non-grok name ⇒ refusal rc 2.
   if (box === "") {
-    log("usage: fleet2 mint-key <grok-box-N>");
+    log("usage: grokfleet mint-key <grok-box-N>");
     return 2;
   }
   if (!/^grok-box-[0-9]/.test(box)) {

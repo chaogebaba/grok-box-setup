@@ -1,4 +1,4 @@
-// schema.ts — the fleet2 state-store schema (blueprint fleet2-state-store D2/D3).
+// schema.ts — the grokfleet state-store schema (blueprint fleet2-state-store D2/D3).
 //
 // ONE schema number lives in `PRAGMA user_version`; `meta.min_reader` is the
 // LOWEST schema number that can still operate a file at that version. Every
@@ -11,9 +11,9 @@
 //   - `PRAGMA user_version` is bumped INSIDE the migration's own transaction, so
 //     a crash between the DDL and the bump replays cleanly;
 //   - a migration that ever needs to be DESTRUCTIVE must bump `min_reader` and
-//     ship `fleet2 state downgrade`. None is in scope.
+//     ship `grokfleet state downgrade`. None is in scope.
 //
-// v1 (Phase A, fleet2 5.8.0) carries EVERY column Phase B uses (`phase`,
+// v1 (Phase A, grokfleet 5.8.0) carries EVERY column Phase B uses (`phase`,
 // `enrol_stage`, `retired_at`) so v2 adds only tables — see D2/D3.
 
 /** The highest schema this binary knows how to create and operate. */
@@ -45,7 +45,7 @@ export interface Migration {
 // rename window legitimately holds two rows on one port
 // (rename-wiring.ts:80-85,103-118), and `grok-box-3` + `grok-box-003` are both
 // legal rows until one is renamed. The invariant "no two ENROLLED rows share a
-// port outside a rename window" is REPORTED by `fleet2 state check`, never
+// port outside a rename window" is REPORTED by `grokfleet state check`, never
 // enforced by the schema.
 const V1: string[] = [
   `CREATE TABLE IF NOT EXISTS meta(
@@ -155,7 +155,7 @@ const V1: string[] = [
    ) STRICT`,
 ];
 
-// --- v2 (Phase B, fleet2 5.9.0) ---------------------------------------------
+// --- v2 (Phase B, grokfleet 5.9.0) ---------------------------------------------
 //
 // ADDITIVE ONLY: three new tables and two new indexes. `min_reader` therefore
 // stays 1, and a 5.8.0 binary opens a v2 file, ignores these tables and keeps

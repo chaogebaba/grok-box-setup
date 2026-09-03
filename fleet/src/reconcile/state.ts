@@ -1,5 +1,5 @@
 // state.ts — every $FLEET_STATE file the reconcile tick reads/writes, bytes
-// IDENTICAL to bash (blueprint F9/G4 table) so bash and fleet2 can be swapped
+// IDENTICAL to bash (blueprint F9/G4 table) so bash and grokfleet can be swapped
 // mid-soak with no migration (D2). All writes swallow errors exactly as bash
 // (`… 2>/dev/null || true`); the tick never aborts on a state-write failure.
 //

@@ -1,4 +1,4 @@
-// cli-reconcile.ts — the `fleet2 reconcile` CLI entry (D12/F4).
+// cli-reconcile.ts — the `grokfleet reconcile` CLI entry (D12/F4).
 //
 // Arg parsing (--apply/--dry-run, unknown ⇒ rc 2) happens in the CLI BEFORE this
 // is called. This function: mkdir FLEET_STATE (swallowed) → take the reconcile
@@ -240,15 +240,15 @@ function enrolSurface(
       await notify(
         "warn",
         `${box}: enrol-stuck — ${row.enrol_fail_streak} failed enrol stages, stuck at stage ${row.enrol_stage}` +
-          `${row.enrol_warn === null ? "" : ` (${row.enrol_warn})`}; 'fleet2 retire ${box}' aborts it`,
+          `${row.enrol_warn === null ? "" : ` (${row.enrol_warn})`}; 'grokfleet retire ${box}' aborts it`,
       );
     },
   };
 }
 
 /**
- * Run `fleet2 reconcile`. Takes the lock unconditionally; lock-held ⇒ rc 0.
- * On the CHILD side (FLEET2_LOCKED) it runs the tick directly.
+ * Run `grokfleet reconcile`. Takes the lock unconditionally; lock-held ⇒ rc 0.
+ * On the CHILD side (GROKFLEET_LOCKED) it runs the tick directly.
  */
 export async function cliReconcile(deps: ReconcileCliDeps): Promise<number> {
   // mkdir -p FLEET_STATE (failure swallowed, main:2536).
@@ -259,11 +259,11 @@ export async function cliReconcile(deps: ReconcileCliDeps): Promise<number> {
   }
 
   // P3/F4: take the lock UNCONDITIONALLY (apply AND dry-run).
-  if (!deps.env.FLEET2_LOCKED) {
+  if (!deps.env.GROKFLEET_LOCKED) {
     const lockfile = `${deps.env.FLEET_STATE}/reconcile.lock`;
     const child = reexecArgv(lockfile, process.execPath, deps.argv, isCompiled);
     if (deps.debugExec) process.stderr.write(`exec: ${JSON.stringify(child)}\n`);
-    const r = await spawnReexec(child, { FLEET2_LOCKED: "1" }, deps.spawner);
+    const r = await spawnReexec(child, { GROKFLEET_LOCKED: "1" }, deps.spawner);
     if (!r.launched || r.code === 127) {
       log("reconcile: refused — util-linux flock not found on PATH (needed for reconcile.lock)");
       return RECONCILE_RC.LOCK_OPEN_FAIL; // cannot lock ⇒ rc 1

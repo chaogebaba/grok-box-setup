@@ -1,15 +1,15 @@
 // ssh-stdio-order.test.ts — agent-ux U1, gate-r1 finding 3.
 //
-// The gate saw `fleet2 ssh box 'for i in 1 2 3; do echo o$i; echo e$i 1>&2;
-// done' 2>&1` print `o1 o2 o3 e1 e2 e3` and read it as fleet2 buffering the
-// streams. It is not. The same probe run with PLAIN ssh and no fleet2 anywhere
+// The gate saw `grokfleet ssh box 'for i in 1 2 3; do echo o$i; echo e$i 1>&2;
+// done' 2>&1` print `o1 o2 o3 e1 e2 e3` and read it as grokfleet buffering the
+// streams. It is not. The same probe run with PLAIN ssh and no grokfleet anywhere
 // groups identically, and the same probe with ~300 ms between writes interleaves
-// correctly through fleet2. The grouping is sshd packetising two separate pipes:
+// correctly through grokfleet. The grouping is sshd packetising two separate pipes:
 // writes that land in one read window arrive as one block per stream, and no
 // client-side change can recover an order that was already lost on the far side.
 //
-// What IS fleet2's to guarantee is that it adds no buffering, no copying and no
-// reordering of its own — that the child writes to fleet2's OWN file
+// What IS grokfleet's to guarantee is that it adds no buffering, no copying and no
+// reordering of its own — that the child writes to grokfleet's OWN file
 // descriptors. That is what this file proves, end to end through the real CLI
 // with a fake `sshpass` on PATH, so there is no ssh and no network in the way:
 // whatever ordering the "remote" side produces is exactly what a caller sees.
@@ -72,10 +72,10 @@ async function runCli(args: string[]): Promise<{ rc: number; merged: string }> {
   return { rc, merged: await Bun.file(out).text() };
 }
 
-describe("U1 fleet2 adds no buffering and no reordering of its own", () => {
+describe("U1 grokfleet adds no buffering and no reordering of its own", () => {
   test("interleaved writes come out in WRITE order, not grouped by stream", async () => {
     // Spaced so the two streams cannot collapse into one read window even if
-    // something downstream batched: if fleet2 buffered a stream, this fails.
+    // something downstream batched: if grokfleet buffered a stream, this fails.
     const remote = "for i in 1 2 3; do echo o$i; sleep 0.2; echo e$i 1>&2; sleep 0.2; done";
     const { rc, merged } = await runCli(["grok-box-001", remote]);
     expect(rc).toBe(0);

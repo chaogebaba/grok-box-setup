@@ -11,7 +11,7 @@ import type { ReexecResult } from "../src/reexec.ts";
 
 function deps(spawnRes: ReexecResult, over: Partial<ReconcileCliDeps> = {}): ReconcileCliDeps {
   return {
-    env: testEnv({ FLEET2_LOCKED: false }),
+    env: testEnv({ GROKFLEET_LOCKED: false }),
     cfg: parseConfig("", "/x"),
     rollout: testRollout(),
     apply: false,

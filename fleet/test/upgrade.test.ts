@@ -44,7 +44,7 @@ const fakeStageFs: StageFs = {
 function baseDeps(runner: FakeRunner, over: Partial<UpgradeDeps> = {}): UpgradeDeps {
   return {
     runner,
-    env: testEnv({ FLEET_BOX_KEY: KEY, FLEET2_LOCKED: true }),
+    env: testEnv({ FLEET_BOX_KEY: KEY, GROKFLEET_LOCKED: true }),
     rollout: testRollout(),
     recordOutcomes: () => {},
     stageFs: fakeStageFs,
@@ -464,10 +464,10 @@ describe("D5 upgrade plan compares VERSION, not the stamped sha", () => {
 
 describe("T11/T11b lock re-exec (F2/G3/H2)", () => {
   test("reexecArgv shape: compiled vs dev (G3)", () => {
-    const argv = ["/usr/local/bin/fleet2", "/synthetic/entry", "upgrade", "--all", "--apply"];
-    // compiled: execPath IS fleet2; argv[1] NOT re-passed
-    expect(reexecArgv("/lock", "/usr/local/bin/fleet2", argv, true)).toEqual([
-      "flock", "-n", "-E", "6", "/lock", "/usr/local/bin/fleet2", "upgrade", "--all", "--apply",
+    const argv = ["/usr/local/bin/grokfleet", "/synthetic/entry", "upgrade", "--all", "--apply"];
+    // compiled: execPath IS grokfleet; argv[1] NOT re-passed
+    expect(reexecArgv("/lock", "/usr/local/bin/grokfleet", argv, true)).toEqual([
+      "flock", "-n", "-E", "6", "/lock", "/usr/local/bin/grokfleet", "upgrade", "--all", "--apply",
     ]);
     // dev: execPath is bun; argv[1] (entry .ts) re-passed
     expect(reexecArgv("/lock", "/usr/bin/bun", ["/usr/bin/bun", "src/cli.ts", "upgrade", "--apply"], false)).toEqual([
@@ -501,7 +501,7 @@ describe("T11/T11b lock re-exec (F2/G3/H2)", () => {
     expect(calls[0]!.opts.stdout).toBe("inherit");
     expect(calls[0]!.opts.stderr).toBe("inherit");
     // the child is told it is the locked incarnation
-    expect(calls[0]!.opts.env["FLEET2_LOCKED"]).toBe("1");
+    expect(calls[0]!.opts.env["GROKFLEET_LOCKED"]).toBe("1");
   });
 
   test("T11b/m18: flock ENOENT (launched=false) → refused rc 6, never unlocked", async () => {

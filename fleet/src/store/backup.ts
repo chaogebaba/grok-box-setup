@@ -2,12 +2,12 @@
 // (blueprint fleet2-state-store D8).
 //
 // `quick_check` is deliberately OFF the per-tick path. It runs:
-//   - at `fleet2 serve` start — a FAILURE there SETS the flag and serve STARTS
+//   - at `grokfleet serve` start — a FAILURE there SETS the flag and serve STARTS
 //     in the flagged mode. The unit is Restart=on-failure with
 //     StartLimitIntervalSec=0 on purpose (vps/install-vps.sh), so a serve that
 //     refused would be an unbounded loop of full scans that never parks in
 //     `failed`;
-//   - at `fleet2 state check`;
+//   - at `grokfleet state check`;
 //   - once per UTC DAY inside the tick's backup step — so it is on the tick path
 //     exactly once a day, on the largest file, next to the VACUUM that already
 //     reads every page.
@@ -16,7 +16,7 @@
 // no writes, and NO backup — the seven existing backups are the recovery
 // material), API MUTATION endpoints return 503, and READONLY endpoints and the
 // TUI keep serving the last data. The flag is cleared only by a passing
-// `fleet2 state check` or by `fleet2 state restore <file>`.
+// `grokfleet state check` or by `grokfleet state restore <file>`.
 
 import { chmodSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, copyFileSync } from "node:fs";
 import type { Store } from "./db.ts";
@@ -154,7 +154,7 @@ export interface RestoreResult {
 }
 
 /**
- * `fleet2 state restore <file>` — copy a backup over `fleet.db`, dropping the
+ * `grokfleet state restore <file>` — copy a backup over `fleet.db`, dropping the
  * stale `-wal`/`-shm` sidecars (they describe the file being replaced, not the
  * replacement), then reopen, `quick_check`, and clear the flag on `ok`.
  *

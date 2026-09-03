@@ -124,29 +124,29 @@ fi
 
 # --- 5. R2-B1: EXECUTE the real recipes and assert on the INSTALLED FILE ------
 # Everything below runs against a scratch tree from mktemp -d. DROPIN_DIR,
-# SOAK_MARKER, CONFIG and FLEET2_REMOTE are all overridden, so /etc/systemd and
+# SOAK_MARKER, CONFIG and GROKFLEET_REMOTE are all overridden, so /etc/systemd and
 # /var/lib/grok-fleet are never touched. SYSTEMCTL=true stands in for systemctl
 # so the recipes complete on a machine with no systemd (or where daemon-reload
 # would fail); the recipes' informational `systemctl cat` is already non-fatal.
 artifact_tests() {
   local T; T="$(mktemp -d)" || { bad "mktemp -d failed — cannot run the artifact tests"; return; }
-  local dropin_dir="$T/etc/systemd/system/fleet-reconcile.service.d"
-  local dropin="$dropin_dir/fleet2.conf"
+  local dropin_dir="$T/etc/systemd/system/grokfleet-reconcile.service.d"
+  local dropin="$dropin_dir/grokfleet.conf"
   local marker="$T/var/lib/grok-fleet/fleet2.soak-ok"
   local config="$T/opt/grok-fleet/config.toml"
-  local fleet2="$T/opt/grok-fleet/fleet2"
+  local grokfleet="$T/opt/grok-fleet/grokfleet"
   mkdir -p "$dropin_dir" "$T/var/lib/grok-fleet" "$T/opt/grok-fleet"
   printf 'apply = true\n' > "$config"
-  # A stand-in fleet2 that just prints the argv the wrapper built.
-  printf '#!/bin/bash\nprintf "ARGS:[%%s]\\n" "$*"\n' > "$fleet2"
-  chmod 0755 "$fleet2"
+  # A stand-in grokfleet that just prints the argv the wrapper built.
+  printf '#!/bin/bash\nprintf "ARGS:[%%s]\\n" "$*"\n' > "$grokfleet"
+  chmod 0755 "$grokfleet"
 
   run_target() {
     (cd "$ROOT" && env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS \
       make --no-print-directory "$@" \
         SYSTEMCTL=true \
         DROPIN_DIR="$dropin_dir" DROPIN="$dropin" \
-        SOAK_MARKER="$marker" CONFIG="$config" FLEET2_REMOTE="$fleet2" >/dev/null 2>&1)
+        SOAK_MARKER="$marker" CONFIG="$config" GROKFLEET_REMOTE="$grokfleet" >/dev/null 2>&1)
   }
 
   # exec_line: the installed wrapper ExecStart (the second one; the first is the
@@ -216,7 +216,7 @@ artifact_tests() {
   fi
 
   # 5e. nothing outside the scratch tree was written.
-  if [ ! -e /etc/systemd/system/fleet-reconcile.service.d/fleet2.conf ] \
+  if [ ! -e /etc/systemd/system/grokfleet-reconcile.service.d/grokfleet.conf ] \
      && [ ! -e /var/lib/grok-fleet/fleet2.soak-ok ]; then
     pass "artifact tests wrote nothing to /etc/systemd or /var/lib/grok-fleet"
   else
@@ -245,7 +245,7 @@ fi
 # exercised is that every refusal fires, and that after the D15 step-2 commit
 # the run gets PAST all of them and stops only at the CONFIRM gate.
 #
-# The bun compile is stubbed via FLEET2_BUILD_CMD (a documented seam in
+# The bun compile is stubbed via GROKFLEET_BUILD_CMD (a documented seam in
 # release-build.sh) so this file stays bash-only and fast, per its header.
 release_tests() {
   local T; T="$(mktemp -d)" || { bad "mktemp -d failed — cannot run the release tests"; return; }
@@ -257,12 +257,12 @@ release_tests() {
   cp "$ROOT/fleet/src/cli.ts" "$R/fleet/src/cli.ts"
   cp "$ROOT/fleet/scripts/release-build.sh" "$R/fleet/scripts/release-build.sh"
   cp "$ROOT/fleet/scripts/release-publish.sh" "$R/fleet/scripts/release-publish.sh"
-  # A stand-in for `make ts-build`: writes a deterministic fleet/dist/fleet2.
+  # A stand-in for `make ts-build`: writes a deterministic fleet/dist/grokfleet.
   cat > "$T/fakebuild.sh" <<'FAKE'
 #!/bin/bash
 mkdir -p fleet/dist
-printf '#!/bin/bash\necho "fleet2 fake"\n' > fleet/dist/fleet2
-chmod 0755 fleet/dist/fleet2
+printf '#!/bin/bash\necho "grokfleet fake"\n' > fleet/dist/grokfleet
+chmod 0755 fleet/dist/grokfleet
 FAKE
   chmod 0755 "$T/fakebuild.sh"
 
@@ -278,7 +278,7 @@ FAKE
   rel() {
     local target="$1"; shift
     ( cd "$R" && env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS \
-        FLEET2_BUILD_CMD="bash $T/fakebuild.sh" \
+        GROKFLEET_BUILD_CMD="bash $T/fakebuild.sh" \
         make --no-print-directory "$target" "$@" 2>&1 )
   }
   scratch_commit() {
@@ -298,13 +298,13 @@ FAKE
   esac
   ( cd "$R" && git checkout -q -- fleet/src/cli.ts )
 
-  # --- #14: FLEET2_RELEASE != v$PKG_VERSION => refusal -----------------------
-  ( cd "$R" && sed -i 's/^FLEET2_RELEASE=.*/FLEET2_RELEASE=v0.0.1/' vps/install-vps.sh )
+  # --- #14: GROKFLEET_RELEASE != v$PKG_VERSION => refusal -----------------------
+  ( cd "$R" && sed -i 's/^GROKFLEET_RELEASE=.*/GROKFLEET_RELEASE=v0.0.1/' vps/install-vps.sh )
   scratch_commit "mismatched pin tag"
   out="$(rel ts-release-build)"
   case "$out" in
-    *'REFUSED'*'FLEET2_RELEASE=v0.0.1'*'PKG_VERSION='*)
-      pass "#14: ts-release-build REFUSES when FLEET2_RELEASE != v\$PKG_VERSION" ;;
+    *'REFUSED'*'GROKFLEET_RELEASE=v0.0.1'*'PKG_VERSION='*)
+      pass "#14: ts-release-build REFUSES when GROKFLEET_RELEASE != v\$PKG_VERSION" ;;
     *) bad "#14: ts-release-build did not refuse on a tag/PKG_VERSION mismatch: [$out]" ;;
   esac
   ( cd "$R" && git revert -q --no-edit HEAD 2>/dev/null \
@@ -312,23 +312,48 @@ FAKE
 
   # --- build HAPPY PATH (local, network-free) --------------------------------
   out="$(rel ts-release-build)"
-  local dist="$R/fleet/dist/fleet2-linux-x64"
+  local dist="$R/fleet/dist/grokfleet-linux-x64"
   if [ -f "$dist" ] && [ -f "$dist.sha256" ]; then
-    pass "ts-release-build emits fleet/dist/fleet2-linux-x64 + its .sha256"
+    pass "ts-release-build emits fleet/dist/grokfleet-linux-x64 + its .sha256"
   else
     bad "ts-release-build produced no artifact/.sha256: [$out]"
   fi
   local digest; digest="$(sha256sum "$dist" 2>/dev/null | cut -d' ' -f1)"
-  if [ -n "$digest" ] && [ "$(installer_pin FLEET2_SHA256)" = "$digest" ]; then
-    pass "ts-release-build rewrites FLEET2_SHA256 in the installer to the artifact's digest (the pin travels with the release)"
+  if [ -n "$digest" ] && [ "$(installer_pin GROKFLEET_SHA256)" = "$digest" ]; then
+    pass "ts-release-build rewrites GROKFLEET_SHA256 in the installer to the artifact's digest (the pin travels with the release)"
   else
-    bad "ts-release-build left FLEET2_SHA256=[$(installer_pin FLEET2_SHA256)], artifact digest [$digest]"
+    bad "ts-release-build left GROKFLEET_SHA256=[$(installer_pin GROKFLEET_SHA256)], artifact digest [$digest]"
   fi
   local dirty; dirty="$( cd "$R" && git diff --name-only HEAD | tr '\n' '|' )"
   if [ "$dirty" = "vps/install-vps.sh|" ]; then
     pass "ts-release-build leaves ONLY vps/install-vps.sh dirty (D15 step 1)"
   else
     bad "ts-release-build left an unexpected dirty set: [$dirty]"
+  fi
+
+  # --- N7 (r1-B5): THE ALLOWED-DIFF GUARD, DRIVEN END TO END -----------------
+  # release-build.sh permits the installer to be dirty ONLY in the two pin
+  # constants, filtered by a literal `^[+-](<RELEASE>|<SHA256>)=` pattern. After
+  # the 5.10.0 rename that pattern names GROKFLEET_*; if it had been missed, the
+  # script's OWN pin rewrite would register as "dirty beyond the two pin
+  # constants" and every release build would die. A SECOND consecutive
+  # ts-release-build over the uncommitted bump is what exercises that branch —
+  # the first run leaves the installer dirty, the second must accept it, say so,
+  # and rewrite the pin again.
+  out="$(rel ts-release-build)"
+  case "$out" in
+    *'already carries an uncommitted pin bump'*'rewriting it'*)
+      pass "N7 (r1-B5): a second ts-release-build over the uncommitted pin bump passes the allowed-diff guard (the filter names the renamed constants)" ;;
+    *'REFUSED'*)
+      bad "N7 (r1-B5): the allowed-diff guard REFUSED its own pin rewrite — the grep pattern still names the pre-rename constants: [$out]" ;;
+    *) bad "N7 (r1-B5): second ts-release-build did not take the already-dirty branch: [$out]" ;;
+  esac
+  # and the rewritten pin still equals the artifact digest (a real rewrite, not a
+  # no-op that happens to pass the guard)
+  if [ -n "$digest" ] && [ "$(installer_pin GROKFLEET_SHA256)" = "$digest" ]; then
+    pass "N7 (r1-B5): the second run rewrote GROKFLEET_SHA256 to the artifact digest end to end"
+  else
+    bad "N7 (r1-B5): after the second run the pin is [$(installer_pin GROKFLEET_SHA256)], artifact digest [$digest]"
   fi
 
   # --- #19b: publish REFUSES on the dirty tree step 1 just left --------------
@@ -340,12 +365,12 @@ FAKE
   esac
 
   # --- #15: after the commit, a MISMATCHED artifact is still refused ---------
-  scratch_commit "release: bump the fleet2 pin"
+  scratch_commit "release: bump the grokfleet pin"
   printf 'tamper\n' >> "$dist"
   out="$(rel ts-release-publish)"
   case "$out" in
-    *'REFUSED'*'artifact digest != the committed FLEET2_SHA256'*)
-      pass "#15: ts-release-publish REFUSES when the artifact digest != the committed FLEET2_SHA256" ;;
+    *'REFUSED'*'artifact digest != the committed GROKFLEET_SHA256'*)
+      pass "#15: ts-release-publish REFUSES when the artifact digest != the committed GROKFLEET_SHA256" ;;
     *) bad "#15: ts-release-publish did not refuse a digest mismatch: [$out]" ;;
   esac
 
@@ -408,9 +433,9 @@ tui_pty_smoke() {
       TERM=xterm-256color \
       HOME="$T/home" \
       XDG_CONFIG_HOME="$T/xdg" \
-      FLEET2_ADMIN_URL="http://127.0.0.1:1" \
-      FLEET2_ADMIN_TOKEN=x \
-      python3 tests/lib/pty-smoke.py 5 q "$raw" -- "$R/fleet/dist/fleet2" tui)"
+      GROKFLEET_ADMIN_URL="http://127.0.0.1:1" \
+      GROKFLEET_ADMIN_TOKEN=x \
+      python3 tests/lib/pty-smoke.py 5 q "$raw" -- "$R/fleet/dist/grokfleet" tui)"
   # shellcheck disable=SC2086  # the KEY=VALUE lines are meant to be split
   eval "$out"
 
@@ -476,10 +501,10 @@ tui_pty_smoke() {
 
   rm -rf "$T"
 }
-if [ ! -x "$ROOT/fleet/dist/fleet2" ]; then
+if [ ! -x "$ROOT/fleet/dist/grokfleet" ]; then
   # `make test` must keep working on a machine with no bun (see the header), and
   # that machine cannot have built the binary either.
-  echo "SKIP: fleet/dist/fleet2 is not built; run 'make ts-build' for the TUI pty smoke"
+  echo "SKIP: fleet/dist/grokfleet is not built; run 'make ts-build' for the TUI pty smoke"
 elif ! command -v python3 >/dev/null 2>&1; then
   echo "SKIP: python3 not installed; the TUI pty smoke needs it to fork a pty"
 else

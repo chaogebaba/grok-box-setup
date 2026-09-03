@@ -57,7 +57,7 @@ export function makeRetireOps(env: Env, cfg: ParsedConfig, runner: Runner): Reti
       return { ok: r.ok, code: r.code };
     },
     async acquireLock() {
-      // The same `flock -w 90 … -c :` probe rename and `fleet2 state` use: it
+      // The same `flock -w 90 … -c :` probe rename and `grokfleet state` use: it
       // proves the lock was free within the window rather than holding it for
       // the command's duration.
       if (Bun.which("flock") === null) return "open-fail";

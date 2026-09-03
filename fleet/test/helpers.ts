@@ -12,7 +12,7 @@ export function testEnv(over: Partial<Env> = {}): Env {
     FLEET_TELEGRAM_ENV: "/etc/grok-fleet/telegram.env",
     FLEET_BOXES: undefined,
     FLEET_MAX_CONCURRENCY: 2,
-    FLEET2_LOCKED: false,
+    GROKFLEET_LOCKED: false,
     FLEET_API_TOKEN_FILE: undefined,
     FLEET_ROLLOUT_SRC: undefined,
     FLEET_TARGET_REF: undefined,

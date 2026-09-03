@@ -9,15 +9,15 @@
 #   1. REFUSES if any tracked file other than the two installer pin constants is
 #      dirty. (D15 step 1: this target's whole job is to leave the tree dirty in
 #      exactly those two lines, so the operator's commit in step 2 is reviewable.)
-#   2. REFUSES if FLEET2_RELEASE in the installer is not "v$PKG_VERSION" (D11).
+#   2. REFUSES if GROKFLEET_RELEASE in the installer is not "v$PKG_VERSION" (D11).
 #      Note this is asserted on the COMMITTED value BEFORE anything is rewritten:
 #      if the target simply set the tag from PKG_VERSION the assertion would be
 #      vacuous, and a PKG_VERSION bump could silently leave the pin naming an
 #      older tag. The tag line is still rewritten afterwards (idempotently), so
-#      "rewrites FLEET2_RELEASE and FLEET2_SHA256" holds; in practice only the
+#      "rewrites GROKFLEET_RELEASE and GROKFLEET_SHA256" holds; in practice only the
 #      digest line changes.
-#   3. Builds the binary, emits dist/fleet2-linux-x64 + its .sha256.
-#   4. Rewrites FLEET2_RELEASE and FLEET2_SHA256 in vps/install-vps.sh so the
+#   3. Builds the binary, emits dist/grokfleet-linux-x64 + its .sha256.
+#   4. Rewrites GROKFLEET_RELEASE and GROKFLEET_SHA256 in vps/install-vps.sh so the
 #      release and its pin travel together.
 #
 # Then: the operator commits that bump (step 2), and runs
@@ -32,8 +32,8 @@ DIST="${2:?usage: release-build.sh <installer> <dist-asset>}"
 # The build command is a seam ONLY so the shell test suite can drive the refusal
 # and happy paths without bun and without a ~10 s compile. Production leaves it
 # at `make ts-build`.
-BUILD_CMD="${FLEET2_BUILD_CMD:-make ts-build}"
-BUILD_OUT="${FLEET2_BUILD_OUT:-fleet/dist/fleet2}"
+BUILD_CMD="${GROKFLEET_BUILD_CMD:-make ts-build}"
+BUILD_OUT="${GROKFLEET_BUILD_OUT:-fleet/dist/grokfleet}"
 
 die() { echo "ts-release-build: REFUSED — $*" >&2; exit 1; }
 say() { echo "ts-release-build: $*"; }
@@ -58,19 +58,19 @@ if [ -n "$dirty" ]; then
   offending="$(git diff -U0 HEAD -- "$INSTALLER" \
     | grep -E '^[+-]' \
     | grep -vE '^(\+\+\+|---)' \
-    | grep -vE '^[+-](FLEET2_RELEASE|FLEET2_SHA256)=' || true)"
+    | grep -vE '^[+-](GROKFLEET_RELEASE|GROKFLEET_SHA256)=' || true)"
   [ -z "$offending" ] || die "$INSTALLER is dirty beyond the two pin constants:
 $offending"
   say "note: $INSTALLER already carries an uncommitted pin bump — rewriting it"
 fi
 
-# --- 2. FLEET2_RELEASE == v$PKG_VERSION (D11) ---------------------------------
+# --- 2. GROKFLEET_RELEASE == v$PKG_VERSION (D11) ---------------------------------
 pkg_version="$(sed -nE 's/^const PKG_VERSION = "([^"]+)".*/\1/p' fleet/src/cli.ts | head -1)"
 [ -n "$pkg_version" ] || die "could not read PKG_VERSION from fleet/src/cli.ts"
-pinned_tag="$(sed -nE 's/^FLEET2_RELEASE=(.*)$/\1/p' "$INSTALLER" | head -1)"
-[ -n "$pinned_tag" ] || die "could not read FLEET2_RELEASE from $INSTALLER"
+pinned_tag="$(sed -nE 's/^GROKFLEET_RELEASE=(.*)$/\1/p' "$INSTALLER" | head -1)"
+[ -n "$pinned_tag" ] || die "could not read GROKFLEET_RELEASE from $INSTALLER"
 if [ "$pinned_tag" != "v$pkg_version" ]; then
-  die "FLEET2_RELEASE=$pinned_tag but fleet/src/cli.ts PKG_VERSION=$pkg_version (expected tag v$pkg_version) — bump one to match the other"
+  die "GROKFLEET_RELEASE=$pinned_tag but fleet/src/cli.ts PKG_VERSION=$pkg_version (expected tag v$pkg_version) — bump one to match the other"
 fi
 say "pin tag $pinned_tag matches PKG_VERSION $pkg_version"
 
@@ -92,10 +92,10 @@ say "sha256 $digest"
 # convenience only — it is never published (D4: a same-origin checksum asset
 # would add zero protection against anyone who can write to the release).
 tmp="$(mktemp)"
-sed -E "s#^FLEET2_RELEASE=.*#FLEET2_RELEASE=$pinned_tag#; s#^FLEET2_SHA256=.*#FLEET2_SHA256=$digest#" \
+sed -E "s#^GROKFLEET_RELEASE=.*#GROKFLEET_RELEASE=$pinned_tag#; s#^GROKFLEET_SHA256=.*#GROKFLEET_SHA256=$digest#" \
   "$INSTALLER" > "$tmp"
 cat "$tmp" > "$INSTALLER"
 rm -f "$tmp"
-say "rewrote FLEET2_RELEASE / FLEET2_SHA256 in $INSTALLER"
+say "rewrote GROKFLEET_RELEASE / GROKFLEET_SHA256 in $INSTALLER"
 say ""
 say "NEXT (D15): commit that bump, then run:  make ts-release-publish CONFIRM=1"

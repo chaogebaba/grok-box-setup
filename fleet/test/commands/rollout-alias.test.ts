@@ -11,14 +11,14 @@ function captureLog(): { lines: string[]; restore: () => void } {
 }
 
 describe("T6 rollout alias (F9/M4)", () => {
-  test("bare rollout ⇒ 3-line refusal rc 2 (fleet2 spelling)", () => {
+  test("bare rollout ⇒ 3-line refusal rc 2 (grokfleet spelling)", () => {
     const cap = captureLog();
     const rc = rolloutRefusal();
     cap.restore();
     expect(rc).toBe(2);
     expect(cap.lines[0]).toContain("rollout: refusing to guess targets. Use:");
-    expect(cap.lines[1]).toContain("fleet2 rollout <box...>      deploy to explicit boxes");
-    expect(cap.lines[2]).toContain("fleet2 rollout --all         deploy to the whole fleet (canary first)");
+    expect(cap.lines[1]).toContain("grokfleet rollout <box...>      deploy to explicit boxes");
+    expect(cap.lines[2]).toContain("grokfleet rollout --all         deploy to the whole fleet (canary first)");
   });
 
   test("canary line: policy=config vs dynamic (F9), NOT hardcoded 005", () => {
@@ -28,7 +28,7 @@ describe("T6 rollout alias (F9/M4)", () => {
 
   test("--dirty accepted for compatibility, no refusal (M4)", () => {
     expect(ROLLOUT_DIRTY_COMPAT_LINE).toBe(
-      "rollout: --dirty is accepted for compatibility; fleet2 deploys the resolved ref, never the working tree",
+      "rollout: --dirty is accepted for compatibility; grokfleet deploys the resolved ref, never the working tree",
     );
     // The compat line is a WARNING-style log, never a refusal — no rc here.
     expect(ROLLOUT_DIRTY_COMPAT_LINE).not.toContain("refus");

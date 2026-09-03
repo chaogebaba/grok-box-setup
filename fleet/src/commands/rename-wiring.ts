@@ -251,7 +251,7 @@ function makeOps(env: Env, cfg: ParsedConfig, runner: Runner): RenameOps {
   };
 }
 
-/** Build production RenameDeps for `fleet2 rename`. */
+/** Build production RenameDeps for `grokfleet rename`. */
 export function makeRenameDeps(env: Env, cfg: ParsedConfig, runner: Runner, version = "5.9.0"): RenameDeps {
   return {
     store: makeStore(env, version),

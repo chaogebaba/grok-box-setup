@@ -1,7 +1,7 @@
 // lock.ts — the in-process reconcile.lock holder for API mutations (TUI-D3, B1).
 //
 // A mutation endpoint MUST hold `${FLEET_STATE}/reconcile.lock` for the whole
-// operation so it cannot race the timer's `fleet2 reconcile` tick (which takes
+// operation so it cannot race the timer's `grokfleet reconcile` tick (which takes
 // the SAME advisory lock via util-linux `flock`). We hold it IN-PROCESS via
 // `bun:ffi` flock(2): open an fd on the lock file, loop
 // `flock(fd, LOCK_EX|LOCK_NB)` at 250ms intervals up to T=30s; on timeout close

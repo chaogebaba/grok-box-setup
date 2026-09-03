@@ -54,7 +54,7 @@ export const bunInheritSpawner: Spawner = async (argv, opts) => {
 
 /**
  * Run the flock re-exec child with inherited stdio. `env` is merged over
- * process.env (the caller passes FLEET2_LOCKED=1). Returns the child outcome.
+ * process.env (the caller passes GROKFLEET_LOCKED=1). Returns the child outcome.
  */
 export function spawnReexec(
   argv: string[],

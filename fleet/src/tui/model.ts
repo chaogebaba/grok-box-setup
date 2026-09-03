@@ -74,7 +74,7 @@ export function detailWidth(size: Size): number {
 /**
  * Every glyph the frame paints as a STATUS, in one place so the width test can
  * measure the set rather than a hand-copied list. All are width 1 in the
- * terminals fleet2 runs in (kitty / alacritty / gnome-terminal / tmux); no
+ * terminals grokfleet runs in (kitty / alacritty / gnome-terminal / tmux); no
  * emoji, because a width-2 cell breaks Ink's measuring.
  */
 export const GLYPH = {
@@ -224,7 +224,7 @@ export function headerSegments(state: TuiState, size: Size): Seg[] {
     state.apply === null ? "apply ?" : `apply ${state.apply ? "ON" : "off"}${state.applySource === "config" ? "" : "?"}`;
   const applyTone: Tone = state.apply === null ? "warn" : state.apply ? "ok" : "muted";
   const segs: Seg[] = [
-    { text: "fleet2", tone: "main", bold: true },
+    { text: "grokfleet", tone: "main", bold: true },
     { text: ` ${c.total} boxes`, tone: "plain" },
     { text: "  ", tone: "plain" },
     { text: `${GLYPH.healthy} ${c.healthy}`, tone: "ok" },

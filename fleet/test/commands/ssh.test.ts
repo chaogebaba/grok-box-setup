@@ -30,7 +30,7 @@ describe("T-ssh usage + argv", () => {
     expect(rc).toBe(2);
     // agent-ux U5 names the new flags in the usage line; the operand tail keeps
     // its bash shape (main:696-699).
-    expect(cap.lines.some((l) => l.includes("usage: fleet2 ssh"))).toBe(true);
+    expect(cap.lines.some((l) => l.includes("usage: grokfleet ssh"))).toBe(true);
     expect(cap.lines.some((l) => l.includes("<box> [cmd...]"))).toBe(true);
     expect(cap.lines.some((l) => l.includes("--timeout <s>"))).toBe(true);
     expect(runner.calls.length).toBe(0);
@@ -55,7 +55,7 @@ describe("T-ssh usage + argv", () => {
   });
 
   test("D11(a): the INTERACTIVE forms carry NO known-hosts option (kills mutant l)", () => {
-    // `fleet2 ssh` is human-invoked, often from a laptop where FLEET_STATE does
+    // `grokfleet ssh` is human-invoked, often from a laptop where FLEET_STATE does
     // not exist. It keeps ssh's defaults, the user's own ~/.ssh/known_hosts, no
     // auto-forget and a visible banner. Both forms.
     for (const argv of [sshCmdArgv("grok-box-8", "uptime"), sshCmdArgv("grok-box-8", undefined)]) {

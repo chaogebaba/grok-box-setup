@@ -1,4 +1,4 @@
-// fleet-status.ts — `fleet2 fleet-status` (D14), the brain status table.
+// fleet-status.ts — `grokfleet fleet-status` (D14), the brain status table.
 //
 // Ports cmd_fleet_status (main:3410-3437) VERBATIM in shape: ONE devices GET;
 // header `%-14s %-7s %-7s %-7s %-12s %-10s` NAME API TUNNEL CHECK AUTHKEY VERSION

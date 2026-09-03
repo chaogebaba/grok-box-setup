@@ -330,7 +330,7 @@ describe("D5 row-d drift compares VERSION, not the stamped repo sha", () => {
 
   test("same VERSION, different sha ⇒ drift no, no rollout, ONE D5 debug line", async () => {
     // The empirical r1 FAIL, exactly: box 005 runs boxup 5.3.1 stamped f42c967
-    // while the target sha has moved to adfdc04 on a fleet2-only commit.
+    // while the target sha has moved to adfdc04 on a grokfleet-only commit.
     const lines: unknown[] = [];
     const deps = driftDeps("5.3.1", "f42c967", { history: (l) => lines.push(l) });
     await runReconcile(deps);

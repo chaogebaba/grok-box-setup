@@ -212,7 +212,7 @@ describe("D5 hysteresis is driven by row e OR the mismatch (kills mutant n)", ()
 // --- the tunnel-write gate ----------------------------------------------------
 
 describe("D11(c) tunnel-write gate (kills mutant s, one row at a time)", () => {
-  /** Every remote command fleet2 sent over the tunnel this tick. */
+  /** Every remote command grokfleet sent over the tunnel this tick. */
   function remoteCmds(runner: FakeRunner): string[] {
     return runner.argvs().filter((a) => a[0] === "ssh").map((a) => a[a.length - 1] ?? "");
   }

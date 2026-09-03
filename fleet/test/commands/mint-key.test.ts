@@ -51,12 +51,12 @@ const noTokenTransport: TailscaleTransport = {
 };
 
 describe("T2 mint-key wrapper usage split (F1, m15)", () => {
-  test("empty arg ⇒ 'usage: fleet2 mint-key <grok-box-N>' rc 2 (NOT the non-grok line)", async () => {
+  test("empty arg ⇒ 'usage: grokfleet mint-key <grok-box-N>' rc 2 (NOT the non-grok line)", async () => {
     const cap = captureLog();
     const rc = await cmdMintKey("", { env, cfg: parseEmptyCfg(), runner: new FakeRunner(), transport: noTokenTransport });
     cap.restore();
     expect(rc).toBe(2);
-    expect(cap.lines.some((l) => l.includes("usage: fleet2 mint-key <grok-box-N>"))).toBe(true);
+    expect(cap.lines.some((l) => l.includes("usage: grokfleet mint-key <grok-box-N>"))).toBe(true);
     expect(cap.lines.some((l) => l.includes("refusing non-grok box ''"))).toBe(false);
   });
 

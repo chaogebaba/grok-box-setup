@@ -24,7 +24,7 @@ export function resolveTsOptions(rest: string[], utcEnv: string | undefined, zon
 
 /**
  * The host's IANA zone, which is what the operator reads their own clock in.
- * `Intl` honours TZ, so `TZ=UTC fleet2 tui` is a third way to get UTC readings
+ * `Intl` honours TZ, so `TZ=UTC grokfleet tui` is a third way to get UTC readings
  * alongside `--utc` and FLEET_TUI_UTC=1 — the difference being that those two
  * print raw ISO strings while TZ only moves the wall clock.
  */

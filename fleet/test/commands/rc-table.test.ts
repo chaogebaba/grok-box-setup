@@ -1,4 +1,4 @@
-// rc-table.test.ts — agent-ux U3/U6: `fleet2 rc` renders from the ONE constant.
+// rc-table.test.ts — agent-ux U3/U6: `grokfleet rc` renders from the ONE constant.
 //
 // Mutant (c): replace renderRcTable's body with a hardcoded table (e.g. the
 // pre-agent-ux list without 124/255) ⇒ "renders EVERY distinct RC value" and

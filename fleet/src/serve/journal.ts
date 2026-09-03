@@ -14,10 +14,23 @@ const JOURNAL_FETCH_LINES = 4000; // R2-A6
 export const JOURNAL_DEFAULT_N = 50;
 export const JOURNAL_MAX_N = 500;
 
-/** The journalctl argv (R2-A6): both units, short-iso, last 4000 lines. */
+/**
+ * The journalctl argv (R2-A6): both units, short-iso, last 4000 lines.
+ *
+ * FOUR `-u` pairs for the 5.10.0 compatibility release, not two. journalctl
+ * matches the unit a line was LOGGED under — `_SYSTEMD_UNIT` — which is the
+ * real unit name at the time, never the compatibility alias it now answers to.
+ * So history written before the rename is only reachable under the pre-rename
+ * names. Drop the two `fleet-*` entries in 5.11.0 with the rest of the
+ * compatibility layer.
+ */
 export function journalArgv(): string[] {
   return [
     "journalctl",
+    "-u",
+    "grokfleet-reconcile.service",
+    "-u",
+    "grokfleet-api.service",
     "-u",
     "fleet-reconcile.service",
     "-u",

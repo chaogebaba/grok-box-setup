@@ -7,7 +7,8 @@ import { makeFetch } from "../../src/serve/server.ts";
 import { TokenStore, TOKEN_NAME_RE, parseTokens } from "../../src/serve/tokens.ts";
 import { fakeContext, memTokenFs, getReq, postReq, TWO_TOKENS, fakeSyscalls, fakeLockDeps, memAudit } from "./helpers.ts";
 import { setLogSink } from "../../src/log.ts";
-import { SERVE_VERSION } from "../../src/serve/handlers.ts";
+import { SERVE_NAME, SERVE_VERSION } from "../../src/serve/handlers.ts";
+import { SERVER_HEADER } from "../../src/serve/http.ts";
 
 let restore: (l: string) => void;
 beforeEach(() => {
@@ -160,6 +161,30 @@ describe("rc→HTTP table (mutant: map a domain rc to a non-200)", () => {
     expect(body.ok).toBe(true);
     expect(body.version).toBe(SERVE_VERSION);
     expect(body).toHaveProperty("tick_age_s");
+  });
+
+  // N1/N5 (5.10.0 rename): the product name is a MACHINE-READABLE field, not
+  // display text, so it is asserted by PARSING the JSON — a mechanical grep over
+  // the source would keep passing if the field were dropped or misspelled, and a
+  // consumer reading it would break silently.
+  test("GET /v1/health names the product (N1) — parsed, not grepped", async () => {
+    const ctx = await fakeContext();
+    const fetch = makeFetch(ctx);
+    const r = await fetch(getReq("/v1/health"));
+    const body = await r.json();
+    expect(body.name).toBe("grokfleet");
+    expect(SERVE_NAME).toBe("grokfleet");
+  });
+
+  test("every API response carries the `server: grokfleet` header (N1)", async () => {
+    const ctx = await fakeContext();
+    const fetch = makeFetch(ctx);
+    expect(SERVER_HEADER).toBe("grokfleet");
+    // an unauthenticated route, an authenticated one, and an error body
+    for (const req of [getReq("/v1/health"), getReq("/v1/fleet", "READSECRET"), getReq("/v1/fleet")]) {
+      const r = await fetch(req);
+      expect(r.headers.get("server")).toBe("grokfleet");
+    }
   });
 
   test("GET /v1/fleet carries the calling token's scope (R3-A1)", async () => {

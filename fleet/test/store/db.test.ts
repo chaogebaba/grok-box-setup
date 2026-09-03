@@ -67,6 +67,8 @@ describe("(a) migrations, user_version and min_reader", () => {
       v1.run(
         `INSERT INTO boxes(name,idx,port,phase,created_at,updated_at) VALUES('grok-box-008',8,20008,'enrolled',${T0},${T0})`,
       );
+      // actor='fleet2' on purpose: a file a 5.8.0 binary left behind carries the
+      // PRE-RENAME actor, and 5.10.0 does not rewrite history (N7).
       v1.run(`INSERT INTO audit(at,actor,action) VALUES(${T0},'fleet2','legacy-import')`);
       v1.close();
 
@@ -76,6 +78,13 @@ describe("(a) migrations, user_version and min_reader", () => {
       // Nothing v1 held was rewritten.
       expect((s.db.query("SELECT name FROM boxes").get() as { name: string }).name).toBe("grok-box-008");
       expect((s.db.query("SELECT COUNT(*) AS n FROM audit").get() as { n: number }).n).toBe(1);
+      // N7: an old row keeps actor='fleet2' verbatim after the migration...
+      expect((s.db.query("SELECT actor FROM audit").get() as { actor: string }).actor).toBe("fleet2");
+      // ...while a row this binary writes carries the new name, so the two
+      // generations coexist in one table.
+      s.audit({ actor: "grokfleet", action: "post-rename", at: T0 });
+      const actors = (s.db.query("SELECT actor FROM audit ORDER BY actor").all() as { actor: string }[]).map((r) => r.actor);
+      expect(actors).toEqual(["fleet2", "grokfleet"]);
       // ...and the three v2 tables are now there and empty.
       for (const t of ["snapshots", "snapshot_boxes", "snapshot_skipped"]) {
         expect((s.db.query(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n).toBe(0);

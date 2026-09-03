@@ -4,10 +4,10 @@ You are an agent on a Grok sand box (or SSH'd into one). This is everything
 you run, in order, for every situation. The program is
 `/workspace/box-setup/boxup`; `sudo` is passwordless.
 
-> Driving the whole fleet from a laptop instead of one box? Use `fleet2`
-> (`fleet2 list|status|check|rollout`) — see the "Fleet operations (laptop)"
-> section in [README.md](../README.md). Note: `fleet2 enroll` is **VPS-only**
-> (#12); after upgrading fleet2 on the VPS, re-run `vps/install-vps.sh` once
+> Driving the whole fleet from a laptop instead of one box? Use `grokfleet`
+> (`grokfleet list|status|check|rollout`) — see the "Fleet operations (laptop)"
+> section in [README.md](../README.md). Note: `grokfleet enroll` is **VPS-only**
+> (#12); after upgrading grokfleet on the VPS, re-run `vps/install-vps.sh` once
 > (idempotent) to drop the old 8-port sshd cap — see
 > [docs/FLEET-BRAIN.md](FLEET-BRAIN.md).
 
@@ -126,7 +126,7 @@ sudo /workspace/box-setup/boxup check   # exit 0 healthy / 1 unhealthy (never 2)
 ```
 
 `status` prints one line; `check` is the single health predicate (same one
-`fleet2` and rollout verification use): exit 0 and `check=OK ...` when
+`grokfleet` and rollout verification use): exit 0 and `check=OK ...` when
 healthy, else exit 1 and `check=FAIL reason=<first-failed-predicate>`.
 
 Healthy: `backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1`
@@ -165,8 +165,8 @@ box is parked for 60s before it retries. A healthy box reads
 | `authkey=expiring:<date>` in status | seeded auth key expires in < 7 days | mint a new reusable key, write it to `secrets/ts-authkey`, update `secrets/ts-authkey.expires` (see §A) |
 | `authkey=EXPIRED:<date>` in status / `check=FAIL reason=authkey EXPIRED` | the unattended recovery key is dead | rotate the key NOW (§A); until then a state-loss event cannot self-recover |
 | `authkey=unknown-expiry` in status / `check: WARN authkey expiry unknown` | `secrets/ts-authkey.expires` missing or unparseable | seed it (§A); the key may still be valid — this is a warning, not a check failure |
-| `ssh grok-box-N` times out but the node is online under another name (e.g. `cursor`, its OS hostname) | after an auth-key rejoin the box registered under the OS hostname and hasn't been renamed yet (H13) | reach it via its `tailscale status` IP or the wrong name, run `sudo /workspace/box-setup/boxup once` (pushes `set --hostname` from the frozen name file); `check` shows `name: live=cursor want=grok-box-N` until it converges. Then delete the OLD grok-box-N node in the console (or let fleet2 reconcile once it exists) |
-| `check=FAIL reason=name: dns=grok-box-N-1 want=grok-box-N` / `ssh grok-box-N` hits a DEAD/stale IP while the box is reachable at `grok-box-N-1` | split-brain: a state-loss rejoin minted a NEW node; the STALE node still holds the `grok-box-N` MagicDNS name, so the live node got a `-1` suffix. **NOT on-box fixable** — `tailscale set --hostname` is a no-op (Self.HostName is already correct; only the MagicDNS name carries `-1`). | DELETE the stale/older OFFLINE device, THEN rename the live one: `curl -X DELETE https://api.tailscale.com/api/v2/device/<stale-id> -u "$TOKEN:"` then `curl -X POST https://api.tailscale.com/api/v2/device/<live-id>/name -u "$TOKEN:" -H 'Content-Type: application/json' -d '{"name":"grok-box-N"}'` (verified HTTP 200 restores the name). This is the fleet2 reconcile row (b) job once the brain exists. |
+| `ssh grok-box-N` times out but the node is online under another name (e.g. `cursor`, its OS hostname) | after an auth-key rejoin the box registered under the OS hostname and hasn't been renamed yet (H13) | reach it via its `tailscale status` IP or the wrong name, run `sudo /workspace/box-setup/boxup once` (pushes `set --hostname` from the frozen name file); `check` shows `name: live=cursor want=grok-box-N` until it converges. Then delete the OLD grok-box-N node in the console (or let grokfleet reconcile once it exists) |
+| `check=FAIL reason=name: dns=grok-box-N-1 want=grok-box-N` / `ssh grok-box-N` hits a DEAD/stale IP while the box is reachable at `grok-box-N-1` | split-brain: a state-loss rejoin minted a NEW node; the STALE node still holds the `grok-box-N` MagicDNS name, so the live node got a `-1` suffix. **NOT on-box fixable** — `tailscale set --hostname` is a no-op (Self.HostName is already correct; only the MagicDNS name carries `-1`). | DELETE the stale/older OFFLINE device, THEN rename the live one: `curl -X DELETE https://api.tailscale.com/api/v2/device/<stale-id> -u "$TOKEN:"` then `curl -X POST https://api.tailscale.com/api/v2/device/<live-id>/name -u "$TOKEN:" -H 'Content-Type: application/json' -d '{"name":"grok-box-N"}'` (verified HTTP 200 restores the name). This is the grokfleet reconcile row (b) job once the brain exists. |
 | `check=FAIL reason=name: unnamed` | box is Running with peers visible but never picked a grok-box-N | `boxup once` / wait a tick — it picks the lowest free name from peers and freezes it; if it persists, check peers are actually visible (`tailscale status`) |
 | tailnet shows two nodes for one box | stale identity got recreated | delete the OLD node in the admin console; never copy `state/` between boxes |
 
@@ -291,8 +291,8 @@ Box names are `grok-box-` + exactly three decimal digits. A legacy unpadded box
 port, with a single brain-side command run on the VPS:
 
 ```bash
-fleet2 rename --dry-run grok-box-8 grok-box-008   # print the plan, touch nothing
-fleet2 rename grok-box-8 grok-box-008             # do it
+grokfleet rename --dry-run grok-box-8 grok-box-008   # print the plan, touch nothing
+grokfleet rename grok-box-8 grok-box-008             # do it
 ```
 
 `rename` refuses unless `<new>` is canonical `grok-box-NNN` **and** its index

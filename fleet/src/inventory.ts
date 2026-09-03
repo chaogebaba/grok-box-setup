@@ -1,4 +1,4 @@
-// inventory.ts — `fleet2 inventory [--json] [box…]` (D6, F7, G4).
+// inventory.ts — `grokfleet inventory [--json] [box…]` (D6, F7, G4).
 //
 // Per box, concurrently (limit FLEET_MAX_CONCURRENCY, default 2 — S3):
 //  - TUNNEL: the VPS-side `ss -tln` probe (F7.1); the box's own tunnel= token is
@@ -165,7 +165,7 @@ export interface InventoryDeps {
  * The staleness header's "previous" timestamp: the newest snapshot's `ts`.
  *
  * Before 5.9.0 this came from `inventory.json`'s own `generatedAt`, i.e. from
- * the last time an OPERATOR ran `fleet2 inventory`. The tick's snapshot is the
+ * the last time an OPERATOR ran `grokfleet inventory`. The tick's snapshot is the
  * better answer as well as the surviving one — it is what the fleet last looked
  * like, refreshed every five minutes, rather than whenever somebody last typed
  * the command.
@@ -273,10 +273,10 @@ export async function runInventory(boxes: string[], deps: InventoryDeps): Promis
 /**
  * Compute the DRIFT cell for a row given the resolved target.
  *
- * D5 — the same VERSION rule the reconciler's row d and the `fleet2 upgrade`
- * plan use. One rule, all call sites: `fleet2 status` must not report `yes` for
+ * D5 — the same VERSION rule the reconciler's row d and the `grokfleet upgrade`
+ * plan use. One rule, all call sites: `grokfleet status` must not report `yes` for
  * a box the reconciler will correctly never roll, which is what a sha
- * comparison did after every fleet2-only commit to main. The SHA column beside
+ * comparison did after every grokfleet-only commit to main. The SHA column beside
  * this one still shows the stamped sha, which is where that information belongs.
  */
 export function driftCell(row: ProbeResult, target: Target | null): string {

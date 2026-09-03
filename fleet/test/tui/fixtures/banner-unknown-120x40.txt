@@ -1,4 +1,4 @@
-fleet2 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick ?   admin  link ● up                                                
+grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick ?   admin  link ● up                                                
 UNKNOWN — no snapshot yet                                                                                               
 
   NAME          TUNNEL CHECK VER     DRIFT    CONFIG  EXPIRY                                                              ╭─ grok-box-001 ─────────────────────────────╮

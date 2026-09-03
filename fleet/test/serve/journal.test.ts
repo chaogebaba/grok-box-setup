@@ -62,11 +62,16 @@ describe("journalctl absent", () => {
 });
 
 describe("journal argv", () => {
-  test("queries BOTH units, short-iso, last 4000", async () => {
+  test("queries BOTH generations of unit names, short-iso, last 4000", async () => {
     const runner = new FakeRunner(() => result({ stdout: "grok-box-1 line", code: 0 }));
     await readJournal("grok-box-1", 50, { runner, which: () => true });
     const argv = runner.calls[0]!.argv;
     expect(argv).toContain("journalctl");
+    expect(argv.join(" ")).toContain("-u grokfleet-reconcile.service");
+    expect(argv.join(" ")).toContain("-u grokfleet-api.service");
+    // 5.10.0 compat: journalctl matches the unit a line was LOGGED under, so
+    // history written before the rename is only reachable under the old names.
+    // These two go in 5.11.0 with the rest of the compatibility layer.
     expect(argv.join(" ")).toContain("-u fleet-reconcile.service");
     expect(argv.join(" ")).toContain("-u fleet-api.service");
     expect(argv.join(" ")).toContain("-o short-iso");

@@ -1,4 +1,4 @@
-// api-client.ts — the TUI's HTTP client over the `fleet2 serve` API (TUI-D7).
+// api-client.ts — the TUI's HTTP client over the `grokfleet serve` API (TUI-D7).
 //
 // The TUI's 5s poll hits ONLY GET /v1/fleet (cheap per TUI-D4). Actions and the
 // detail-pane history/journal are on-demand. HTTP 5xx or malformed JSON is

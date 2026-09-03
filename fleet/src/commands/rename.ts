@@ -1,4 +1,4 @@
-// rename.ts — `fleet2 rename [--dry-run] <old> <new>` (D11/F11), the live
+// rename.ts — `grokfleet rename [--dry-run] <old> <new>` (D11/F11), the live
 // box-rename to the canonical grok-box-NNN WITHOUT changing the index/port.
 // Ports cmd_rename (main:3670-3848) + helpers (main:3493-3665): copy-first,
 // verify, delete-last, resumable, under the reconcile lock (F2). The
@@ -109,14 +109,14 @@ export async function cmdRename(args: string[], deps: RenameDeps): Promise<numbe
   for (const a of args) {
     if (a === "--dry-run") dry = true;
     else if (a.startsWith("-")) {
-      process.stderr.write(`fleet2 rename: unknown flag '${a}'\n`);
+      process.stderr.write(`grokfleet rename: unknown flag '${a}'\n`);
       return 2;
     } else pos.push(a);
   }
   const old = pos[0] ?? "";
   const neu = pos[1] ?? "";
   if (old === "" || neu === "") {
-    process.stderr.write("fleet2 rename: usage: rename [--dry-run] <old> <new>\n");
+    process.stderr.write("grokfleet rename: usage: rename [--dry-run] <old> <new>\n");
     return 2;
   }
 
