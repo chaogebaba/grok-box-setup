@@ -3,10 +3,10 @@
 #
 # Args: <soak_since> <force> <marker_path> <dropin_path> <dropin_dir> <wrapper_exec>
 #
-# Verifies a TRAILING window over `journalctl -u grokfleet-reconcile -u
-# fleet-reconcile`: BOTH unit names, because a soak window may straddle the
-# 5.10.0 rename and journalctl matches the unit a line was LOGGED under, not
-# the compatibility alias it now answers to (N6; the second -u goes in 5.11.0):
+# Verifies a TRAILING window over `journalctl -u grokfleet-reconcile`. The
+# 5.10.0 release also queried `-u fleet-reconcile`, because a soak window could
+# straddle the rename and journalctl matches the unit a line was LOGGED under;
+# that window closed with the compatibility layer in 5.11.0:
 #   - >= ceil(0.69 * window_seconds/300) `reconcile: done (DRY-RUN)` lines (I3);
 #   - ZERO non-zero ExecMainStatus / Result=exit-code runs in the window.
 # On PASS: write the marker (attestation) and install the WRAPPER drop-in.
@@ -46,10 +46,10 @@ if command -v journalctl >/dev/null 2>&1; then
   # "0\n0" — which then landed verbatim in the FORCE=1 marker as
   # `observed=0\n0 required=199`. Capture the count and reset on failure instead,
   # then hard-clamp to digits so the marker is always ONE clean line.
-  done_count="$(journalctl -u grokfleet-reconcile -u fleet-reconcile --since "$since" 2>/dev/null | grep -c 'reconcile: done (DRY-RUN)')" || done_count=0
+  done_count="$(journalctl -u grokfleet-reconcile --since "$since" 2>/dev/null | grep -c 'reconcile: done (DRY-RUN)')" || done_count=0
   case "$done_count" in ''|*[!0-9]*) done_count=0 ;; esac
   # any non-zero ExecMainStatus / Result=exit-code in the window
-  fail_runs="$(journalctl -u grokfleet-reconcile -u fleet-reconcile --since "$since" 2>/dev/null \
+  fail_runs="$(journalctl -u grokfleet-reconcile --since "$since" 2>/dev/null \
     | grep -E 'Result=exit-code|ExecMainStatus=[1-9]' | awk '{print $1"T"$2"Z"}' | paste -sd, - || true)"
 else
   echo "ts-apply-flip: journalctl not available — cannot verify soak" >&2

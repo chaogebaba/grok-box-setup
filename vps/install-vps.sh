@@ -13,9 +13,8 @@
 #   /var/lib/grok-fleet    mutable state (device cache, per-box expiry, locks)
 #   grokfleet-reconcile.timer   systemd timer, OnUnitActiveSec=5min
 #   grokfleet-reconcile.service oneshot: grokfleet reconcile (DRY-RUN until
-#                          apply=true). 5.10.0 also writes the pre-rename unit
-#                          names as compatibility symlinks/aliases for ONE
-#                          release (N2); they are removed in 5.11.0.
+#                          apply=true). The 5.10.0 compatibility names are GONE
+#                          as of 5.11.0; an upgrade REMOVES any left behind.
 #
 # Usage (on the VPS, as root):
 #   sudo bash vps/install-vps.sh              # install / upgrade (idempotent)
@@ -46,14 +45,20 @@ ETC_DIR="$PREFIX/etc/grok-fleet"
 STATE_DIR="$PREFIX/var/lib/grok-fleet"
 SYSTEMD_DIR="$PREFIX/etc/systemd/system"
 # 5.10.0 rename (blueprint fleet2-rename-grokfleet N1): the units carry the
-# product name. The OLD_* names are the ONE-RELEASE compatibility surface (N2),
-# removed in 5.11.0 — see the TODO at install_grokfleet().
+# product name.
 SERVICE="grokfleet-reconcile.service"
 TIMER="grokfleet-reconcile.timer"
 API_SERVICE="grokfleet-api.service"
-OLD_SERVICE="fleet-reconcile.service"
-OLD_TIMER="fleet-reconcile.timer"
-OLD_API_SERVICE="fleet-api.service"
+
+# The 5.10.0 compatibility names, kept HERE FOR REMOVAL ONLY (N2 promised them
+# for exactly one release and 5.11.0 is that release). Nothing writes these any
+# more: `remove_compat_names` deletes whatever a 5.10.0 install left behind, and
+# `uninstall` clears them too so a host that never reached 5.11.0 still ends
+# clean. Naming them is what makes the removal possible — it is not a surface.
+STALE_SERVICE="fleet-reconcile.service"
+STALE_TIMER="fleet-reconcile.timer"
+STALE_API_SERVICE="fleet-api.service"
+STALE_CLI="fleet2"
 
 # B-3: the ONE sanctioned sshd drop-in that constrains the fleet user to
 # remote-forward-only. We install it UNDER the drop-in directory and NEVER edit
@@ -80,55 +85,16 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # they have not pinned. Capture what the environment supplied BEFORE the
 # committed pin shadows it, so the preflight can tell the two apart.
 #
-# N7 (5.10.0 rename) — every env seam below answers to BOTH spellings for ONE
-# release. `FLEET2_<X>` is accepted wherever `GROKFLEET_<X>` is, under one rule:
-#   * only one spelling set  ⇒ that value is used (a deprecation note is logged
-#     for the old one, so an operator's stale export is never silently ignored);
-#   * both set and EQUAL     ⇒ used, logged once;
-#   * both set and DIFFERENT ⇒ REFUSE rc 1, naming both.
-# That is the same instinct as the D3 paired-override refusal below: ambiguous
-# pin input is refused, never guessed. REMOVE THE FLEET2_* HALF IN 5.11.0
-# (TODO 5.11.0: delete resolve_compat_env + its callers and read GROKFLEET_*
-# directly).
-GROKFLEET_ENV_REFUSAL=""
-resolve_compat_env() {
-  # $1 = variable suffix (RELEASE, SHA256, …); $2 = the name of the shell
-  # variable to assign the resolved value into. Assigns rather than echoes so a
-  # refusal can `return 1` — a $( ) subshell could not abort the caller.
-  local suffix="$1" out="$2" neu old
-  eval "neu=\${GROKFLEET_${suffix}-}"
-  eval "old=\${FLEET2_${suffix}-}"
-  if [ -n "$neu" ] && [ -n "$old" ]; then
-    if [ "$neu" != "$old" ]; then
-      GROKFLEET_ENV_REFUSAL="GROKFLEET_${suffix}='$neu' and FLEET2_${suffix}='$old' are BOTH set and DIFFER — unset one (FLEET2_${suffix} is the 5.10.0-only compatibility spelling and is removed in 5.11.0)"
-      return 1
-    fi
-    log "note: GROKFLEET_${suffix} and FLEET2_${suffix} are both set and agree — using it (FLEET2_${suffix} is deprecated; removed in 5.11.0)"
-    printf -v "$out" '%s' "$neu"
-    return 0
-  fi
-  if [ -n "$old" ]; then
-    log "note: FLEET2_${suffix} is deprecated — use GROKFLEET_${suffix} (accepted for 5.10.0 only, removed in 5.11.0)"
-    printf -v "$out" '%s' "$old"
-    return 0
-  fi
-  printf -v "$out" '%s' "$neu"
-  return 0
-}
-
-GROKFLEET_RELEASE_ENV=""
-GROKFLEET_SHA256_ENV=""
-GROKFLEET_BASE_URL_ENV=""
-GROKFLEET_ASSET_ENV=""
-GROKFLEET_BINARY_ENV=""
-GROKFLEET_FETCH_ROOT_ENV=""
-resolve_compat_env RELEASE    GROKFLEET_RELEASE_ENV    \
-  && resolve_compat_env SHA256     GROKFLEET_SHA256_ENV     \
-  && resolve_compat_env BASE_URL   GROKFLEET_BASE_URL_ENV   \
-  && resolve_compat_env ASSET      GROKFLEET_ASSET_ENV      \
-  && resolve_compat_env BINARY     GROKFLEET_BINARY_ENV     \
-  && resolve_compat_env FETCH_ROOT GROKFLEET_FETCH_ROOT_ENV \
-  || { log "install-vps.sh: REFUSING — $GROKFLEET_ENV_REFUSAL"; exit 1; }
+# The env seams, read DIRECTLY (5.11.0). The 5.10.0 release also accepted a
+# `FLEET2_<X>` spelling for each of these and refused when both were set and
+# differed; that one-release compatibility is gone, and an operator with a stale
+# `FLEET2_*` export now simply gets the committed pin, which is the safe answer.
+GROKFLEET_RELEASE_ENV="${GROKFLEET_RELEASE-}"
+GROKFLEET_SHA256_ENV="${GROKFLEET_SHA256-}"
+GROKFLEET_BASE_URL_ENV="${GROKFLEET_BASE_URL-}"
+GROKFLEET_ASSET_ENV="${GROKFLEET_ASSET-}"
+GROKFLEET_BINARY_ENV="${GROKFLEET_BINARY-}"
+GROKFLEET_FETCH_ROOT_ENV="${GROKFLEET_FETCH_ROOT-}"
 
 # `make ts-release-build` rewrites EXACTLY these two lines (fleet/scripts/
 # release-build.sh); keep them at column 0 in `NAME=value` form.
@@ -176,30 +142,32 @@ fi
 # --keep-user) remove the fleet user. Never touches sshd/xray/hysteria/wg0.
 uninstall() {
   log "uninstalling (PREFIX='${PREFIX:-/}')"
-  # N2: BOTH generations of unit names. A host that never saw 5.10.0 has only
-  # the OLD_* names; a 5.10.0 host has the new names plus the compat
-  # symlinks/alias. Disabling a name that does not exist is a harmless no-op.
+  # BOTH generations of unit names: a host that stopped at 5.9.x has only the
+  # pre-rename names, a 5.10.0 host has the new names plus the compatibility
+  # links this release removes. Disabling a name that does not exist is a
+  # harmless no-op, and uninstall must leave neither generation behind.
   if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
-    systemctl disable --now "$OLD_TIMER" >/dev/null 2>&1 || true
+    systemctl disable --now "$STALE_TIMER" >/dev/null 2>&1 || true
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     systemctl disable --now "$API_SERVICE" >/dev/null 2>&1 || true
     systemctl stop "$API_SERVICE" >/dev/null 2>&1 || true
-    systemctl disable --now "$OLD_API_SERVICE" >/dev/null 2>&1 || true
-    systemctl stop "$OLD_API_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable --now "$STALE_API_SERVICE" >/dev/null 2>&1 || true
+    systemctl stop "$STALE_API_SERVICE" >/dev/null 2>&1 || true
   fi
   rm -f "$SYSTEMD_DIR/$SERVICE" "$SYSTEMD_DIR/$TIMER" "$SYSTEMD_DIR/$API_SERVICE" \
-        "$SYSTEMD_DIR/$OLD_SERVICE" "$SYSTEMD_DIR/$OLD_TIMER" "$SYSTEMD_DIR/$OLD_API_SERVICE"
+        "$SYSTEMD_DIR/$STALE_SERVICE" "$SYSTEMD_DIR/$STALE_TIMER" "$SYSTEMD_DIR/$STALE_API_SERVICE"
   if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
   rm -rf "$OPT_DIR"
   # F4: remove the PATH symlink ONLY when it resolves to our target (never a
   # foreign symlink, never a regular file). PREFIX-rooted so a scratch uninstall
-  # only ever touches the scratch link. N2: the compat `fleet2` link points at
-  # the SAME target, so the guard matches either name against either target.
+  # only ever touches the scratch link. The retired `fleet2` link pointed at the
+  # SAME target, so the guard matches either name against either target — an
+  # uninstall on a host that never reached 5.11.0 still clears it.
   local link
-  for link in "$PREFIX/usr/local/bin/grokfleet" "$PREFIX/usr/local/bin/fleet2"; do
+  for link in "$PREFIX/usr/local/bin/grokfleet" "$PREFIX/usr/local/bin/$STALE_CLI"; do
     if [ -L "$link" ] && { [ "$(readlink "$link")" = "$OPT_DIR_REAL/grokfleet" ] \
        || [ "$(readlink "$link")" = "$OPT_DIR_REAL/fleet2" ]; }; then
       rm -f "$link"
@@ -295,13 +263,12 @@ grokfleet_fetch_cleanup() {
   fi
 }
 
-# r2-n1 — PEAK DISK AT THE 5.10.0 CUTOVER IS FIVE BINARIES, NOT FOUR.
-# Between N6 steps (3) and (7) the host holds, at ~80 MB each: the fetch temp,
-# the $OPT_DIR temp, the incumbent `fleet2`, the new `grokfleet`, and a
-# pre-existing `fleet2.prev` — roughly 400 MB, against ~961 MB on the brain VPS.
-# So the run refuses up front rather than dying halfway through a rename. A
-# later (post-cutover) upgrade holds four, about 320 MB. Overridable so the test
-# suite can drive the refusal.
+# r2-n1 — PEAK DISK. An upgrade holds four ~80 MB binaries at once: the fetch
+# temp, the $OPT_DIR temp, the incumbent `grokfleet` and `grokfleet.prev` — about
+# 320 MB, against ~961 MB on the brain VPS. The threshold keeps the 450 MB
+# headroom the 5.10.0 cutover needed (it briefly held five) rather than tightening
+# it for a saving nothing asks for. The run refuses up front rather than dying
+# halfway through. Overridable so the test suite can drive the refusal.
 GROKFLEET_DISK_MIN_KB="${GROKFLEET_DISK_MIN_KB:-460800}"   # 450 MB
 
 # Free kB on the filesystem holding $1, walking up to the nearest existing dir
@@ -406,14 +373,13 @@ grokfleet_preflight() {
   return 0
 }
 
-# --- the 5.10.0 CUTOVER installer (blueprint fleet2-rename-grokfleet N6/N6a) --
+# --- the installer (blueprint fleet2-rename-grokfleet N6/N6a) ----------------
 #
 # install_grokfleet ABSORBS what used to be three functions — install_fleet2,
 # install_units and install_fleet_api (N6a). That absorption is load-bearing,
 # not tidying: install_units/install_fleet_api wrote REAL unit files at the
-# pre-rename paths with `ExecStart=$OPT_DIR/fleet2`. If either survived it would
-# overwrite the two compatibility symlinks this function writes with units
-# naming a binary that step (7) has just removed.
+# pre-rename paths with `ExecStart=$OPT_DIR/fleet2`. Either one surviving would
+# reinstate a unit naming a binary that no longer exists.
 #
 # `install_grokfleet || exit 1` DISABLES `set -e` for the whole function body
 # (the D13 outage: an ENOSPC on the 80 MB copy did not abort, control reached
@@ -421,43 +387,32 @@ grokfleet_preflight() {
 # replacement). So EVERY mutating line here checks its own status and routes to
 # a named handler; nothing relies on `set -e`.
 #
-# Order, ONE run (a step's number is its N6 number):
+# Order, ONE run (a step's number is its N6 number, kept so the blueprint still
+# reads against this file):
 #   (1) stage the verified bytes into an $OPT_DIR temp   — fail ⇒ nothing changed
 #   (2) `version` smoke on that temp                     — fail ⇒ rm temp
 #   (3) PRESERVE-THEN-INSTALL grokfleet(.prev)           — the T8 idempotency
-#   (4) preserve + disable the OLD units  [CUTOVER only] — the N4 artifact
-#   (5) write the three NEW units + the two compat symlinks   [every run]
-#   (6) enable the timer, carry the API's boot enablement     [every run]
-#   (7) demote $OPT_DIR/fleet2 -> grokfleet.prev         [old binary only]
-#   (8) PATH symlinks grokfleet + fleet2                 [every run]
-#   (9) try-restart the API — the ONE survivable failure [every run]
+#   (5) write the three units                            [every run]
+#   (6) enable the timer, carry the API's boot enablement [every run]
+#   (8) the grokfleet PATH symlink                        [every run]
+#   (9) try-restart the API — the ONE survivable failure  [every run]
 #
-# Steps (5), (6), (8) and (9) are IDEMPOTENT and run on EVERY run, exactly as
-# install_units / install_fleet_api / the PATH symlink did unconditionally
-# before: a 5.10.0 host keeps getting its units repaired, its timer re-enabled
-# and a deleted compat link restored. They are the safety net of this release.
+# STEPS (4) AND (7) ARE GONE with the 5.10.0 compatibility layer (N2 promised it
+# for exactly one release). They preserved and disabled the PRE-RENAME units and
+# demoted the pre-rename BINARY, and both were gated on artefacts only a 5.9.x
+# host has. What replaces them is `remove_compat_names`, which DELETES what a
+# 5.10.0 install left behind.
 #
-# TWO INDEPENDENT DISCRIMINATORS (r6-B1), each testing what its own step
-# manipulates rather than a proxy for it:
-#   * step (7) runs iff $OPT_DIR/fleet2 is a regular file (the binary demotion);
-#   * step (4) runs iff $SYSTEMD_DIR/fleet-reconcile.service is a REGULAR FILE
-#     and NOT a symlink (the unit preserve/disable). CUTOVER=1 means (4) ran.
-# A half-rolled-back host — the N4 binary restored, the units still the compat
-# symlinks — therefore demotes the binary but does NOT re-preserve symlinks as
-# units, which would poison the rollback artifact with 5.10.0 content.
-#
-# TODO 5.11.0: delete the whole compatibility layer — OLD_SERVICE/OLD_TIMER/
-# OLD_API_SERVICE, the two `ln -sfn` compat symlinks, the timer's
-# `Alias=fleet-reconcile.timer`, the `/usr/local/bin/fleet2` link, step (4),
-# step (7) and resolve_compat_env().
+# Every step here is IDEMPOTENT and runs on EVERY run: a host keeps getting its
+# units repaired, its timer re-enabled and a deleted PATH link restored. That is
+# the safety net of this release.
 
 # Set by step (9) (and by a recovered step-(5) failure on a re-run): the run had
 # a problem that did NOT stop it. Main still exits 1 (r4-B1) — a survivable
 # failure must not truncate the run, and the exit code must still say it failed.
 DEFERRED_FAIL=0
-# Set by step (4). 1 = this run performed the 5.9.x -> 5.10.0 unit cutover.
-CUTOVER=0
-# `systemctl is-enabled` for the API unit, recorded BEFORE step (4) disables it.
+# `systemctl is-enabled` for the API unit, read in step (6) so an upgrade carries
+# the operator's boot state across.
 API_WAS_ENABLED=""
 # Step (3) bookkeeping, so a later failure can undo it EXACTLY (see undo_step3).
 GF_HAD_BINARY=0
@@ -499,13 +454,9 @@ ExecStart=/bin/bash -c 'apply=""; grep -Eq "^[[:space:]]*apply[[:space:]]*=[[:sp
 SuccessExitStatus=7
 EOF
 
-  # N2: the TIMER is the ONE unit the installer enables, so it is the one unit
-  # whose compatibility name `Alias=` can actually create — `Alias=` materialises
-  # only on `systemctl enable`. The two SERVICES are never enabled by the
-  # installer (the reconcile service has no [Install] at all and is timer-driven;
-  # the API unit is enabled by the empirical gate on PASS, TUI-D8), so their
-  # compatibility names are written below as plain unit symlinks instead — which
-  # is byte-for-byte what `enable` would have written for an Alias=.
+  # 5.11.0: the timer's `Alias=fleet-reconcile.timer` is GONE with the rest of
+  # the one-release compatibility layer. `remove_compat_names` deletes the alias
+  # symlink `systemctl enable` materialised for it on a 5.10.0 host.
   install -m 0644 /dev/stdin "$SYSTEMD_DIR/$TIMER" <<EOF || return 1
 [Unit]
 Description=Run grok-fleet reconcile every 5 minutes
@@ -518,9 +469,6 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
-# 5.10.0 compatibility (N2, ONE release — removed in 5.11.0): keep answering to
-# the pre-rename timer name. A .timer alias must live in a .timer unit.
-Alias=fleet-reconcile.timer
 EOF
 
   # TUI-D8: the admin API unit. NOT enabled here — the empirical gate enables it
@@ -558,13 +506,48 @@ EOF
   return 0
 }
 
-# N2: the two compatibility SERVICE names, written by the installer itself
-# because `Alias=` cannot reach them (see write_grokfleet_units). `ln -sfn`
-# unlinks then creates, so it replaces a regular file at the destination — which
-# is exactly what the cutover needs, and what makes a re-run idempotent.
-write_compat_service_links() {
-  ln -sfn "$SERVICE" "$SYSTEMD_DIR/$OLD_SERVICE" || return 1
-  ln -sfn "$API_SERVICE" "$SYSTEMD_DIR/$OLD_API_SERVICE" || return 1
+# 5.11.0: REMOVE the 5.10.0 compatibility names. N2 promised them for exactly one
+# release; this is the release that takes them away.
+#
+# What a 5.10.0 host carries, and what this deletes:
+#   * $SYSTEMD_DIR/fleet-reconcile.service — a unit symlink the installer wrote;
+#   * $SYSTEMD_DIR/fleet-api.service       — the same;
+#   * $SYSTEMD_DIR/fleet-reconcile.timer   — the symlink `systemctl enable`
+#     materialised for the timer's `Alias=`;
+#   * $bindir/fleet2                       — the PATH link.
+#
+# IDEMPOTENT by construction: `rm -f` on an absent path is a no-op, so a second
+# run changes nothing and a fresh install removes nothing. Each unit path is only
+# removed when it is a SYMLINK — a regular file there is an operator's own unit
+# and this installer does not delete other people's units. The PATH link keeps
+# the F4 guard: removed only when it resolves to OUR target.
+#
+# The timer is DISABLED before its alias link goes, or the *.wants symlink
+# dangles and systemd keeps resolving the old name through it.
+remove_compat_names() {
+  local removed=0 u link bindir="${BIN_DIR:-$PREFIX/usr/local/bin}"
+  if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
+    if [ -L "$SYSTEMD_DIR/$STALE_TIMER" ]; then
+      systemctl disable "$STALE_TIMER" >/dev/null 2>&1 || true
+    fi
+  fi
+  for u in "$STALE_SERVICE" "$STALE_TIMER" "$STALE_API_SERVICE"; do
+    if [ -L "$SYSTEMD_DIR/$u" ]; then
+      rm -f "$SYSTEMD_DIR/$u" || { log "install_grokfleet: could not remove the stale $u link"; return 1; }
+      log "removed the retired compatibility unit name $u"
+      removed=1
+    elif [ -e "$SYSTEMD_DIR/$u" ]; then
+      log "note: $SYSTEMD_DIR/$u is a REGULAR FILE, not our compatibility link — left alone"
+    fi
+  done
+  link="$bindir/$STALE_CLI"
+  if [ -L "$link" ] && { [ "$(readlink "$link")" = "$OPT_DIR_REAL/grokfleet" ] \
+     || [ "$(readlink "$link")" = "$OPT_DIR_REAL/$STALE_CLI" ]; }; then
+    rm -f "$link" || { log "install_grokfleet: could not remove the stale $link"; return 1; }
+    log "removed the retired CLI link $link"
+    removed=1
+  fi
+  [ "$removed" = 1 ] && log "the 5.10.0 compatibility names are gone (N2: one release only)"
   return 0
 }
 
@@ -581,59 +564,25 @@ undo_step3() {
   fi
 }
 
-# Step (4) failure: re-enable the old timer and the API per the RECORDED state,
-# undo step (3), and refuse.
-rollback_step4() {
-  if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl enable --now "$OLD_TIMER" >/dev/null 2>&1 || true
-    case "$API_WAS_ENABLED" in
-      enabled|enabled-runtime) systemctl enable "$OLD_API_SERVICE" >/dev/null 2>&1 || true ;;
-    esac
-  fi
-  undo_step3
-  log "install_grokfleet: step (4) FAILED — pre-rename units re-enabled, grokfleet undone, nothing renamed"
-}
-
-# Step (5)/(6) failure, BRANCH-AWARE (r5-B1). With CUTOVER=1 the rollback
-# artifact belongs to THIS run's incumbent, so restoring it is correct. With
-# CUTOVER=0 it holds the ORIGINAL cutover's 5.9.0 units, naming a binary that no
-# longer exists — restoring those would leave unstartable units and (with the
-# blueprint's `rm grokfleet`) no engine at all. So the re-run branch never
-# touches units.prev/ and never removes grokfleet; it simply rewrites the units
-# and the symlinks again.
+# Step (5)/(6) failure. There is no CUTOVER branch any more: with steps (4) and
+# (7) gone nothing preserves a `units.prev/` artifact, and the one that a 5.10.0
+# cutover left behind holds 5.9.0 units naming a binary that no longer exists —
+# restoring those would leave unstartable units and no engine at all. So the
+# handler NEVER touches units.prev/ and never removes grokfleet; it rewrites the
+# units and lets the run continue with the failure recorded (DEFERRED_FAIL).
 rollback_step5() {
-  local u
-  if [ "$CUTOVER" = 1 ]; then
-    log "install_grokfleet: step (5)/(6) FAILED on the CUTOVER run — restoring $OPT_DIR/units.prev"
-    rm -f "$SYSTEMD_DIR/$SERVICE" "$SYSTEMD_DIR/$TIMER" "$SYSTEMD_DIR/$API_SERVICE" \
-          "$SYSTEMD_DIR/$OLD_SERVICE" "$SYSTEMD_DIR/$OLD_API_SERVICE"
-    for u in "$OLD_SERVICE" "$OLD_TIMER" "$OLD_API_SERVICE"; do
-      [ -e "$OPT_DIR/units.prev/$u" ] || continue
-      cp -P -f "$OPT_DIR/units.prev/$u" "$SYSTEMD_DIR/$u" 2>/dev/null || true
-    done
-    if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      systemctl enable --now "$OLD_TIMER" >/dev/null 2>&1 || true
-      case "$API_WAS_ENABLED" in
-        enabled|enabled-runtime) systemctl enable "$OLD_API_SERVICE" >/dev/null 2>&1 || true ;;
-      esac
-    fi
-    undo_step3
-    log "install_grokfleet: pre-rename units restored, timer re-enabled, grokfleet undone"
-    return 1
-  fi
-  log "install_grokfleet: step (5)/(6) FAILED on a RE-RUN — units.prev is NOT touched (it holds the 5.9.0 units) and grokfleet stays; rewriting the units"
-  if write_grokfleet_units && write_compat_service_links; then
+  log "install_grokfleet: step (5)/(6) FAILED — units.prev is NOT touched and grokfleet stays; rewriting the units"
+  if write_grokfleet_units; then
     if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload >/dev/null 2>&1 || true
     fi
-    # Recovered: the host has correct 5.10.0 units, so the run continues — but
-    # the exit code still reports the failure (the DEFERRED_FAIL pattern).
+    # Recovered: the host has correct units, so the run continues — but the exit
+    # code still reports the failure (the DEFERRED_FAIL pattern).
     DEFERRED_FAIL=1
     log "install_grokfleet: units rewritten successfully — continuing, the installer will still exit 1"
     return 0
   fi
-  log "install_grokfleet: the rewrite FAILED too — host stays on 5.10.0 with whatever units are on disk; fix by hand and re-run"
+  log "install_grokfleet: the rewrite FAILED too — the host keeps whatever units are on disk; fix by hand and re-run"
   return 1
 }
 
@@ -658,14 +607,11 @@ install_grokfleet() {
   fi
 
   # === (3) PRESERVE-THEN-INSTALL (r8-B1) ====================================
-  # `.prev` is the previous grokfleet from the SECOND release on: without this
-  # copy every upgrade after the 5.10.0 cutover would destroy its predecessor,
-  # because step (7) — the other writer of grokfleet.prev — is gated on the
-  # pre-rename binary and never fires again. The `cmp` guard keeps a no-change
-  # re-run byte-identical (the T8 property). On the CUTOVER run $OPT_DIR/grokfleet
-  # does not exist yet, so this copy cannot fire and step (7) is the sole writer;
-  # on a HALF-ROLLED-BACK host both fire and (7) wins, which is the correct
-  # pairing (a 5.9.0 binary next to the 5.9.0 units in units.prev/).
+  # `.prev` is the previous grokfleet, and since step (7) went with the 5.10.0
+  # compatibility layer this is the ONLY writer of it — which is exactly what
+  # `make ts-cutback` restores. The `cmp` guard keeps a no-change re-run
+  # byte-identical (the T8 property): an unchanged binary is not preserved over
+  # itself, so `.prev` keeps naming the last DIFFERENT version.
   GF_HAD_BINARY=0
   GF_WROTE_PREV=0
   if [ -e "$OPT_DIR/grokfleet" ]; then
@@ -701,99 +647,37 @@ install_grokfleet() {
     log "retired incumbent bash fleetctl -> $OPT_DIR/fleetctl.retired-c303696 (0644, manual fallback)"
   fi
 
-  # === (4) preserve + disable the PRE-RENAME units — CUTOVER RUN ONLY =======
-  # Discriminator: the old reconcile SERVICE path is a REGULAR FILE and not a
-  # symlink. `-f` alone follows symlinks and would still be true on a migrated
-  # host, where that path holds the compatibility symlink.
-  CUTOVER=0
-  if [ -f "$SYSTEMD_DIR/$OLD_SERVICE" ] && [ ! -L "$SYSTEMD_DIR/$OLD_SERVICE" ]; then
-    # ARTIFACT GUARD, HOISTED ABOVE EVERY MUTATION IN THIS STEP (r7-B1). It reads
-    # units.prev/ and nothing else, so it can run first — and only then is
-    # "nothing changed" literally true. units.prev/ is the N4 rollback artifact
-    # and must only ever hold OLD-version units; a previous damaged run could
-    # have left 5.10.0 units there, and overwriting a good artifact with new-
-    # version units would make the next rollback restore 5.10.0 units alongside
-    # the 5.9.0 binary — exactly the failure the artifact exists to prevent.
-    if [ -e "$OPT_DIR/units.prev/$OLD_SERVICE" ] \
-       && grep -q "$OPT_DIR/grokfleet" "$OPT_DIR/units.prev/$OLD_SERVICE" 2>/dev/null; then
-      undo_step3
-      log "grokfleet: refusing — $OPT_DIR/units.prev already holds 5.10.0 units; if that is intended, rm -r $OPT_DIR/units.prev and re-run"
-      return 1
-    fi
-
-    # RECORD the operator's boot state for the API BEFORE disabling it. On an
-    # upgrade this is state the operator (or the empirical gate on PASS)
-    # established deliberately; the never-enable policy describes a FRESH
-    # install, so applying it here would turn a `disable` into a permanent
-    # removal that only shows up at the next reboot.
-    if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
-      API_WAS_ENABLED="$(systemctl is-enabled "$OLD_API_SERVICE" 2>/dev/null || true)"
-      log "recorded $OLD_API_SERVICE boot state: '${API_WAS_ENABLED:-<unreadable>}'"
-      # Disable BEFORE removing the unit files (the uninstall precedent), or the
-      # *.wants symlinks dangle and then silently resolve again through the
-      # compatibility name.
-      systemctl disable --now "$OLD_TIMER" >/dev/null 2>&1 \
-        || { rollback_step4; return 1; }
-      # NOT --now for the API: the RUNNING api keeps serving until step (9)
-      # rebinds it to the new bytes.
-      systemctl disable "$OLD_API_SERVICE" >/dev/null 2>&1 \
-        || { rollback_step4; return 1; }
-    fi
-
-    mkdir -p "$OPT_DIR/units.prev" || { rollback_step4; return 1; }
-    for u in "$OLD_SERVICE" "$OLD_TIMER" "$OLD_API_SERVICE"; do
-      if [ ! -e "$SYSTEMD_DIR/$u" ]; then
-        log "note: no $u to preserve (rollback will not restore it)"
-        continue
-      fi
-      # -P: NEVER dereference. Two of these three paths become symlinks to the
-      # new units later in this run, and a plain `cp` on a re-entry would copy
-      # the TARGET's contents into the rollback artifact.
-      cp -P -f "$SYSTEMD_DIR/$u" "$OPT_DIR/units.prev/$u" || { rollback_step4; return 1; }
-    done
-    CUTOVER=1
-    log "preserved the pre-rename units in $OPT_DIR/units.prev (N4 rollback artifact)"
-  fi
-
-  # === (5) the three NEW units, then the two compatibility symlinks =========
+  # === (5) the three units =================================================
   # Unit-write failures are FATAL from 5.10.0 (they were non-fatal when
   # install_units/install_fleet_api were called bare). Deliberate: a half-renamed
   # host is worse than an aborted install, and rollback_step5 is what makes fatal
   # safe.
   write_grokfleet_units || { rollback_step5 || return 1; }
-  if [ "$CUTOVER" = 1 ]; then
-    # Only the TIMER path needs an explicit removal: its compatibility name comes
-    # from `enable` (the Alias), not from a link we write, so a leftover regular
-    # file there would shadow the alias. The two SERVICE paths need no rm —
-    # `ln -sfn` unlinks then creates. On a re-run (CUTOVER=0) these three paths
-    # hold the compat symlinks and the timer alias: leave them alone.
-    rm -f "$SYSTEMD_DIR/$OLD_TIMER" || { rollback_step5 || return 1; }
-  fi
   # D7: a phase-2 cutover drop-in (fleet-reconcile.service.d/fleet2.conf) is
   # obsolete — the base unit ExecStart runs the engine directly. Removed on every
   # run. r3-n2: any FUTURE drop-in belongs under grokfleet-reconcile.service.d/,
   # because systemd resolves drop-ins by the REAL unit name; a directory named
-  # after the compatibility alias is silently ignored.
-  local dropin="$SYSTEMD_DIR/$OLD_SERVICE.d/fleet2.conf"
+  # after a retired compatibility name is silently ignored.
+  local dropin="$SYSTEMD_DIR/$STALE_SERVICE.d/fleet2.conf"
   if [ -e "$dropin" ]; then
     rm -f "$dropin" || { rollback_step5 || return 1; }
-    rmdir "$SYSTEMD_DIR/$OLD_SERVICE.d" 2>/dev/null || true
+    rmdir "$SYSTEMD_DIR/$STALE_SERVICE.d" 2>/dev/null || true
     log "removed obsolete cutover drop-in $dropin"
   fi
-  write_compat_service_links || { rollback_step5 || return 1; }
-  log "installed $SERVICE + $TIMER + $API_SERVICE; compatibility names $OLD_SERVICE / $OLD_API_SERVICE link to them (removed in 5.11.0)"
+  # 5.11.0: the compatibility names go HERE, after the real units are on disk and
+  # before the daemon-reload, so systemd never sees a moment with neither name.
+  remove_compat_names || { rollback_step5 || return 1; }
+  log "installed $SERVICE + $TIMER + $API_SERVICE"
 
   if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || { rollback_step5 || return 1; }
 
     # === (6) enable the timer; CARRY OVER the API's boot enablement =========
     systemctl enable --now "$TIMER" || { rollback_step5 || return 1; }
-    log "enabled $TIMER (reconcile every 5min; dry-run until config apply=true); $OLD_TIMER resolves through Alias="
-    if [ "$CUTOVER" = 0 ]; then
-      # No step (4) on this run, so the recorded state comes from the unit that
-      # actually exists.
-      API_WAS_ENABLED="$(systemctl is-enabled "$API_SERVICE" 2>/dev/null || true)"
-    fi
+    log "enabled $TIMER (reconcile every 5min; dry-run until config apply=true)"
+    # Carry the operator's (or the empirical gate's) API boot state across the
+    # upgrade: the never-enable policy describes a FRESH install only.
+    API_WAS_ENABLED="$(systemctl is-enabled "$API_SERVICE" 2>/dev/null || true)"
     case "$API_WAS_ENABLED" in
       enabled|enabled-runtime)
         systemctl enable "$API_SERVICE" >/dev/null 2>&1 || true
@@ -810,33 +694,18 @@ install_grokfleet() {
     log "PREFIX set (or no systemctl) — units written but not enabled"
   fi
 
-  # === (7) demote the PRE-RENAME binary ====================================
-  # Discriminator: $OPT_DIR/fleet2 is a regular file. `mv` (not `cp`) is
-  # deliberate — a rename is not idempotent by nature, and on a re-run this step
-  # simply does not fire; step (3) is the idempotent preservation path.
-  if [ -f "$OPT_DIR/fleet2" ]; then
-    mv -f "$OPT_DIR/fleet2" "$OPT_DIR/grokfleet.prev" || { rollback_step5 || return 1; }
-    log "demoted $OPT_DIR/fleet2 -> $OPT_DIR/grokfleet.prev (the rollback target of THIS install)"
-    if [ -e "$OPT_DIR/fleet2.prev" ]; then
-      rm -f "$OPT_DIR/fleet2.prev" || { log "install_grokfleet: could not remove superseded $OPT_DIR/fleet2.prev"; return 1; }
-      log "removed the superseded $OPT_DIR/fleet2.prev (two releases old; its units are gone)"
-    fi
-  fi
-
-  # === (8) PATH symlinks — BEFORE the restart ==============================
+  # === (8) the PATH symlink — BEFORE the restart ==========================
   # Deliberately ahead of step (9): the one survivable failure below must leave a
   # host whose CLI resolves, so the operator's first recovery command works.
-  # Nothing here depends on the service. The `fleet2` name is the N2 CLI
-  # compatibility link and points at the SAME target (removed in 5.11.0).
+  # Nothing here depends on the service. The `fleet2` compatibility link is GONE
+  # in 5.11.0 — `remove_compat_names` deleted it above.
   # BIN_DIR is an extracted-function test seam; normal installs retain the
   # established PREFIX-relative destination.
   local bindir="${BIN_DIR:-$PREFIX/usr/local/bin}"
   mkdir -p "$bindir" || { log "install_grokfleet: could not create $bindir for CLI links"; return 1; }
   ln -sfn "$OPT_DIR_REAL/grokfleet" "$bindir/grokfleet" \
     || { log "install_grokfleet: could not link $bindir/grokfleet"; return 1; }
-  ln -sfn "$OPT_DIR_REAL/grokfleet" "$bindir/fleet2" \
-    || { log "install_grokfleet: could not link $bindir/fleet2"; return 1; }
-  log "linked $bindir/grokfleet and $bindir/fleet2 -> $OPT_DIR_REAL/grokfleet"
+  log "linked $bindir/grokfleet -> $OPT_DIR_REAL/grokfleet"
 
   # === (9) rebind a RUNNING API to the new bytes ===========================
   # A long-running unit keeps executing the binary it was STARTED with, and the
@@ -847,16 +716,14 @@ install_grokfleet() {
   # never-start policy (TUI-D8) is unchanged. ONLY the API — the reconcile unit
   # is a Type=oneshot whose next tick execs the new binary on its own.
   if [ -z "$PREFIX" ] && command -v systemctl >/dev/null 2>&1; then
-    if systemctl is-active --quiet "$API_SERVICE" 2>/dev/null \
-       || systemctl is-active --quiet "$OLD_API_SERVICE" 2>/dev/null; then
-      if systemctl try-restart "$API_SERVICE" >/dev/null 2>&1 \
-         || systemctl try-restart "$OLD_API_SERVICE" >/dev/null 2>&1; then
+    if systemctl is-active --quiet "$API_SERVICE" 2>/dev/null; then
+      if systemctl try-restart "$API_SERVICE" >/dev/null 2>&1; then
         log "restarted $API_SERVICE (binary changed)"
       else
         # THE ONE SURVIVABLE FAILURE. Return 0 so every phase after this call
         # site still runs — including the sshd drop-in, the only one the file
         # marks fatal-if-it-fails — and let main exit 1 on DEFERRED_FAIL.
-        log "grokfleet: API restart failed — host is on 5.10.0, CLI usable, run: systemctl start $API_SERVICE"
+        log "grokfleet: API restart failed — the CLI is usable; run: systemctl start $API_SERVICE"
         DEFERRED_FAIL=1
       fi
     else

@@ -818,8 +818,8 @@ release_pin_matches_pkg_test() {
 # install_grokfleet ends with a `try-restart` of the API unit, but ONLY when it is
 # already active — TUI-D8's "never enable, never start" policy stands for the API.
 #
-# The harness evals install_grokfleet AND the four helpers it now calls (N6a
-# absorbed install_units/install_fleet_api into it) with a fake systemctl and a
+# The harness evals install_grokfleet AND the helpers it calls (N6a absorbed
+# install_units/install_fleet_api into it) with a fake systemctl and a
 # recording stub binary on PATH, both writing to ONE log, so the ORDER of
 # `version` and `try-restart` is assertable and not just their presence.
 api_rebind_test() {
@@ -856,18 +856,18 @@ BIN_DIR="$root/bin"
 SERVICE="grokfleet-reconcile.service"
 TIMER="grokfleet-reconcile.timer"
 API_SERVICE="grokfleet-api.service"
-OLD_SERVICE="fleet-reconcile.service"
-OLD_TIMER="fleet-reconcile.timer"
-OLD_API_SERVICE="fleet-api.service"
+STALE_SERVICE="fleet-reconcile.service"
+STALE_TIMER="fleet-reconcile.timer"
+STALE_API_SERVICE="fleet-api.service"
+STALE_CLI="fleet2"
 DEFERRED_FAIL=0
-CUTOVER=0
 API_WAS_ENABLED=""
 GF_HAD_BINARY=0
 GF_WROTE_PREV=0
 GROKFLEET_VERIFIED_BINARY="$d/grokfleet-stub"
 log(){ printf 'LOG %s\n' "\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in write_grokfleet_units write_compat_service_links undo_step3 rollback_step4 rollback_step5 install_grokfleet; do
+for fn in write_grokfleet_units remove_compat_names undo_step3 rollback_step5 install_grokfleet; do
   eval "\$(extract_from "$VPS_INSTALL" "\$fn")"
 done
 FAKE_ACTIVE=$active install_grokfleet
@@ -945,104 +945,143 @@ echo "-----"
 # Everything here runs against a mock PREFIX root. `systemctl` is absent from
 # these runs (PREFIX is set), so the assertions are about FILES: unit contents,
 # symlinks, the preserved rollback artifact and the demoted binary. The
-# systemctl-shaped behaviour (disable-before-remove, the enablement carry-over)
-# is driven separately by cutover_mock() below, which evals the function with a
-# recording systemctl exactly like the API-rebind harness does.
+# systemctl-shaped behaviour (the alias disable-before-remove, the enablement
+# carry-over) is driven separately by upgrade_mock() below, which evals the
+# function with a recording systemctl exactly like the API-rebind harness does.
 # =============================================================================
 
-# seed_5_9_0 <pfx>: a mock host as 5.9.0 left it — the pre-rename binary, a
-# pre-existing fleet2.prev (the VPS has one: 5.9.0 was installed over 5.8.0),
-# and the three pre-rename unit files as REGULAR files.
-seed_5_9_0() {
+# seed_5_10_0 <pfx>: a mock host as 5.10.0 left it — the grokfleet binary, the
+# three REAL units, and the whole one-release compatibility surface that 5.11.0
+# now removes: the two service symlinks, the timer's alias symlink (what
+# `systemctl enable` materialises for `Alias=`), and the `fleet2` PATH link.
+seed_5_10_0() {
   local pfx="$1"
-  mkdir -p "$pfx/opt/grok-fleet" "$pfx/etc/systemd/system"
-  printf '#!/bin/bash\necho fleet2 5.9.0\n' > "$pfx/opt/grok-fleet/fleet2"
-  chmod 0755 "$pfx/opt/grok-fleet/fleet2"
-  printf 'OLD-PREV-5.8.0\n' > "$pfx/opt/grok-fleet/fleet2.prev"
-  cat > "$pfx/etc/systemd/system/fleet-reconcile.service" <<EOF
-[Unit]
-Description=grok-fleet reconcile (FLEET-BRAIN brain)
+  mkdir -p "$pfx/opt/grok-fleet" "$pfx/etc/systemd/system" "$pfx/usr/local/bin"
+  printf '#!/bin/bash\n[ "$1" = version ] && echo "grokfleet 5.10.0"\nexit 0\n' > "$pfx/opt/grok-fleet/grokfleet"
+  chmod 0755 "$pfx/opt/grok-fleet/grokfleet"
+  local sd="$pfx/etc/systemd/system"
+  cat > "$sd/grokfleet-reconcile.service" <<EOF
 [Service]
-Type=oneshot
-ExecStart=$pfx/opt/grok-fleet/fleet2 reconcile
+ExecStart=$pfx/opt/grok-fleet/grokfleet reconcile
 EOF
-  cat > "$pfx/etc/systemd/system/fleet-reconcile.timer" <<'EOF'
+  cat > "$sd/grokfleet-reconcile.timer" <<'EOF'
 [Timer]
 OnUnitActiveSec=5min
 [Install]
 WantedBy=timers.target
+Alias=fleet-reconcile.timer
 EOF
-  cat > "$pfx/etc/systemd/system/fleet-api.service" <<EOF
+  cat > "$sd/grokfleet-api.service" <<EOF
 [Service]
-ExecStart=$pfx/opt/grok-fleet/fleet2 serve
+ExecStart=$pfx/opt/grok-fleet/grokfleet serve
 EOF
+  # the compatibility surface, exactly as 5.10.0 wrote it
+  ln -sfn grokfleet-reconcile.service "$sd/fleet-reconcile.service"
+  ln -sfn grokfleet-api.service "$sd/fleet-api.service"
+  ln -sfn grokfleet-reconcile.timer "$sd/fleet-reconcile.timer"
+  ln -sfn /opt/grok-fleet/grokfleet "$pfx/usr/local/bin/fleet2"
 }
 
-# --- N2: the compatibility surface after a CUTOVER run ------------------------
-compat_surface_test() {
+# --- 5.11.0: the compatibility layer is REMOVED on upgrade -------------------
+# The N2 schedule promised those names for exactly one release. This asserts the
+# whole removal AND that the removal touched nothing else: the three real units
+# must still be there, with their content unchanged, and the grokfleet PATH link
+# must still resolve. A second run is a no-op — nothing to remove, nothing to
+# report, and the tree is byte-identical.
+compat_removed_test() {
   local pfx; pfx="$(mktemp -d)"
-  seed_5_9_0 "$pfx"
+  seed_5_10_0 "$pfx"
+  local sd="$pfx/etc/systemd/system"
+  local out; out="$(GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"
+  local r=""
+  # (1) every compatibility name is gone
+  [ -e "$sd/fleet-reconcile.service" ] || [ -L "$sd/fleet-reconcile.service" ] && r="$r svc=LEFT" || r="$r svc=gone"
+  [ -e "$sd/fleet-api.service" ] || [ -L "$sd/fleet-api.service" ] && r="$r api=LEFT" || r="$r api=gone"
+  [ -e "$sd/fleet-reconcile.timer" ] || [ -L "$sd/fleet-reconcile.timer" ] && r="$r timer=LEFT" || r="$r timer=gone"
+  [ -e "$pfx/usr/local/bin/fleet2" ] || [ -L "$pfx/usr/local/bin/fleet2" ] && r="$r cli=LEFT" || r="$r cli=gone"
+  # (2) the timer no longer DECLARES the alias, so a future enable cannot recreate it
+  grep -q '^Alias=' "$sd/grokfleet-reconcile.timer" && r="$r alias=DECLARED" || r="$r alias=gone"
+  # (3) the REAL units are all present and INTACT — the removal is only about the
+  #     compatibility names, so each unit still drives the grokfleet binary. (The
+  #     installer rewrites the three unit files on every run by design, so this
+  #     asserts their CONTENT rather than their bytes being untouched.)
+  [ -f "$sd/grokfleet-reconcile.service" ] && [ -f "$sd/grokfleet-reconcile.timer" ] \
+    && [ -f "$sd/grokfleet-api.service" ] && r="$r units=present" || r="$r units=MISSING"
+  grep -q "$pfx/opt/grok-fleet/grokfleet reconcile" "$sd/grokfleet-reconcile.service" \
+    && r="$r svcbody=drives-grokfleet" || r="$r svcbody=WRONG"
+  grep -q "ExecStart=$pfx/opt/grok-fleet/grokfleet serve" "$sd/grokfleet-api.service" \
+    && r="$r apibody=drives-grokfleet" || r="$r apibody=WRONG"
+  grep -q '^OnUnitActiveSec=5min$' "$sd/grokfleet-reconcile.timer" \
+    && r="$r timerbody=intact" || r="$r timerbody=WRONG"
+  # (4) the real CLI link still resolves
+  [ -L "$pfx/usr/local/bin/grokfleet" ] && r="$r gfcli=link" || r="$r gfcli=MISSING"
+  # (5) it SAID so
+  case "$out" in *'the 5.10.0 compatibility names are gone'*) r="$r said=yes" ;; *) r="$r said=NO" ;; esac
+  # (6) IDEMPOTENT: a second run removes nothing and changes nothing
+  local before after out2
+  before="$( (cd "$pfx" && find . \( -type f -o -type l \) -exec ls -ld {} \; | awk '{print $1, $NF}' | sort) )"
+  out2="$(GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"
+  after="$( (cd "$pfx" && find . \( -type f -o -type l \) -exec ls -ld {} \; | awk '{print $1, $NF}' | sort) )"
+  [ "$before" = "$after" ] && r="$r rerun=identical" || r="$r rerun=CHANGED"
+  case "$out2" in *'compatibility names are gone'*) r="$r rerun_said=YES" ;; *) r="$r rerun_said=no" ;; esac
+  rm -rf "$pfx"
+  echo "${r# }"
+}
+cr="$(compat_removed_test)"
+want_cr="svc=gone api=gone timer=gone cli=gone alias=gone units=present svcbody=drives-grokfleet apibody=drives-grokfleet timerbody=intact gfcli=link said=yes rerun=identical rerun_said=no"
+if [ "$cr" = "$want_cr" ]; then
+  pass "5.11.0: upgrading a 5.10.0 host removes every compatibility name and leaves the real units alone (idempotent on a re-run)"
+else
+  bad "5.11.0 compat removal wrong: [$cr] want [$want_cr]"
+fi
+
+# A FRESH install writes none of them in the first place.
+compat_never_written_test() {
+  local pfx; pfx="$(mktemp -d)"
   GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   local sd="$pfx/etc/systemd/system" r=""
-  [ -L "$sd/fleet-reconcile.service" ] && [ "$(readlink "$sd/fleet-reconcile.service")" = "grokfleet-reconcile.service" ] \
-    && r="$r svc=link" || r="$r svc=BAD"
-  [ -L "$sd/fleet-api.service" ] && [ "$(readlink "$sd/fleet-api.service")" = "grokfleet-api.service" ] \
-    && r="$r api=link" || r="$r api=BAD"
-  # both compat names RESOLVE to a real unit file
-  [ -f "$sd/fleet-reconcile.service" ] && [ -f "$sd/fleet-api.service" ] && r="$r resolve=yes" || r="$r resolve=NO"
-  grep -q '^Alias=fleet-reconcile.timer$' "$sd/grokfleet-reconcile.timer" && r="$r timeralias=yes" || r="$r timeralias=NO"
-  # the pre-rename timer FILE is gone (its compat name comes from the Alias)
-  [ -e "$sd/fleet-reconcile.timer" ] && r="$r oldtimer=LEFT" || r="$r oldtimer=gone"
-  # the CLI compat link
-  local l="$pfx/usr/local/bin/fleet2"
-  [ -L "$l" ] && [ "$(readlink "$l")" = "/opt/grok-fleet/grokfleet" ] && r="$r cli=link" || r="$r cli=BAD"
+  local n; n="$(find "$sd" -maxdepth 1 -name 'fleet-*' 2>/dev/null | wc -l | tr -d ' ')"
+  r="$r stale_units=$n"
+  [ -e "$pfx/usr/local/bin/fleet2" ] && r="$r cli=WRITTEN" || r="$r cli=none"
+  grep -q '^Alias=' "$sd/grokfleet-reconcile.timer" && r="$r alias=DECLARED" || r="$r alias=none"
   rm -rf "$pfx"
   echo "${r# }"
 }
-cs="$(compat_surface_test)"
-want_cs="svc=link api=link resolve=yes timeralias=yes oldtimer=gone cli=link"
-if [ "$cs" = "$want_cs" ]; then
-  pass "rename (N2): the cutover writes both compat service symlinks, the timer Alias= and the fleet2 CLI link"
+cn="$(compat_never_written_test)"
+if [ "$cn" = "stale_units=0 cli=none alias=none" ]; then
+  pass "5.11.0: a FRESH install writes no compatibility unit name, no fleet2 link and no timer Alias="
 else
-  bad "N2 compat surface wrong: [$cs] want [$want_cs]"
+  bad "5.11.0 fresh install still writes a compat name: [$cn] want [stale_units=0 cli=none alias=none]"
 fi
 
-# --- N6 step (7) + N4: the demotion and the rollback artifact -----------------
-cutover_artifacts_test() {
+# A REGULAR FILE at a compatibility path is somebody else's unit: left alone.
+compat_regular_file_test() {
   local pfx; pfx="$(mktemp -d)"
-  seed_5_9_0 "$pfx"
-  local before_sha; before_sha="$(sha256sum "$pfx/opt/grok-fleet/fleet2" | cut -d' ' -f1)"
-  GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
-  local o="$pfx/opt/grok-fleet" r=""
-  [ -e "$o/fleet2" ] && r="$r fleet2=LEFT" || r="$r fleet2=gone"
-  [ -e "$o/fleet2.prev" ] && r="$r oldprev=LEFT" || r="$r oldprev=gone"
-  if [ -e "$o/grokfleet.prev" ] && [ "$(sha256sum "$o/grokfleet.prev" | cut -d' ' -f1)" = "$before_sha" ]; then
-    r="$r prev=is-5.9.0"
-  else r="$r prev=WRONG"; fi
-  # units.prev holds the THREE pre-rename units, and they name the OLD binary
-  local u="$o/units.prev" n
-  n="$(find "$u" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
-  r="$r unitsprev=$n"
-  grep -q "/opt/grok-fleet/fleet2 reconcile" "$u/fleet-reconcile.service" 2>/dev/null \
-    && r="$r artifact=old-units" || r="$r artifact=WRONG"
+  seed_5_10_0 "$pfx"
+  local sd="$pfx/etc/systemd/system"
+  rm -f "$sd/fleet-api.service"
+  printf '[Service]\nExecStart=/usr/bin/true\n' > "$sd/fleet-api.service"   # NOT ours
+  local out; out="$(GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"
+  local r=""
+  [ -f "$sd/fleet-api.service" ] && [ ! -L "$sd/fleet-api.service" ] && r="$r kept=yes" || r="$r kept=NO"
+  case "$out" in *'is a REGULAR FILE, not our compatibility link — left alone'*) r="$r said=yes" ;; *) r="$r said=NO" ;; esac
   rm -rf "$pfx"
   echo "${r# }"
 }
-ca="$(cutover_artifacts_test)"
-want_ca="fleet2=gone oldprev=gone prev=is-5.9.0 unitsprev=3 artifact=old-units"
-if [ "$ca" = "$want_ca" ]; then
-  pass "rename (N6.7/N4): the pre-rename binary is demoted to grokfleet.prev, the stale fleet2.prev removed, units.prev holds the OLD units"
+crf="$(compat_regular_file_test)"
+if [ "$crf" = "kept=yes said=yes" ]; then
+  pass "5.11.0: a REGULAR FILE at a compatibility path is an operator's own unit — removed never, reported once"
 else
-  bad "N6.7/N4 artifacts wrong: [$ca] want [$want_ca]"
+  bad "5.11.0 regular-file guard wrong: [$crf] want [kept=yes said=yes]"
 fi
 
-# --- N6 step (3): .prev is the previous grokfleet from the SECOND release on ---
-# Install 5.10.0 over 5.9.0, then a differing "5.10.1" over that: grokfleet.prev
-# must become the 5.10.0 bytes. Mutant (drop the step-3 copy) ⇒ prev stays 5.9.0.
-# And a byte-identical re-run must write nothing (the T8 property).
+# --- N6 step (3): .prev is the previous grokfleet ----------------------------
+# Install over a 5.10.0 host, then a differing build over that: grokfleet.prev
+# must become the FIRST install's bytes. Mutant (drop the step-3 copy) ⇒ .prev is
+# never written at all. And a byte-identical re-run must write nothing (T8).
 second_release_prev_test() {
   local pfx sd; pfx="$(mktemp -d)"; sd="$(mktemp -d)"
-  seed_5_9_0 "$pfx"
+  seed_5_10_0 "$pfx"
   GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   local first_sha; first_sha="$(sha256sum "$pfx/opt/grok-fleet/grokfleet" | cut -d' ' -f1)"
   # a byte-identical re-run first: nothing may change
@@ -1053,8 +1092,8 @@ second_release_prev_test() {
   local r=""
   [ "$before" = "$after" ] && r="$r rerun=identical" || r="$r rerun=CHANGED"
   # now a DIFFERENT build
-  local next="$sd/grokfleet-5.10.1"
-  printf '#!/bin/bash\n[ "$1" = version ] && echo "grokfleet 5.10.1"\nexit 0\n' > "$next"; chmod 0755 "$next"
+  local next="$sd/grokfleet-5.11.1"
+  printf '#!/bin/bash\n[ "$1" = version ] && echo "grokfleet 5.11.1"\nexit 0\n' > "$next"; chmod 0755 "$next"
   GROKFLEET_BINARY="$next" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   if [ "$(sha256sum "$pfx/opt/grok-fleet/grokfleet.prev" | cut -d' ' -f1)" = "$first_sha" ]; then
     r="$r prev=previous-grokfleet"
@@ -1064,168 +1103,82 @@ second_release_prev_test() {
 }
 sr="$(second_release_prev_test)"
 if [ "$sr" = "rerun=identical prev=previous-grokfleet" ]; then
-  pass "rename (N6.3/r8-B1): a no-change re-run is byte-identical (T8) and the NEXT release preserves the outgoing grokfleet as .prev"
+  pass "installer (N6.3/r8-B1): a no-change re-run is byte-identical (T8) and the NEXT release preserves the outgoing grokfleet as .prev"
 else
   bad "N6.3 preserve-then-install wrong: [$sr] want [rerun=identical prev=previous-grokfleet]"
 fi
 
-# --- N6 steps (5)/(8), re-run idempotence: a deleted compat link is restored ---
+# --- N6 steps (5)/(8), re-run idempotence: a deleted unit/link is restored ----
 rerun_repairs_test() {
   local pfx; pfx="$(mktemp -d)"
-  seed_5_9_0 "$pfx"
+  seed_5_10_0 "$pfx"
   GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   local sd="$pfx/etc/systemd/system" o="$pfx/opt/grok-fleet"
-  local bin_sha prev_sha
-  bin_sha="$(sha256sum "$o/grokfleet" | cut -d' ' -f1)"
-  prev_sha="$(sha256sum "$o/grokfleet.prev" | cut -d' ' -f1)"
-  local units_before; units_before="$( (cd "$o/units.prev" && find . -type f -exec sha256sum {} \; | sort) )"
-  rm -f "$sd/fleet-api.service"                      # an operator (or a bad edit) removed one
+  local bin_sha; bin_sha="$(sha256sum "$o/grokfleet" | cut -d' ' -f1)"
+  rm -f "$sd/grokfleet-api.service"          # an operator (or a bad edit) removed one
+  rm -f "$pfx/usr/local/bin/grokfleet"       # …and the PATH link
   GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
   local r=""
-  [ -L "$sd/fleet-api.service" ] && r="$r restored=yes" || r="$r restored=NO"
+  [ -f "$sd/grokfleet-api.service" ] && r="$r unit=restored" || r="$r unit=MISSING"
+  [ -L "$pfx/usr/local/bin/grokfleet" ] && r="$r link=restored" || r="$r link=MISSING"
   [ "$(sha256sum "$o/grokfleet" | cut -d' ' -f1)" = "$bin_sha" ] && r="$r bin=same" || r="$r bin=CHANGED"
-  [ "$(sha256sum "$o/grokfleet.prev" | cut -d' ' -f1)" = "$prev_sha" ] && r="$r prev=same" || r="$r prev=CHANGED"
-  [ "$( (cd "$o/units.prev" && find . -type f -exec sha256sum {} \; | sort) )" = "$units_before" ] \
-    && r="$r artifact=same" || r="$r artifact=CHANGED"
   rm -rf "$pfx"
   echo "${r# }"
 }
 rr="$(rerun_repairs_test)"
-if [ "$rr" = "restored=yes bin=same prev=same artifact=same" ]; then
-  pass "rename (N6.5/N6.8): a re-run restores a deleted compat symlink and changes nothing else (binary, .prev and units.prev untouched)"
+if [ "$rr" = "unit=restored link=restored bin=same" ]; then
+  pass "installer (N6.5/N6.8): a re-run restores a deleted unit and a deleted PATH link, and leaves the binary alone"
 else
-  bad "N6 re-run repair wrong: [$rr] want [restored=yes bin=same prev=same artifact=same]"
-fi
-
-# --- r6-B1: the HALF-ROLLED-BACK host --------------------------------------
-# The N4 sequence run halfway: the binary restored to $OPT_DIR/fleet2, the unit
-# paths still the compatibility symlinks. Step (4) must NOT run (its
-# discriminator is the unit file, not the binary), so units.prev keeps its 5.9.0
-# content; step (7) DOES run, because $OPT_DIR/fleet2 is a regular file.
-half_rollback_test() {
-  local pfx; pfx="$(mktemp -d)"
-  seed_5_9_0 "$pfx"
-  GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
-  local o="$pfx/opt/grok-fleet"
-  local units_before; units_before="$( (cd "$o/units.prev" && find . -type f -exec sha256sum {} \; | sort) )"
-  # half rollback: restore the binary only
-  cp -f "$o/grokfleet.prev" "$o/fleet2"; chmod 0755 "$o/fleet2"
-  GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
-  local r=""
-  [ "$( (cd "$o/units.prev" && find . -type f -exec sha256sum {} \; | sort) )" = "$units_before" ] \
-    && r="$r artifact=unchanged" || r="$r artifact=POISONED"
-  grep -q "/opt/grok-fleet/fleet2 reconcile" "$o/units.prev/fleet-reconcile.service" \
-    && r="$r artifact=names-old-binary" || r="$r artifact=NAMES-NEW"
-  [ -e "$o/fleet2" ] && r="$r fleet2=LEFT" || r="$r fleet2=demoted"
-  [ -x "$o/grokfleet" ] && "$o/grokfleet" version >/dev/null 2>&1 && r="$r host=on-5.10.0" || r="$r host=BROKEN"
-  rm -rf "$pfx"
-  echo "${r# }"
-}
-hr="$(half_rollback_test)"
-want_hr="artifact=unchanged artifact=names-old-binary fleet2=demoted host=on-5.10.0"
-if [ "$hr" = "$want_hr" ]; then
-  pass "rename (N6/r6-B1): on a half-rolled-back host the binary is demoted but units.prev is NOT re-preserved (still names the old binary)"
-else
-  bad "N6 half-rollback wrong: [$hr] want [$want_hr]"
-fi
-
-# --- r7-B1: the artifact guard refuses with the host UNTOUCHED ----------------
-# units.prev already holding 5.10.0 units means an earlier damaged run poisoned
-# the rollback artifact. The guard is hoisted above every mutation in step (4),
-# so the refusal changes nothing — and it names its own remedy.
-artifact_guard_test() {
-  local pfx; pfx="$(mktemp -d)"
-  seed_5_9_0 "$pfx"
-  local o="$pfx/opt/grok-fleet"
-  mkdir -p "$o/units.prev"
-  printf '[Service]\nExecStart=%s/opt/grok-fleet/grokfleet reconcile\n' "$pfx" > "$o/units.prev/fleet-reconcile.service"
-  local before after out rc
-  before="$( (cd "$pfx" && find . \( -type f -o -type l \) -printf '%p %s %m\n' | sort) )"
-  out="$(GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"; rc=$?
-  after="$( (cd "$pfx" && find . \( -type f -o -type l \) -printf '%p %s %m\n' | sort) )"
-  local r="rc=$rc"
-  [ "$before" = "$after" ] && r="$r tree=SAME" || r="$r tree=CHANGED"
-  case "$out" in
-    *"refusing — $o/units.prev already holds 5.10.0 units"*"rm -r $o/units.prev and re-run"*)
-      r="$r why=guard+remedy" ;;
-    *) r="$r why=OTHER" ;;
-  esac
-  rm -rf "$pfx"
-  echo "$r"
-}
-ag="$(artifact_guard_test)"
-if [ "$ag" = "rc=1 tree=SAME why=guard+remedy" ]; then
-  pass "rename (N6.4/r7-B1): a poisoned units.prev refuses rc 1 with the host byte-identical, naming the remedy"
-else
-  bad "N6.4 artifact guard wrong: [$ag] want [rc=1 tree=SAME why=guard+remedy]"
-fi
-
-# --- r6-B1 second half: the preserve never DEREFERENCES a compat symlink ------
-# `cp -P`. Without it, re-entering step (4) on a host whose unit paths are
-# symlinks would copy the TARGET (a 5.10.0 unit) into the rollback artifact.
-inst_all="$(sed -n '/^install_grokfleet() {/,/^}$/p' "$VPS_INSTALL")"
-if printf '%s\n' "$inst_all" | grep -Fq 'cp -P -f "$SYSTEMD_DIR/$u" "$OPT_DIR/units.prev/$u"'; then
-  pass "rename (N6.4): the unit preserve uses cp -P (a symlink is never dereferenced into the rollback artifact)"
-else
-  bad "N6.4: the units.prev preserve is not 'cp -P' — a compat symlink would be dereferenced: [$inst_all]"
+  bad "N6 re-run repair wrong: [$rr] want [unit=restored link=restored bin=same]"
 fi
 
 # --- N6a: install_units / install_fleet_api are GONE, not merely unused -------
 # If either survived it would write REAL unit files at the pre-rename paths with
-# an ExecStart naming a binary step (7) removed, silently overwriting the compat
-# symlinks. Comments may still discuss them; no code line may name them.
+# an ExecStart naming a binary that no longer exists. Comments may still discuss
+# them; no code line may name them.
 n6a_hits="$(grep -vE '^[[:space:]]*#' "$VPS_INSTALL" | grep -cE 'install_units|install_fleet_api' || true)"
 if [ "$n6a_hits" = 0 ]; then
-  pass "rename (N6a): no code line names install_units or install_fleet_api (both absorbed into install_grokfleet)"
+  pass "installer (N6a): no code line names install_units or install_fleet_api (both absorbed into install_grokfleet)"
 else
   bad "N6a: $n6a_hits code line(s) still name install_units/install_fleet_api: [$(grep -vE '^[[:space:]]*#' "$VPS_INSTALL" | grep -nE 'install_units|install_fleet_api')]"
 fi
 
-# --- N7: the two-spelling env rule -------------------------------------------
-# only one set ⇒ used; both set and equal ⇒ used + logged once; both set and
-# different ⇒ REFUSE rc 1 naming both. Driven on GROKFLEET_BINARY/FLEET2_BINARY,
-# which needs no network.
-env_compat_test() {
-  local mode="$1" pfx out rc; pfx="$(mktemp -d)"
-  case "$mode" in
-    old)   out="$(FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"; rc=$? ;;
-    both_same) out="$(FLEET2_BINARY="$STUB" GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"; rc=$? ;;
-    both_diff) out="$(FLEET2_BINARY="/nonexistent/other" GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"; rc=$? ;;
-  esac
-  local installed=no; [ -x "$pfx/opt/grok-fleet/grokfleet" ] && installed=yes
+# --- 5.11.0: the FLEET2_* env compatibility is gone --------------------------
+# 5.10.0 accepted `FLEET2_<X>` beside `GROKFLEET_<X>` and REFUSED rc 1 when both
+# were set and differed. Both halves go here: a stale `FLEET2_BINARY` export is
+# now simply ignored (the committed pin wins), and setting both no longer
+# refuses. Driven on BINARY, which needs no network.
+env_no_compat_test() {
+  local pfx out rc; pfx="$(mktemp -d)"
+  # FLEET2_BINARY alone: ignored, so the run falls through to the pinned FETCH,
+  # which has no network here and therefore fails — the point is that it did NOT
+  # install the FLEET2_BINARY bytes and did NOT mention the old spelling.
+  out="$(FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"; rc=$?
+  local r=""
+  [ -x "$pfx/opt/grok-fleet/grokfleet" ] && r="$r honoured=YES" || r="$r honoured=no"
+  case "$out" in *FLEET2_*) r="$r mentions=YES" ;; *) r="$r mentions=no" ;; esac
   rm -rf "$pfx"
-  printf 'rc=%s installed=%s|%s\n' "$rc" "$installed" "$out"
+  # both set and DIFFERENT: no refusal any more — GROKFLEET_BINARY simply wins.
+  pfx="$(mktemp -d)"
+  out="$(FLEET2_BINARY="/nonexistent/other" GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"; rc=$?
+  [ "$rc" = 0 ] && [ -x "$pfx/opt/grok-fleet/grokfleet" ] && r="$r both=installed" || r="$r both=REFUSED"
+  case "$out" in *REFUSING*DIFFER*) r="$r refusal=STILL-THERE" ;; *) r="$r refusal=gone" ;; esac
+  rm -rf "$pfx"
+  echo "${r# }"
 }
-eold="$(env_compat_test old)"
-case "$eold" in
-  rc=0\ installed=yes\|*'FLEET2_BINARY is deprecated'*)
-    pass "rename (N7): FLEET2_BINARY alone is still honoured, with a deprecation note (an operator's old export is never silently ignored)" ;;
-  *) bad "N7 old-spelling-only wrong: [$eold]" ;;
-esac
-esame="$(env_compat_test both_same)"
-case "$esame" in
-  rc=0\ installed=yes\|*'both set and agree'*)
-    pass "rename (N7): both spellings set and EQUAL are accepted and logged once" ;;
-  *) bad "N7 both-set-equal wrong: [$esame]" ;;
-esac
-ediff="$(env_compat_test both_diff)"
-case "$ediff" in
-  rc=1\ installed=no\|*'REFUSING'*'GROKFLEET_BINARY'*'FLEET2_BINARY'*'DIFFER'*)
-    pass "rename (N7): both spellings set and DIFFERENT refuse rc 1, naming both" ;;
-  *) bad "N7 both-set-differ wrong: [$ediff]" ;;
-esac
-
-# The compatibility surface is under test here by BOTH names, not substituted:
-# the fleet2 PATH symlink, grokfleet.prev being the 5.9.0 binary, and
-# FLEET2_BINARY being accepted alongside GROKFLEET_BINARY. Those are the three
-# `fleet2` mentions this file is allowlisted for in tests/lib/rename-allowlist.txt.
+env_out="$(env_no_compat_test)"
+if [ "$env_out" = "honoured=no mentions=no both=installed refusal=gone" ]; then
+  pass "5.11.0: FLEET2_* env spellings are ignored and the both-set refusal is gone (GROKFLEET_* is the only seam)"
+else
+  bad "5.11.0 env compat still present: [$env_out] want [honoured=no mentions=no both=installed refusal=gone]"
+fi
 
 # --- N6 failure injection (i): the binary install fails ⇒ nothing changed ------
 # A stub that exits non-zero on `version` stands in for ENOSPC on the 80 MB copy,
 # a noexec mount or a wrong-arch binary — the D13 failures.
 inject_binary_fail_test() {
   local pfx sd; pfx="$(mktemp -d)"; sd="$(mktemp -d)"
-  seed_5_9_0 "$pfx"
+  seed_5_10_0 "$pfx"
   local bad="$sd/grokfleet-bad"; printf '#!/bin/bash\nexit 3\n' > "$bad"; chmod 0755 "$bad"
   local before after rc
   before="$( (cd "$pfx" && find . \( -type f -o -type l \) -printf '%p %s %m\n' | sort) )"
@@ -1233,26 +1186,25 @@ inject_binary_fail_test() {
   after="$( (cd "$pfx" && find . \( -type f -o -type l \) -printf '%p %s %m\n' | sort) )"
   local r="rc=$rc"
   [ "$before" = "$after" ] && r="$r tree=SAME" || r="$r tree=CHANGED"
-  [ -x "$pfx/opt/grok-fleet/fleet2" ] && r="$r fleet2=present-exec" || r="$r fleet2=BAD"
-  [ -e "$pfx/opt/grok-fleet/grokfleet" ] && r="$r grokfleet=LEFT" || r="$r grokfleet=absent"
+  [ -x "$pfx/opt/grok-fleet/grokfleet" ] && "$pfx/opt/grok-fleet/grokfleet" version >/dev/null 2>&1 \
+    && r="$r incumbent=intact" || r="$r incumbent=BROKEN"
   rm -rf "$pfx" "$sd"
   echo "$r"
 }
 ib="$(inject_binary_fail_test)"
-if [ "$ib" = "rc=1 tree=SAME fleet2=present-exec grokfleet=absent" ]; then
-  pass "rename (N6 (i)): a failed binary install leaves the host byte-identical — the pre-rename engine present and executable"
+if [ "$ib" = "rc=1 tree=SAME incumbent=intact" ]; then
+  pass "installer (N6 (i)): a failed binary install leaves the host byte-identical — the incumbent engine present and executable"
 else
-  bad "N6 (i) binary-failure wrong: [$ib] want [rc=1 tree=SAME fleet2=present-exec grokfleet=absent]"
+  bad "N6 (i) binary-failure wrong: [$ib] want [rc=1 tree=SAME incumbent=intact]"
 fi
 
-# --- N6 failure injection (ii)/(iii): the cutover with a RECORDING systemctl ---
-# Drives install_grokfleet with a fake systemctl so the disable-before-remove
-# ordering, the enablement carry-over and the step-(5) rollback are assertable.
-#   $1 = the pre-run `is-enabled` answer for fleet-api.service
+# --- N6 failure injection: the upgrade with a RECORDING systemctl -------------
+# Drives install_grokfleet with a fake systemctl so the API enablement carry-over
+# and the step-(5) failure handler are assertable.
+#   $1 = the pre-run `is-enabled` answer for grokfleet-api.service
 #   $2 = "ok" | "unitfail" (make the unit write fail)
-#   $3 = "cutover" | "rerun"
-cutover_mock() {
-  local api_enabled="$1" mode="$2" shape="$3"
+upgrade_mock() {
+  local api_enabled="$1" mode="$2"
   local d root inner; d="$(mktemp -d)"; root="$(mktemp -d)"; inner="$(mktemp)"
   mkdir -p "$root/opt" "$root/systemd"
   cat > "$d/systemctl" <<SC
@@ -1261,42 +1213,22 @@ printf 'systemctl %s\n' "\$*" >> "$d/calls.log"
 if [ "\$1" = is-active ]; then exit 1; fi
 if [ "\$1" = is-enabled ]; then
   case "\$2" in
-    fleet-api.service|grokfleet-api.service) echo "$api_enabled"; [ "$api_enabled" = enabled ] && exit 0 || exit 1 ;;
+    grokfleet-api.service) echo "$api_enabled"; [ "$api_enabled" = enabled ] && exit 0 || exit 1 ;;
   esac
   echo disabled; exit 1
 fi
 exit 0
 SC
   chmod +x "$d/systemctl"
-  cat > "$d/grokfleet-stub" <<'ST'
-#!/usr/bin/env bash
-exit 0
-ST
-  chmod +x "$d/grokfleet-stub"
-  if [ "$shape" = cutover ]; then
-    printf '#!/bin/bash\necho old\n' > "$root/opt/fleet2"; chmod 0755 "$root/opt/fleet2"
-    printf '[Service]\nExecStart=%s/opt/fleet2 reconcile\n' "$root" > "$root/systemd/fleet-reconcile.service"
-    printf '[Timer]\n[Install]\nWantedBy=timers.target\n' > "$root/systemd/fleet-reconcile.timer"
-    printf '[Service]\nExecStart=%s/opt/fleet2 serve\n' "$root" > "$root/systemd/fleet-api.service"
-  else
-    # a migrated (5.10.0) host: the compat symlinks + a units.prev holding the
-    # ORIGINAL 5.9.0 units, which the re-run branch must never restore.
-    printf '#!/bin/bash\nexit 0\n' > "$root/opt/grokfleet"; chmod 0755 "$root/opt/grokfleet"
-    printf '[Service]\nExecStart=%s/opt/grokfleet reconcile\n' "$root" > "$root/systemd/grokfleet-reconcile.service"
-    printf '[Timer]\n' > "$root/systemd/grokfleet-reconcile.timer"
-    printf '[Service]\n' > "$root/systemd/grokfleet-api.service"
-    ln -sfn grokfleet-reconcile.service "$root/systemd/fleet-reconcile.service"
-    ln -sfn grokfleet-api.service "$root/systemd/fleet-api.service"
-    mkdir -p "$root/opt/units.prev"
-    printf '[Service]\nExecStart=%s/opt/fleet2 reconcile\n' "$root" > "$root/opt/units.prev/fleet-reconcile.service"
-    printf '[Timer]\n' > "$root/opt/units.prev/fleet-reconcile.timer"
-    printf '[Service]\n' > "$root/opt/units.prev/fleet-api.service"
-  fi
-  # "unitfail": an `install` shim that fails ONLY for the first new unit write.
-  # This makes each write boundary independent: removing that line's
-  # `|| return 1` cannot fall through to another injected failure and pass for
-  # the wrong reason. Shadowing $SYSTEMD_DIR instead would change what step (4)
-  # reads; a directory destination also fails because GNU install writes into it.
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$d/grokfleet-stub"; chmod +x "$d/grokfleet-stub"
+  # a migrated (5.10.0) host: the real units plus the compatibility links.
+  printf '#!/bin/bash\nexit 0\n' > "$root/opt/grokfleet"; chmod 0755 "$root/opt/grokfleet"
+  printf '[Service]\nExecStart=%s/opt/grokfleet reconcile\n' "$root" > "$root/systemd/grokfleet-reconcile.service"
+  printf '[Timer]\n' > "$root/systemd/grokfleet-reconcile.timer"
+  printf '[Service]\n' > "$root/systemd/grokfleet-api.service"
+  ln -sfn grokfleet-reconcile.service "$root/systemd/fleet-reconcile.service"
+  ln -sfn grokfleet-api.service "$root/systemd/fleet-api.service"
+  ln -sfn grokfleet-reconcile.timer "$root/systemd/fleet-reconcile.timer"
   local sysdir="$root/systemd" real_install; real_install="$(command -v install)"
   if [ "$mode" = unitfail ]; then
     cat > "$d/install" <<INS
@@ -1319,18 +1251,18 @@ BIN_DIR="$root/bin"
 SERVICE="grokfleet-reconcile.service"
 TIMER="grokfleet-reconcile.timer"
 API_SERVICE="grokfleet-api.service"
-OLD_SERVICE="fleet-reconcile.service"
-OLD_TIMER="fleet-reconcile.timer"
-OLD_API_SERVICE="fleet-api.service"
+STALE_SERVICE="fleet-reconcile.service"
+STALE_TIMER="fleet-reconcile.timer"
+STALE_API_SERVICE="fleet-api.service"
+STALE_CLI="fleet2"
 DEFERRED_FAIL=0
-CUTOVER=0
 API_WAS_ENABLED=""
 GF_HAD_BINARY=0
 GF_WROTE_PREV=0
 GROKFLEET_VERIFIED_BINARY="$d/grokfleet-stub"
 log(){ printf 'LOG %s\n' "\$*"; }
 extract_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in write_grokfleet_units write_compat_service_links undo_step3 rollback_step4 rollback_step5 install_grokfleet; do
+for fn in write_grokfleet_units remove_compat_names undo_step3 rollback_step5 install_grokfleet; do
   eval "\$(extract_from "$VPS_INSTALL" "\$fn")"
 done
 install_grokfleet; echo "RC=\$?"
@@ -1338,94 +1270,63 @@ INNER
   local out; out="$(timeout 30 bash "$inner" 2>&1)"
   printf '%s\n---CALLS---\n' "$out"
   cat "$d/calls.log" 2>/dev/null
-  # a compact state report the caller can grep
   printf '%s\n' '---STATE---'
   [ -e "$root/opt/grokfleet" ] && echo "state grokfleet=present" || echo "state grokfleet=absent"
-  [ -e "$root/opt/fleet2" ] && echo "state fleet2=present" || echo "state fleet2=absent"
-  if [ -e "$root/opt/units.prev/fleet-reconcile.service" ]; then
-    grep -q '/opt/fleet2 reconcile' "$root/opt/units.prev/fleet-reconcile.service" \
-      && echo "state artifact=old-units" || echo "state artifact=NEW-UNITS"
-  else echo "state artifact=absent"; fi
-  [ -e "$root/systemd/fleet-reconcile.service" ] && echo "state oldsvc=present" || echo "state oldsvc=absent"
+  [ -L "$root/systemd/fleet-reconcile.service" ] && echo "state oldsvc=present" || echo "state oldsvc=absent"
+  [ -L "$root/systemd/fleet-reconcile.timer" ] && echo "state oldtimer=present" || echo "state oldtimer=absent"
   rm -f "$inner"; rm -rf "$d" "$root"
 }
 
-# (4) ordering: the timer is DISABLED before the old unit files are touched, and
-# the API is disabled WITHOUT --now (it keeps serving until the rebind).
-co="$(cutover_mock enabled ok cutover)"
-co_calls="$(printf '%s\n' "$co" | sed -n '/---CALLS---/,/---STATE---/p')"
-dis_line="$(printf '%s\n' "$co_calls" | grep -n 'disable --now fleet-reconcile.timer' | head -1 | cut -d: -f1)"
-en_line="$(printf '%s\n' "$co_calls" | grep -n 'enable --now grokfleet-reconcile.timer' | head -1 | cut -d: -f1)"
+# The compatibility names are removed under a REAL systemctl too, and the timer
+# alias is DISABLED before its link goes (or the wants-symlink dangles).
+up="$(upgrade_mock enabled ok)"
+up_calls="$(printf '%s\n' "$up" | sed -n '/---CALLS---/,/---STATE---/p')"
+up_state="$(printf '%s\n' "$up" | sed -n '/---STATE---/,$p')"
+r_up=""
+printf '%s\n' "$up_state" | grep -q 'oldsvc=absent' && r_up="$r_up oldsvc=gone" || r_up="$r_up oldsvc=LEFT"
+printf '%s\n' "$up_state" | grep -q 'oldtimer=absent' && r_up="$r_up oldtimer=gone" || r_up="$r_up oldtimer=LEFT"
+dis_line="$(printf '%s\n' "$up_calls" | grep -n 'systemctl disable fleet-reconcile.timer' | head -1 | cut -d: -f1)"
+en_line="$(printf '%s\n' "$up_calls" | grep -n 'enable --now grokfleet-reconcile.timer' | head -1 | cut -d: -f1)"
 if [ -n "$dis_line" ] && [ -n "$en_line" ] && [ "$dis_line" -lt "$en_line" ]; then
-  pass "rename (N6.4/B3): the pre-rename timer is DISABLED before the new one is enabled (no dangling wants-symlink)"
+  r_up="$r_up order=disable-first"
 else
-  bad "N6.4 disable ordering wrong — disable@$dis_line enable@$en_line: [$co_calls]"
+  r_up="$r_up order=WRONG(dis@$dis_line en@$en_line)"
 fi
-if printf '%s\n' "$co_calls" | grep -q '^systemctl disable fleet-api.service$'; then
-  pass "rename (N6.4/r2-B3): the API is disabled WITHOUT --now (it keeps serving until the step-9 rebind)"
+r_up="${r_up# }"
+if [ "$r_up" = "oldsvc=gone oldtimer=gone order=disable-first" ]; then
+  pass "5.11.0: under a real systemctl the alias timer is DISABLED before its link is removed, and both service links go"
 else
-  bad "N6.4: the API disable is missing or used --now: [$co_calls]"
+  bad "5.11.0 systemctl-side removal wrong: [$r_up] want [oldsvc=gone oldtimer=gone order=disable-first]"
 fi
 
 # (6) the API's boot enablement is CARRIED OVER, both starting states.
-if printf '%s\n' "$co_calls" | grep -q 'systemctl enable grokfleet-api.service'; then
-  pass "rename (N6.6/r3-B2): an ENABLED pre-rename API is re-enabled under the new name"
+if printf '%s\n' "$up_calls" | grep -q 'systemctl enable grokfleet-api.service'; then
+  pass "installer (N6.6/r3-B2): an ENABLED API is re-enabled after the upgrade"
 else
-  bad "N6.6: the API enablement was not carried over: [$co_calls]"
+  bad "N6.6: the API enablement was not carried over: [$up_calls]"
 fi
-co_dis="$(cutover_mock disabled ok cutover)"
-co_dis_calls="$(printf '%s\n' "$co_dis" | sed -n '/---CALLS---/,/---STATE---/p')"
-if printf '%s\n' "$co_dis_calls" | grep -q 'systemctl enable grokfleet-api.service'; then
-  bad "N6.6: a DISABLED pre-rename API was wrongly enabled after the rename: [$co_dis_calls]"
+up_dis="$(upgrade_mock disabled ok)"
+up_dis_calls="$(printf '%s\n' "$up_dis" | sed -n '/---CALLS---/,/---STATE---/p')"
+if printf '%s\n' "$up_dis_calls" | grep -q 'systemctl enable grokfleet-api.service'; then
+  bad "N6.6: a DISABLED API was wrongly enabled by the upgrade: [$up_dis_calls]"
 else
-  pass "rename (N6.6/r3-B2): a DISABLED pre-rename API stays disabled (the never-enable policy is unchanged)"
-fi
-
-# (ii) a unit write fails on the CUTOVER run ⇒ the old units and the timer
-# enablement are restored and grokfleet is gone.
-cf="$(cutover_mock enabled unitfail cutover)"
-cf_calls="$(printf '%s\n' "$cf" | sed -n '/---CALLS---/,/---STATE---/p')"
-cf_state="$(printf '%s\n' "$cf" | sed -n '/---STATE---/,$p')"
-r_ii=""
-printf '%s\n' "$cf" | grep -q '^RC=1$' && r_ii="$r_ii rc=1" || r_ii="$r_ii rc=NOT1"
-printf '%s\n' "$cf_state" | grep -q 'grokfleet=absent' && r_ii="$r_ii grokfleet=absent" || r_ii="$r_ii grokfleet=LEFT"
-printf '%s\n' "$cf_state" | grep -q 'fleet2=present' && r_ii="$r_ii fleet2=present" || r_ii="$r_ii fleet2=GONE"
-printf '%s\n' "$cf_calls" | grep -q 'enable --now fleet-reconcile.timer' && r_ii="$r_ii timer=re-enabled" || r_ii="$r_ii timer=NOT-RESTORED"
-printf '%s\n' "$cf_calls" | grep -q 'systemctl enable fleet-api.service' && r_ii="$r_ii api=re-enabled" || r_ii="$r_ii api=NOT-RESTORED"
-r_ii="${r_ii# }"
-want_ii="rc=1 grokfleet=absent fleet2=present timer=re-enabled api=re-enabled"
-if [ "$r_ii" = "$want_ii" ]; then
-  pass "rename (N6 (ii)): a unit-write failure on the cutover restores the old units + timer + API enablement and removes grokfleet"
-else
-  bad "N6 (ii) cutover unit-failure wrong: [$r_ii] want [$want_ii]"
+  pass "installer (N6.6/r3-B2): a DISABLED API stays disabled (the never-enable policy is unchanged)"
 fi
 
-# (r5-B1) the SAME failure on a RE-RUN must NOT restore units.prev and must NOT
-# remove grokfleet — units.prev holds 5.9.0 units naming a binary that is gone.
-rf="$(cutover_mock disabled unitfail rerun)"
+# A unit-write failure must NOT restore units.prev and must NOT remove grokfleet:
+# any units.prev on disk holds 5.9.0 units naming a binary that is gone.
+rf="$(upgrade_mock disabled unitfail)"
 rf_state="$(printf '%s\n' "$rf" | sed -n '/---STATE---/,$p')"
 r_rr=""
 printf '%s\n' "$rf_state" | grep -q 'grokfleet=present' && r_rr="$r_rr grokfleet=present" || r_rr="$r_rr grokfleet=REMOVED"
-printf '%s\n' "$rf_state" | grep -q 'artifact=old-units' && r_rr="$r_rr artifact=unchanged" || r_rr="$r_rr artifact=CHANGED"
-printf '%s\n' "$rf" | grep -q 'units.prev is NOT touched' && r_rr="$r_rr branch=rerun" || r_rr="$r_rr branch=WRONG"
+printf '%s\n' "$rf" | grep -q 'units.prev is NOT touched' && r_rr="$r_rr branch=rewrite" || r_rr="$r_rr branch=WRONG"
 r_rr="${r_rr# }"
-if [ "$r_rr" = "grokfleet=present artifact=unchanged branch=rerun" ]; then
-  pass "rename (N6.5/r5-B1): a unit-write failure on a RE-RUN leaves grokfleet present and units.prev untouched (branch-aware handler)"
+if [ "$r_rr" = "grokfleet=present branch=rewrite" ]; then
+  pass "installer (N6.5/r5-B1): a unit-write failure leaves grokfleet present and units.prev untouched"
 else
-  bad "N6.5 re-run failure handler wrong: [$r_rr] want [grokfleet=present artifact=unchanged branch=rerun]"
+  bad "N6.5 failure handler wrong: [$r_rr] want [grokfleet=present branch=rewrite]"
 fi
 
-# (iii) after a full cutover there is no stale wants-symlink naming an old unit,
-# and the enablement end state is what the operator had. Driven on the mock
-# prefix: `systemctl` is a shim, so the assertion is on the CALLS it made — a
-# `disable --now` of the old timer, an `enable --now` of the new one, and no
-# `enable` of an old unit name after the cutover.
-post_old_enable="$(printf '%s\n' "$co_calls" | grep -c 'enable --now fleet-reconcile.timer' || true)"
-if [ "$post_old_enable" = 0 ]; then
-  pass "rename (N6 (iii)): a successful cutover never re-enables a pre-rename unit name (no second wants-symlink)"
-else
-  bad "N6 (iii): the cutover enabled a pre-rename unit name $post_old_enable time(s): [$co_calls]"
-fi
 
 # --- N6 step (9): the ONE survivable failure ---------------------------------
 # A failing try-restart logs one line, sets DEFERRED_FAIL and RETURNS 0, so every
@@ -1473,7 +1374,7 @@ else
   bad "N6.9 deferred-failure wiring wrong: [$df_out] want [sets=yes exits=yes order=after-phases]"
 fi
 # and the one-line operator message is verbatim what the blueprint specifies
-if grep -q 'grokfleet: API restart failed — host is on 5.10.0, CLI usable, run: systemctl start' "$VPS_INSTALL"; then
+if grep -q 'grokfleet: API restart failed — the CLI is usable; run: systemctl start' "$VPS_INSTALL"; then
   pass "rename (N6.9): the survivable failure logs the one-line remedy"
 else
   bad "N6.9: the API-restart failure message is missing or reworded"

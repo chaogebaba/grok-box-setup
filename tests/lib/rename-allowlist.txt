@@ -27,19 +27,22 @@
 #       r3-n1. State under $FLEET_STATE that gates flipping apply=true.
 #       Renaming it would silently reset an in-flight soak.
 #   FLEET2_*
-#       N7. The pre-rename env spellings, accepted for ONE release beside
-#       GROKFLEET_*, and the tests that prove BOTH are accepted.
-#   fleet2.prev / fleet2.conf / the residual `fleet2`
-#       N2/N6. The compatibility surface itself: $OPT_DIR/fleet2 and its .prev
-#       (what the cutover consumes), the obsolete phase-2 drop-in the installer
-#       still removes by its historical name, the /usr/local/bin/fleet2 link,
-#       and the tests that assert all of it by BOTH names rather than
-#       substituting one for the other.
+#       The pre-rename env spellings are GONE as of 5.11.0. What is left names
+#       them only to prove they are ignored (tests/test-install-vps.sh) or to
+#       record that they were (a comment in vps/install-vps.sh).
+#   fleet2.conf / the residual `fleet2`
+#       The REMOVAL of the compatibility surface: `STALE_CLI="fleet2"` and the
+#       guards that delete `/usr/local/bin/fleet2` and the obsolete phase-2
+#       drop-in by their historical names, plus the tests that seed a 5.10.0
+#       host and assert every one of them is gone afterwards. Naming a thing in
+#       order to delete it is not a compatibility surface.
 #   tmp/orch/*
 #       Historical records — dispatch logs and gate memos, never edited.
 #
-# EVERY LINE HERE EXCEPT THE SOAK MARKER AND THE BLUEPRINT FILENAMES IS DELETED
-# IN 5.11.0, when the compatibility layer goes. This file is that checklist.
+# 5.11.0 DELETED the compatibility layer, and this file shrank with it. What
+# remains is the soak marker, the blueprint filenames, and the code and tests
+# that REMOVE the retired names. The next thing to go is `STALE_*` itself, once
+# no host can still be carrying a 5.10.0 unit link.
 Makefile	/var/lib/grok-fleet/fleet2\.soak-ok	1
 Makefile	fleet2	2
 Makefile	fleet2-release-install	1
@@ -117,19 +120,17 @@ fleet/test/store/tick-snapshot.test.ts	fleet2-state-store	1
 fleet/test/store/tick.test.ts	fleet2	1
 fleet/test/store/tick.test.ts	fleet2-state-store	1
 fleet/test/tui/leases.test.ts	fleet2-lease-api	1
-tests/test-install-vps.sh	FLEET2_	8
-tests/test-install-vps.sh	fleet2	38
+tests/test-install-vps.sh	FLEET2_	9
+tests/test-install-vps.sh	fleet2	12
 tests/test-install-vps.sh	fleet2-release-install	3
 tests/test-install-vps.sh	fleet2-rename-grokfleet	1
 tests/test-install-vps.sh	fleet2-zero-touch-join	1
-tests/test-install-vps.sh	fleet2\.prev	4
 tests/test-makefile-targets.sh	/var/lib/grok-fleet/fleet2\.soak-ok	2
 tests/test-makefile-targets.sh	fleet2	3
 tests/test-makefile-targets.sh	fleet2-release-install	1
 tmp/orch/fleetctl-test-coverage-map.md	fleet2	7
-vps/install-vps.sh	FLEET2_	6
-vps/install-vps.sh	fleet2	27
+vps/install-vps.sh	FLEET2_	2
+vps/install-vps.sh	fleet2	12
 vps/install-vps.sh	fleet2-release-install	1
 vps/install-vps.sh	fleet2-rename-grokfleet	2
 vps/install-vps.sh	fleet2\.conf	2
-vps/install-vps.sh	fleet2\.prev	4

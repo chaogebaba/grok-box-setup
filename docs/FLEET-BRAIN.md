@@ -584,30 +584,38 @@ written before the rename keep `actor='fleet2'` — history is not rewritten.
 `/var/lib/grok-fleet/fleet2.soak-ok`. It is state under `$FLEET_STATE` and it
 gates flipping `apply=true`; renaming it would silently reset an in-flight soak.
 
-**Compatibility, for exactly one release (removed in 5.11.0).** The installer
-writes it; it is not a systemd `Alias=` mechanism, because `Alias=` materialises
-only on `systemctl enable` and two of the three units are never enabled.
+**Compatibility, REMOVED in 5.11.0.** 5.10.0 kept the pre-rename names answering
+for exactly one release. 5.11.0 takes them away, and an upgrade DELETES whatever a
+5.10.0 install left behind — idempotently, so a second run reports nothing and
+changes nothing. A regular file at one of those paths is somebody else's unit and
+is left alone; only our own symlinks are removed.
 
-| Old name | How it still answers |
-|---|---|
-| `fleet-reconcile.service` | a unit symlink → `grokfleet-reconcile.service`, written by the installer |
-| `fleet-api.service` | a unit symlink → `grokfleet-api.service`, written by the installer |
-| `fleet-reconcile.timer` | `Alias=fleet-reconcile.timer` in the new timer's `[Install]` (the timer is the one unit the installer enables) |
-| `fleet2` on `PATH` | `/usr/local/bin/fleet2` → `/opt/grok-fleet/grokfleet` |
-| `FLEET2_*` env | accepted alongside `GROKFLEET_*`: one spelling set ⇒ used; both set and equal ⇒ used and logged; both set and DIFFERENT ⇒ the installer refuses rc 1 naming both |
+| Retired name | What 5.10.0 wrote | What 5.11.0 does |
+|---|---|---|
+| `fleet-reconcile.service` | a unit symlink → `grokfleet-reconcile.service` | removes the symlink |
+| `fleet-api.service` | a unit symlink → `grokfleet-api.service` | removes the symlink |
+| `fleet-reconcile.timer` | `Alias=fleet-reconcile.timer` in the timer's `[Install]` | drops the `Alias=` line, disables the alias, removes its symlink |
+| `fleet2` on `PATH` | `/usr/local/bin/fleet2` → `/opt/grok-fleet/grokfleet` | removes the link |
+| `FLEET2_*` env | accepted beside `GROKFLEET_*`, refusing when both were set and differed | ignored; `GROKFLEET_*` is the only seam and there is no refusal |
 
-`grokfleet serve`'s journal endpoint queries **both** generations of unit names,
-because `journalctl` matches the unit a line was logged under and never the
-alias it now answers to. A future drop-in belongs under
-`grokfleet-reconcile.service.d/` — systemd resolves drop-ins by the real unit
-name, so a directory named after the compatibility alias is silently ignored.
+The alias timer is DISABLED before its link goes, or the `*.wants` symlink
+dangles and systemd keeps resolving the old name through it.
 
-**Rollback to 5.9.0.** There is no `grokfleet rollback-rename` command: a
-one-time path does not earn code. Rollback restores the binary **and** the unit
-files, because an alias named `fleet-reconcile.service` points at the new unit,
-whose `ExecStart` is `grokfleet` — restoring the binary alone would report
-success while still running 5.10.0. The installer preserves the pre-rename units
-at `/opt/grok-fleet/units.prev/` next to `grokfleet.prev` for exactly this:
+`grokfleet serve`'s journal endpoint queried **both** generations of unit names
+for that release, because `journalctl` matches the unit a line was logged under
+and never the alias it answered to. It queries only the `grokfleet-*` units now;
+pre-rename history is `journalctl -u fleet-reconcile` by hand. A drop-in belongs
+under `grokfleet-reconcile.service.d/` — systemd resolves drop-ins by the real
+unit name, so a directory named after a retired name is silently ignored.
+
+**Rollback to 5.9.0 (historical).** There is no `grokfleet rollback-rename`
+command: a one-time path does not earn code. This is the 5.10.0 procedure, kept
+because a host that never took 5.11.0 may still need it. It restores the binary
+**and** the unit files: restoring the binary alone would report success while
+still running the new engine. The 5.10.0 installer preserved the pre-rename units
+at `/opt/grok-fleet/units.prev/` next to `grokfleet.prev` for exactly this. From
+5.11.0 nothing writes `units.prev/` any more — the ordinary rollback target is
+`grokfleet.prev` plus `make ts-cutback`.
 
 ```bash
 systemctl disable --now grokfleet-reconcile.timer
