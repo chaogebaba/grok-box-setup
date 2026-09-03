@@ -733,8 +733,13 @@ function leaseLine2(state: TuiState, b: FleetBox, zone: string): Seg[] {
       { text: l.state, tone },
     ];
   }
-  // A `service` lease carries no expiry at all; saying so beats `in - · expires —`.
-  if (l.expires_at === null) return [{ text: "  no expiry", tone: "muted" }];
+  // An ACTIVE `service` lease carries no expiry at all, so it gets its own line
+  // rather than `in - · expires —`. It stays in the LEASE's tone (MAIN): the box
+  // is held, and a MUTED line would read as an absent field rather than as a
+  // standing reservation. Reached only for a lease that is still active — the
+  // state branch above owns `expired` and `lost`, whose grace form is keyed on
+  // the STATE and not on whether an expiry exists.
+  if (l.expires_at === null) return [{ text: "  no expiry", tone }];
   return [
     { text: `  in ${left(state.nowMs, l.expires_at)}`, tone },
     { text: SEP, tone: "muted" },

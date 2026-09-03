@@ -362,6 +362,18 @@ describe("O5 — the `L` leases view", () => {
     expect(cell("grok-box-008")).toBe("≤16m"); // lost: an UPPER bound
   });
 
+  // O6 (r7): the row's LEFT for an ACTIVE service lease is `-` — there is no
+  // expiry to count down to — while a lost/expired one still shows its grace.
+  test("LEFT is `-` for an active SERVICE lease, and still the grace when it is lost", () => {
+    const active = leaseRows([fullLease({ kind: "service", expires_at: null })], NOW)[1]!;
+    expect(active.slice(64, 71).trim()).toBe("-");
+    const lost = leaseRows(
+      [fullLease({ kind: "service", state: "lost", expires_at: null, grace_ends_at: "2026-05-01T00:17:00Z" })],
+      NOW,
+    )[1]!;
+    expect(lost.slice(64, 71).trim()).toBe("≤16m");
+  });
+
   test("a long purpose is cut to `…` and does not touch AGE", () => {
     const rows = leaseRows([fullLease({ purpose: "debug a wedged rollout that will not finish" })], NOW);
     expect(rows[1]).toContain("debug a wedged rollo… ");
@@ -450,6 +462,38 @@ describe("O6 — the detail card's lease lines", () => {
       const text = card(state({ boxes: [box("grok-box-1", over)] }));
       expect(text).toContain("no lease");
       expect(text.split("\n").some((l) => l.includes("│free"))).toBe(false);
+    }
+  });
+
+  // O6 (r7): a `service` lease has no expiry, so line 2 is its own sentence —
+  // in the LEASE's tone, because the box IS held. And the state branch owns
+  // `expired`/`lost` FIRST: a lost service lease takes the grace form, not this
+  // one, so a box that went away is never reported as a standing reservation.
+  test("an ACTIVE service lease reads `no expiry`, in the lease's own tone", () => {
+    const s = state({
+      boxes: [{ ...box("grok-box-1"), lease: lease({ kind: "service", expires_at: null }) }],
+    });
+    const line = detailLines(s, WIDE).find((l) => l.text.includes("no expiry"))!;
+    expect(line.text).toContain("  no expiry");
+    expect(line.segments!.find((x) => x.text.includes("no expiry"))!.tone).toBe("main");
+  });
+
+  test("a LOST or EXPIRED service lease takes the state-keyed grace form, not `no expiry`", () => {
+    for (const [st, want] of [
+      ["lost", "grace ≤16m · lost"],
+      ["expired", "grace 16m · expired"],
+    ] as const) {
+      const s = state({
+        boxes: [
+          {
+            ...box("grok-box-1"),
+            lease: lease({ kind: "service", state: st, expires_at: null, grace_ends_at: "2026-05-01T00:17:00Z" }),
+          },
+        ],
+      });
+      const text = card(s);
+      expect(text).toContain(want);
+      expect(text).not.toContain("no expiry");
     }
   });
 
