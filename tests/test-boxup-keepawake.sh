@@ -535,6 +535,10 @@ read_box_name(){ echo grok-box-008; }
 boxup_git_sha(){ echo abc1234; }
 authkey_expiry_state(){ echo ok; }
 tunnel_state(){ echo up; }
+# grokfleet-jobs J9 appended two more tokens after the keepawake four. They are
+# not this suite's concern, so they are stubbed exactly like tunnel_state above;
+# tests/test-boxup-jobs.sh (case 12) owns their content.
+jobs_status_tokens(){ printf 'job=- job_state=-'; }
 bash -c 'sleep 300; :' _ tailscaled --statedir "\$STATE_DIR" </dev/null >/dev/null 2>&1 &
 wpid=\$!; echo "\$wpid" > "\$WORKER_PID"
 date +%s > "\$RUN_DIR/hb"
@@ -555,7 +559,7 @@ INNER
   rm -f "$inner"
 }
 line="$(status_line 20 | sed -n 1p)"
-if printf '%s\n' "$line" | grep -Eq ' disk=22% keepawake=on keepawake_last=2026-[0-9-]+T[0-9:]+Z keepawake_rc=ok jumps=2$'; then
+if printf '%s\n' "$line" | grep -Eq ' disk=22% keepawake=on keepawake_last=2026-[0-9-]+T[0-9:]+Z keepawake_rc=ok jumps=2 job=- job_state=-$'; then
   pass "(8) status: the four keepawake tokens follow disk=, jumps is baseline-subtracted (3-1=2)"
 else
   bad  "(8) status tokens missing/misplaced: [$line]"

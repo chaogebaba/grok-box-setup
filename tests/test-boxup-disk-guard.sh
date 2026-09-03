@@ -122,6 +122,14 @@ BOXUP_DISK_WARN_PCT=80
 BOXUP_DISK_FAIL_PCT=90
 BOXUP_DISK_TRUNCATE_MIN_BYTES=\$MIB          # 1 MiB floor for the fixtures
 BOXUP_DISK_INTERVAL=60
+# grokfleet-jobs J6 gave the guard a BUILT-IN second allowlist and a job-log
+# counter hook. Neither is this suite's concern, so both are pointed away from
+# anything it creates: an empty built-in list and a JOBS_DIR with no records
+# means the `case` inside disk_truncate_one never matches and every assertion
+# below is about the same code paths it was written for.
+# tests/test-boxup-jobs.sh (cases 10, 10e, 10f, 11b) owns the job-log behaviour.
+DISK_GUARD_BUILTIN_TRUNCATE=""
+JOBS_DIR="\$WORK/nojobs"
 DISK_STATE="\$RUN_DIR/disk"
 DISK_STAMP="\$RUN_DIR/last-disk-guard"
 DISK_WARN_STAMP="\$RUN_DIR/last-disk-warn"
@@ -390,6 +398,8 @@ DISK_WARN_STAMP="\$RUN_DIR/last-disk-warn"
 BOXUP_DISK_WARN_PCT=80
 BOXUP_DISK_FAIL_PCT=90
 BOXUP_DISK_TRUNCATE_MIN_BYTES=1048576
+DISK_GUARD_BUILTIN_TRUNCATE=""
+JOBS_DIR="\$WORK/nojobs"
 DISK_GUARD_TRUNCATE="\$WORK/nothing.log"
 
 # A REAL process carrying a tailscaled argv bound to STATE_DIR. check_reason's
