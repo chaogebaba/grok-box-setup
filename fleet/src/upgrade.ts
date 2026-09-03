@@ -64,8 +64,9 @@ export const RC = {
    * Same NUMBER as REFUSED — 6 has always meant "refused, nothing was done", and
    * lock-busy is that. Named separately because the reason differs.
    *
-   * `grokfleet rename` returns 1 for the same condition (commands/rename.ts:163-166):
-   * an existing inconsistency, named here and deliberately left alone.
+   * `grokfleet rename` returns 6 for the same condition (commands/rename.ts):
+   * it maps a busy reconcile lock onto RC.LOCK_BUSY like everything else. An
+   * older comment here claimed rc 1; the runtime has always been 6.
    */
   LOCK_BUSY: 6,
   /**

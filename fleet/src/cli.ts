@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.10.0"; // 5.10.0: the brain is named grokfleet everywhere the operator sees it.
+const PKG_VERSION = "5.11.0"; // 5.11.0: box leases (workload layer step 1) + the 5.10.0 compat layer removed.
 
 async function gitShaFromGit(): Promise<string> {
   try {
@@ -130,7 +130,9 @@ async function main(argv: string[]): Promise<number> {
     case "list":
       return cmdList(runner, stdout, wantsJson(rest));
     case "ssh":
-      return cmdSsh(rest, { runner, cfg });
+      // lease-api L4: `env` is what makes `--via tunnel` and its rc-6 refusal
+      // possible; without it the transport resolves to tailnet as before.
+      return cmdSsh(rest, { runner, cfg, env });
     case "remove-timer": {
       const { existsSync, unlinkSync } = await import("node:fs");
       const home = process.env.HOME ?? "";
@@ -209,6 +211,14 @@ async function main(argv: string[]): Promise<number> {
       // Laptop-runnable (lane B) — no locality guard.
       const { cmdTui } = await import("./tui/main.ts");
       return cmdTui(rest, { env });
+    }
+    case "lease": {
+      // Laptop-runnable, exactly like `tui`: the lease CLI talks to the admin
+      // API and never reads the store, so ONE code path serves both machines
+      // (r5-B1). No locality guard.
+      const { makeLeaseDeps } = await import("./commands/lease-wiring.ts");
+      const { cmdLease } = await import("./commands/lease.ts");
+      return cmdLease(rest, makeLeaseDeps(env, cfg, runner, stdout));
     }
     case "state": {
       // state-store D8. VPS-only for the same reason `serve` is: the store lives

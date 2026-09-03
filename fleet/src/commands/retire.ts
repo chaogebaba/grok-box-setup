@@ -38,6 +38,7 @@ import type { Store } from "../store/db.ts";
 import type { StoreState } from "../store/state.ts";
 import { RC } from "../upgrade.ts";
 import { log } from "../log.ts";
+import { deferringLeaseFor, markLost } from "../store/leases.ts";
 
 /** The message `rename` and `grokfleet state` already print for a busy lock. */
 export const RETIRE_BUSY_LINE =
@@ -108,31 +109,35 @@ export interface RetireArgs {
   box: string;
   forget: boolean;
   dryRun: boolean;
+  /** lease-api L3: retire a box that is IN USE anyway, losing its lease. */
+  force: boolean;
 }
 
 export function parseRetireArgs(args: string[]): RetireArgs | { usage: true } {
   let forget = false;
   let dryRun = false;
+  let force = false;
   const rest: string[] = [];
   for (const a of args) {
     if (a === "--forget") forget = true;
     else if (a === "--dry-run") dryRun = true;
+    else if (a === "--force") force = true;
     else if (a.startsWith("-")) return { usage: true };
     else rest.push(a);
   }
   const box = rest[0];
   if (box === undefined || box === "" || rest.length > 1) return { usage: true };
-  return { box, forget, dryRun };
+  return { box, forget, dryRun, force };
 }
 
 export async function cmdRetire(args: string[], deps: RetireDeps): Promise<number> {
   const out = deps.out ?? ((s: string) => process.stdout.write(s));
   const parsed = parseRetireArgs(args);
   if ("usage" in parsed) {
-    log("usage: grokfleet retire [--forget] [--dry-run] <grok-box-N>");
+    log("usage: grokfleet retire [--forget] [--dry-run] [--force] <grok-box-N>");
     return RC.USAGE;
   }
-  const { box, forget, dryRun } = parsed;
+  const { box, forget, dryRun, force } = parsed;
   if (!/^grok-box-[0-9]/.test(box)) {
     log(`retire: refusing non-grok box '${box}'`);
     return RC.USAGE;
@@ -150,13 +155,28 @@ export async function cmdRetire(args: string[], deps: RetireDeps): Promise<numbe
       log(`retire: ${box} has no store row — nothing to retire`);
       return RC.USAGE;
     }
+    // lease-api L3: a box someone is USING is not retired out from under them.
+    // `--force` is the explicit override, and it marks the lease `lost` with
+    // reason `retired` so the holder's poll learns what happened.
+    const held = deferringLeaseFor(handle.store, box);
+    if (held !== undefined && !force) {
+      log(
+        `retire: REFUSING — ${box} is leased by ${held.holder} (${held.purpose}, ${held.state}); ` +
+          `release the lease or pass --force (which marks it lost)`,
+      );
+      return RC.REFUSED;
+    }
+
     if (row.phase === "retired" && !forget) {
       out(`retire: ${box} is already retired (retired_at=${row.retired_at ?? "?"})\n`);
       return RC.OK;
     }
 
     if (dryRun) {
-      out(`retire: DRY-RUN ${box} (phase ${row.phase}${forget ? ", --forget" : ""})\n`);
+      out(`retire: DRY-RUN ${box} (phase ${row.phase}${forget ? ", --forget" : ""}${force ? ", --force" : ""})\n`);
+      if (held !== undefined) {
+        out(`retire:   lease ${held.lease_id} (${held.holder}) marked LOST with reason 'retired'\n`);
+      }
       out(`retire:   store row      ${forget ? "DELETED (counters, key row and alerts cascade)" : `${row.phase} -> retired (row kept)`}\n`);
       out(`retire:   VPS authorized_keys line for port ${row.port ?? "?"} removed\n`);
       out(`retire:   ${deps.env.FLEET_ETC}/authorized-keys.d/${box}.line removed\n`);
@@ -176,6 +196,14 @@ export async function cmdRetire(args: string[], deps: RetireDeps): Promise<numbe
     if (got !== "ok") {
       log(RETIRE_BUSY_LINE);
       return RC.LOCK_BUSY;
+    }
+
+    // lease-api L3: --force past a live lease. Marked LOST (not released) with
+    // reason `retired`, so `lease show` and the `lease run` poll both name what
+    // actually happened rather than reporting a clean handback.
+    if (held !== undefined) {
+      markLost(handle.store, held, "retired", handle.store.now());
+      log(`retire: --force marked lease ${held.lease_id} on ${box} LOST (reason 'retired')`);
     }
 
     // (2) the VPS-side artefacts, BEFORE the store write: if the file cannot be

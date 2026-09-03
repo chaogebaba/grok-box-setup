@@ -1,4 +1,4 @@
-grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ✖ DOWN                                            
+grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ✖ DOWN                                         
 LINK DOWN 45s — showing last-good data, retrying                                                                        
 
   NAME          TUNNEL CHECK VER     DRIFT    CONFIG  EXPIRY                                                              ╭─ grok-box-001 ─────────────────────────────╮
@@ -7,6 +7,7 @@ LINK DOWN 45s — showing last-good data, retrying
 ✖ grok-box-003  down   FAIL  5.3.0   no       in-sync 3d                  │checkfail no · asleep no · canary none      │
                                                                           │checkfail# — · expires —                    │
                                                                           │phase — · observed —                        │
+                                                                          │lease —                                     │
                                                                           │asleep since —                              │
                                                                           │asleep last — · api backoff —               │
                                                                           │24h (loading…)                              │

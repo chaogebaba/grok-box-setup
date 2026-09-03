@@ -129,3 +129,19 @@ function readIf(p: string): string | undefined {
     return undefined;
   }
 }
+
+/**
+ * A READ-WRITE store handle for the lease endpoints (lease-api L2).
+ *
+ * Deliberately NOT `openWriteState`: the lease writes touch one table and need
+ * no legacy export, and they take NO reconcile lock (L2) — the partial unique
+ * index is what serialises them. Returns undefined when there is no store yet,
+ * so the acquire path answers "no eligible box" rather than creating a database
+ * out of a GET-shaped request.
+ */
+export function openLeaseStore(env: Env): { store: Store; close(): void } | undefined {
+  const path = storePath(env.FLEET_STATE);
+  if (!existsSync(path)) return undefined;
+  const store = openStore({ path, dir: env.FLEET_STATE });
+  return { store, close: () => store.close() };
+}

@@ -171,6 +171,7 @@ describe("D1 detail pane rows", () => {
         "│checkfail no · asleep no · canary none      │",
         "│checkfail# — · expires —                    │",
         "│phase — · observed —                        │",
+        "│lease —                                     │",
         "│asleep since —                              │",
         "│asleep last — · api backoff —               │",
         "│24h (loading…)                              │",

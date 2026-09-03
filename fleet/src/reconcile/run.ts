@@ -48,6 +48,7 @@ import { dailyMaintenance } from "../store/backup.ts";
 import { AUDIT_RETENTION_DAYS, SNAPSHOT_RETENTION_DAYS } from "../store/schema.ts";
 import { pruneSnapshots } from "../store/snapshots.ts";
 import { observe, type Observed } from "./observe.ts";
+import type { DeferringLease, LeaseTickApi } from "./lease-tick.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
@@ -64,6 +65,17 @@ const BACKOFF_CAP_SECS = 1200; // 20-min cap (main:2750-2754); beyond ⇒ implau
  * the observation in the first place.
  */
 export const TUNNEL_WRITING_ACTIONS = new Set(["mint", "rotate", "rollout", "delete-then-rename"]);
+
+/**
+ * lease-api L3: the decision-table actions a LEASE defers. `rollout` only —
+ * `mint` and `rotate` still run, because key expiry does not wait for a
+ * caller's CI job, and `delete-then-rename` is a tailnet-side dedup that does
+ * not touch the box's workload. `config-push` is not a loop action; the config
+ * pass defers it (actions/config-pass.ts).
+ *
+ * Mutant (l2) adds `mint` to this set and the tick test fails.
+ */
+export const LEASE_DEFERRED_ACTIONS = new Set(["rollout"]);
 
 /** The log label each of those uses (the seed path logs as `mint-key`). */
 export function actionLabel(a: string): string {
@@ -138,6 +150,12 @@ export interface ReconcileDeps {
   discover?: DiscoverDeps;
   /** monotonic clock (ms) for the discover budget; injected for tests. */
   nowMsFn?: () => number;
+  /**
+   * lease-api L3: the lease layer for this tick. Omitted ⇒ no leases at all,
+   * which is the 5.10.0 behaviour and what keeps the box-free runReconcile
+   * tests hermetic.
+   */
+  leases?: LeaseTickApi;
 }
 
 export interface ReconcileResult {
@@ -325,6 +343,12 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
     return { rc: finishStore(deps, 0) };
   }
 
+  // --- lease-api L3: expiry + grace sweeps, BEFORE the action loop ---
+  // A lease acquired since the last tick is honoured from here on: the map is
+  // read ONCE and every deferral decision in this tick uses it, so a lease that
+  // lands mid-tick cannot half-apply.
+  const deferring: Map<string, DeferringLease> = deps.leases?.begin(nowS) ?? new Map();
+
   // --- per-box loop (SERIAL) ---
   let rc: 0 | 1 = 0;
   const drifted: DriftedBox[] = [];
@@ -337,7 +361,7 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   // exactly the scope of one tick.
   const tunnelDeps: TunnelDeps = { warnOnce: makeWarnOnce() };
   for (const box of deps.targetBoxes) {
-    const r = await reconcileOne(box, devs, deps, drifted, snapshots, observed, tick, tunnelDeps);
+    const r = await reconcileOne(box, devs, deps, drifted, snapshots, observed, tick, tunnelDeps, deferring);
     if (r === 1) rc = 1;
   }
 
@@ -348,12 +372,23 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   drun?.finish();
 
   // --- rollout once (F8), BEFORE the config pass ---
-  await runRolloutOnce(drifted, {
-    rollout: deps.rollout,
-    targetSha: deps.targetSha,
-    targetVersion: deps.targetVersion,
-    upgradeDeps: deps.upgradeDeps,
-  });
+  // lease-api L3 canary rule (rollout engine): the ROLLOUT canary is FIXED
+  // (`[rollout].canary`) — there is no dynamic choice in the phase-1 engine — so
+  // when it holds a deferring lease the pass is SKIPPED, never run canary-less
+  // (mutant l6). A pass that had nothing to do is neither a skip nor a run.
+  const rolloutCanaryLease = deferring.get(deps.rollout.canary);
+  if (drifted.length > 0 && rolloutCanaryLease !== undefined) {
+    log(`rollout: canary ${deps.rollout.canary} leased by ${rolloutCanaryLease.holder} — pass skipped`);
+    await deps.leases?.canarySkip("rollout-canary-leased", deps.rollout.canary, nowS);
+  } else {
+    if (drifted.length > 0) deps.leases?.canaryRan("rollout-canary-leased", deps.rollout.canary);
+    await runRolloutOnce(drifted, {
+      rollout: deps.rollout,
+      targetSha: deps.targetSha,
+      targetVersion: deps.targetVersion,
+      upgradeDeps: deps.upgradeDeps,
+    });
+  }
 
   // --- config pass (rc LOGGED, never folded — D6c) ---
   const cpDeps: ConfigPassDeps = {
@@ -366,11 +401,25 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
     configCanary: deps.configCanary,
     managedFilesPresent: deps.managedFilesPresent,
     apply: deps.apply,
+    // lease-api L3: the config pass defers pushes to leased boxes and refuses to
+    // run without canary protection when its canary is leased.
+    leases: deferring,
   };
   const cpRes = await configPass(cpDeps);
+  if (cpRes.canaryLeased !== undefined) {
+    await deps.leases?.canarySkip("config-canary-leased", cpRes.canaryLeased, nowS);
+  } else if (cpRes.canary !== undefined) {
+    deps.leases?.canaryRan("config-canary-leased", cpRes.canary);
+  }
 
   // --- identity pass (log-only) ---
   identityPass({ devs, targetBoxes: deps.targetBoxes });
+
+  // lease-api L3: mid-run box loss, from THIS tick's `observed` labels. It runs
+  // after the loop (the labels are only complete now) and before the snapshot
+  // write, so the two-consecutive-tick reading of `unhealthy` compares the
+  // in-memory label against the row at `tick - 1`.
+  await deps.leases?.detectLoss(observed, tick, nowS);
 
   // TUI-D4: fold the config-pass verdict into the per-box snapshot + record the
   // config-pass canary, then append the snapshot line (finally-path).
@@ -432,6 +481,7 @@ async function reconcileOne(
   observedBy: Map<string, Observed>,
   tick: number,
   tunnelDeps: TunnelDeps = {},
+  deferring: Map<string, DeferringLease> = new Map(),
 ): Promise<0 | 1> {
   if (boxIndex(box) === undefined) return 1; // box_index fail ⇒ rc 1
   let rcOne: 0 | 1 = 0;
@@ -640,6 +690,17 @@ async function reconcileOne(
     // can never cause the mint-seed-fail-revoke of empirical r2, on any row.
     if (hostkeyMismatch && TUNNEL_WRITING_ACTIONS.has(a)) {
       log(`${actionLabel(a)}: ${box} deferred — host key mismatch`);
+      continue;
+    }
+
+    // lease-api L3 lease gate, at the SAME site and for the same reason: the
+    // box is in use, so the actions that would write its workload are deferred.
+    // Placed ABOVE the `drifted.push` below, or the rollout pass after the loop
+    // would scp into a box someone is building on. `mint`/`rotate` deliberately
+    // fall through — key expiry does not wait.
+    const lease = deferring.get(box);
+    if (lease !== undefined && LEASE_DEFERRED_ACTIONS.has(a)) {
+      log(`${actionLabel(a)}: ${box} deferred — leased by ${lease.holder} (${lease.purpose})`);
       continue;
     }
 

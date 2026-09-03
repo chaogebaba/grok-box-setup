@@ -34,6 +34,13 @@ import {
   boxGuard,
   fsEnrolledBoxes,
 } from "./handlers.ts";
+import {
+  handleLeaseAcquire,
+  handleLeaseGet,
+  handleLeaseList,
+  handleLeaseRelease,
+  handleLeaseRenew,
+} from "./lease-handlers.ts";
 import { log } from "../log.ts";
 import { openStore, storePath } from "../store/db.ts";
 import { existsSync } from "node:fs";
@@ -200,6 +207,15 @@ async function route(ctx: ServerContext, req: Request): Promise<Response> {
       const hours = hoursParam !== null ? Number.parseInt(hoursParam, 10) : 24;
       return handleHistory(ctx, box, Number.isNaN(hours) ? 24 : hours);
     }
+    // lease-api L2: the lease READS are readonly scope. The default set is
+    // `released_at IS NULL` (all three deferring states); `?all=1` adds released
+    // rows and `?state=` filters within the chosen set.
+    if (path === "/v1/leases") {
+      return handleLeaseList(ctx, url.searchParams.get("all") === "1", url.searchParams.get("state"));
+    }
+    const mLease = path.match(/^\/v1\/leases\/([^/]+)$/);
+    if (mLease) return handleLeaseGet(ctx, decodeURIComponent(mLease[1]!));
+
     const mJob = path.match(/^\/v1\/jobs\/([^/]+)$/);
     if (mJob) {
       if (auth.scope !== "admin") return err.forbidden();
@@ -211,6 +227,20 @@ async function route(ctx: ServerContext, req: Request): Promise<Response> {
   // --- POST mutations (admin scope) ---
   if (method === "POST") {
     if (auth.scope !== "admin") return err.forbidden();
+
+    // lease-api L2: acquire + renew. NO confirm (a lease is a reservation, not a
+    // destructive action) and NO reconcile lock — see lease-handlers.ts.
+    if (path === "/v1/leases") {
+      const c = await readConfirm(req);
+      if ("bad" in c) return err.badBody();
+      return handleLeaseAcquire(ctx, auth, c.body);
+    }
+    const mRenew = path.match(/^\/v1\/leases\/([^/]+)\/renew$/);
+    if (mRenew) {
+      const c = await readConfirm(req);
+      if ("bad" in c) return err.badBody();
+      return handleLeaseRenew(ctx, auth, decodeURIComponent(mRenew[1]!), c.body);
+    }
 
     // reconcile (no box).
     if (path === "/v1/reconcile") {
@@ -266,6 +296,14 @@ async function route(ctx: ServerContext, req: Request): Promise<Response> {
       return handleRename(ctx, box, to, auth);
     }
 
+    return err.notFound("unknown route");
+  }
+
+  // --- DELETE (admin scope): lease release ---
+  if (method === "DELETE") {
+    if (auth.scope !== "admin") return err.forbidden();
+    const mRel = path.match(/^\/v1\/leases\/([^/]+)$/);
+    if (mRel) return handleLeaseRelease(ctx, auth, decodeURIComponent(mRel[1]!));
     return err.notFound("unknown route");
   }
 

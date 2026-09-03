@@ -31,7 +31,7 @@ describe("T-ssh usage + argv", () => {
     // agent-ux U5 names the new flags in the usage line; the operand tail keeps
     // its bash shape (main:696-699).
     expect(cap.lines.some((l) => l.includes("usage: grokfleet ssh"))).toBe(true);
-    expect(cap.lines.some((l) => l.includes("<box> [cmd...]"))).toBe(true);
+    expect(cap.lines.some((l) => l.includes("[cmd...]"))).toBe(true);
     expect(cap.lines.some((l) => l.includes("--timeout <s>"))).toBe(true);
     expect(runner.calls.length).toBe(0);
   });

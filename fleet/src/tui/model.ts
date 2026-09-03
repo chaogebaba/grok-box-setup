@@ -14,6 +14,7 @@
 // concatenation of `segments`, which the model tests pin.
 
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
+import type { BoxLease, FleetBox } from "./api-client.ts";
 import type { TuiState } from "./state.ts";
 import type { Tone } from "./tone.ts";
 
@@ -51,7 +52,7 @@ const STALE_SECONDS = 15 * 60; // TUI-D7
 /** The Detail pane's FIXED height. The row-budget arithmetic in `layout.ts`
  *  depends on it (the pane is omitted rather than clipped when the budget is
  *  smaller), and the chrome-agreement test pins it against `detailLines`. */
-export const DETAIL_ROWS = 10;
+export const DETAIL_ROWS = 11;
 
 /** The gap between the table column and the Detail column. The old painter
  *  composed `padVisible(left, leftW) + "  " + right`, so Detail text starts at
@@ -84,6 +85,8 @@ export const GLYPH = {
   asleep: "☾",
   unknown: "○",
   canary: "★",
+  /** lease-api L5: this box is IN USE — a lease row with `released_at IS NULL`. */
+  leased: "⚑",
 } as const;
 
 // --- small formatters (verbatim from render.ts) ------------------------------
@@ -146,7 +149,7 @@ const SEP = " · "; // V5: the detail card's field separator (MUTED)
 /** Glyph + tone for a box's health (TUI-D5, V2). Order: incident > degraded >
  *  asleep > healthy > down/unknown. `☾` (asleep) is MUTED, never an error tone —
  *  a sleeping box is the normal case on this fleet, not a fault. */
-export function boxHealth(state: TuiState, b: SnapshotBox): { glyph: string; tone: Tone } {
+export function boxHealth(state: TuiState, b: FleetBox): { glyph: string; tone: Tone } {
   void state;
   if (b.asleep) return { glyph: GLYPH.asleep, tone: "muted" }; // muted, NOT an error colour
   if (b.check === "FAIL") return { glyph: GLYPH.down, tone: "down" }; // incident
@@ -155,8 +158,28 @@ export function boxHealth(state: TuiState, b: SnapshotBox): { glyph: string; ton
   return { glyph: GLYPH.unknown, tone: "muted" }; // down / never-probed / unknown
 }
 
+/**
+ * lease-api L5/L3/r2-n3: the `⚑` tone follows the lease's STATE, because the
+ * three states mean different things to an operator — `active` is someone
+ * working (MAIN), `lost` is a box that went away under a running command
+ * (DOWN), `expired` is a lease nobody renewed (WARN).
+ */
+export function leaseTone(l: BoxLease | null | undefined): Tone {
+  if (l === null || l === undefined) return "plain";
+  if (l.state === "lost") return "down";
+  if (l.state === "expired") return "warn";
+  return "main";
+}
+
+/** How many boxes are IN USE (any deferring state — the L3 rule). */
+export function leasedCount(boxes: FleetBox[]): number {
+  let n = 0;
+  for (const b of boxes) if (b.lease !== null && b.lease !== undefined) n++;
+  return n;
+}
+
 /** Count fleet health for the header. */
-export function counts(boxes: SnapshotBox[]): { total: number; healthy: number; degraded: number; down: number; asleep: number } {
+export function counts(boxes: FleetBox[]): { total: number; healthy: number; degraded: number; down: number; asleep: number } {
   let healthy = 0;
   let degraded = 0;
   let down = 0;
@@ -195,7 +218,7 @@ export interface CellTones {
  * row's health. `quiet is the goal state` — an in-sync config and a no-drift box
  * are MUTED so the eye lands on the cells that are not.
  */
-export function cellTones(b: SnapshotBox): CellTones {
+export function cellTones(b: FleetBox): CellTones {
   return {
     tunnel: b.tunnel === "up" ? "ok" : b.tunnel === "down" ? "down" : "muted",
     check: b.check === "OK" ? "ok" : b.check === "FAIL" ? "down" : "muted",
@@ -219,6 +242,7 @@ export function messageTone(text: string): Tone {
 /** V4: the header bar, left→right — identity, health, mode, link. */
 export function headerSegments(state: TuiState, size: Size): Seg[] {
   const c = counts(state.boxes);
+  const leased = leasedCount(state.boxes);
   const stale = state.tickAgeS !== null && state.tickAgeS >= STALE_SECONDS;
   const applyText =
     state.apply === null ? "apply ?" : `apply ${state.apply ? "ON" : "off"}${state.applySource === "config" ? "" : "?"}`;
@@ -235,6 +259,16 @@ export function headerSegments(state: TuiState, size: Size): Seg[] {
     { text: "  ", tone: "plain" },
     { text: `${GLYPH.asleep} ${c.asleep}`, tone: "muted" },
     { text: "  ", tone: "plain" },
+    // lease-api L5: the leased count, computed from the `lease` field on the
+    // `/v1/fleet` per-box entries — the poll stays SINGLE-ENDPOINT (r10-B1).
+    // Rendered only when there is something to say: an all-zero counter on a
+    // fleet nobody is using is noise, and `quiet is the goal state` (V3).
+    ...(leased > 0
+      ? ([
+          { text: `${GLYPH.leased} ${leased} leased`, tone: "accent" as Tone },
+          { text: "  ", tone: "plain" as Tone },
+        ] as Seg[])
+      : []),
     { text: applyText, tone: applyTone },
     { text: "  ", tone: "plain" },
     { text: state.tickAgeS === null ? "tick ?" : `tick ${fmtAge(state.tickAgeS)}`, tone: stale ? "warn" : "muted" },
@@ -265,7 +299,7 @@ export function headerText(state: TuiState, size: Size): string {
 const TABLE_HEADER_COLS = { glyph: 2, name: 14, tunnel: 7, check: 6, ver: 8, drift: 9, config: 8, expiry: 8 };
 
 /** The filtered box list (case-insensitive substring on name). */
-export function filteredBoxes(state: TuiState): SnapshotBox[] {
+export function filteredBoxes(state: TuiState): FleetBox[] {
   if (state.filter === "") return state.boxes;
   const f = state.filter.toLowerCase();
   return state.boxes.filter((b) => b.name.toLowerCase().includes(f));
@@ -295,9 +329,15 @@ export function tableLines(state: TuiState, size: Size): TableLine[] {
     const dash = (v: string | null | undefined): string => (v === null || v === undefined || v === "" ? "-" : String(v));
     const isCanary = state.canary !== null && b.name === state.canary;
     const selected = i === state.selected;
+    // lease-api L5: the `⚑` sits INSIDE the NAME cell (NAME is 14 and names are
+    // 12, so it fits) and carries its OWN tone — the name keeps the row's health
+    // tone, the flag says who is using the box.
+    const flag = b.lease === null || b.lease === undefined ? "" : ` ${GLYPH.leased}`;
+    const nameText = pad(b.name, Math.max(0, TABLE_HEADER_COLS.name - flag.length));
     const segs: Seg[] = [
       { text: `${health.glyph} `, tone: health.tone },
-      { text: pad(b.name, TABLE_HEADER_COLS.name), tone: health.tone, bold: selected },
+      { text: nameText, tone: health.tone, bold: selected },
+      ...(flag === "" ? [] : ([{ text: flag, tone: leaseTone(b.lease) }] as Seg[])),
       { text: pad(dash(b.tunnel), TABLE_HEADER_COLS.tunnel), tone: b.tunnel === null || b.tunnel === undefined ? "muted" : t.tunnel },
       { text: pad(dash(b.check), TABLE_HEADER_COLS.check), tone: b.check === null || b.check === undefined ? "muted" : t.check },
       { text: pad(dash(b.ver), TABLE_HEADER_COLS.ver), tone: t.ver },
@@ -498,6 +538,26 @@ function joinFields(groups: Seg[][]): Seg[] {
   return out;
 }
 
+/** The detail card's `lease …` row (or `lease —` when the box is free). */
+function leaseFields(l: BoxLease | null | undefined, ts: (v: string | null | undefined) => string): Seg[] {
+  if (l === null || l === undefined) return field("lease", DASH, "muted");
+  const tone = leaseTone(l);
+  const segs: Seg[] = [
+    { text: "lease", tone: "muted" },
+    { text: " ", tone: "muted" },
+    { text: l.holder, tone },
+    { text: SEP, tone: "muted" },
+    { text: l.purpose, tone: "plain" },
+    { text: SEP, tone: "muted" },
+    { text: l.kind, tone: "muted" },
+  ];
+  if (l.expires_at !== null) {
+    segs.push({ text: SEP, tone: "muted" }, { text: `expires ${ts(l.expires_at)}`, tone: "plain" });
+  }
+  if (l.state !== "active") segs.push({ text: SEP, tone: "muted" }, { text: l.state, tone });
+  return segs;
+}
+
 /**
  * The Detail pane's lines — exactly DETAIL_ROWS of them when a box is selected,
  * none otherwise. V5: a FRAMED card exactly `width` columns wide, labels muted
@@ -567,6 +627,9 @@ export function detailLines(state: TuiState, width: number): DetailLine[] {
       field("observed", dashEm(f?.observed), observedTone(f?.observed)),
     ]),
   );
+  // lease-api L5: who is holding this box, if anyone. Same rule as everywhere
+  // else — the row with `released_at IS NULL`, whatever its state.
+  body.push(leaseFields(b.lease, ts));
   body.push(field("asleep since", ts(f?.asleep_since), "plain"));
   // TUI-D4 row budget: the card is fixed at DETAIL_ROWS and the phase/observed
   // line above needed one. `api backoff` rides on the `asleep last` row rather

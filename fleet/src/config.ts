@@ -4,6 +4,7 @@
 // with the file path + Bun's message (T7).
 
 import { log } from "./log.ts";
+import { DEFAULT_LEASE_LIMITS, type LeaseLimits } from "./store/leases.ts";
 
 export class ConfigError extends Error {
   constructor(
@@ -80,9 +81,17 @@ const KNOWN_ROLLOUT_KEYS = new Set([
   "auto",
 ]);
 
+/**
+ * lease-api L3/r2-n4: the `[leases]` knobs. The DEFAULTS are authoritative and an
+ * unknown `[leases]` key is LOGGED, never fatal — exactly like `[rollout]`.
+ */
+const KNOWN_LEASE_KEYS = new Set(["ephemeral_max_life_s", "expired_grace_s", "lost_grace_s"]);
+
 export interface ParsedConfig {
   fleetBrain: Table;
   rollout: Table;
+  /** the `[leases]` table (empty when absent). */
+  leases: Table;
   /** The raw parsed object (empty when the file is absent). */
   raw: Table;
   /** True when the config file existed and parsed. */
@@ -97,7 +106,7 @@ export interface ParsedConfig {
  */
 export function parseConfig(text: string | undefined, path: string): ParsedConfig {
   if (text === undefined) {
-    return { fleetBrain: {}, rollout: {}, raw: {}, present: false };
+    return { fleetBrain: {}, rollout: {}, leases: {}, raw: {}, present: false };
   }
   let raw: Table;
   try {
@@ -108,13 +117,20 @@ export function parseConfig(text: string | undefined, path: string): ParsedConfi
   }
   const fleetBrain = asTable(raw["fleet-brain"]);
   const rollout = asTable(raw["rollout"]);
+  const leases = asTable(raw["leases"]);
   // Unknown keys in [rollout] → one info line, never fatal (D5).
   for (const k of Object.keys(rollout)) {
     if (!KNOWN_ROLLOUT_KEYS.has(k)) {
       log(`config: unknown key [rollout].${k} ignored`);
     }
   }
-  return { fleetBrain, rollout, raw, present: true };
+  // lease-api r2-n4: the same rule for [leases].
+  for (const k of Object.keys(leases)) {
+    if (!KNOWN_LEASE_KEYS.has(k)) {
+      log(`config: unknown key [leases].${k} ignored`);
+    }
+  }
+  return { fleetBrain, rollout, leases, raw, present: true };
 }
 
 export interface RolloutEnv {
@@ -150,4 +166,17 @@ export async function loadConfig(path: string): Promise<ParsedConfig> {
   if (!(await file.exists())) return parseConfig(undefined, path);
   const text = await file.text();
   return parseConfig(text, path);
+}
+
+/**
+ * Resolve `[leases]` over the defaults (lease-api L1/L3). Every value is a
+ * positive integer of seconds; anything else keeps the default, because the
+ * DEFAULT is the authority and a typo must not shorten a grace silently.
+ */
+export function resolveLeaseLimits(cfg: ParsedConfig): LeaseLimits {
+  return {
+    ephemeralMaxLifeS: asPosInt(cfg.leases["ephemeral_max_life_s"], DEFAULT_LEASE_LIMITS.ephemeralMaxLifeS),
+    expiredGraceS: asPosInt(cfg.leases["expired_grace_s"], DEFAULT_LEASE_LIMITS.expiredGraceS),
+    lostGraceS: asPosInt(cfg.leases["lost_grace_s"], DEFAULT_LEASE_LIMITS.lostGraceS),
+  };
 }
