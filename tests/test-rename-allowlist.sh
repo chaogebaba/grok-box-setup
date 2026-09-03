@@ -84,6 +84,14 @@ done < "$ALLOW"
 unexpected=0
 checked=0
 while IFS= read -r f; do
+  # The checker and its manifest necessarily spell the legacy token: the former
+  # defines the search and documents the rule, while the latter is structured
+  # evidence consumed above. They are not product/source occurrences. Keeping
+  # this exclusion explicit avoids a recursive whole-file allowlist entry while
+  # preserving the exact-count checks for every file actually under test.
+  case "$f" in
+    tests/test-rename-allowlist.sh|tests/lib/rename-allowlist.txt) continue ;;
+  esac
   [ -f "$f" ] || continue
   grep -Iq "$OLD_NAME" "$f" 2>/dev/null || continue
   checked=$((checked + 1))

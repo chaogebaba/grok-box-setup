@@ -119,4 +119,4 @@ vps/install-vps.sh	fleet2-rename-grokfleet	2
 vps/install-vps.sh	FLEET2_	6
 vps/install-vps.sh	fleet2\.prev	4
 vps/install-vps.sh	fleet2\.conf	2
-vps/install-vps.sh	fleet2	26
+vps/install-vps.sh	fleet2	27

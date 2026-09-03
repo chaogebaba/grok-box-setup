@@ -671,10 +671,10 @@ install_grokfleet() {
   if [ -e "$OPT_DIR/grokfleet" ]; then
     GF_HAD_BINARY=1
     if ! cmp -s "$tmp" "$OPT_DIR/grokfleet"; then
-      if cp -f "$OPT_DIR/grokfleet" "$OPT_DIR/grokfleet.prev" 2>/dev/null; then
-        GF_WROTE_PREV=1
-        log "kept the outgoing binary as $OPT_DIR/grokfleet.prev"
-      fi
+      cp -f "$OPT_DIR/grokfleet" "$OPT_DIR/grokfleet.prev" \
+        || { rm -f "$tmp"; log "install_grokfleet: could not preserve the outgoing $OPT_DIR/grokfleet as .prev — incumbent is untouched"; return 1; }
+      GF_WROTE_PREV=1
+      log "kept the outgoing binary as $OPT_DIR/grokfleet.prev"
     fi
   fi
   mv -f "$tmp" "$OPT_DIR/grokfleet" \
@@ -736,7 +736,8 @@ install_grokfleet() {
         || { rollback_step4; return 1; }
       # NOT --now for the API: the RUNNING api keeps serving until step (9)
       # rebinds it to the new bytes.
-      systemctl disable "$OLD_API_SERVICE" >/dev/null 2>&1 || true
+      systemctl disable "$OLD_API_SERVICE" >/dev/null 2>&1 \
+        || { rollback_step4; return 1; }
     fi
 
     mkdir -p "$OPT_DIR/units.prev" || { rollback_step4; return 1; }
@@ -775,7 +776,7 @@ install_grokfleet() {
   # after the compatibility alias is silently ignored.
   local dropin="$SYSTEMD_DIR/$OLD_SERVICE.d/fleet2.conf"
   if [ -e "$dropin" ]; then
-    rm -f "$dropin"
+    rm -f "$dropin" || { rollback_step5 || return 1; }
     rmdir "$SYSTEMD_DIR/$OLD_SERVICE.d" 2>/dev/null || true
     log "removed obsolete cutover drop-in $dropin"
   fi
@@ -817,7 +818,7 @@ install_grokfleet() {
     mv -f "$OPT_DIR/fleet2" "$OPT_DIR/grokfleet.prev" || { rollback_step5 || return 1; }
     log "demoted $OPT_DIR/fleet2 -> $OPT_DIR/grokfleet.prev (the rollback target of THIS install)"
     if [ -e "$OPT_DIR/fleet2.prev" ]; then
-      rm -f "$OPT_DIR/fleet2.prev"
+      rm -f "$OPT_DIR/fleet2.prev" || { log "install_grokfleet: could not remove superseded $OPT_DIR/fleet2.prev"; return 1; }
       log "removed the superseded $OPT_DIR/fleet2.prev (two releases old; its units are gone)"
     fi
   fi
@@ -827,10 +828,14 @@ install_grokfleet() {
   # host whose CLI resolves, so the operator's first recovery command works.
   # Nothing here depends on the service. The `fleet2` name is the N2 CLI
   # compatibility link and points at the SAME target (removed in 5.11.0).
-  local bindir="$PREFIX/usr/local/bin"
-  mkdir -p "$bindir" 2>/dev/null || true
-  ln -sfn "$OPT_DIR_REAL/grokfleet" "$bindir/grokfleet" 2>/dev/null || true
-  ln -sfn "$OPT_DIR_REAL/grokfleet" "$bindir/fleet2" 2>/dev/null || true
+  # BIN_DIR is an extracted-function test seam; normal installs retain the
+  # established PREFIX-relative destination.
+  local bindir="${BIN_DIR:-$PREFIX/usr/local/bin}"
+  mkdir -p "$bindir" || { log "install_grokfleet: could not create $bindir for CLI links"; return 1; }
+  ln -sfn "$OPT_DIR_REAL/grokfleet" "$bindir/grokfleet" \
+    || { log "install_grokfleet: could not link $bindir/grokfleet"; return 1; }
+  ln -sfn "$OPT_DIR_REAL/grokfleet" "$bindir/fleet2" \
+    || { log "install_grokfleet: could not link $bindir/fleet2"; return 1; }
   log "linked $bindir/grokfleet and $bindir/fleet2 -> $OPT_DIR_REAL/grokfleet"
 
   # === (9) rebind a RUNNING API to the new bytes ===========================
