@@ -216,8 +216,9 @@ discovers every `grok-box-NNN` peer; it never touches other machines.
 
 > **grokfleet (bun + TypeScript brain).** The VPS-side brain is bun +
 > TypeScript. It was called `fleet2` up to and including 5.9.0 and is
-> `grokfleet` from 5.10.0 on; 5.10.0 keeps the old unit names, the `fleet2`
-> command and the `FLEET2_*` variables working for that one release. See
+> `grokfleet` from 5.10.0 on. 5.10.0 kept the old unit names, the `fleet2`
+> command and the `FLEET2_*` variables working for that one release; 5.11.0
+> removes them, and upgrading deletes any that are still on the host. See
 > [`fleet/README.md`](fleet/README.md) and
 > [`docs/FLEET-BRAIN.md`](docs/FLEET-BRAIN.md) §"Upgrades and inventory (grokfleet)".
 

@@ -137,9 +137,11 @@ async function quiet<T>(fn: () => Promise<T>): Promise<T> {
 
 describe("retire: argument parsing", () => {
   test("the flags are order-independent and the positional is mandatory", () => {
-    expect(parseRetireArgs(["grok-box-011"])).toEqual({ box: "grok-box-011", forget: false, dryRun: false });
-    expect(parseRetireArgs(["--forget", "grok-box-011"])).toEqual({ box: "grok-box-011", forget: true, dryRun: false });
-    expect(parseRetireArgs(["grok-box-011", "--dry-run"])).toEqual({ box: "grok-box-011", forget: false, dryRun: true });
+    expect(parseRetireArgs(["grok-box-011"])).toEqual({ box: "grok-box-011", forget: false, dryRun: false, force: false });
+    expect(parseRetireArgs(["--forget", "grok-box-011"])).toEqual({ box: "grok-box-011", forget: true, dryRun: false, force: false });
+    expect(parseRetireArgs(["grok-box-011", "--dry-run"])).toEqual({ box: "grok-box-011", forget: false, dryRun: true, force: false });
+    // lease-api L3: --force is the override for a box that is currently leased.
+    expect(parseRetireArgs(["--force", "grok-box-011"])).toEqual({ box: "grok-box-011", forget: false, dryRun: false, force: true });
     expect(parseRetireArgs([])).toEqual({ usage: true });
     expect(parseRetireArgs(["--wat", "grok-box-011"])).toEqual({ usage: true });
     // two positionals is a mistake, not a batch: retire is one box at a time.

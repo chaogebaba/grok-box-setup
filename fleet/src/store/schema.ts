@@ -17,7 +17,7 @@
 // `enrol_stage`, `retired_at`) so v2 adds only tables — see D2/D3.
 
 /** The highest schema this binary knows how to create and operate. */
-export const KNOWN_SCHEMA = 2;
+export const KNOWN_SCHEMA = 3;
 
 /** Timestamps everywhere in the store are integer epoch SECONDS, UTC. */
 export const AUDIT_RETENTION_DAYS = 92;
@@ -221,9 +221,49 @@ const V2: string[] = [
   `CREATE INDEX IF NOT EXISTS snapshot_boxes_name_tick ON snapshot_boxes(name, tick)`,
 ];
 
+// --- v3 (grokfleet 5.11.0, blueprint fleet2-lease-api L1) ---------------------
+//
+// ADDITIVE ONLY: one new table and its indexes, so `min_reader` STAYS 1. A
+// 5.9.0/5.10.0 binary opens a v3 file, ignores `leases` and keeps working — that
+// IS the lease rollback, and it is a DOCUMENTED LIMITATION rather than a safe
+// one: an older binary does not honour an active lease, so its tick pushes
+// config and rolls out to a leased box. FLEET-BRAIN says so.
+//
+// The unique partial index is the one-deferring-lease-per-box invariant, and it
+// is the ONLY thing serialising two concurrent acquires (L2): no lease endpoint
+// takes the reconcile lock, so a racing second INSERT loses to the index with a
+// constraint error, which the API renders as 409.
+//
+// `released_at IS NULL` is the deferral predicate everywhere: a row in that
+// state still holds the box's slot whatever its `state` is (`active`, `lost` in
+// grace, `expired` in grace) — L3's "one rule for every in-use surface".
+const V3: string[] = [
+  `CREATE TABLE IF NOT EXISTS leases(
+     lease_id    TEXT PRIMARY KEY,
+     box_id      INTEGER NOT NULL REFERENCES boxes(box_id) ON DELETE CASCADE,
+     kind        TEXT NOT NULL CHECK(kind IN ('ephemeral','service')),
+     holder      TEXT NOT NULL,
+     purpose     TEXT NOT NULL,
+     created_at  INTEGER NOT NULL,
+     expires_at  INTEGER,
+     renewed_at  INTEGER,
+     released_at INTEGER,
+     state       TEXT NOT NULL CHECK(state IN ('active','released','expired','lost')),
+     expired_at  INTEGER,
+     lost_at     INTEGER,
+     lost_reason TEXT
+   ) STRICT`,
+
+  // The invariant, in the schema: at most ONE deferring lease per box.
+  `CREATE UNIQUE INDEX IF NOT EXISTS leases_box_open ON leases(box_id) WHERE released_at IS NULL`,
+  `CREATE INDEX IF NOT EXISTS leases_state ON leases(state)`,
+  `CREATE INDEX IF NOT EXISTS leases_expires_at ON leases(expires_at)`,
+];
+
 export const MIGRATIONS: Migration[] = [
   { to: 1, minReader: 1, statements: V1 },
   { to: 2, minReader: 1, statements: V2 },
+  { to: 3, minReader: 1, statements: V3 },
 ];
 
 /** Every v1 table, in the order a full replay must DELETE them (children first). */

@@ -129,3 +129,39 @@ function readIf(p: string): string | undefined {
     return undefined;
   }
 }
+
+/**
+ * A READ-WRITE store handle for the lease endpoints (lease-api L2).
+ *
+ * Deliberately NOT `openWriteState`: the lease writes touch one table and need
+ * no legacy export, and they take NO reconcile lock (L2) — the partial unique
+ * index is what serialises them. Returns undefined when there is no store yet,
+ * so the acquire path answers "no eligible box" rather than creating a database
+ * out of a GET-shaped request.
+ */
+export function openLeaseStore(env: Env): { store: Store; close(): void } | undefined {
+  const path = storePath(env.FLEET_STATE);
+  if (!existsSync(path)) return undefined;
+  const store = openStore({ path, dir: env.FLEET_STATE });
+  return { store, close: () => store.close() };
+}
+
+/**
+ * The READ-ONLY twin, for the lease READS (`GET /v1/leases`, and the `lease`
+ * field on `/v1/fleet` and `/v1/boxes/:name`).
+ *
+ * Deliberately separate: `openStore` MIGRATES when it opens read-write, and a
+ * GET must never move a file's schema forward. A store still on v2 therefore
+ * reads as "no lease layer" and every read path serves `null`.
+ */
+export function openLeaseStoreRo(env: Env): { store: Store; close(): void } | undefined {
+  const path = storePath(env.FLEET_STATE);
+  if (!existsSync(path)) return undefined;
+  try {
+    const store = openStore({ path, dir: env.FLEET_STATE, readonly: true });
+    return { store, close: () => store.close() };
+  } catch (e) {
+    if (!(e instanceof ConfigError)) throw e;
+    return undefined;
+  }
+}

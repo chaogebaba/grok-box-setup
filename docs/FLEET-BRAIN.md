@@ -584,30 +584,38 @@ written before the rename keep `actor='fleet2'` — history is not rewritten.
 `/var/lib/grok-fleet/fleet2.soak-ok`. It is state under `$FLEET_STATE` and it
 gates flipping `apply=true`; renaming it would silently reset an in-flight soak.
 
-**Compatibility, for exactly one release (removed in 5.11.0).** The installer
-writes it; it is not a systemd `Alias=` mechanism, because `Alias=` materialises
-only on `systemctl enable` and two of the three units are never enabled.
+**Compatibility, REMOVED in 5.11.0.** 5.10.0 kept the pre-rename names answering
+for exactly one release. 5.11.0 takes them away, and an upgrade DELETES whatever a
+5.10.0 install left behind — idempotently, so a second run reports nothing and
+changes nothing. A regular file at one of those paths is somebody else's unit and
+is left alone; only our own symlinks are removed.
 
-| Old name | How it still answers |
-|---|---|
-| `fleet-reconcile.service` | a unit symlink → `grokfleet-reconcile.service`, written by the installer |
-| `fleet-api.service` | a unit symlink → `grokfleet-api.service`, written by the installer |
-| `fleet-reconcile.timer` | `Alias=fleet-reconcile.timer` in the new timer's `[Install]` (the timer is the one unit the installer enables) |
-| `fleet2` on `PATH` | `/usr/local/bin/fleet2` → `/opt/grok-fleet/grokfleet` |
-| `FLEET2_*` env | accepted alongside `GROKFLEET_*`: one spelling set ⇒ used; both set and equal ⇒ used and logged; both set and DIFFERENT ⇒ the installer refuses rc 1 naming both |
+| Retired name | What 5.10.0 wrote | What 5.11.0 does |
+|---|---|---|
+| `fleet-reconcile.service` | a unit symlink → `grokfleet-reconcile.service` | removes the symlink |
+| `fleet-api.service` | a unit symlink → `grokfleet-api.service` | removes the symlink |
+| `fleet-reconcile.timer` | `Alias=fleet-reconcile.timer` in the timer's `[Install]` | drops the `Alias=` line, disables the alias, removes its symlink |
+| `fleet2` on `PATH` | `/usr/local/bin/fleet2` → `/opt/grok-fleet/grokfleet` | removes the link |
+| `FLEET2_*` env | accepted beside `GROKFLEET_*`, refusing when both were set and differed | ignored; `GROKFLEET_*` is the only seam and there is no refusal |
 
-`grokfleet serve`'s journal endpoint queries **both** generations of unit names,
-because `journalctl` matches the unit a line was logged under and never the
-alias it now answers to. A future drop-in belongs under
-`grokfleet-reconcile.service.d/` — systemd resolves drop-ins by the real unit
-name, so a directory named after the compatibility alias is silently ignored.
+The alias timer is DISABLED before its link goes, or the `*.wants` symlink
+dangles and systemd keeps resolving the old name through it.
 
-**Rollback to 5.9.0.** There is no `grokfleet rollback-rename` command: a
-one-time path does not earn code. Rollback restores the binary **and** the unit
-files, because an alias named `fleet-reconcile.service` points at the new unit,
-whose `ExecStart` is `grokfleet` — restoring the binary alone would report
-success while still running 5.10.0. The installer preserves the pre-rename units
-at `/opt/grok-fleet/units.prev/` next to `grokfleet.prev` for exactly this:
+`grokfleet serve`'s journal endpoint queried **both** generations of unit names
+for that release, because `journalctl` matches the unit a line was logged under
+and never the alias it answered to. It queries only the `grokfleet-*` units now;
+pre-rename history is `journalctl -u fleet-reconcile` by hand. A drop-in belongs
+under `grokfleet-reconcile.service.d/` — systemd resolves drop-ins by the real
+unit name, so a directory named after a retired name is silently ignored.
+
+**Rollback to 5.9.0 (historical).** There is no `grokfleet rollback-rename`
+command: a one-time path does not earn code. This is the 5.10.0 procedure, kept
+because a host that never took 5.11.0 may still need it. It restores the binary
+**and** the unit files: restoring the binary alone would report success while
+still running the new engine. The 5.10.0 installer preserved the pre-rename units
+at `/opt/grok-fleet/units.prev/` next to `grokfleet.prev` for exactly this. From
+5.11.0 nothing writes `units.prev/` any more — the ordinary rollback target is
+`grokfleet.prev` plus `make ts-cutback`.
 
 ```bash
 systemctl disable --now grokfleet-reconcile.timer
@@ -1457,8 +1465,8 @@ back:
 
 - **rc 6** — the reconcile lock was held for the whole 90-second wait. Nothing was
   done. `grokfleet state check` and `grokfleet state reconcile-files --apply` use it.
-  (`grokfleet rename` returns 1 for the same condition; that inconsistency is known
-  and out of scope here.)
+  `grokfleet rename` and `grokfleet retire` return 6 for it too, and `retire`
+  reuses the code for its refusal to un-enrol a box that currently holds a lease.
 - **rc 7** — "recorded; export failed". Every store write committed and the
   mutation succeeded; only the legacy export a rolled-back 5.7.1 would read is
   stale. The tick, `grokfleet enroll` and the `state` subcommands all use it, and
@@ -1467,6 +1475,137 @@ back:
   the signal, and the next tick's divergence check reports the lag until it
   clears. API mutation endpoints return 200 with a `warnings` entry
   (`code: "export_failed"`) instead, because a committed mutation is a success.
+
+## Leases (grokfleet 5.11.0, blueprint fleet2-lease-api)
+
+Nothing before 5.11.0 said "this box is in use". A CI runner, a proxy or an agent
+picked a box by hand and the reconciler could push config or roll boxup onto it
+mid-run. A **lease** is the reservation that fixes that: a row that says who holds
+which box and why, plus one call that answers "give me a healthy box I can ssh
+to" — with reasons when none qualifies.
+
+A lease reserves a box and nothing else. It does not run anything for you, it
+does not stream logs and it does not supervise a service; that is step 2.
+
+### The model
+
+| Field | Meaning |
+|---|---|
+| `kind` | `ephemeral` — a TTL (default 2 h, max 24 h), renewable up to a HARD 24 h lifetime from creation. `service` — no expiry; it lives until released (the long-lived proxy case). |
+| `holder` | the API token's name, or `cli:<user>@<host>`. |
+| `state` | `active`, `released`, `expired`, `lost`. |
+| `released_at` | **the one predicate that matters.** `NULL` means the lease still DEFERS and still holds the box's slot, whatever its state. |
+
+That last row is the whole rule, and every surface obeys it: `grokfleet lease ls`,
+`GET /v1/leases`, the `lease` field on `GET /v1/fleet` and `GET /v1/boxes/:name`,
+the TUI's `⚑`, and the tick's deferral. One box can hold at most one deferring
+lease, enforced by a partial unique index rather than by a lock.
+
+### Eligibility, and why not
+
+`POST /v1/leases` picks the box you NAMED when it qualifies, and otherwise the
+HIGHEST eligible index. Picking from the top keeps leases out of the config
+pass's way: its dynamic canary is the LOWEST-index awake box.
+
+A box qualifies when it is `enrolled`, its `observed` in the latest snapshot is
+`healthy` or `drifted`, that snapshot is at most 15 minutes old, it holds no
+deferring lease, and it is not the configured rollout canary. `drifted` is
+deliberately eligible — with auto-rollout off a healthy box lags a boxup release
+forever — and a caller that cares opts out with `require.no_drift` or
+`require.boxup_version`.
+
+When nothing qualifies the answer is **409** with a per-box reason map, in this
+precedence when several apply:
+
+```
+leased by … > lost lease in grace (…) > leased by … (expired, grace)
+  > configured rollout canary
+  > observed <asleep|incoherent|hostkey_mismatch|unhealthy>
+  > observed api_unknown (read-only tick)
+  > snapshot stale (<age>)
+  > drifted (require.no_drift)
+  > boxup <v> < required <v>
+  > phase <p>
+```
+
+No lease endpoint takes the reconcile lock and none of them returns 423. Two
+concurrent acquires for one box are serialised by the index: one gets 201, the
+other 409. A lease is honoured by the first tick that STARTS after the INSERT
+commits.
+
+### What the tick does
+
+A box with a deferring lease is IN USE, so `rollout` and `config-push` are
+deferred with one line each. `mint` and `rotate` still run: key expiry does not
+wait for a build. If the box a canary pass depends on is leased, that pass is
+SKIPPED rather than run without canary protection, and three consecutive skips
+raise `rollout-canary-leased` or `config-canary-leased` once per day.
+
+Expiry does not free the box immediately. The row becomes `expired` and keeps
+deferring for a 10-minute grace, because the expiry may have happened under a
+running command; the holder's `release` ends the grace early. Loss works the same
+way: a box whose `observed` turns `asleep`, `incoherent` or `hostkey_mismatch`
+loses its lease at once, and `unhealthy` needs two consecutive ticks (heavy work
+can fail a single `boxup check`). A lost lease keeps deferring for 30 minutes, or
+until the box has been back for two consecutive ticks.
+
+`grokfleet retire` on a leased box refuses (rc 6). `--force` retires it anyway
+and marks the lease `lost` with reason `retired`.
+
+### Recipes
+
+CI — one job, one box, released whatever happens:
+
+```bash
+grokfleet lease run --purpose "ci: build #1234" --json -- 'cd /workspace && make test'
+```
+
+`run` exits with the REMOTE command's rc when a command ran, and **255** when
+nothing ran at all. 255 is also ssh's own transport failure, so a bare 255 is not
+actionable: pass `--json` and key on the envelope instead.
+
+```json
+{"rc": 255, "lease_id": null, "box": null, "lease_state": "unknown",
+ "reasons": {"grok-box-001": "observed asleep"}}
+```
+
+`lease_id: null` means nothing ran — retry later, the fleet was busy. A non-null
+`lease_id` with `lease_state` of `lost` or `unknown` means the command's outcome
+is NOT known: do not retry on the strength of the rc alone. `expired` means the
+lease lapsed under a still-running command; the box is deferred for ten more
+minutes and you should release when done.
+
+A long-lived service — a proxy that must outlive any TTL:
+
+```bash
+id=$(grokfleet lease acquire --purpose "grok proxy" --kind service --json | jq -r .lease_id)
+grokfleet ssh --lease "$id" 'sudo systemctl start my-proxy'
+# …and when it is decommissioned:
+grokfleet lease release "$id"
+```
+
+A run that may exceed 24 hours MUST use `--kind service`. An ephemeral lease
+cannot be renewed past its 24-hour lifetime cap, and `--ttl 24h` is a valid but
+unrenewable lease — that is the design, not a bug.
+
+### `--via`, and the laptop caveat
+
+`grokfleet ssh` reaches a box two ways. `--via tunnel` uses the VPS reverse
+tunnel with the engine's own key and `known_hosts`; `--via tailnet` uses the
+password form over the tailnet. The default is `tunnel` when the box-access
+identity file is readable and `tailnet` otherwise.
+
+A laptop whose `$FLEET_ETC` holds a synced copy of that identity file therefore
+picks `tunnel` and refuses rc 6, because nothing listens on its loopback. Pass
+`--via tailnet` there.
+
+### Rolling back to 5.10.0
+
+Schema v3 is additive and `min_reader` stays 1, so a 5.10.0 binary opens a v3
+file and keeps working. **It does not honour leases**: its tick has no lease layer
+at all, so it will push config and roll boxup onto a leased box. That is the
+documented cost of the rollback. Reinstalling 5.11.0 resumes deferral from the
+same rows — nothing is lost, only ignored while the older binary runs.
 
 ## Prior art / reference URLs
 

@@ -1,4 +1,4 @@
-grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ● up                                              
+grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ● up                                           
 
 ── history grok-box-001 ──  rows 1–13 of 13                                                                             
 TS                    TUNNEL CHECK VER       DRIFT  CONFIG   CHECKFAIL ASLEEP APPLY

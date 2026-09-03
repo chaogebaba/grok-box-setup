@@ -30,6 +30,10 @@ import { tunnelUp, tunnelSsh } from "../tunnel.ts";
 import { knownHostsFile } from "../hostkey.ts";
 import { CHECK_COMMAND } from "../remote.ts";
 import { existsSync, readFileSync } from "node:fs";
+import { boxLeaseField, fleetLeaseMap, type BoxLeaseField } from "./lease-handlers.ts";
+import { deferringLeaseFor } from "../store/leases.ts";
+import { openLeaseStore } from "../store/membership.ts";
+import { resolveLeaseLimits } from "../config.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 
@@ -37,7 +41,7 @@ const CHECK_TIMEOUT_MS = 20_000;
 /** The product name reported by the API (N1): `/v1/health`.name and the
  * `server` response header. */
 export const SERVE_NAME = "grokfleet";
-export const SERVE_VERSION = "5.10.0";
+export const SERVE_VERSION = "5.11.0";
 
 /**
  * state-store D3/D7 (Phase B): every snapshot read is a STORE query.
@@ -250,7 +254,18 @@ export function handleHealth(ctx: ServerContext): Response {
 // --- GET /v1/fleet (readonly) ------------------------------------------------
 export function handleFleet(ctx: ServerContext, auth: RequestAuth): Response {
   const latest = latestSnapshot(ctx.env);
-  const boxes = (latest?.boxes ?? []).map((b) => mergeBox(ctx.env, b));
+  // lease-api L2/r10-B1: the TUI's 5s poll is single-endpoint by design, so the
+  // `⚑` flag and the `⚑ <n> leased` header count have to come from HERE. The
+  // field is ADDITIVE and attached at SERVE time from ONE
+  // `SELECT … WHERE released_at IS NULL` per request — `SnapshotBox`,
+  // `SnapshotLine`, the store tables and `toSnapshotLine`'s byte-identical
+  // round-trip are untouched, and `GET /v1/history` does NOT carry it (history
+  // is what was OBSERVED, not who held what).
+  const leases = fleetLeaseMap(ctx);
+  const boxes = (latest?.boxes ?? []).map((b) => ({
+    ...mergeBox(ctx.env, b),
+    lease: leases.get(b.name) ?? null,
+  }));
   // `apply` is read LIVE from the config; every OTHER field still comes from the
   // snapshot (and tick_age_s / staleness are unchanged).
   const live = readLiveApply(ctx.env, latest?.apply ?? null);
@@ -279,6 +294,11 @@ export function handleBox(ctx: ServerContext, box: string): Response {
     snapshot_ts: latest?.ts ?? null,
     box: merged ?? null,
     markers: m,
+    // lease-api L3/r9-B1: "in use" is ONE rule everywhere — the row with
+    // `released_at IS NULL`, whatever its state (`active`, `lost` in grace,
+    // `expired` in grace). Filtering on `state IN ('active','lost')` here is
+    // mutant (l21) and the expired-grace test catches it.
+    lease: boxLease(ctx, box),
     // D1 (5.7.0): the facts the engine records and the TUI never showed. All
     // read-only; a client that predates them simply ignores them.
     ...boxDetailFacts(ctx.env, box),
@@ -513,6 +533,27 @@ export function fsEnrolledBoxes(env: ServerContext["env"]): string[] {
     return readMembership(env);
   } catch {
     return [];
+  }
+}
+
+/**
+ * The per-box lease field (L3). Same predicate as `/v1/fleet`'s: `released_at
+ * IS NULL`, any state. `null` when there is no store, the store predates schema
+ * v3, or the box holds no deferring lease.
+ */
+export function boxLease(ctx: ServerContext, box: string): BoxLeaseField | null {
+  let h: ReturnType<typeof openLeaseStore>;
+  try {
+    h = openLeaseStore(ctx.env);
+  } catch {
+    return null;
+  }
+  if (h === undefined) return null;
+  try {
+    const row = deferringLeaseFor(h.store, box);
+    return row === undefined ? null : boxLeaseField(row, resolveLeaseLimits(ctx.cfg));
+  } finally {
+    h.close();
   }
 }
 
