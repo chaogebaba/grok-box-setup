@@ -132,7 +132,7 @@ resolve_compat_env RELEASE    GROKFLEET_RELEASE_ENV    \
 
 # `make ts-release-build` rewrites EXACTLY these two lines (fleet/scripts/
 # release-build.sh); keep them at column 0 in `NAME=value` form.
-GROKFLEET_RELEASE=v5.10.0
+GROKFLEET_RELEASE=v5.11.0
 # Placeholder until the first `make ts-release-build` writes the real digest.
 # Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
 GROKFLEET_SHA256=41fa0e4cce39b6bc9a694277bc75105ee59d762cd28a98242816d464a8d40cd5
