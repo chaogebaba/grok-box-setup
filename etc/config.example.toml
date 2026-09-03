@@ -61,6 +61,26 @@ tags = "tag:grok-box"
 # install.sh — never `git pull` in place.
 #repo = "https://github.com/chaogebaba/grok-box-setup.git"
 
+[keepawake]
+# boxup-keepawake K1/K2. The box platform pauses a box after an idle window
+# keyed to AGENT TURNS, and a paused box is invisible to the brain. This makes
+# the box keep ITSELF awake: every `interval_min` minutes the worker asks the
+# local gateway (127.0.0.1:1340) to run one minimal agent turn.
+#
+# COST: this is a real model turn and it spends the account's quota — 72 a day
+# per box at the default cadence. That is why the mechanism measures itself:
+# /workspace/boxup-keepawake.log records every attempt and its outcome, and
+# tests/keepawake-readout.sh turns the fleet's logs into the KEEP/ABANDON table.
+#
+#   0            OFF. The guard becomes a no-op (one "keepawake: off" line an
+#                hour) and costs nothing. This is the ABANDON setting, and the
+#                brain can push it fleet-wide through managed.toml.
+#   1..9         silently raised to 10 — the floor exists because the cost is
+#                per fire, and `interval_min = 1` would be 1440 turns a day.
+#   20           default.
+#
+#interval_min = 20
+
 [managed]
 # FLEET-BRAIN config-truth escape hatch (docs/FLEET-BRAIN.md §config-truth).
 #

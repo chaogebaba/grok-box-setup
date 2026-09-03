@@ -91,6 +91,7 @@ external hourly automation calls it by that name.
 | sleep / thaw | tailscaled's map poll (node goes grey) | selfheal worker: stale-heartbeat freeze detection recycles tailscaled |
 | image swap | everything outside `/workspace`: packages, `/etc/shadow`, sshd config, host keys, nft rules, the `/usr/local/bin/boxup` PATH link, all processes | hourly `boxup once` re-converges from `/workspace/box-setup`: vendored binaries in `bin/`, node identity in `state/tailscale/`, ssh host keys in `state/ssh/`, the PATH symlink |
 | process crash | sshd / tailscaled / worker | worker restarts procs; hourly `once` restarts the worker |
+| idle sleep (platform pause) | nothing on the box — but a paused box is unreachable: no converge, no alerts, no ssh, and the VPS brain cannot wake it | keep-awake guard: every `[keepawake] interval_min` minutes the worker asks the local gateway to run one minimal agent turn, which is what the platform's idle clock actually watches |
 | root disk fills | nothing yet — but a full root overlay makes `install.sh` exit 1, so the box stops taking rollouts and the brain sees it stuck | disk guard: every tick reads `df /`; at the fail threshold it truncates the allowlisted platform logs as their owner, and `boxup check` FAILs until usage drops |
 
 Design, environment facts, and the reasoning behind every special case:
@@ -145,6 +146,66 @@ Observations land in three places: the worker log
 (`disk-guard: truncated <path> (<bytes> B, root <pct>%)`), `$RUN_DIR/disk` as
 `<pct>% <level> <epoch>`, and the `disk=` token appended to the end of the
 `boxup status` line (`disk=22%`, `disk=85%/warn`, `disk=93%/fail`).
+
+## Keep-awake guard
+
+The platform pauses a box after an idle window keyed to **agent turns**, and a
+paused box is unreachable — the brain cannot converge it, alert on it, or wake
+it. The platform's own hourly `keep-alive` automation is too slow (003 slept
+51 m 50 s inside an hourly gap) and gets parked on Auto-review approval widgets,
+which do not refresh the idle clock. Since 5.4.0 every worker tick can drive the
+same mechanism at a faster cadence, from the box itself.
+
+| Knob | Default | What it does |
+|---|---|---|
+| `[keepawake] interval_min` | `20` | minutes between fires. `0` turns the guard off entirely; `1`–`9` are raised to the floor of `10`. Read through `config_get`, so the brain can push it in `managed.toml`. |
+| `BOXUP_GATEWAY_URL` | `http://127.0.0.1:1340` | the box's local gateway. A test seam; you do not change this on a box. |
+| `BOXUP_GATEWAY_JSON` | `/home/box/sand-data/gateway.json` | where the gateway's bearer token is discovered. |
+
+One fire is `POST /api/sendPrompt` with the prompt `Reply with only the word:
+ok`, the bearer from the discovery file, and `agentId` read from `GET /health`
+**on that same tick** — the gateway restarts and the agent id changes with it,
+so it is never hard-coded. A request carrying an `Origin` header is refused 403,
+so none is sent.
+
+**This costs a real model turn per fire — 72 a box a day at 20 minutes.** The
+guard is therefore skip-first (a genuinely running turn already refreshed the
+idle clock, so it fires nothing) and it measures itself. Every attempt appends
+one line to `/workspace/boxup-keepawake.log`, skips and unreachable gateways
+included:
+
+```
+2026-09-03T04:20:11Z rc=ok before=1788382445430 after=1788382463529
+2026-09-03T04:40:12Z rc=skip before=1788383644001 after=-
+2026-09-03T05:00:14Z rc=unreachable before=- after=-
+```
+
+`rc` is one of seven values, also surfaced on the status line as
+`keepawake=on keepawake_last=<ISO> keepawake_rc=<rc> jumps=<n>`:
+
+| `rc` | Meaning |
+|---|---|
+| `ok` | accepted, and a turn started within 10 s |
+| `inert` | accepted, but no turn appeared — **not** a success |
+| `refused` | HTTP error, or a body without `"accepted":true` |
+| `skip` | a real turn was already running; nothing was fired |
+| `unreachable` | `/health` did not answer (retried no faster than every 90 s) |
+| `parked-ok` | fired into a parked approval widget and the idle clock advanced |
+| `parked-blocked` | fired into a parked approval widget and it did **not** — the guard warns once an hour to clear the widget in the GUI |
+
+`jumps` counts tailscaled's `time jump detected` lines since the per-install
+baseline written at the first converge, which is how a sleep is detected at all.
+`tests/keepawake-readout.sh` turns a directory of pulled logs into the per-box
+per-day table that decides whether the mechanism stays: only days in which the
+mechanism demonstrably fired are in the denominator.
+
+**One honest caveat.** A paused box writes nothing, so a sleep erases the log
+slots it covers, and the readout attributes absent slots to sleep as an
+approximation. A stopped worker, an image swap, or a crashed gateway produce
+absent slots too. Every one of those alternative causes pushes the verdict
+toward abandoning the mechanism, which is the cheap error: abandoning costs one
+config key to reverse, while keeping a mechanism that does not work costs 792
+model turns a day across the fleet.
 
 ## Fleet operations (laptop)
 
