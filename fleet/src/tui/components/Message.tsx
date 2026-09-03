@@ -1,18 +1,13 @@
-// Message.tsx — the transient status/action line. V6: OK when it reads as a
-// success, DOWN when it names an error or a failure, plain otherwise —
-// `messageTone` decides, and the model test pins the table.
+// Message.tsx — the status line (occupancy O4a). It used to be the transient
+// message only; it now renders the SEGMENTS `statusLine` composes: the `/filter`
+// prompt, the `[free]` badge and the message, each already in its own tone.
+// V6's `messageTone` still decides the message segment's colour — inside
+// `statusLine`, not here.
 
 import React from "react";
-import { Box, Text } from "ink";
-import { messageTone } from "../model.ts";
-import { toneProps } from "../tone.ts";
+import Segments from "./Segments.tsx";
+import type { Seg } from "../model.ts";
 
-export default function Message({ text, noColor }: { text: string; noColor: boolean }): React.ReactElement {
-  return (
-    <Box flexShrink={0} height={1}>
-      <Text {...toneProps(messageTone(text), noColor)} wrap="truncate">
-        {text}
-      </Text>
-    </Box>
-  );
+export default function Message({ segs, noColor }: { segs: Seg[]; noColor: boolean }): React.ReactElement {
+  return <Segments segments={segs} noColor={noColor} />;
 }

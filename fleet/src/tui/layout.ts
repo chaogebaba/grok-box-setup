@@ -18,7 +18,7 @@ import {
   filteredBoxes,
   fitSegments,
   footerLines,
-  messageText,
+  statusLine,
   modalLines,
   rowsIndicator,
   segText,
@@ -52,7 +52,10 @@ export function tableChromeRows(state: TuiState, size: Size): number {
   if (discoverText(state, size) !== undefined) n += 1;
   n += 1; // blank spacer after the header/banner/discover
   if (state.modal) n += 1 + modalLines(state).length;
-  else if (messageText(state) !== undefined) n += 2; // blank spacer + the message
+  // O4a: the status line replaces the message line in the SAME slot at the
+  // SAME cost — the filter text, the `[free]` badge and the message, derived
+  // from state every frame.
+  else if (statusLine(state) !== null) n += 2; // blank spacer + the status line
   n += 1; // blank spacer before the footer
   n += footerLines(state, size).length;
   return n;

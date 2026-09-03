@@ -41,6 +41,7 @@ export function state(over: Partial<TuiState> = {}): TuiState {
     selected: 0,
     filter: "",
     filtering: false,
+    freeOnly: false,
     noColor: true,
     tz: "UTC",
     ...over,

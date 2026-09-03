@@ -40,7 +40,7 @@ describe("keys inside an open view", () => {
     expect(m.lastFrame()).toContain("── diff grok-box-001");
     await m.press("q");
     expect(m.lastFrame()).not.toContain("── diff grok-box-001");
-    expect(m.lastFrame()).toContain("TUNNEL"); // the table is back
+    expect(m.lastFrame()).toContain("WHO"); // the table is back
     expect(quit).toBe(0);
     m.unmount();
   });

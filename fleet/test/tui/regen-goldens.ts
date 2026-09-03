@@ -27,7 +27,8 @@ import {
   discoverText,
   footerLines,
   headerText,
-  messageText,
+  segText,
+  statusLine,
   modalLines,
   tableLines,
   tableWidth,
@@ -52,12 +53,15 @@ export function oldFrame(state: TuiState, size: Size): string[] {
   if (discover !== undefined && !viewOpen) out.push(discover);
   out.push("");
 
-  const message = messageText(state);
+  // O4a: the fixture carries the SAME status line the mounted frame paints —
+  // the message-only form under a full-screen view, the full one under a table.
+  const viewStatus = statusLine(state, { view: true });
+  const status = statusLine(state);
   if (viewOpen) {
     for (const l of viewLines(state, size)) out.push(l.text);
-    if (message !== undefined) {
+    if (viewStatus !== null) {
       out.push("");
-      out.push(message);
+      out.push(segText(viewStatus));
     }
   } else {
     const leftW = tableWidth(size);
@@ -72,9 +76,9 @@ export function oldFrame(state: TuiState, size: Size): string[] {
     if (state.modal !== undefined) {
       out.push("");
       for (const m of modalLines(state)) out.push(m.text);
-    } else if (message !== undefined) {
+    } else if (status !== null) {
       out.push("");
-      out.push(message);
+      out.push(segText(status));
     }
   }
   out.push("");

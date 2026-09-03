@@ -149,16 +149,20 @@ describe("frame goldens", () => {
 describe("the 30-box fleet's window is bottom-anchored on the selection", () => {
   const at = (name: string): Golden => GOLDENS.find((g) => g.name === name)!;
 
-  test("admin at 120x12: 8 table rows — the column header, 6 box rows and the indicator", async () => {
+  // occupancy O7: `f free` + `L leases` push the admin one-line footer to 138
+  // characters, so admin takes the TWO-line footer at 120 columns too and gets
+  // the same 7 table rows readonly has — one fewer box row than before 5.11.1.
+  test("admin at 120x12: 7 table rows — the column header, 5 box rows and the indicator", async () => {
     const g = at("fleet30-admin-120x12-top");
-    expect(tableViewLines(g.state, g.size).length).toBe(8);
+    expect(footerLines(g.state, g.size).length).toBe(2);
+    expect(tableViewLines(g.state, g.size).length).toBe(7);
     const frame = await frameOf(g.state, g.size);
-    expect(frame).toContain("rows 1–6 of 30");
-    expect(frame).toContain("grok-box-006");
-    expect(frame).not.toContain("grok-box-007");
+    expect(frame).toContain("rows 1–5 of 30");
+    expect(frame).toContain("grok-box-005");
+    expect(frame).not.toContain("grok-box-006");
   });
 
-  test("readonly at 120x12: the two-line footer costs one row — 5 box rows", async () => {
+  test("readonly at 120x12: the same two-line footer, the same 5 box rows", async () => {
     const g = at("fleet30-readonly-120x12-top");
     expect(footerLines(g.state, g.size).length).toBe(2);
     expect(tableViewLines(g.state, g.size).length).toBe(7);
@@ -171,10 +175,10 @@ describe("the 30-box fleet's window is bottom-anchored on the selection", () => 
     const mid = at("fleet30-admin-120x12-middle");
     const win = tableWindow(mid.state, mid.size);
     expect(win.end - 1).toBe(mid.state.selected); // bottom-anchored
-    expect(await frameOf(mid.state, mid.size)).toContain("rows 11–16 of 30");
+    expect(await frameOf(mid.state, mid.size)).toContain("rows 12–16 of 30");
 
     const bottom = at("fleet30-admin-120x12-bottom");
-    expect(await frameOf(bottom.state, bottom.size)).toContain("rows 25–30 of 30");
+    expect(await frameOf(bottom.state, bottom.size)).toContain("rows 26–30 of 30");
   });
 });
 
@@ -192,6 +196,8 @@ test("a resize re-lays out the frame and drops the Detail pane below 100 columns
   const frame = m.lastFrame();
   expect(frame).not.toContain("╭─ grok-box-001 ");
   expect(frame.split("\n").length).toBeLessThanOrEqual(20);
-  expect(frame).toContain("grok-box-001  up"); // the table is still there
+  // occupancy O1: TUNNEL is gone from the row; WHO sits after NAME and an
+  // unleased box reads `-` there.
+  expect(frame).toContain("grok-box-001  -"); // the table is still there
   m.unmount();
 });

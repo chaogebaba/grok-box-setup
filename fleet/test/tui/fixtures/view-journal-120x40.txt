@@ -1,6 +1,6 @@
-grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ● up                                           
+grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0 · free 1  apply off  tick 10s   admin  link ● up                                  
 
-── journal grok-box-002 ──  rows 1–35 of 200                                                                            
+── journal grok-box-002 ──  rows 1–34 of 200                                                                            
 Apr 30 12:00:00 box grok-agent[1]: line 0
 Apr 30 12:01:00 box grok-agent[1]: line 1
 Apr 30 12:02:00 box grok-agent[1]: line 2
@@ -35,6 +35,6 @@ Apr 30 12:30:00 box grok-agent[1]: line 30
 Apr 30 12:31:00 box grok-agent[1]: line 31
 Apr 30 12:32:00 box grok-agent[1]: line 32
 Apr 30 12:33:00 box grok-agent[1]: line 33
-Apr 30 12:34:00 box grok-agent[1]: line 34
 
-↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history │ P push  M rotate  R rename  T check  C reconcile
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases                                 
+P push  M rotate  R rename  T check  C reconcile                                                                        

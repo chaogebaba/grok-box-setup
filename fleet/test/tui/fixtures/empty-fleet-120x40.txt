@@ -1,6 +1,7 @@
-grokfleet 0 boxes  ● 0  ◆ 0  ✖ 0  ☾ 0  apply off  tick 10s   admin  link ● up                                           
+grokfleet 0 boxes  ● 0  ◆ 0  ✖ 0  ☾ 0 · free 0  apply off  tick 10s   admin  link ● up                                  
 
-  NAME          TUNNEL CHECK VER     DRIFT    CONFIG  EXPIRY
+  NAME          WHO         VER     DRIFT   CONFIG  EXP
 (no boxes)
 
-↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history │ P push  M rotate  R rename  T check  C reconcile
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases                                 
+P push  M rotate  R rename  T check  C reconcile                                                                        

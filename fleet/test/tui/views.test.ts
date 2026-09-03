@@ -30,9 +30,11 @@ import { box, state, SIZE_120x40 } from "./helpers.ts";
 const SIZE_100x24 = { cols: 100, rows: 24 };
 const SIZE_140x40 = { cols: 140, rows: 40 };
 const SIZE_200x50 = { cols: 200, rows: 50 };
-/** Wide enough for the widest single row: the folded `asleep last · api backoff`
- *  pair needs ~82 columns inside the frame (state-store D4 row budget). */
+/** Wide enough for the widest single row: the folded
+ *  `asleep since · last · backoff` triple (occupancy O6), which is ~130
+ *  columns of card and so needs a pane wider than 300 columns leaves. */
 const SIZE_300x50 = { cols: 300, rows: 50 };
+const SIZE_400x50 = { cols: 400, rows: 50 };
 
 const FACTS: BoxDetail = {
   name: "grok-box-1",
@@ -58,13 +60,13 @@ describe("D1 detail pane rows", () => {
     // A pane wide enough for the longest row: at 120 columns the pane is 46
     // wide and the folded asleep-last/api-backoff row does not fit, which V5
     // TRUNCATES (it used to overflow and wrap into the next line).
-    const pane = renderDetail(s, SIZE_300x50).join("\n");
+    const pane = renderDetail(s, SIZE_400x50).join("\n");
     expect(pane).toContain("checkfail# 3");
     expect(pane).toContain("expires 2026-06-01 (40d)");
     // Timestamps are wall-clock readings in the state's zone (UTC in fixtures).
     expect(pane).toContain("asleep since Mar 20 09:46 UTC (41d ago)");
-    expect(pane).toContain("asleep last Mar 20 10:46 UTC (41d ago)");
-    expect(pane).toContain("api backoff 2 fails, retry Mar 20 12:33 UTC (41d ago)");
+    expect(pane).toContain("last Mar 20 10:46 UTC (41d ago)");
+    expect(pane).toContain("backoff 2 fails, retry Mar 20 12:33 UTC (41d ago)");
     // state-store D4: the two facts a box's state used to be re-derived for.
     expect(pane).toContain("phase enrolled");
     expect(pane).toContain("observed healthy");
@@ -76,12 +78,12 @@ describe("D1 detail pane rows", () => {
     // (state-store D4 row budget), and raw ISO strings make that row the widest
     // the card paints. A narrower pane truncates it and this case is about the
     // timestamp FORMAT, not the truncation.
-    const pane = renderDetail(s, SIZE_300x50).join("\n");
+    const pane = renderDetail(s, SIZE_400x50).join("\n");
     expect(pane).toContain("checkfail# 3");
     expect(pane).toContain("expires 2026-06-01 (40d)");
     expect(pane).toContain("asleep since 2026-03-20T09:46:40Z");
-    expect(pane).toContain("asleep last 2026-03-20T10:46:40Z");
-    expect(pane).toContain("api backoff 2 fails, retry 2026-03-20T12:33:20Z");
+    expect(pane).toContain("last 2026-03-20T10:46:40Z");
+    expect(pane).toContain("backoff 2 fails, retry 2026-03-20T12:33:20Z");
   });
 
   // V5's bug fix: nothing the pane paints may be wider than the pane.
@@ -90,10 +92,12 @@ describe("D1 detail pane rows", () => {
     const w = detailWidth(SIZE_120x40);
     const rows = renderDetail(s, SIZE_120x40);
     for (const r of rows) expect(r.length).toBe(w);
-    // TUI-D4 row budget: `api backoff` rides on the `asleep last` row so the
-    // new phase/observed line costs no rows (the card is fixed at DETAIL_ROWS).
-    const backoff = rows.find((r) => r.includes("asleep last"))!;
-    expect(backoff.startsWith("│asleep last Mar 20 10:46 UTC (41d ago) · api")).toBe(true);
+    // occupancy O6: `asleep since`, `last` and `backoff` now share ONE row, so
+    // the lease gets a second line without moving DETAIL_ROWS.
+    const backoff = rows.find((r) => r.includes("asleep since"))!;
+    // At the 46-column pane the row is TRUNCATED, backoff tail first — which is
+    // exactly why O6 puts `asleep since` at the head of the merged line.
+    expect(backoff.startsWith("│asleep since Mar 20 09:46 UTC (41d ago) · la")).toBe(true);
     expect(backoff.endsWith("│")).toBe(true);
   });
 
@@ -112,9 +116,7 @@ describe("D1 detail pane rows", () => {
     const pane = renderDetail(state({ detailFacts: { box: "grok-box-1", facts: older } }), SIZE_120x40).join("\n");
     expect(pane).toContain("checkfail# —");
     expect(pane).toContain("expires —");
-    expect(pane).toContain("asleep since —");
-    expect(pane).toContain("asleep last —");
-    expect(pane).toContain("api backoff —");
+    expect(pane).toContain("asleep since — · last — · backoff —");
     // A 5.8.0 engine omits both new fields; the pane renders them as — rather
     // than dropping the row, so the card keeps its fixed height either way.
     expect(pane).toContain("phase —");
@@ -124,7 +126,7 @@ describe("D1 detail pane rows", () => {
   test("with NO facts loaded at all the rows still render, as —", () => {
     const pane = renderDetail(state({ detailFacts: undefined }), SIZE_120x40).join("\n");
     expect(pane).toContain("checkfail# —");
-    expect(pane).toContain("api backoff —");
+    expect(pane).toContain("backoff —");
   });
 
   // B4's in-flight rule, and the mutant "detail fields rendered without the
@@ -171,9 +173,9 @@ describe("D1 detail pane rows", () => {
         "│checkfail no · asleep no · canary none      │",
         "│checkfail# — · expires —                    │",
         "│phase — · observed —                        │",
-        "│lease —                                     │",
-        "│asleep since —                              │",
-        "│asleep last — · api backoff —               │",
+        "│free                                        │",
+        "│  acquire may still refuse: /v1/leases 409 r│",
+        "│asleep since — · last — · backoff —         │",
         "│24h (loading…)                              │",
         "╰────────────────────────────────────────────╯",
       ].join("\n"),
@@ -186,18 +188,20 @@ describe("D5 footer re-layout", () => {
   test("SNAPSHOT at 100 cols: two lines, navigation+views then actions", () => {
     const f = renderFooter(state({ scope: "admin" }), SIZE_100x24);
     expect(f.length).toBe(2);
-    expect(f[0]!.trimEnd()).toBe("↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history");
+    expect(f[0]!.trimEnd()).toBe("↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases");
     expect(f[1]!.trimEnd()).toBe("P push  M rotate  R rename  T check  C reconcile");
   });
+  // occupancy O7: `f free` and `L leases` make the one line 138 characters, so
+  // 140 is still wide enough for it — 120 no longer is.
   test("SNAPSHOT at 140 cols: one line carrying every key", () => {
     const f = renderFooter(state({ scope: "admin" }), SIZE_140x40);
     expect(f.length).toBe(1);
     expect(f[0]!.trimEnd()).toBe(
-      "↑↓ select  / filter  r refresh  q quit │ D diff  J journal  H history │ P push  M rotate  R rename  T check  C reconcile",
+      "↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases │ P push  M rotate  R rename  T check  C reconcile",
     );
   });
   test("no key falls off at >= 100 cols, at any width and either scope", () => {
-    const keys = ["↑↓", "/ filter", "r refresh", "q quit", "D diff", "J journal", "H history", "P push", "M rotate", "R rename", "T check", "C reconcile"];
+    const keys = ["↑↓", "/ filter", "f free", "r refresh", "q quit", "D diff", "J journal", "H history", "L leases", "P push", "M rotate", "R rename", "T check", "C reconcile"];
     for (const cols of [100, 110, 119, 120, 121, 130, 140, 200]) {
       for (const scope of ["admin", "readonly"] as const) {
         const joined = renderFooter(state({ scope }), { cols, rows: 40 }).join("\n");
@@ -372,7 +376,7 @@ describe("an open view replaces the table, under the banners", () => {
     });
     const frame = await frameOf(s, SIZE_120x40);
     expect(frame).toContain("── diff grok-box-1");
-    expect(frame).not.toContain("TUNNEL"); // the table header is gone
+    expect(frame).not.toContain("WHO"); // the table header is gone
     expect(frame).not.toContain("discover:"); // and so is the discover row
     expect(frame).not.toContain("grok-box-2");
   });

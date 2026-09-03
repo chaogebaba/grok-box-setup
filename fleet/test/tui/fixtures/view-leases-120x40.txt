@@ -1,0 +1,10 @@
+grokfleet 11 boxes  ● 7  ◆ 1  ✖ 1  ☾ 2 · free 4 · ⚑ 3 leased  apply off  tick 10s   admin  link ● up                    
+
+── leases ──  rows 1–4 of 4                                                                                             
+BOX           WHO         KIND      PURPOSE               AGE   LEFT   STATE   
+grok-box-001  ci:runner-3 ephemeral gate                  22m   1h11   active  
+grok-box-007  svc:brain   service   keep-awake            22m   16m    expired 
+grok-box-008  dev         ephemeral debug a wedged rollo… 22m   ≤16m   lost    
+
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases                                 
+P push  M rotate  R rename  T check  C reconcile                                                                        
