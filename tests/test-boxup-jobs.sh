@@ -98,6 +98,9 @@
 #         is refused                                    [mutants g1, g2, g4]
 #   (15b) a tick that SKIPS on a contended converge lock has still supervised
 #         jobs, because the guard runs before the lock          [mutant g3]
+#   (15c) a slot path that cannot be created is reported as such (rc 2) and
+#         blocks the restart, instead of being reported as contention
+#                                                                [mutant g4]
 #
 # NOTE (blueprint (10d)): detecting a fast writer's regenerated log from the
 # COUNTER rather than from sizes is a BRAIN-side property — the box's job is to
@@ -780,6 +783,31 @@ tick-contended-lock)
   echo "hb=[\$([ -f "\$RUN_DIR/hb" ] && echo written || echo missing)]"
   ;;
 
+slot-path-unusable)
+  # The only deterministic way the slot mkdir fails once the run dir exists:
+  # something left a regular FILE where .slot must be a directory. A claim that
+  # reported success here would restart with no slot and hand the box a second
+  # job — the same invariant break, from a third direction.
+  mkrec SVCFILE kind=service keep_alive=1 restart_on_swap=1 cap=1
+  printf 'sleep 300' > "\$JOBS_DIR/SVCFILE/cmd"
+  printf '%s' "\$WORK" > "\$JOBS_DIR/SVCFILE/cwd"
+  rm -rf "\$JOBS_SLOT"
+  : > "\$JOBS_SLOT"                       # a FILE, not a directory
+  echo "slot_is_file=[\$([ -f "\$JOBS_SLOT" ] && echo yes || echo no)]"
+  jobs_slot_claim SVCFILE; echo "claim_rc=[\$?]"
+  jobs_guard
+  sleep 0.5
+  echo "state=[\$(jobs_state SVCFILE)]"
+  echo "took_slot=[\$([ -d "\$JOBS_SLOT" ] && echo yes || echo no)]"
+  echo "could_not_take=[\$(grep -c 'could not TAKE the job slot' "\$LOGLINES")]"
+  echo "wrong_held_msg=[\$(grep -c 'held by ?' "\$LOGLINES")]"
+  n=0
+  for d in /proc/[0-9]*; do
+    is_job_wrapper_proc "\${d##*/}" SVCFILE && n=\$((n + 1))
+  done
+  echo "wrappers=[\$n]"
+  ;;
+
 ls-and-usage)
   mkrec A kind=run rc=0 started=t1 ended=t2
   mkrec B kind=service keep_alive=1
@@ -1239,6 +1267,23 @@ if [ "$(field "$o" tick_rc)" = 0 ] && \
   pass "(15b) a tick that SKIPS on a contended converge lock has still restarted the service and stamped hb — the guard runs before the lock, not inside it"
 else
   bad  "(15b) job supervision was lost to a contended lock: [$(printf '%s' "$o" | tr '\n' ' ')]"
+fi
+
+# ---------------------------------------------------------------------------
+# (15c) a claim that CANNOT take the slot is reported as such, and no restart
+# happens                                                        [mutant g4]
+# ---------------------------------------------------------------------------
+o="$(run_case slot-path-unusable)"
+if [ "$(field "$o" slot_is_file)"   = yes ] && \
+   [ "$(field "$o" claim_rc)"       = 2 ] && \
+   [ "$(field "$o" state)"          = "lost:image-swap" ] && \
+   [ "$(field "$o" took_slot)"      = no ] && \
+   [ "$(field "$o" wrappers)"       = 0 ] && \
+   [ "$(field "$o" could_not_take)" -ge 1 ] && \
+   [ "$(field "$o" wrong_held_msg)" = 0 ]; then
+  pass "(15c) a slot path that cannot be created returns 2, blocks the restart, and logs 'could not TAKE' rather than the misleading 'held by ?' that made the 5.5.1 wedge unreadable"
+else
+  bad  "(15c) an unusable slot path was reported as a success or as contention: [$(printf '%s' "$o" | tr '\n' ' ')]"
 fi
 
 # ---------------------------------------------------------------------------
