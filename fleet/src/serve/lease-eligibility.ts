@@ -181,18 +181,21 @@ export function chooseBox(i: EligibilityInput): EligibilityResult {
     if (b === undefined) {
       reasons[i.named] = "unknown box";
       for (const c of candidates) {
-        const r = ineligibleReason(c, i);
-        if (r !== undefined) reasons[c.name] = r;
+        reasons[c.name] = ineligibleReason(c, i) ?? "eligible (not requested)";
       }
       return { reasons };
     }
     const r = ineligibleReason(b, i);
     if (r === undefined) return { chosen: b, chosen_because: "named box", reasons: {} };
     // A named-but-ineligible box still gets the FULL map: the caller asked a
-    // specific question and the answer is "not that one, and here is the fleet".
+    // specific question and the answer is "not that one, and here is the rest of
+    // the fleet". Boxes that WERE eligible are named too — an agent that asked
+    // for one box and cannot have it needs to see which others it could take,
+    // and silence would read as "none of them".
+    reasons[b.name] = r;
     for (const c of candidates) {
-      const cr = ineligibleReason(c, i);
-      if (cr !== undefined) reasons[c.name] = cr;
+      if (c.name === b.name) continue;
+      reasons[c.name] = ineligibleReason(c, i) ?? "eligible (not requested)";
     }
     return { reasons };
   }

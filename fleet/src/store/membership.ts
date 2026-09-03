@@ -145,3 +145,23 @@ export function openLeaseStore(env: Env): { store: Store; close(): void } | unde
   const store = openStore({ path, dir: env.FLEET_STATE });
   return { store, close: () => store.close() };
 }
+
+/**
+ * The READ-ONLY twin, for the lease READS (`GET /v1/leases`, and the `lease`
+ * field on `/v1/fleet` and `/v1/boxes/:name`).
+ *
+ * Deliberately separate: `openStore` MIGRATES when it opens read-write, and a
+ * GET must never move a file's schema forward. A store still on v2 therefore
+ * reads as "no lease layer" and every read path serves `null`.
+ */
+export function openLeaseStoreRo(env: Env): { store: Store; close(): void } | undefined {
+  const path = storePath(env.FLEET_STATE);
+  if (!existsSync(path)) return undefined;
+  try {
+    const store = openStore({ path, dir: env.FLEET_STATE, readonly: true });
+    return { store, close: () => store.close() };
+  } catch (e) {
+    if (!(e instanceof ConfigError)) throw e;
+    return undefined;
+  }
+}

@@ -12,7 +12,7 @@ import type { RequestAuth } from "./http.ts";
 import { err, jsonError, jsonOk } from "./http.ts";
 import { writeAudit } from "./audit.ts";
 import { isValidBoxName, boxIndex, portFor } from "../boxes.ts";
-import { openLeaseStore } from "../store/membership.ts";
+import { openLeaseStore, openLeaseStoreRo } from "../store/membership.ts";
 import { readLatestBoxFacts } from "../store/snapshots.ts";
 import {
   acquireLease,
@@ -129,11 +129,27 @@ export function fleetLeaseMap(ctx: ServerContext): Map<string, BoxLeaseField> {
   return out;
 }
 
-/** A read handle that tolerates a missing/older store (both ⇒ undefined). */
-function openLeaseStoreRead(ctx: ServerContext): { store: import("../store/db.ts").Store; close(): void } | undefined {
-  let h: { store: import("../store/db.ts").Store; close(): void } | undefined;
+type Handle = { store: import("../store/db.ts").Store; close(): void };
+
+/**
+ * A READ handle that tolerates a missing store and one that predates schema v3
+ * (both ⇒ undefined, and every read path then serves `null` / an empty list).
+ * READ-ONLY on purpose: a GET must never migrate the file.
+ */
+function openLeaseStoreRead(ctx: ServerContext): Handle | undefined {
+  return guard(() => openLeaseStoreRo(ctx.env));
+}
+
+/** The WRITE handle for acquire/renew/release. Opening read-write migrates a
+ *  pre-v3 file forward, which is exactly what a first lease needs. */
+function openLeaseStoreWrite(ctx: ServerContext): Handle | undefined {
+  return guard(() => openLeaseStore(ctx.env));
+}
+
+function guard(open: () => Handle | undefined): Handle | undefined {
+  let h: Handle | undefined;
   try {
-    h = openLeaseStore(ctx.env);
+    h = open();
   } catch {
     return undefined;
   }
@@ -211,7 +227,7 @@ export function handleLeaseAcquire(ctx: ServerContext, auth: RequestAuth, body: 
     }
   }
 
-  const h = openLeaseStoreRead(ctx);
+  const h = openLeaseStoreWrite(ctx);
   if (h === undefined) {
     return jsonError(409, "no_eligible_box", "no state store with leases yet — run a reconcile tick first");
   }
@@ -353,7 +369,7 @@ export function handleLeaseRenew(
     if (n > LEASE_MAX_TTL_S) return err.badBody(`leases: 'ttl_s' exceeds the ${LEASE_MAX_TTL_S}s maximum`);
     ttlS = n;
   }
-  const h = openLeaseStoreRead(ctx);
+  const h = openLeaseStoreWrite(ctx);
   if (h === undefined) return err.notFound(`unknown lease '${id}'`);
   try {
     const limits = limitsOf(ctx);
@@ -388,7 +404,7 @@ export function handleLeaseRenew(
 // --- DELETE /v1/leases/:id (admin) -------------------------------------------
 
 export function handleLeaseRelease(ctx: ServerContext, auth: RequestAuth, id: string): Response {
-  const h = openLeaseStoreRead(ctx);
+  const h = openLeaseStoreWrite(ctx);
   if (h === undefined) return err.notFound(`unknown lease '${id}'`);
   try {
     const limits = limitsOf(ctx);
