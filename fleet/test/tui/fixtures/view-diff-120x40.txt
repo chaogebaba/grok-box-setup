@@ -1,4 +1,4 @@
-grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ● up                                              
+grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 10s   admin  link ● up                                           
 
 ── diff grok-box-001 ──  rows 21–55 of 200                                                                              
 --- diff line 20 for the config push

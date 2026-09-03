@@ -5,8 +5,8 @@
 // app (`app.tsx`) drives these through `useReducer`; the tests drive them
 // directly. `TuiState` is unchanged from the hand-rolled TUI.
 
-import type { SnapshotBox, SnapshotDiscover, SnapshotLine } from "../history/schema.ts";
-import type { BoxDetail, FleetView } from "./api-client.ts";
+import type { SnapshotDiscover, SnapshotLine } from "../history/schema.ts";
+import type { BoxDetail, FleetBox, FleetView } from "./api-client.ts";
 import type { Scope } from "../serve/tokens.ts";
 import type { ActionSpec } from "./actions.ts";
 import { actionForKey, RECONCILE_ACTION, confirmValue, needsTarget } from "./actions.ts";
@@ -56,7 +56,9 @@ export interface ModalState {
 
 export interface TuiState {
   /** last-good fleet view (may be stale while link is down). */
-  boxes: SnapshotBox[];
+  /** lease-api L5/r11-n1: the fleet view's OWN widened box type — the history
+   *  `SnapshotBox` plus the additive `lease` field. */
+  boxes: FleetBox[];
   snapshotTs: string | null;
   apply: boolean | null;
   /** "snapshot" ⇒ the live config read failed and this value may be stale; the

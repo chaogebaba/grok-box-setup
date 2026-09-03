@@ -272,3 +272,26 @@ export function pruneSnapshots(store: Store, retentionDays: number, at: number):
   if (n > 0) store.db.query("DELETE FROM snapshots WHERE ts < ?").run(cutoff);
   return n;
 }
+
+/**
+ * The LATEST snapshot's per-box `observed`/`ver`/`drift`, keyed by name
+ * (lease-api L2: eligibility is evaluated against the store + the LATEST
+ * snapshot, no live probe).
+ *
+ * Distinct from `observedFor`, which answers "the newest snapshot that recorded
+ * THIS box" — a box missing from the latest tick would otherwise be judged on a
+ * reading from an arbitrarily old one.
+ */
+export function readLatestBoxFacts(
+  store: Store,
+): { tick: number; ts: number; boxes: Map<string, { observed: string; ver: string; drift: string }> } | undefined {
+  const row = (store.db.query("SELECT tick, ts FROM snapshots ORDER BY ts DESC, tick DESC LIMIT 1").get() ??
+    undefined) as { tick: number; ts: number } | undefined;
+  if (row === undefined) return undefined;
+  const rows = store.db
+    .query("SELECT name, observed, ver, drift FROM snapshot_boxes WHERE tick = ?")
+    .all(row.tick) as Array<{ name: string; observed: string; ver: string; drift: string }>;
+  const boxes = new Map<string, { observed: string; ver: string; drift: string }>();
+  for (const b of rows) boxes.set(b.name, { observed: b.observed, ver: b.ver, drift: b.drift });
+  return { tick: row.tick, ts: row.ts, boxes };
+}

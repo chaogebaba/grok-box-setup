@@ -68,14 +68,29 @@ export function makeWarnOnce(sink: (msg: string) => void = log): (msg: string) =
   };
 }
 
-/** Build the ssh argv for a box + remote command (D3, F6, D11a). */
-export function sshArgv(box: string, boxKey: string, remoteCommand: string, knownHosts: string): string[] {
-  const port = portFor(box);
-  if (port === undefined) throw new Error(`tunnel: cannot derive port for '${box}'`);
+/**
+ * The OPTION PREFIX BELOW THE PORT — the one that must be byte-identical
+ * wherever grokfleet dials a box over its reverse tunnel (lease-api r4-B2).
+ *
+ *   -i <boxKey> -o BatchMode=yes <KNOWN_HOSTS_OPTS>
+ *   -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8
+ *
+ * It exists because `grokfleet ssh --via tunnel` must not hand-write its own
+ * copy: a hand-written argv pinned the box into the CALLER's
+ * `~/.ssh/known_hosts` — a file host-key repair cannot clean — hard-failed the
+ * first connection under BatchMode, and hung on a dead tunnel (r3-B1). One
+ * helper, three callers, a deep-equal test (mutant l12).
+ *
+ * The PORT FLAG stays with each builder and is deliberately NOT owned here
+ * (r6-B1): `sshArgv` needs `-p` and `scpArgv` needs `-P`, because lowercase
+ * `-p` is scp's PRESERVE-TIMES flag — a helper that owned the port would
+ * silently break the copy builder.
+ *
+ * The D11(a) injection seam is preserved: `boxKey` and `knownHosts` are
+ * explicit parameters, so no caller can fall back to /root/.ssh/known_hosts.
+ */
+export function tunnelSshOpts(boxKey: string, knownHosts: string): string[] {
   return [
-    "ssh",
-    "-p",
-    String(port),
     "-i",
     boxKey,
     "-o",
@@ -85,6 +100,18 @@ export function sshArgv(box: string, boxKey: string, remoteCommand: string, know
     "StrictHostKeyChecking=accept-new",
     "-o",
     "ConnectTimeout=8",
+  ];
+}
+
+/** Build the ssh argv for a box + remote command (D3, F6, D11a). */
+export function sshArgv(box: string, boxKey: string, remoteCommand: string, knownHosts: string): string[] {
+  const port = portFor(box);
+  if (port === undefined) throw new Error(`tunnel: cannot derive port for '${box}'`);
+  return [
+    "ssh",
+    "-p",
+    String(port),
+    ...tunnelSshOpts(boxKey, knownHosts),
     "box@127.0.0.1",
     remoteCommand,
   ];
@@ -98,15 +125,7 @@ export function scpArgv(box: string, boxKey: string, local: string, remote: stri
     "scp",
     "-P",
     String(port),
-    "-i",
-    boxKey,
-    "-o",
-    "BatchMode=yes",
-    ...KNOWN_HOSTS_OPTS(knownHosts),
-    "-o",
-    "StrictHostKeyChecking=accept-new",
-    "-o",
-    "ConnectTimeout=8",
+    ...tunnelSshOpts(boxKey, knownHosts),
     local,
     `box@127.0.0.1:${remote}`,
   ];

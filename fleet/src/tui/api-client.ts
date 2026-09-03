@@ -11,6 +11,54 @@ import type { Scope } from "../serve/tokens.ts";
 
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
+/**
+ * lease-api L5/r11-n1: the fleet view's per-box entry is the history
+ * `SnapshotBox` PLUS the additive `lease` field the `/v1/fleet` handler attaches
+ * at serve time. It is its OWN type on purpose — `SnapshotBox` and
+ * `SnapshotLine` in history/schema.ts stay untouched, so the store round-trip
+ * and `GET /v1/history` are unaffected.
+ */
+export interface FleetBox extends SnapshotBox {
+  lease?: BoxLease | null;
+}
+
+/** The compact per-box lease field on `/v1/fleet` and `/v1/boxes/:name`. */
+export interface BoxLease {
+  lease_id: string;
+  state: "active" | "released" | "expired" | "lost";
+  holder: string;
+  purpose: string;
+  kind: "ephemeral" | "service";
+  expires_at: string | null;
+  grace_ends_at: string | null;
+}
+
+/** A lease as `GET /v1/leases[/:id]` serves it. */
+export interface Lease {
+  lease_id: string;
+  box: string;
+  kind: "ephemeral" | "service";
+  holder: string;
+  purpose: string;
+  state: "active" | "released" | "expired" | "lost";
+  created_at: string;
+  expires_at: string | null;
+  renewed_at: string | null;
+  released_at: string | null;
+  expired_at: string | null;
+  lost_at: string | null;
+  lost_reason: string | null;
+  grace_ends_at: string | null;
+}
+
+/** The 201 body of `POST /v1/leases`: a lease plus how to reach the box. */
+export interface AcquiredLease extends Lease {
+  observed: string | null;
+  drift: string | null;
+  connect: Record<string, unknown>;
+  chosen_because: string;
+}
+
 /** The GET /v1/fleet body (handleFleet). */
 export interface FleetView {
   snapshot_ts: string | null;
@@ -20,7 +68,7 @@ export interface FleetView {
   apply_source: "config" | "snapshot";
   canary: string | null;
   scope: Scope;
-  boxes: SnapshotBox[];
+  boxes: FleetBox[];
   /** zero-touch join summary (D7); null on a server or tick without one. */
   discover: SnapshotDiscover | null;
 }
@@ -44,12 +92,26 @@ export interface BoxDetail {
    *  recorded. A 5.8.0 engine omits both; the pane renders `—`. */
   phase?: string | null;
   observed?: string | null;
+  /** lease-api L3: the deferring lease on this box, or null. Absent on a
+   *  pre-5.11.0 engine. */
+  lease?: BoxLease | null;
 }
 
 /** A discriminated result: ok payload, or a link-down/auth/other failure. */
 export type ClientResult<T> =
   | { ok: true; value: T }
-  | { ok: false; kind: "link_down" | "unauthorized" | "forbidden" | "error"; status?: number; message: string };
+  | {
+      ok: false;
+      kind: "link_down" | "unauthorized" | "forbidden" | "error";
+      status?: number;
+      message: string;
+      /** lease-api L2: the 409 `no_eligible_box` per-box reason map. */
+      reasons?: Record<string, string>;
+      /** the error body's `code` (e.g. `no_eligible_box`, `lifetime_cap`). */
+      code?: string;
+      /** `lifetime_cap` only: when the ephemeral lifetime bound is reached. */
+      cap_at?: string;
+    };
 
 /** An operation-ran result body ({rc, log}). */
 export interface OpResult {
@@ -70,6 +132,18 @@ export interface ApiClient {
   rotateKey(box: string): Promise<ClientResult<OpResult>>;
   rename(box: string, to: string): Promise<ClientResult<OpResult>>;
   reconcile(): Promise<ClientResult<{ job_id: string }>>;
+  // --- lease-api L4/r5-B1: the lease surface, on the SAME typed client -------
+  acquireLease(body: {
+    purpose: string;
+    kind?: "ephemeral" | "service";
+    ttl_s?: number;
+    box?: string;
+    require?: Record<string, unknown>;
+  }): Promise<ClientResult<AcquiredLease>>;
+  renewLease(id: string, ttlS?: number): Promise<ClientResult<Lease>>;
+  releaseLease(id: string): Promise<ClientResult<Lease>>;
+  getLease(id: string): Promise<ClientResult<Lease>>;
+  listLeases(opts?: { all?: boolean; state?: string }): Promise<ClientResult<Lease[]>>;
 }
 
 const REQ_TIMEOUT_MS = 8_000;
@@ -157,7 +231,7 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
           apply_source: o.apply_source === "config" ? "config" : "snapshot",
           canary: o.canary ?? null,
           scope: (o.scope as Scope) ?? "readonly",
-          boxes: o.boxes as SnapshotBox[],
+          boxes: o.boxes as FleetBox[],
           // D7: absent on a pre-5.6.0 server; the renderer tolerates null.
           discover: (o.discover as SnapshotDiscover | undefined) ?? null,
         };
@@ -181,6 +255,7 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
               : null,
           phase: typeof o.phase === "string" ? o.phase : null,
           observed: typeof o.observed === "string" ? o.observed : null,
+          lease: (o.lease as BoxLease | null | undefined) ?? null,
         };
       });
     },
@@ -211,6 +286,35 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
     rename(box, to) {
       return postOp(`/v1/boxes/${encodeURIComponent(box)}/rename`, { to, confirm: box });
     },
+    acquireLease(body) {
+      return leaseCall<AcquiredLease>("POST", "/v1/leases", body);
+    },
+    renewLease(id, ttlS) {
+      return leaseCall<Lease>(
+        "POST",
+        `/v1/leases/${encodeURIComponent(id)}/renew`,
+        ttlS === undefined ? {} : { ttl_s: ttlS },
+      );
+    },
+    releaseLease(id) {
+      return leaseCall<Lease>("DELETE", `/v1/leases/${encodeURIComponent(id)}`);
+    },
+    getLease(id) {
+      return leaseCall<Lease>("GET", `/v1/leases/${encodeURIComponent(id)}`);
+    },
+    listLeases(opts) {
+      const q = new URLSearchParams();
+      if (opts?.all === true) q.set("all", "1");
+      if (opts?.state !== undefined) q.set("state", opts.state);
+      const qs = q.toString();
+      return (async (): Promise<ClientResult<Lease[]>> => {
+        const r = await leaseCall<{ leases?: unknown }>("GET", `/v1/leases${qs === "" ? "" : `?${qs}`}`);
+        if (!r.ok) return r;
+        return Array.isArray(r.value.leases)
+          ? { ok: true, value: r.value.leases as Lease[] }
+          : { ok: false, kind: "link_down", message: "malformed response" };
+      })();
+    },
     reconcile() {
       return (async (): Promise<ClientResult<{ job_id: string }>> => {
         const r = await req("POST", "/v1/reconcile", { confirm: "fleet" });
@@ -222,6 +326,29 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
       })();
     },
   };
+
+  /**
+   * The lease calls share one adapter because they share one failure contract:
+   * a 409 carries a `code` and, for `no_eligible_box`, the per-box `reasons`
+   * map the CLI prints on stderr (L4). Everything else maps exactly as the rest
+   * of the client does — 5xx and transport are LINK DOWN.
+   */
+  async function leaseCall<T>(method: string, path: string, body?: unknown): Promise<ClientResult<T>> {
+    const r = await req(method, path, body);
+    if (r.status === 0) return { ok: false, kind: "link_down", message: "link down" };
+    if (r.status < 200 || r.status >= 300) {
+      const fail = failFor(r.status, errMessage(r.json, `HTTP ${r.status}`));
+      const j = r.json as { error?: { code?: unknown }; reasons?: unknown; cap_at?: unknown } | undefined;
+      const code = typeof j?.error?.code === "string" ? (j.error.code as string) : undefined;
+      const reasons =
+        j?.reasons !== null && typeof j?.reasons === "object" && !Array.isArray(j?.reasons)
+          ? (j.reasons as Record<string, string>)
+          : undefined;
+      const capAt = typeof j?.cap_at === "string" ? (j.cap_at as string) : undefined;
+      return { ...(fail as Extract<ClientResult<T>, { ok: false }>), code, reasons, cap_at: capAt };
+    }
+    return { ok: true, value: r.json as T };
+  }
 
   // journal is a GET but shares the OpResult shape.
   async function postOpGet(path: string): Promise<ClientResult<OpResult>> {

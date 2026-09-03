@@ -9,7 +9,7 @@
 
 import type { Env } from "../env.ts";
 import type { ParsedConfig, RolloutConfig } from "../config.ts";
-import { resolveRollout, configCanary } from "../config.ts";
+import { resolveRollout, configCanary, resolveLeaseLimits } from "../config.ts";
 import { BunRunner } from "../runner.ts";
 import { reexecArgv } from "../upgrade.ts";
 import { spawnReexec, type Spawner } from "../reexec.ts";
@@ -26,6 +26,8 @@ import { makeDiscoverDeps } from "./discover-wiring.ts";
 import type { ReconcileDeps } from "./run.ts";
 import type { EnrolSurface } from "./discover.ts";
 import { writeSnapshot } from "../store/snapshots.ts";
+import { leasesAvailable } from "../store/leases.ts";
+import { LeaseTick } from "./lease-tick.ts";
 import { ENROL_STUCK_RENOTIFY_SECS, ENROL_STUCK_STREAK } from "../store/state.ts";
 import { resolveTarget } from "../stage.ts";
 import { fsTelegramSource, fetchPoster, notify as notifyFn } from "../notify.ts";
@@ -199,6 +201,10 @@ export async function assembleTickDeps(
     nowSec: opts.nowSec,
     discover,
     enrol: enrolSurface(state, notify),
+    // lease-api L3: the production tick honours leases. Wired only when the
+    // store carries the v3 table, so a Phase A/B file (or a rollback) simply
+    // has no lease layer and the tick behaves exactly as 5.10.0 did.
+    leases: leasesAvailable(store) ? new LeaseTick({ store, state, notify, limits: resolveLeaseLimits(cfg) }) : undefined,
     // TUI-D4 + state-store D3: the production tick writes ONE snapshot into the
     // three `snapshots` tables, in ONE transaction. `history/*.jsonl` is no
     // longer written — a 5.8.0 binary rolled back onto this file resumes

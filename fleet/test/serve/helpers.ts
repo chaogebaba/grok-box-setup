@@ -8,7 +8,7 @@ import type { FlockSyscalls, WithLockDeps } from "../../src/serve/lock.ts";
 import { AsyncMutex } from "../../src/serve/lock.ts";
 import { FakeRunner } from "../fake-runner.ts";
 import { testEnv, testRollout } from "../helpers.ts";
-import { loadConfig } from "../../src/config.ts";
+import { loadConfig, parseConfig } from "../../src/config.ts";
 import { openStore, storePath } from "../../src/store/db.ts";
 import { writeSnapshot } from "../../src/store/snapshots.ts";
 import type { SnapshotLine } from "../../src/history/schema.ts";
@@ -121,13 +121,22 @@ export interface FakeCtxOpts {
   whichJournalctl?: (bin: string) => boolean;
   now?: () => Date;
   jobs?: JobRegistry;
+  /** lease-api: a REAL $FLEET_STATE, for tests whose endpoint reads the store. */
+  fleetState?: string;
+  /** override the rollout config (the lease canary rules read `canary`). */
+  rollout?: ReturnType<typeof testRollout>;
+  /** raw config text, parsed as $FLEET_CONFIG (the `[leases]` knobs). */
+  configText?: string;
 }
 
 /** Build a ServerContext with all-fake seams for handler/route tests. */
 export async function fakeContext(opts: FakeCtxOpts = {}): Promise<ServerContext> {
-  const env = testEnv({ FLEET_STATE: "/tmp/does-not-exist-serve-test" });
-  const cfg = await loadConfig("/nonexistent-config.toml");
-  const rollout = testRollout();
+  const env = testEnv({ FLEET_STATE: opts.fleetState ?? "/tmp/does-not-exist-serve-test" });
+  const cfg =
+    opts.configText === undefined
+      ? await loadConfig("/nonexistent-config.toml")
+      : parseConfig(opts.configText, "/fake/config.toml");
+  const rollout = opts.rollout ?? testRollout();
   const { fs } = opts.tokenFs ? { fs: opts.tokenFs } : memTokenFs(opts.tokenBody ?? TWO_TOKENS);
   const tokens = TokenStore.load(`${env.FLEET_ETC}/serve-tokens.toml`, fs);
   const jobs = opts.jobs ?? new JobRegistry(() => "job-fixed-1");

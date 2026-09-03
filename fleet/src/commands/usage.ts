@@ -22,7 +22,7 @@ Usage: grokfleet <command> [args] [flags]
 
 Laptop or VPS:
   grokfleet list                              — discover grok-box-N peers (name, tailscale IP, online)
-  grokfleet ssh <box> [cmd...]                — run ONE quoted command on a box, or open a session
+  grokfleet ssh <box>|--lease <id> [cmd...]   — run ONE quoted command on a box, or open a session
   grokfleet tui [--utc]                       — laptop admin panel over the serve API
   grokfleet remove-timer                      — remove the retired laptop check timer (once per laptop)
   grokfleet rc                                — print the exit-code table
@@ -48,6 +48,7 @@ VPS-side (refuse rc 6 elsewhere):
   grokfleet state restore <file>              — copy a backup over fleet.db (stop the timer first)
   grokfleet state import [--force]            — replay the pre-5.8.0 files into the store
   grokfleet state reconcile-files [--apply]   — resolve a reported enrolled.tsv divergence
+  grokfleet lease acquire|renew|release|ls|show|run — reserve a box so the tick leaves it alone
 
 flags:
   --json          one JSON document on stdout instead of the table — list, status, inventory,
@@ -60,6 +61,11 @@ flags:
   --tty           ssh: force a pty (ssh -t) for programs that need one
   --no-stdin      ssh: close the child's stdin instead of inheriting it
   --timeout <s>   ssh: kill the remote command after <s> seconds and exit 124
+  --via <t>       ssh/lease run: tailnet or tunnel (default: tunnel on the VPS, tailnet elsewhere)
+  --lease <id>    ssh: target the box that lease holds
+  --purpose <p>   lease: why the box is being held (required for acquire)
+  --kind <k>      lease: ephemeral (TTL, renewable to a 24h cap) or service (until released)
+  --ttl <d>       lease: 2h / 30m / 90s (ephemeral only; max 24h)
   --notify        check: send the unhealthy summary to Telegram
   --all           upgrade/rollout: every enrolled box, canary first
   --canary <box>  upgrade/rollout: override the canary for this pass

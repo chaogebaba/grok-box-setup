@@ -17,12 +17,12 @@ export const JOURNAL_MAX_N = 500;
 /**
  * The journalctl argv (R2-A6): both units, short-iso, last 4000 lines.
  *
- * FOUR `-u` pairs for the 5.10.0 compatibility release, not two. journalctl
- * matches the unit a line was LOGGED under — `_SYSTEMD_UNIT` — which is the
- * real unit name at the time, never the compatibility alias it now answers to.
- * So history written before the rename is only reachable under the pre-rename
- * names. Drop the two `fleet-*` entries in 5.11.0 with the rest of the
- * compatibility layer.
+ * TWO `-u` pairs again. The 5.10.0 release carried four, because journalctl
+ * matches the unit a line was LOGGED under — `_SYSTEMD_UNIT` — so history
+ * written before the rename was only reachable under the pre-rename names. That
+ * was the one-release compatibility window (N2) and 5.11.0 closes it: those
+ * lines are now months old and outside the 4000-line fetch anyway. An operator
+ * who wants them runs `journalctl -u fleet-reconcile` by hand.
  */
 export function journalArgv(): string[] {
   return [
@@ -31,10 +31,6 @@ export function journalArgv(): string[] {
     "grokfleet-reconcile.service",
     "-u",
     "grokfleet-api.service",
-    "-u",
-    "fleet-reconcile.service",
-    "-u",
-    "fleet-api.service",
     "-o",
     "short-iso",
     "-n",

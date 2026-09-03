@@ -42,9 +42,16 @@
 
 import type { Runner } from "../runner.ts";
 import type { ParsedConfig } from "../config.ts";
+import type { Env } from "../env.ts";
 import { log } from "../log.ts";
 import { RC } from "../upgrade.ts";
 import { RC_POINTER_LINE } from "./rc.ts";
+import { portFor } from "../boxes.ts";
+import { tunnelSshOpts, tunnelUp } from "../tunnel.ts";
+import { knownHostsFile } from "../hostkey.ts";
+import { accessSync, constants } from "node:fs";
+import { makeApiClient, type ApiClient } from "../tui/api-client.ts";
+import { resolveTuiConfig, TuiConfigError } from "../tui/config.ts";
 
 const BOX_USER = "box";
 const DEFAULT_SSH_PASSWORD = "12345678";
@@ -115,6 +122,9 @@ export function sshCmdArgv(box: string, command: string | undefined, extraOpts: 
 
 // --- argument parsing --------------------------------------------------------
 
+/** lease-api L4/r2-B2: which transport `grokfleet ssh` dials the box over. */
+export type SshVia = "tailnet" | "tunnel";
+
 export interface SshPlan {
   box: string;
   /** The remote command ("$*" join), or undefined for an interactive session. */
@@ -125,6 +135,11 @@ export interface SshPlan {
   stdin: "inherit" | "ignore";
   /** --timeout, in seconds; undefined ⇒ no grokfleet deadline (the default). */
   timeoutSecs?: number;
+  /** --via; undefined ⇒ resolved at run time (tunnel when the identity file is
+   *  readable, i.e. on the VPS as root/fleet; tailnet otherwise). */
+  via?: SshVia;
+  /** --lease <id>: target the box THAT lease holds, resolved through the API. */
+  lease?: string;
 }
 
 export type SshParse = { plan: SshPlan } | { err: string } | { help: true };
@@ -145,6 +160,8 @@ export function parseSshArgs(args: string[]): SshParse {
   let tty = false;
   let stdin: "inherit" | "ignore" = "inherit";
   let timeoutSecs: number | undefined;
+  let via: SshVia | undefined;
+  let lease: string | undefined;
   let endOfFlags = false;
 
   for (let i = 0; i < args.length; i++) {
@@ -161,6 +178,29 @@ export function parseSshArgs(args: string[]): SshParse {
       }
       if (a === "--no-stdin") {
         stdin = "ignore";
+        continue;
+      }
+      if (a === "--via") {
+        const v = args[++i];
+        if (v !== "tailnet" && v !== "tunnel") return { err: `--via must be 'tailnet' or 'tunnel' (got '${v ?? ""}')` };
+        via = v;
+        continue;
+      }
+      if (a.startsWith("--via=")) {
+        const v = a.slice("--via=".length);
+        if (v !== "tailnet" && v !== "tunnel") return { err: `--via must be 'tailnet' or 'tunnel' (got '${v}')` };
+        via = v;
+        continue;
+      }
+      if (a === "--lease") {
+        const v = args[++i];
+        if (v === undefined || v === "") return { err: "--lease needs a lease id" };
+        lease = v;
+        continue;
+      }
+      if (a.startsWith("--lease=")) {
+        lease = a.slice("--lease=".length);
+        if (lease === "") return { err: "--lease needs a lease id" };
         continue;
       }
       if (a === "--timeout") {
@@ -185,21 +225,34 @@ export function parseSshArgs(args: string[]): SshParse {
     else words.push(a);
   }
 
-  if (box === undefined || box === "") return { err: "usage: grokfleet ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd...]" };
+  // With `--lease <id>` the BOX comes from the lease, so the first bare word is
+  // already command text rather than a target.
+  if (lease !== undefined) {
+    if (box !== undefined) words.unshift(box);
+    // resolved from the lease at run time; parseSshArgs never invents a name.
+    box = "";
+  } else if (box === undefined || box === "") {
+    return {
+      err: "usage: grokfleet ssh [--tty] [--no-stdin] [--timeout <s>] [--via tailnet|tunnel] (<box> | --lease <id>) [cmd...]",
+    };
+  }
   return {
-    plan: { box, command: words.length > 0 ? words.join(" ") : undefined, tty, stdin, timeoutSecs },
+    plan: { box: box!, command: words.length > 0 ? words.join(" ") : undefined, tty, stdin, timeoutSecs, via, lease },
   };
 }
 
 /** `grokfleet ssh --help` (U3/U5): greppable, one line per flag, rc pointer last. */
 export const SSH_HELP = [
-  "grokfleet ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd...]  — run a command on a box, or open a session",
+  "grokfleet ssh [--tty] [--no-stdin] [--timeout <s>] [--via tailnet|tunnel] (<box> | --lease <id>) [cmd...]  — run a command on a box, or open a session",
   "",
   "  no cmd            interactive session (inherited stdio)",
   "  <cmd...>          transparent remote exec: stdout/stderr stream through, rc is the REMOTE rc",
   "  --tty             force a pty (ssh -tt) for programs that need one",
   "  --no-stdin        close the child's stdin instead of inheriting it",
   "  --timeout <s>     kill the remote command after <s> seconds (SIGTERM, SIGKILL after 5s) and exit 124",
+  "  --via <t>         transport: tailnet (sshpass over the tailnet) or tunnel (the VPS reverse tunnel).",
+  "                    Default: tunnel when the box-access identity file is readable, tailnet otherwise.",
+  "  --lease <id>      target the box that lease holds (resolved through the admin API)",
   "  --                end grokfleet flags; everything after it is command text",
   "",
   "Pass ONE quoted command string: the words are joined with a single space and",
@@ -286,6 +339,16 @@ const realTimers: TimerSeam = {
 export interface SshDeps {
   runner: Runner;
   cfg: ParsedConfig;
+  /** the resolved environment — the tunnel transport needs FLEET_BOX_KEY and
+   *  FLEET_STATE (the engine's own known_hosts). Absent ⇒ tunnel is unavailable
+   *  and `--via tunnel` refuses rc 6. */
+  env?: Env;
+  /** readability probe for the identity file (tests inject). */
+  readable?: (path: string) => boolean;
+  /** listener probe for the box's tunnel port (tests inject). */
+  tunnelUp?: (box: string) => Promise<boolean>;
+  /** admin API client factory for `--lease <id>` (tests inject). */
+  api?: () => ApiClient;
   /** interactive spawner (inherited stdio); defaults to Bun.spawn. */
   interactive?: InteractiveSpawner;
   /** streaming spawner for the non-interactive form; defaults to Bun.spawn. */
@@ -298,7 +361,61 @@ export interface SshDeps {
   write?: (s: string) => void;
 }
 
-/** cmd_ssh [flags] <box> [cmd...]. */
+/**
+ * The three `--via tunnel` argv forms (lease-api r4-B2). They differ ONLY after
+ * the option prefix, which is `tunnelSshOpts` and nothing else:
+ *
+ *   command      … -p <port> <prefix> box@127.0.0.1 <cmd>   (identical to sshArgv)
+ *   interactive  … -p <port> <prefix> -t box@127.0.0.1
+ *   --tty        … -p <port> <prefix> -t box@127.0.0.1 <cmd>
+ *
+ * Mutant (l12) builds its own option list without KNOWN_HOSTS_OPTS and the
+ * deep-equal test fails; mutant (l13) passes an empty command instead of `-t`
+ * for the interactive form and the argv test fails.
+ */
+export function tunnelFormArgv(
+  box: string,
+  boxKey: string,
+  knownHosts: string,
+  opts: { command?: string; tty: boolean },
+): string[] {
+  const port = portFor(box);
+  if (port === undefined) throw new Error(`ssh: cannot derive a tunnel port for '${box}'`);
+  const argv = ["ssh", "-p", String(port), ...tunnelSshOpts(boxKey, knownHosts)];
+  if (opts.command === undefined || opts.tty) argv.push("-t");
+  argv.push("box@127.0.0.1");
+  if (opts.command !== undefined) argv.push(opts.command);
+  return argv;
+}
+
+/**
+ * The `--via` default (r2-B2): `tunnel` when the identity file is READABLE —
+ * i.e. on the VPS as root or the fleet user — and `tailnet` otherwise.
+ *
+ * A laptop whose `$FLEET_ETC` happens to hold a synced copy of the identity file
+ * therefore picks `tunnel` and then REFUSES rc 6, because nothing listens on its
+ * loopback. Pass `--via tailnet` there (r4-n5; the docs say so).
+ */
+export function defaultVia(identityReadable: boolean): SshVia {
+  return identityReadable ? "tunnel" : "tailnet";
+}
+
+function fileReadable(path: string): boolean {
+  try {
+    accessSync(path, constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The production `--lease <id>` resolver: the admin API, exactly as `tui` does. */
+function defaultApi(): ApiClient {
+  const c = resolveTuiConfig();
+  return makeApiClient(c.url, c.token);
+}
+
+/** cmd_ssh [flags] (<box> | --lease <id>) [cmd...]. */
 export async function cmdSsh(args: string[], deps: SshDeps): Promise<number> {
   const parsed = parseSshArgs(args);
   if ("help" in parsed) {
@@ -311,6 +428,56 @@ export async function cmdSsh(args: string[], deps: SshDeps): Promise<number> {
     return RC.USAGE;
   }
   const plan = parsed.plan;
+
+  // --- lease-api L4: `--lease <id>` targets the box THAT lease holds ---------
+  // The CLI never reads the store, even on the VPS (r5-B1): one code path serves
+  // both machines, and it is the same typed client `grokfleet tui` uses.
+  let box = plan.box;
+  if (plan.lease !== undefined) {
+    let client: ApiClient;
+    try {
+      client = (deps.api ?? defaultApi)();
+    } catch (e) {
+      log(`ssh: ${e instanceof TuiConfigError ? e.message : String(e)}`);
+      return RC.REFUSED;
+    }
+    const r = await client.getLease(plan.lease);
+    if (!r.ok) {
+      log(`ssh: lease ${plan.lease}: ${r.message}`);
+      return RC.REFUSED;
+    }
+    box = r.value.box;
+  }
+
+  const identity = deps.env?.FLEET_BOX_KEY;
+  const readable = deps.readable ?? fileReadable;
+  const via: SshVia = plan.via ?? defaultVia(identity !== undefined && readable(identity));
+
+  if (via === "tunnel") {
+    if (deps.env === undefined || identity === undefined || !readable(identity)) {
+      log(
+        `ssh: --via tunnel needs a readable box-access identity file${identity === undefined ? "" : ` (${identity})`} — this is the VPS-only transport; use --via tailnet`,
+      );
+      return RC.REFUSED;
+    }
+    const up = await (deps.tunnelUp ?? ((b: string) => tunnelUp(deps.runner, b)))(box);
+    if (!up) {
+      log(
+        `ssh: --via tunnel: nothing is listening on 127.0.0.1:${portFor(box) ?? "?"} for ${box} — use --via tailnet from a machine that is not the VPS`,
+      );
+      return RC.REFUSED;
+    }
+    const argv = tunnelFormArgv(box, identity, knownHostsFile(deps.env), {
+      command: plan.command,
+      tty: plan.tty,
+    });
+    // Interactive (no command) and --tty both want a pty and inherited stdio.
+    if (plan.command === undefined || plan.tty) {
+      return (deps.interactive ?? bunInteractiveSpawner).spawn(argv, {});
+    }
+    return runStreaming(argv, {}, plan, deps, box);
+  }
+
   const pw = resolveSshPassword(deps.cfg, deps.envSource);
 
   // Interactive: no command at all, or --tty (a pty program). Inherited stdio,
@@ -323,14 +490,29 @@ export async function cmdSsh(args: string[], deps: SshDeps): Promise<number> {
     // reaching for --tty is by definition not at a terminal, so the flag would
     // have been a no-op exactly for the caller who asked for it. -tt forces it.
     const extra = plan.tty ? ["-tt"] : [];
-    return spawner.spawn(sshCmdArgv(plan.box, plan.command, extra), { SSHPASS: pw });
+    return spawner.spawn(sshCmdArgv(box, plan.command, extra), { SSHPASS: pw });
   }
 
   // Non-interactive: TRANSPARENT exec. No Runner (it captures and discards),
   // and NOT the interactive spawner either — this form must be signalable for
   // --timeout and must choose its own stdin mode.
+  return runStreaming(sshCmdArgv(box, plan.command, QUIET_OPTS), { SSHPASS: pw }, plan, deps, box);
+}
+
+/**
+ * The streaming non-interactive form, shared by both transports: inherited
+ * stdout/stderr, the remote rc passed through verbatim, and the `--timeout`
+ * escalation (SIGTERM, SIGKILL after 5 s, rc 124).
+ */
+async function runStreaming(
+  argv: string[],
+  env: Record<string, string>,
+  plan: SshPlan,
+  deps: SshDeps,
+  box: string,
+): Promise<number> {
   const spawner = deps.exec ?? bunExecSpawner;
-  const child = spawner.spawn(sshCmdArgv(plan.box, plan.command, QUIET_OPTS), { SSHPASS: pw }, { stdin: plan.stdin });
+  const child = spawner.spawn(argv, env, { stdin: plan.stdin });
 
   if (plan.timeoutSecs === undefined) {
     const code = await child.exited;
@@ -352,7 +534,7 @@ export async function cmdSsh(args: string[], deps: SshDeps): Promise<number> {
 
   if (firedTimeout) {
     // grokfleet's OWN failure, so U4 applies: one stderr line naming the reason.
-    log(`ssh: ${plan.box}: timed out after ${plan.timeoutSecs}s — remote command killed`);
+    log(`ssh: ${box}: timed out after ${plan.timeoutSecs}s — remote command killed`);
     return RC.TIMEOUT;
   }
   return code ?? RC.FAILURE;

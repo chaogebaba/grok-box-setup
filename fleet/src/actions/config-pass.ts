@@ -20,6 +20,7 @@ import { tunnelUp } from "../tunnel.ts";
 import { pushManaged, type ManagedSource } from "./config-push.ts";
 import type { PushDeps } from "./config-push.ts";
 import { log } from "../log.ts";
+import type { DeferringLease } from "../reconcile/lease-tick.ts";
 
 export interface ConfigPassDeps {
   runner: Runner;
@@ -34,6 +35,12 @@ export interface ConfigPassDeps {
   /** true iff managed files exist (managed_files_present). */
   managedFilesPresent: boolean;
   apply: boolean;
+  /**
+   * lease-api L3: the boxes that currently hold a DEFERRING lease, keyed by
+   * name. Absent ⇒ no lease layer (the 5.10.0 behaviour, and what keeps the
+   * box-free config-pass tests hermetic).
+   */
+  leases?: Map<string, DeferringLease>;
 }
 
 export interface ConfigPassResult {
@@ -52,6 +59,12 @@ export interface ConfigPassResult {
    * unchanged.
    */
   perBox: Map<string, "in-sync" | "drift" | "skip">;
+  /**
+   * lease-api L3: set to the canary's NAME when the pass was skipped because a
+   * FIXED canary holds a deferring lease. The caller turns three consecutive
+   * skips into `alerts(kind='config-canary-leased')`.
+   */
+  canaryLeased?: string;
 }
 
 /**
@@ -64,6 +77,10 @@ async function chooseCanary(
 ): Promise<{ canary: string | undefined; policy: "fixed" | "dynamic" }> {
   if (deps.configCanary !== undefined) return { canary: deps.configCanary, policy: "fixed" };
   for (const b of deps.targetBoxes) {
+    // lease-api L3: the DYNAMIC choice steps over a deferring-leased box rather
+    // than skipping the pass — an un-leased lower box is still canary
+    // protection, and the dynamic policy exists precisely to pick one.
+    if (deps.leases?.has(b) === true) continue;
     if (await tunnelUp(deps.runner, b)) return { canary: b, policy: "dynamic" };
   }
   return { canary: undefined, policy: "dynamic" };
@@ -78,6 +95,24 @@ export async function configPass(deps: ConfigPassDeps): Promise<ConfigPassResult
   const pushDeps: PushDeps = { runner: deps.runner, env: deps.env, source: deps.source, unknownSink };
 
   const { canary, policy } = await chooseCanary(deps);
+
+  // lease-api L3: a FIXED canary that is leased cannot be pushed to, and the
+  // pass must never run without canary protection (mutant l6). So the whole
+  // pass is skipped this tick and the caller counts the skip.
+  if (canary !== undefined && policy === "fixed" && deps.leases?.has(canary) === true) {
+    log(`config: canary ${canary} leased — pass skipped`);
+    return {
+      rc: 0,
+      ok: 0,
+      skipped: 1,
+      failed: 0,
+      canary,
+      policy,
+      perBox: new Map([[canary, "skip"]]),
+      canaryLeased: canary,
+    };
+  }
+
   let ok = 0;
   let skipped = 0;
   let failed = 0;
@@ -171,6 +206,14 @@ export async function configPass(deps: ConfigPassDeps): Promise<ConfigPassResult
   // The rest, serially, in target order (minus the canary).
   for (const b of deps.targetBoxes) {
     if (b === canary) continue;
+    // lease-api L3: the config push is a WRITE to a box someone is using.
+    const lease = deps.leases?.get(b);
+    if (lease !== undefined) {
+      log(`config-push: ${b} deferred — leased by ${lease.holder} (${lease.purpose})`);
+      perBox.set(b, "skip");
+      skipped++;
+      continue;
+    }
     if (deps.state.readHostkeyMismatch(b)) {
       // D11(c), as for the canary above.
       log(`config: ${b} deferred — host key mismatch`);
