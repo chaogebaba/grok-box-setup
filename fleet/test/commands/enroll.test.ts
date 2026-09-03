@@ -169,7 +169,7 @@ describe("T1 cmd_enroll integration (F4/D4/D3/F7/m1)", () => {
     const rc = await cmdEnroll([], happySE());
     cap.restore();
     expect(rc).toBe(2);
-    expect(cap.lines.some((l) => l.includes("usage: fleet2 enroll [--no-box-config] <grok-box-N>"))).toBe(true);
+    expect(cap.lines.some((l) => l.includes("usage: grokfleet enroll [--no-box-config] <grok-box-N>"))).toBe(true);
   });
 
   test("non-grok box ⇒ rc 2", async () => {

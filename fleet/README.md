@@ -1,9 +1,9 @@
-# fleet2 — the grok-fleet brain in bun + TypeScript (phase 1)
+# grokfleet — the grok-fleet brain in bun + TypeScript (phase 1)
 
-`fleet2` is the fleet brain rewritten in bun + TypeScript. Phase 1 provides two
+`grokfleet` is the fleet brain rewritten in bun + TypeScript. Phase 1 provides two
 commands — **inventory** and batch **upgrade** — as a single compiled binary
-that runs on the VPS alongside the bash `fleet2` (see `../docs/FLEET-BRAIN.md`
-§"Upgrades and inventory (fleet2, phase 1)" for the full contract).
+that runs on the VPS alongside the bash `grokfleet` (see `../docs/FLEET-BRAIN.md`
+§"Upgrades and inventory (grokfleet, phase 1)" for the full contract).
 
 Zero runtime npm dependencies. Requires bun 1.4.0.
 
@@ -11,7 +11,7 @@ Zero runtime npm dependencies. Requires bun 1.4.0.
 
 ```
 src/
-  cli.ts          entry — `fleet2 <cmd> [flags]`
+  cli.ts          entry — `grokfleet <cmd> [flags]`
   build-flags.ts  IS_COMPILED (build-time --define)
   env.ts          path/env resolution (FLEET_ETC/STATE/CONFIG/BOX_KEY…)
   log.ts notify.ts config.ts state.ts    logging / Telegram / TOML / inventory.json
@@ -32,18 +32,18 @@ make ts-test                         # or: cd fleet && bun test
 ## Build
 
 ```sh
-make ts-build     # → fleet/dist/fleet2 (bun --compile --minify --sourcemap
+make ts-build     # → fleet/dist/grokfleet (bun --compile --minify --sourcemap
                   #   --target=bun-linux-x64 --define IS_COMPILED=true)
-./fleet/dist/fleet2 version
+./fleet/dist/grokfleet version
 ```
 
 ## Deploy (VPS)
 
 ```sh
-make ts-deploy    # scp → /opt/grok-fleet/.fleet2.tmp, keep fleet2.prev,
-                  # chmod 0755, atomic `mv -f`, then smoke `fleet2 version`
+make ts-deploy    # scp → /opt/grok-fleet/.grokfleet.tmp, keep grokfleet.prev,
+                  # chmod 0755, atomic `mv -f`, then smoke `grokfleet version`
 ```
 
-Rollback of the binary itself: `mv /opt/grok-fleet/fleet2.prev /opt/grok-fleet/fleet2`.
+Rollback of the binary itself: `mv /opt/grok-fleet/grokfleet.prev /opt/grok-fleet/grokfleet`.
 
-Override the target host: `make ts-deploy VPS=root@<host> FLEET2_REMOTE=/opt/grok-fleet/fleet2`.
+Override the target host: `make ts-deploy VPS=root@<host> GROKFLEET_REMOTE=/opt/grok-fleet/grokfleet`.

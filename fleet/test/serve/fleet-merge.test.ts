@@ -36,7 +36,7 @@ afterEach(() => {
  * both through the store.
  */
 function stateWith(line: SnapshotLine, markers: Record<string, Parameters<typeof seedBoxRow>[2]> = {}): string {
-  const s = SCRATCH.dir("fleet2-merge");
+  const s = SCRATCH.dir("grokfleet-merge");
   dirs.push(s);
   for (const [name, m] of Object.entries(markers)) seedBoxRow(s, name, m);
   seedSnapshots(s, [line]);
@@ -124,7 +124,7 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
   });
 
   test("GET /v1/health with NO snapshot ⇒ tick_age_s null", async () => {
-    const s = SCRATCH.dir("fleet2-merge");
+    const s = SCRATCH.dir("grokfleet-merge");
     dirs.push(s);
     const ctx = await ctxFor(s, []);
     const fetch = makeFetch(ctx);

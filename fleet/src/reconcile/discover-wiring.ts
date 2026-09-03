@@ -140,13 +140,13 @@ export function withAbortPoints(
 /** The single remote read a candidate probe performs after `ssh … true`. */
 const PROBE_READ = [
   `cat '${BOX_HOSTNAME}' 2>/dev/null || true`,
-  "echo '---fleet2-probe---'",
+  "echo '---grokfleet-probe---'",
   `'${BOX_ROOT}/boxup' version 2>/dev/null || true`,
 ].join("; ");
 
 /** Split the probe read's stdout into (hostname, boxup version). */
 export function parseProbeRead(stdout: string): { hostname: string; boxup: string | undefined } {
-  const [head = "", tail = ""] = stdout.split("---fleet2-probe---");
+  const [head = "", tail = ""] = stdout.split("---grokfleet-probe---");
   return { hostname: head.replace(/\s+/g, ""), boxup: parseBoxupVersion(tail) };
 }
 

@@ -48,7 +48,7 @@ const LINE: SnapshotLine = {
 };
 
 function stateWith(markers: Record<string, string> = {}): string {
-  const s = mkdtempSync(join(tmpdir(), "fleet2-boxdetail-"));
+  const s = mkdtempSync(join(tmpdir(), "grokfleet-boxdetail-"));
   dirs.push(s);
   const hist = join(s, "history");
   mkdirSync(hist, { recursive: true });
@@ -130,7 +130,7 @@ describe("D1: the detail facts on GET /v1/boxes/:name", () => {
 
 describe("apiFails() is the read-only accessor (B3)", () => {
   test("it reads the counter in the readCounter idiom and writes nothing", () => {
-    const dir = mkdtempSync(join(tmpdir(), "fleet2-apifails-"));
+    const dir = mkdtempSync(join(tmpdir(), "grokfleet-apifails-"));
     dirs.push(dir);
     const st = new ReconcileState(dir, nodeStateFs);
     expect(st.apiFails()).toBe(0); // absent file ⇒ 0
@@ -142,7 +142,7 @@ describe("apiFails() is the read-only accessor (B3)", () => {
     expect(existsSync(join(dir, "api.next_retry"))).toBe(false);
   });
   test("recordApiFailure, by contrast, BUMPS and stamps — which is why reads use apiFails", () => {
-    const dir = mkdtempSync(join(tmpdir(), "fleet2-apifails2-"));
+    const dir = mkdtempSync(join(tmpdir(), "grokfleet-apifails2-"));
     dirs.push(dir);
     const st = new ReconcileState(dir, nodeStateFs);
     st.recordApiFailure(1_000_000);

@@ -455,11 +455,10 @@ INNER
 # ---------------------------------------------------------------------------
 # (b1)/(b2) the status token: present, immediately after tunnel=/tunnelfail=,
 # bare at ok and level-suffixed at fail. APPEND-ONLY is the contract that keeps
-# fleet2 and every legacy reader unaffected (G3) — disk= must never MOVE, but a
-# later feature may append after it, and boxup 5.4.0's keepawake tokens do
-# exactly that. (b2) below still anchors disk=93%/fail at end-of-line because
-# print_status prints the keepawake tokens only through keepawake_status_tokens,
-# which this scenario does not extract.
+# grokfleet and every legacy reader unaffected (G3) — disk= must never MOVE, but
+# a later feature may append after it, and boxup 5.4.0's keepawake tokens do
+# exactly that. Both assertions therefore end their value at a space OR at
+# end-of-line rather than pinning disk= to the end of the status line.
 # ---------------------------------------------------------------------------
 o="$(run_line 22 status)"; line="$(r1 "$o")"
 if printf '%s\n' "$line" | grep -Eq ' tunnel=up tunnelfail=[0-9]+ disk=22%( |$)'; then

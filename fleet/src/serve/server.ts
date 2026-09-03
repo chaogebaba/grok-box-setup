@@ -1,4 +1,4 @@
-// server.ts — `fleet2 serve` (TUI-D2/D9/D10/D11): the tailnet-bound token-auth
+// server.ts — `grokfleet serve` (TUI-D2/D9/D10/D11): the tailnet-bound token-auth
 // HTTP/JSON API. Bind resolution, auth, routing, confirm guard, scope
 // enforcement live here; per-endpoint behavior is in handlers.ts (thin
 // adapters, TUI-D1).
@@ -58,7 +58,7 @@ export function startupIntegrityCheck(env: Env): void {
         return;
       }
       store.setIntegrityFailed();
-      log(`serve: state store quick_check FAILED (${verdict}) — starting with mutations refused (503); run 'fleet2 state check'`);
+      log(`serve: state store quick_check FAILED (${verdict}) — starting with mutations refused (503); run 'grokfleet state check'`);
     } finally {
       store.close();
     }
@@ -362,7 +362,7 @@ function processShutdown(): { done: Promise<void>; unregister: () => void } {
 }
 
 /**
- * `fleet2 serve` entry (already past the locality guard in cli.ts). Resolves the
+ * `grokfleet serve` entry (already past the locality guard in cli.ts). Resolves the
  * bind (rc 6 when absent), loads tokens (rc 6 on a bad file / missing ffi),
  * installs the log tee, and starts Bun.serve. THE RETURNED PROMISE STAYS PENDING
  * FOR THE SERVER'S LIFETIME — it resolves ONLY on a shutdown signal

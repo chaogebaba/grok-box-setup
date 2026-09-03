@@ -20,7 +20,7 @@ const API_TIMEOUT_MS = 30_000;
 /**
  * Per-invocation transport knobs (P2/D2/D3, zero-touch join).
  *
- * `fleet2 enroll` on the CLI passes none of these and keeps its historical
+ * `grokfleet enroll` on the CLI passes none of these and keeps its historical
  * behaviour. A DISCOVER-initiated enrol passes all three:
  *
  *  - `password` — P2 threading. The resolved discover password is handed IN and
@@ -108,7 +108,7 @@ function withStore<T>(
   }
 }
 
-/** Build the production EnrollSideEffects for `fleet2 enroll`. */
+/** Build the production EnrollSideEffects for `grokfleet enroll`. */
 export function fleetVpsUser(): string {
   return process.env.FLEET_VPS_USER ?? process.env.FLEET_USER ?? "fleet";
 }

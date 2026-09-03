@@ -1,4 +1,4 @@
-fleet2 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 16m   admin  link ● up                                              
+grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0  apply off  tick 16m   admin  link ● up                                              
 STALE 16m — snapshot older than 15m                                                                                     
 
   NAME          TUNNEL CHECK VER     DRIFT    CONFIG  EXPIRY                                                              ╭─ grok-box-001 ─────────────────────────────╮

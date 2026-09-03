@@ -1,4 +1,4 @@
-// rc.ts — `fleet2 rc`, the discoverable exit-code table (agent-ux U3).
+// rc.ts — `grokfleet rc`, the discoverable exit-code table (agent-ux U3).
 //
 // The table is NOT written twice. `RC` in upgrade.ts is the one constant; this
 // module attaches a one-line meaning to every DISTINCT number in it and renders
@@ -8,7 +8,7 @@
 
 import { RC } from "../upgrade.ts";
 
-/** Every exit code fleet2 can return (the union of RC's values). */
+/** Every exit code grokfleet can return (the union of RC's values). */
 export type RcCode = (typeof RC)[keyof typeof RC];
 
 /**
@@ -25,7 +25,7 @@ export const RC_MEANING: Readonly<Record<RcCode, string>> = {
   5: "policy precheck refused, nothing written",
   6: "refused, nothing done (VPS-only, missing key, reconcile lock held)",
   7: "recorded, but the legacy file export failed",
-  124: "ssh --timeout elapsed; fleet2 killed the remote command",
+  124: "ssh --timeout elapsed; grokfleet killed the remote command",
   255: "ssh transport failure (box unreachable)",
 };
 
@@ -37,7 +37,7 @@ export function rcCodes(): RcCode[] {
 
 /** The human table (stdout, rc 0). */
 export function renderRcTable(): string {
-  const lines = ["fleet2 exit codes"];
+  const lines = ["grokfleet exit codes"];
   for (const code of rcCodes()) lines.push(`  ${String(code).padEnd(3)}  ${RC_MEANING[code]}`);
   lines.push("");
   lines.push("stdout is data; diagnostics and errors go to stderr.");
@@ -52,4 +52,4 @@ export function renderRcJson(): string {
 }
 
 /** The pointer line every help text ends with (U3). */
-export const RC_POINTER_LINE = "exit codes: fleet2 rc";
+export const RC_POINTER_LINE = "exit codes: grokfleet rc";

@@ -28,7 +28,7 @@ import {
 } from "../src/remote.ts";
 
 function mkScratch(): string {
-  return mkdtempSync(`${tmpdir()}/fleet2-remote-`);
+  return mkdtempSync(`${tmpdir()}/grokfleet-remote-`);
 }
 
 describe("T4a constant character scan (m5)", () => {

@@ -10,7 +10,7 @@
 #   * the working tree is dirty            (so the tag names exactly what is pinned)
 #   * HEAD is not on main
 #   * the tag already exists
-#   * the built artifact's digest != the committed FLEET2_SHA256   (D12)
+#   * the built artifact's digest != the committed GROKFLEET_SHA256   (D12)
 #   * CONFIRM=1 is absent
 # The plan is PRINTED before any of it happens (D8).
 #
@@ -44,10 +44,10 @@ branch="$(git rev-parse --abbrev-ref HEAD)"
 [ "$branch" = main ] || die "HEAD is on '$branch', not main"
 
 # --- read the committed pin ---------------------------------------------------
-tag="$(sed -nE 's/^FLEET2_RELEASE=(.*)$/\1/p' "$INSTALLER" | head -1)"
-want="$(sed -nE 's/^FLEET2_SHA256=(.*)$/\1/p' "$INSTALLER" | head -1)"
-[ -n "$tag" ]  || die "could not read FLEET2_RELEASE from $INSTALLER"
-[ -n "$want" ] || die "could not read FLEET2_SHA256 from $INSTALLER"
+tag="$(sed -nE 's/^GROKFLEET_RELEASE=(.*)$/\1/p' "$INSTALLER" | head -1)"
+want="$(sed -nE 's/^GROKFLEET_SHA256=(.*)$/\1/p' "$INSTALLER" | head -1)"
+[ -n "$tag" ]  || die "could not read GROKFLEET_RELEASE from $INSTALLER"
+[ -n "$want" ] || die "could not read GROKFLEET_SHA256 from $INSTALLER"
 
 # --- tag must not exist -------------------------------------------------------
 if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
@@ -58,7 +58,7 @@ fi
 [ -f "$DIST" ] || die "no artifact at $DIST — run 'make ts-release-build' first"
 got="$(sha256sum "$DIST" | cut -d' ' -f1)"
 if [ "$got" != "$want" ]; then
-  die "artifact digest != the committed FLEET2_SHA256 — the published bytes and the pin would disagree
+  die "artifact digest != the committed GROKFLEET_SHA256 — the published bytes and the pin would disagree
   artifact $DIST: $got
   committed pin:  $want
   re-run 'make ts-release-build' and commit the bump"
@@ -69,7 +69,7 @@ say "PLAN — this creates a PUBLIC tag and a PUBLIC release asset:"
 say "  repo      $REPO"
 say "  tag       $tag   (created at $(git rev-parse --short HEAD), branch $branch)"
 say "  asset     $DIST  ($(wc -c < "$DIST") bytes)"
-say "  sha256    $got   (== the committed FLEET2_SHA256)"
+say "  sha256    $got   (== the committed GROKFLEET_SHA256)"
 say "  NOTE      no .sha256 asset is published (D4): a same-origin checksum adds"
 say "            zero protection against anyone who can write to the release."
 
@@ -82,9 +82,9 @@ if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
   die "release $tag already exists on $REPO"
 fi
 
-git tag -a "$tag" -m "fleet2 $tag"
+git tag -a "$tag" -m "grokfleet $tag"
 git push origin "refs/tags/$tag"
 gh release create "$tag" "$DIST" --repo "$REPO" \
-  --title "fleet2 $tag" \
-  --notes "fleet2 linux-x64 release asset. Verified by vps/install-vps.sh against the in-repo FLEET2_SHA256=$got — see docs/FLEET-BRAIN.md §\"Release + install\" for what that does and does not defend against."
+  --title "grokfleet $tag" \
+  --notes "grokfleet linux-x64 release asset. Verified by vps/install-vps.sh against the in-repo GROKFLEET_SHA256=$got — see docs/FLEET-BRAIN.md §\"Release + install\" for what that does and does not defend against."
 say "published $tag on $REPO"

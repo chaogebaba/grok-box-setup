@@ -3,14 +3,14 @@
 //
 // The walker drives every command entry point in `src/commands/*` (and the
 // cli.ts dispatch) with seams rigged to fail, capturing BOTH stderr channels
-// fleet2 uses: `log()` (the timestamped journal line) and direct
+// grokfleet uses: `log()` (the timestamped journal line) and direct
 // `process.stderr.write` calls. Each case is NAMED, so mutant (d) — delete one
 // stderr line — fails pointing at the path that went quiet.
 //
-// ONE documented exemption: `fleet2 ssh <box> <cmd>` passing through a non-zero
-// REMOTE rc. U1 makes that form a transparent exec — fleet2 must not inject a
+// ONE documented exemption: `grokfleet ssh <box> <cmd>` passing through a non-zero
+// REMOTE rc. U1 makes that form a transparent exec — grokfleet must not inject a
 // line into streams the caller is parsing, and ssh's own stderr is inherited, so
-// the failure is never actually silent. fleet2's OWN ssh failures (usage, the
+// the failure is never actually silent. grokfleet's OWN ssh failures (usage, the
 // --timeout kill) do print, and are covered here.
 
 import { describe, test, expect } from "bun:test";
@@ -39,7 +39,7 @@ const EMPTY_CFG = parseConfig(undefined, "/x");
 const CFG_DIFF_FLEET_TOML = '[ssh]\npassword = "abc"\n';
 const SS_UP_20008 = 'LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:(("sshd",pid=41,fd=7))\n';
 
-/** Capture everything fleet2 sends to stderr, whichever channel it uses. */
+/** Capture everything grokfleet sends to stderr, whichever channel it uses. */
 function capture<T>(fn: (out: (s: string) => void) => Promise<T> | T): Promise<{ rc: T; err: string; out: string }> {
   const errParts: string[] = [];
   const outParts: string[] = [];
@@ -135,12 +135,12 @@ const CASES: Array<{
   },
   {
     name: "locality: VPS-only refusal",
-    expect: "VPS-only in fleet2",
+    expect: "VPS-only in grokfleet",
     run: () => capture(() => (refuseVpsOnly("status", false) ? RC.REFUSED : RC.OK)),
   },
   {
     name: "ssh: no box (usage)",
-    expect: "usage: fleet2 ssh",
+    expect: "usage: grokfleet ssh",
     run: () => capture(() => cmdSsh([], { runner: new FakeRunner(), cfg: EMPTY_CFG })),
   },
   {
@@ -251,7 +251,7 @@ const CASES: Array<{
   },
   {
     name: "mint-key: empty box (usage)",
-    expect: "usage: fleet2 mint-key",
+    expect: "usage: grokfleet mint-key",
     run: () => capture(() => cmdMintKey("", { env: testEnv(), cfg: EMPTY_CFG, runner: new FakeRunner() })),
   },
   {
@@ -279,7 +279,7 @@ const CASES: Array<{
   },
   {
     name: "enroll: no box (usage)",
-    expect: "usage: fleet2 enroll",
+    expect: "usage: grokfleet enroll",
     run: () =>
       capture(async () => {
         const r = await cmdEnroll([], stubEnrollSideEffects());
@@ -303,12 +303,12 @@ const CASES: Array<{
   },
   {
     name: "state: unknown subcommand (usage)",
-    expect: "usage: fleet2 state",
+    expect: "usage: grokfleet state",
     run: () => capture((out) => cmdState(["nonsense"], stubStateDeps(out))),
   },
   {
     name: "state restore: missing file operand",
-    expect: "usage: fleet2 state restore",
+    expect: "usage: grokfleet state restore",
     run: () => capture((out) => cmdState(["restore"], stubStateDeps(out))),
   },
   {

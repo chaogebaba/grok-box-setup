@@ -9,7 +9,7 @@
 //   marker absent + no enrolled.tsv       ⇒ fresh store, marker source='fresh'
 //   marker present                        ⇒ NEVER import, whatever the files say
 //
-// `fleet2 state import --force` replays explicitly (operator only). The replay
+// `grokfleet state import --force` replays explicitly (operator only). The replay
 // DELETEs every data row first, so a re-run after a crash is a clean replay
 // rather than a merge. An UNPARSEABLE legacy file is rc 3 naming the file, the
 // transaction rolled back and the marker NOT written: corrupt must not read as
@@ -47,13 +47,13 @@ import { log } from "../log.ts";
 export interface ExportPaths {
   fleetState: string;
   etc: string;
-  /** the running fleet2 version, stamped into the export header. */
+  /** the running grokfleet version, stamped into the export header. */
   version: string;
 }
 
 /** The header every exported TEXT file carries (D6, note 5). */
 export function exportHeader(version: string): string {
-  return `# exported by fleet2 ${version} — read-only, edit via fleet2\n`;
+  return `# exported by grokfleet ${version} — read-only, edit via grokfleet\n`;
 }
 
 // --- atomic file helpers -----------------------------------------------------
@@ -66,7 +66,7 @@ export function exportHeader(version: string): string {
 function atomicWrite(path: string, data: string, mode = 0o600): void {
   const dir = path.replace(/\/[^/]*$/, "");
   mkdirSync(dir, { recursive: true });
-  const tmp = `${dir}/.fleet2-export.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+  const tmp = `${dir}/.grokfleet-export.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
   try {
     writeFileSync(tmp, data);
     chmodSync(tmp, mode);
@@ -203,7 +203,7 @@ export type ImportOutcome =
 export interface ImportOptions {
   fleetState: string;
   etc: string;
-  /** replay even when the marker is present (`fleet2 state import --force`). */
+  /** replay even when the marker is present (`grokfleet state import --force`). */
   force?: boolean;
 }
 
@@ -290,7 +290,7 @@ export function importLegacy(store: Store, opts: ImportOptions): ImportOutcome {
     store.setMeta("legacy_imported_at", String(at));
     store.setMeta("legacy_import_source", "files");
     store.audit({
-      actor: "fleet2",
+      actor: "grokfleet",
       action: "legacy-import",
       rc: 0,
       at,

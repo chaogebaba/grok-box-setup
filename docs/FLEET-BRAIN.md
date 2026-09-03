@@ -1,7 +1,7 @@
 # FLEET-BRAIN.md — always-on VPS brain + out-of-band reverse-SSH channel
 
 **Status: PHASE 1 IMPLEMENTED on `feat/fleet-brain`.** This began as the design
-wall (design only) and now also carries the phase-1 implementation (`fleet2`
+wall (design only) and now also carries the phase-1 implementation (`grokfleet`
 brain subcommands, `vps/install-vps.sh`, and the `tests/test-fleet-brain.sh`
 suite). The wall below remains the AUTHORITY: where the code disagrees with a
 row, the code is wrong and is fixed to match. This is the
@@ -23,7 +23,7 @@ has three gaps that need an off-box actor:
 2. **The shared 90-day key + manual `.expires`** (H11): one shared key for the
    whole fleet, rotated by hand, with an operator-typed expiry sidecar. A dead
    key means no box can rejoin after state loss.
-3. **The laptop is not always online.** `fleet2` today runs from the laptop;
+3. **The laptop is not always online.** `grokfleet` today runs from the laptop;
    reconciliation, rollout, and alerting stop when the laptop sleeps.
 
 **Measured resurrection latency (r4 truth run):** box-8 was bricked by the r4
@@ -63,7 +63,7 @@ Design against THESE facts, not assumptions:
   `BackendState=NeedsLogin` (0 peers — NOT in any tailnet). ⇒ "VPS joins the
   tailnet" (§2) is a ONE-TIME `tailscale up` with a **tagged** key
   (`tag:fleet-brain`; needs the ACL `tagOwners` entry first — see Resolved
-  decision 3, and `fleet2 enroll` prechecks it via `GET /acl`).
+  decision 3, and `grokfleet enroll` prechecks it via `GET /acl`).
 - **Do NOT disturb these running services:** xray (ports 1001/1002/1006/1080/
   1234), hysteria (443), WireGuard `wg0` 10.66.0.1/24, cron,
   unattended-upgrades, rsyslog. Our reverse ports (20000+N; 20001–20008 is the
@@ -92,21 +92,21 @@ Schema: **Decision | Alternatives considered / why they lost | Breaks if undone 
 |---|---|---|---|
 | **The `boxup` tick supervises a plain `ssh -N` reverse tunnel in a loop** — NOT autossh, NOT a systemd unit. Each tick: if no live tunnel process for this box, (re)spawn `ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes -i /workspace/box-setup/secrets/tunnel_ed25519 -R 127.0.0.1:$((20000+N)):localhost:22 -p 22 fleet@107.172.132.211`, detached via `spawn_detached` (flock --close safe). Liveness is **client-driven** — the VPS has `ClientAliveInterval 0` and will NOT reap a dead tunnel, so `ServerAliveInterval/CountMax` on the box side must drop a stale link (and the VPS reconcile cross-checks with `ss -tln`). Box-side liveness = the ssh pid alive AND (VPS-side) the port is listening. | (a) **autossh** — LOST on the BOX: autossh is a separate package not guaranteed present after an image swap (DESIGN.md: overlay wiped, only `/workspace` returns), and it is one more binary to vendor. Its whole job (respawn on death) is something the 15s tick ALREADY does for tailscaled/sshd/worker — one supervision model, not two. (b) **systemd unit on the box** — LOST: there is NO systemd running in the sand container (DESIGN.md §environment: PID 1 is tini, systemd on disk but inactive). A `.service` would never start. (c) **`ssh -f` (background itself)** — LOST: `-f` detaches from boxup's supervision so the tick can't track/replace it; use `-N` foreground under `spawn_detached` and let the tick own the lifecycle. | Boxes behind the sand NAT are unreachable when the tailnet is down — which is exactly when the brain most needs to reach them (to re-mint a key). No tunnel ⇒ the brain is blind precisely during the outage it exists to fix. | autossh-vs-systemd survey confirms both are viable ON A HOST but both assume a process supervisor exists: [systemd persistent tunnel](https://blog.kylemanna.com/linux/ssh-reverse-tunnel-on-linux-with-systemd/), [autossh systemd unit](https://gist.github.com/ntrepid8/0af12c012dd2567c800799d86eb44f90), [supervisord tunnel precedent (imbue-ai latchkey)](https://github.com/imbue-ai/mngr/issues/2423). We have no supervisor on the box except the boxup tick, so the tick IS the supervisor. `ExitOnForwardFailure=yes` + `ServerAlive*` from [ssh_config(5)] make a dead tunnel exit promptly so the next tick respawns it — mandatory here because the VPS's `ClientAliveInterval 0` won't. |
 | **Per-box ed25519 key at `/workspace/box-setup/secrets/tunnel_ed25519{,.pub}`** (mode 600, generated on the box, never leaves it as a private key). Survives image swaps because it lives under `/workspace`. | (a) reuse the tailscale node key / ssh host key — LOST: different trust domain; the tunnel key authenticates the box TO THE VPS, and rotating one must not disturb the others. (b) a shared fleet tunnel key — LOST: one leaked box key would grant every box's tunnel identity; per-box keys keep a box compromise to its own port (see §4). | Without a persistent per-box key the tunnel can't re-establish after a swap without re-enrollment every time. | [OpenSSH key management]; per-box-key isolation mirrors the per-box tailscale identity rule (DESIGN.md "Identity out of git"). |
-| **Enrollment (chicken-and-egg): the box's tunnel PUBKEY first reaches the VPS over OpenSSH on the tailnet, via `fleet2 enroll <box>`** run from the brain (**VPS-ONLY** since #12/F4: enroll writes `~fleet/.ssh` locally and post-checks the VPS daemon, so it refuses with rc 6 off the VPS) WHILE the box is still on the tailnet. fleet2 reads the pubkey over `ssh box@grok-box-N sudo cat /workspace/box-setup/secrets/tunnel_ed25519.pub` (the box's own OpenSSH server on the tailnet, reached with the laptop/VPS operator key or password) and appends a locked-down `authorized_keys` line (see §2) for `fleet@vps`. **This is the SAME OpenSSH-over-tailnet channel the reconciler uses for box access (Resolved decision 7)** — one login model, not two. **Tailscale SSH is NOT usable here:** the frozen on-box wall runs every box with `--ssh=false` ("Tailscale SSH stays off: OpenSSH is the only login path", DESIGN.md), so `tailscale ssh grok-box-N` cannot connect — the TS-SSH server is off on the destination. A box generates its keypair on first `boxup once` if absent. **One-step enroll:** enroll also writes the box's OWN `config.toml` `[fleet]` block (`vps`/`box_index`) over that SAME OpenSSH-on-the-tailnet session (idempotent; `--no-box-config` opts out), so the box dials its tunnel on the next `boxup once` with no manual hand-edit (see Ops notes). **Post-enrol proof (#12):** after writing the box-side block, enroll waits up to `ENROLL_TUNNEL_WAIT` seconds (default 90; `0` = skip, for offline/test enrol; `--no-box-config` also skips since the box won't dial) for the reverse listener to appear on `127.0.0.1:20000+N`, logging success or exiting **rc 4** if it never comes up (the `enrolled.tsv` row is still written — resumable by `boxup once`). It also runs a **policy precheck** first: if the VPS sshd effective `permitlisten` for the fleet user permits neither `any` nor `127.0.0.1:20000+N`, it aborts with **rc 5** before writing anything (the exact #12 failure, caught early). Tunnel-up proof is best-effort: it confirms *some* process bound the loopback port, not specifically this box's tunnel (a pre-existing listener logs a WARNING). **Precondition check (Q3):** enroll first does `GET /api/v2/tailnet/-/acl` and REFUSES with a clear message if `tag:fleet-brain` has no `tagOwners` entry — a box rebuilding identity with an unauthorized tag can't rejoin, so the ACL must exist before any tagged join. | (a) ship the pubkey in git / config.toml — LOST: per-box, generated on the box, must not be committed (same rule as identity). (b) have the box POST its own pubkey to the VPS — LOST: the box would need a VPS credential, widening blast radius; enrollment is a brain-initiated, one-time, tailnet-gated action. (c) skip the ACL precheck — LOST: a missing `tagOwners` entry fails the tagged join opaquely; check it up front. (d) **Tailscale SSH as the bootstrap channel — LOST: disabled fleet-wide by the on-box wall (`--ssh=false`); OpenSSH is the only login path to a box, so enrollment and first-contact MUST use OpenSSH over the tailnet.** | No enrollment path ⇒ a fresh box's tunnel is never trusted by the VPS and the OOB channel never forms; no ACL precheck ⇒ a tagged join fails cryptically. | OpenSSH over the tailnet is the box's only login path (DESIGN.md `--ssh=false` wall); ACL read: [Tailscale API GET /acl](https://tailscale.com/api#tag/policyfile). |
+| **Enrollment (chicken-and-egg): the box's tunnel PUBKEY first reaches the VPS over OpenSSH on the tailnet, via `grokfleet enroll <box>`** run from the brain (**VPS-ONLY** since #12/F4: enroll writes `~fleet/.ssh` locally and post-checks the VPS daemon, so it refuses with rc 6 off the VPS) WHILE the box is still on the tailnet. grokfleet reads the pubkey over `ssh box@grok-box-N sudo cat /workspace/box-setup/secrets/tunnel_ed25519.pub` (the box's own OpenSSH server on the tailnet, reached with the laptop/VPS operator key or password) and appends a locked-down `authorized_keys` line (see §2) for `fleet@vps`. **This is the SAME OpenSSH-over-tailnet channel the reconciler uses for box access (Resolved decision 7)** — one login model, not two. **Tailscale SSH is NOT usable here:** the frozen on-box wall runs every box with `--ssh=false` ("Tailscale SSH stays off: OpenSSH is the only login path", DESIGN.md), so `tailscale ssh grok-box-N` cannot connect — the TS-SSH server is off on the destination. A box generates its keypair on first `boxup once` if absent. **One-step enroll:** enroll also writes the box's OWN `config.toml` `[fleet]` block (`vps`/`box_index`) over that SAME OpenSSH-on-the-tailnet session (idempotent; `--no-box-config` opts out), so the box dials its tunnel on the next `boxup once` with no manual hand-edit (see Ops notes). **Post-enrol proof (#12):** after writing the box-side block, enroll waits up to `ENROLL_TUNNEL_WAIT` seconds (default 90; `0` = skip, for offline/test enrol; `--no-box-config` also skips since the box won't dial) for the reverse listener to appear on `127.0.0.1:20000+N`, logging success or exiting **rc 4** if it never comes up (the `enrolled.tsv` row is still written — resumable by `boxup once`). It also runs a **policy precheck** first: if the VPS sshd effective `permitlisten` for the fleet user permits neither `any` nor `127.0.0.1:20000+N`, it aborts with **rc 5** before writing anything (the exact #12 failure, caught early). Tunnel-up proof is best-effort: it confirms *some* process bound the loopback port, not specifically this box's tunnel (a pre-existing listener logs a WARNING). **Precondition check (Q3):** enroll first does `GET /api/v2/tailnet/-/acl` and REFUSES with a clear message if `tag:fleet-brain` has no `tagOwners` entry — a box rebuilding identity with an unauthorized tag can't rejoin, so the ACL must exist before any tagged join. | (a) ship the pubkey in git / config.toml — LOST: per-box, generated on the box, must not be committed (same rule as identity). (b) have the box POST its own pubkey to the VPS — LOST: the box would need a VPS credential, widening blast radius; enrollment is a brain-initiated, one-time, tailnet-gated action. (c) skip the ACL precheck — LOST: a missing `tagOwners` entry fails the tagged join opaquely; check it up front. (d) **Tailscale SSH as the bootstrap channel — LOST: disabled fleet-wide by the on-box wall (`--ssh=false`); OpenSSH is the only login path to a box, so enrollment and first-contact MUST use OpenSSH over the tailnet.** | No enrollment path ⇒ a fresh box's tunnel is never trusted by the VPS and the OOB channel never forms; no ACL precheck ⇒ a tagged join fails cryptically. | OpenSSH over the tailnet is the box's only login path (DESIGN.md `--ssh=false` wall); ACL read: [Tailscale API GET /acl](https://tailscale.com/api#tag/policyfile). |
 | **HONEST LIMIT: if `/workspace` itself is wiped, the tunnel key AND the frozen hostname are gone.** The box then has no tunnel identity and no name. Recovery REQUIRES a tailnet-side action (re-enrollment over OpenSSH on the tailnet, or a fresh auth-key join that the brain drives once the box reappears on the tailnet). The OOB tunnel is a second path for the *node-deleted-but-workspace-intact* case, NOT a workspace-loss backstop. | pretend the tunnel survives a workspace wipe — LOST: dishonest; `/workspace` is "probably persistent" (DESIGN.md) but not guaranteed, and the key/name live there. | Overstating the tunnel's coverage would hide the one failure it can't handle, inviting a false sense of recovery. | DESIGN.md §persistence-model ("keep a full re-join path for the day /workspace isn't"). |
 
 ### 2. VPS side (`fleet@`, `/opt/grok-fleet`, systemd)
 
 | Decision | Alternatives considered / why lost | Breaks if undone | Prior art |
 |---|---|---|---|
-| **Footprint: one tree + one unit set.** Code+config at `/opt/grok-fleet` (fleet2 from THIS repo + `config.toml`), mutable state at `/var/lib/grok-fleet` (device cache, per-box last-seen, run locks), secrets mode 600 at `/etc/grok-fleet` (API token, and a COPY of each box's tunnel authorized-keys mapping). systemd `fleet-reconcile.timer` (OnUnitActiveSec=5min) → `fleet-reconcile.service` (Type=oneshot, runs `fleet2 reconcile`). | (a) cron — LOST: no per-run logging/lock/￼status the way a systemd oneshot + journal gives; the VPS HAS systemd (unlike the box), so use it. (b) a long-running daemon — LOST: a 5-min oneshot under a timer is crash-simple, has no in-memory state to corrupt, and each run re-reads truth from the API + tunnels. | Sprawl across the VPS makes the footprint unauditable and violates the "one dir + one unit set" scope the user granted. | systemd timer-vs-daemon for periodic reconcile: [systemd.timer(5)](https://www.freedesktop.org/software/systemd/man/systemd.timer.html); oneshot reconcile pattern mirrors DESIGN.md's D6 "one predicate, orchestrator trusts it". |
+| **Footprint: one tree + one unit set.** Code+config at `/opt/grok-fleet` (grokfleet from THIS repo + `config.toml`), mutable state at `/var/lib/grok-fleet` (device cache, per-box last-seen, run locks), secrets mode 600 at `/etc/grok-fleet` (API token, and a COPY of each box's tunnel authorized-keys mapping). systemd `grokfleet-reconcile.timer` (OnUnitActiveSec=5min) → `grokfleet-reconcile.service` (Type=oneshot, runs `grokfleet reconcile`). | (a) cron — LOST: no per-run logging/lock/￼status the way a systemd oneshot + journal gives; the VPS HAS systemd (unlike the box), so use it. (b) a long-running daemon — LOST: a 5-min oneshot under a timer is crash-simple, has no in-memory state to corrupt, and each run re-reads truth from the API + tunnels. | Sprawl across the VPS makes the footprint unauditable and violates the "one dir + one unit set" scope the user granted. | systemd timer-vs-daemon for periodic reconcile: [systemd.timer(5)](https://www.freedesktop.org/software/systemd/man/systemd.timer.html); oneshot reconcile pattern mirrors DESIGN.md's D6 "one predicate, orchestrator trusts it". |
 | **`fleet` user is shell-less and forward-only.** Each box's `~fleet/.ssh/authorized_keys` line is `restrict,port-forwarding,permitlisten="127.0.0.1:<20000+N>" <box pubkey>`. `restrict` disables pty/agent/X11/forwarding then `port-forwarding` re-enables ONLY forwarding; `permitlisten` pins the box to its OWN port and 127.0.0.1 only. `sshd_config` for that Match block: `PermitOpen none` (no local forwarding), `AllowTcpForwarding remote`, `PermitListen any` (the server-config no longer caps the fleet user — the per-key `permitlisten` is the sole confinement, #12; the explicit `any` also stops an operator's main-section `PermitListen` from silently capping the fleet user), `PermitTTY no`, `ForceCommand /usr/sbin/nologin` (or `command="false"`). | (a) a real login user — LOST: a box compromise would get a VPS shell. (b) `no-pty,no-agent-forwarding,...` enumerated — LOST: `restrict` is allow-list-by-default (future-proof: new dangerous features are off unless re-enabled), the enumerated form is deny-list (a new feature defaults ON). (c) omit `permitlisten` — LOST: any box could then bind ANY loopback port and impersonate another box's tunnel. | Without `restrict`+`permitlisten` a single box key could open a shell or hijack another box's port on the brain — the brain becomes the fleet's single point of total compromise. | `restrict`/`permitlisten` semantics (allow-list, per-key port pin): [sshd(8) AUTHORIZED_KEYS](https://man.openbsd.org/OpenBSD-current/sshd) (note: `ssh -R` sends listen host "localhost" when unspecified, so pin `127.0.0.1:<port>` and have the box request `127.0.0.1:` explicitly); reverse-tunnel bastion hardening: [restrict on a bastion](https://blog.vitalvas.com/post/2026/02/04/reverse-ssh-tunnels/), [permitlisten Q&A](https://superuser.com/questions/1552105/). |
-| **Deterministic port map: box N → VPS loopback port `20000+N` (indices 1–999, the three-digit `grok-box-NNN` name range, `fleet2` `box_index_from_name`/`box_name_from_index`).** fleet2 derives it from `grok-box-N`; the same N is pinned in each key's `permitlisten`. There is **no eight-box/sshd-list cap** (#12): the server-config Match block sets `PermitListen any`, so confinement is the per-key `permitlisten="127.0.0.1:20000+N"` alone. The originally inventoried 20001–20008 range is confirmed clear of the VPS's existing listeners (xray 1001/1002/1006/1080/1234, hysteria 443, wg0) — see VPS ground truth; ports beyond it are not separately collision-inventoried (`fleet2 enroll`'s tunnel-up proof only confirms *some* listener bound the port — see the #12 note below). | a dynamic/negotiated port — LOST: then `permitlisten` can't be a fixed per-key pin and the brain can't address a box without a lookup handshake. | Non-deterministic ports break the per-key `permitlisten` pin (the security control) and make `fleet2` unable to find a box's tunnel; a colliding port would clash with xray/hysteria. | static allocation is the norm for named backends; mirrors DESIGN.md naming ("lowest free grok-box-N, then frozen"). |
+| **Deterministic port map: box N → VPS loopback port `20000+N` (indices 1–999, the three-digit `grok-box-NNN` name range, `grokfleet` `box_index_from_name`/`box_name_from_index`).** grokfleet derives it from `grok-box-N`; the same N is pinned in each key's `permitlisten`. There is **no eight-box/sshd-list cap** (#12): the server-config Match block sets `PermitListen any`, so confinement is the per-key `permitlisten="127.0.0.1:20000+N"` alone. The originally inventoried 20001–20008 range is confirmed clear of the VPS's existing listeners (xray 1001/1002/1006/1080/1234, hysteria 443, wg0) — see VPS ground truth; ports beyond it are not separately collision-inventoried (`grokfleet enroll`'s tunnel-up proof only confirms *some* listener bound the port — see the #12 note below). | a dynamic/negotiated port — LOST: then `permitlisten` can't be a fixed per-key pin and the brain can't address a box without a lookup handshake. | Non-deterministic ports break the per-key `permitlisten` pin (the security control) and make `grokfleet` unable to find a box's tunnel; a colliding port would clash with xray/hysteria. | static allocation is the norm for named backends; mirrors DESIGN.md naming ("lowest free grok-box-N, then frozen"). |
 | **The VPS ALSO joins the tailnet, tagged `tag:fleet-brain`, as a SECOND path — DECIDED: YES.** The tunnel is the out-of-band primary (works when the tailnet is down); the tailnet membership gives the brain (a) the enrollment channel (**OpenSSH over the tailnet** — `ssh box@grok-box-N …`; Tailscale SSH is off fleet-wide, §1), (b) a health cross-check (can the box reach the brain over BOTH paths?), and (c) a path to reach a box over OpenSSH for first-contact before a tunnel exists. `tag:fleet-brain` gets NO exit-node/subnet rights in the ACL — it is a management identity only. Joining is a ONE-TIME `tailscale up --advertise-tags=tag:fleet-brain` (the VPS's tailscaled is installed + running but `NeedsLogin` — VPS ground truth). | (a) tunnel-only, VPS off the tailnet — LOST: then enrollment has no bootstrap channel and the brain can't distinguish "tailnet down" from "this box down" (no second observation). (b) tailnet-only, no tunnel — LOST: the tailnet is exactly what fails in the case the brain exists to fix; the brain would be blind during the outage. | Tunnel-only loses the enrollment bootstrap and the two-path health signal; tailnet-only loses the brain during a tailnet outage. Both paths together are the design. | Two-path management (in-band + OOB) is standard for out-of-band mgmt; Tailscale tags as a management-only identity: [Tailscale ACL tags](https://tailscale.com/kb/1068/acl-tags). |
 | **We do NOT touch the VPS's global sshd config this iteration; the `fleet` user is key-only via its OWN `authorized_keys`.** VPS ground truth: `PasswordAuthentication yes`, `PermitRootLogin yes` globally — accepted AS-IS (changing them risks locking out the operator / disturbing xray/hysteria/wg0 coexisting on the host). The `fleet` user carries no password (`passwd -l fleet`) so `PasswordAuthentication yes` cannot be used against it; its only credential is the per-box pubkey lines with `restrict,...,permitlisten`. | (a) harden global sshd (set PasswordAuthentication no, PermitRootLogin prohibit-password) — LOST this iteration: out of scope, high blast radius on a shared host we don't own the policy of; it's the operator's call, tracked as a follow-up. | If we silently rewrote global sshd we could lock out root or break the operator's other access; keeping `fleet` locked + key-only bounds our change to one user. | Per-user `authorized_keys` restriction without global changes: [sshd(8) AUTHORIZED_KEYS](https://man.openbsd.org/OpenBSD-current/sshd). |
 | **Tunnels MUST survive an sshd restart (unattended-upgrades).** VPS ground truth: `unattended-upgrades` is active and may restart `sshd`, dropping every reverse tunnel. The box-side `ssh -N` carries `ServerAliveInterval=30 ServerAliveCountMax=3` so a dropped tunnel dies within ~90s and the next boxup tick respawns it; the VPS-side `ss -tln` probe (reconcile input ii) confirms re-listen. No VPS-side keepalive is possible (`ClientAliveInterval 0`, and we don't touch global sshd). | rely on the VPS to keep the tunnel — LOST: `ClientAliveInterval 0` means the VPS never reaps/notices a half-dead tunnel; recovery MUST be client-driven. | Without client-side ServerAlive + tick respawn, an sshd restart silently blinds the brain to every box until the next full reconnect. | ssh keepalive semantics: [ssh_config(5) ServerAliveInterval]. |
 
-### 3. `fleet2 reconcile` — decision table
+### 3. `grokfleet reconcile` — decision table
 
 Runs every 5 min under the timer. **Inputs** per box: (i) the Tailscale API
 device list (`GET /api/v2/tailnet/-/devices?fields=all` — `lastSeen`, `nodeId`,
@@ -122,12 +122,12 @@ signal, cross-checked by whether a `boxup check` over it succeeds); (iii)
 | a | tailnet says the node is **gone/offline** (absent from devices, or `lastSeen` stale) BUT the **tunnel is alive** | mint a per-box tag-scoped key, seed it ATOMICALLY over the tunnel (written as root via `sudo env … sh -c`; the key travels on stdin, never argv), run `boxup once` over the tunnel | `POST /api/v2/tailnet/-/keys` with `capabilities.devices.create = {reusable:true, ephemeral:false, preauthorized:true, tags:["tag:grok-box"]}`, `expirySeconds` ≤ 7776000 (90d). **`reusable:true, ephemeral:false` is MANDATORY** (frozen on-box wall, H11): the seeded key must survive REPEATED state-loss rejoins between rotations — a `reusable:false` key dies on first consumption, killing the box's unattended-rejoin path for the next state-loss event. Per-box scoping + rotation (row c) + API revoke on rotation is the blast-radius control, NOT single-use. **Atomic + verified seed (S1):** write the returned `key` to `secrets/.ts-authkey.tmp` (mode 600) over the tunnel, `sha256sum` verify the write, `mv` into place `secrets/ts-authkey`; then write the returned **`expires`** to `secrets/ts-authkey.expires` (replaces the manual H11 sidecar — see §6). Confirm via `sudo boxup status` over the tunnel that the new authkey state shows BEFORE the brain records the mint as done / advances the mint-window guard; on verify-fail, do NOT advance the guard (retry next tick). Never log the key. **Seed or verify failure ⇒ the just-minted key is revoked** (an unrecorded live key is the worse failure) and the mint-window guard is NOT advanced; if the failure happened after the remote `mv` the box may hold the now-revoked NEW key and be left without a valid authkey, so the re-mint happens on the next state-loss/rejoin or known-expiry trigger (never a guarantee that the OLD key is still installed). **Escalation (N-1):** if the atomic-seed/`boxup status` verify fails for **> 3 consecutive runs** (mint 2xx but the over-tunnel seed never converges while `boxup check` still passes on the OLD key), raise the SAME actionable incident as row `e` (reachable-but-cannot-converge) — otherwise a silently no-op'ing mint would only surface via the < 7d expiry warn. |
 | b | **duplicate hostname** in the device list (≥2 devices whose `hostname`==grok-box-N) | delete the **OLDER OFFLINE** one, THEN restore the live node's name | pick the device with the older `created`/`lastSeen` that is currently offline; `DELETE /api/v2/device/<stale-id>`. THEN — because a state-loss rejoin gives the LIVE node the MagicDNS name `grok-box-N-1` and `tailscale set --hostname` does NOT clear the `-1` suffix (F2, verified on box-8) — restore the name via `POST /api/v2/device/<live-id>/name` `{"name":"grok-box-N"}` (verified HTTP 200, name restored). NEVER delete the online one; if BOTH are online, do NOT delete — flag an incident (ambiguous, needs a human). **Eventual consistency (P2-4):** rows `a` and `b` are eventually consistent ACROSS reconcile runs, not atomic — the mint in `a` creates the `grok-box-N-1` corpse that `b` renames on a LATER run, so `grok-box-N` may resolve to the corpse for up to one 5-min window post-rejoin. |
 | c | **AUTH-KEY expiry < 7 days** (the minted key's `expires`, persisted to `secrets/ts-authkey.expires`) | **rotate**: mint a fresh per-box key (same shape as `a` — `reusable:true, ephemeral:false, preauthorized:true`), seed ATOMICALLY over the tunnel (S1), update `.expires`, then API-revoke the OLD key | Proactive. **Two DIFFERENT clocks — do not conflate (S2):** (i) the **AUTH-KEY expiry** = the `expires` RETURNED by the key-create in row `a`, persisted to `.expires` — THIS is our rotation trigger (< 7d). (ii) the device **NODE-KEY expiry** = `expires` on the *device* object, governed by `keyExpiryDisabled=true` fleet-wide — NOT our concern and NOT a rotation trigger. Rotate on (i) only; never read the device node-key `expires` as if it were the auth-key expiry. The per-box key + API `expires` supersede the manual 90-day sidecar. |
-| d | **version drift** (`boxup check` / status `v=` VERSION != target VERSION — see "Drift key" below; NOT the stamped sha) | **canary rollout REUSING the existing D7 rollout logic** (canary-first, verify via `boxup check`, abort-on-first-failure) — driven over the tunnels instead of laptop-over-tailnet | do NOT reimplement rollout; fleet2 already owns D7 canary/abort/no-auto-rollback. Deploy = push the new tree + `install.sh` (which runs the E1 version-change migration) over the tunnel. |
+| d | **version drift** (`boxup check` / status `v=` VERSION != target VERSION — see "Drift key" below; NOT the stamped sha) | **canary rollout REUSING the existing D7 rollout logic** (canary-first, verify via `boxup check`, abort-on-first-failure) — driven over the tunnels instead of laptop-over-tailnet | do NOT reimplement rollout; grokfleet already owns D7 canary/abort/no-auto-rollback. Deploy = push the new tree + `install.sh` (which runs the E1 version-change migration) over the tunnel. |
 | e | **BOTH paths dead** (no tailnet device/stale `lastSeen` AND no tunnel) | tiered per Q1 (user ruling) | **Informational "asleep"** after **T = 2h** of both-paths-dead (≈ two missed hourly `once` windows): one alert, then a DAILY digest — a sand box legitimately sleeps. **ACTIONABLE incident** (paged, not digest) IMMEDIATELY — after 2 consecutive reconcile runs — when the split is INCOHERENT: the API says the device is **online / `lastSeen` fresh** yet BOTH paths are dead (something is lying), OR tunnel-alive + `boxup check` FAIL persists **> 3 runs** (a box that is reachable but cannot converge). |
 | — | **API failure / rate-limit policy (S3, applies to every row)** | on any Tailscale API **non-2xx (429 / 5xx / timeout)**, the run is **READ-ONLY**: no mint, no delete, no rename this run. Retry on the next timer tick with bounded backoff **5 → 10 → 20 min**; `notify()` alert after **3 consecutive** API failures. NEVER act on a **partial device list** (a truncated/errored `GET devices` is treated as no data, not as "device absent" → never triggers a delete or a mint). | fail-closed + idempotent: a failing dependency must not half-complete a mutation (esp. combined with the atomic-seed guard in row `a`). |
 | — | **idempotency + safety (applies to every row)** | a per-run `flock` on `/var/lib/grok-fleet/reconcile.lock` (never two reconciles at once); every action is idempotent (mint only if no valid key seeded this window; delete only a specific stale id; `boxup once` is already idempotent); and reconcile NEVER runs a box action while that box's OWN converge lock is held — it drives `boxup once`/`check` which take the box's lock themselves (D3), so the brain issues the command and lets the box serialize. The brain does not hold a box's lock; it calls boxup, which does. | mirrors DESIGN.md D3 (converge lock) + the D7 rollout flock. |
-| — | **No HOME dependency (VPS bring-up bug A).** fleet2 runs under `set -u`; systemd does NOT export `HOME` for a system service, so NO top-level `$HOME` expansion may be unguarded — every one is `${HOME:-}` (config-path default arm + the systemd-user-timer `UNIT_DIR`). The unit sets `Environment=HOME=/var/lib/grok-fleet` (the state tree, keeping the whole brain inside the one declared footprint — not `/root`). | (a) rely on systemd exporting HOME — LOST: it doesn't for a system unit, so a bare `$HOME` aborts at LOAD before dispatch. (b) `HOME=/root` — LOST: puts fleet activity outside the declared `/opt`+`/var/lib`+`/etc` grok-fleet footprint (one-tree rule). | **Breaks if undone:** a bare top-level `$HOME` under `set -u` with no HOME → `HOME: unbound variable`, the script aborts at load, and EVERY `fleet-reconcile.timer` run fails `status=1/FAILURE` before `cmd_reconcile` ever runs (proven live on the VPS). | `set -u` unbound-var semantics; systemd system units start with an empty env (no HOME) unless one is set. |
-| — | **Never `exec` with a persistent stderr redirect (VPS bring-up bug B).** An `exec N>file 2>/dev/null` (redirections + NO command) makes the `2>/dev/null` PERMANENT for the whole process — it silently swallows every subsequent `log()` (all of which write to stderr). Open a lock/log fd with the redirect SCOPED to a brace group: `{ exec 9>"$lock"; } 2>/dev/null \|\| { log ...; return 1; }`. | (a) `exec 9>"$lock" 2>/dev/null` — LOST: swallows all later stderr; interactive `reconcile` exits 0 with NO output. (b) `exec 9>&- 2>/dev/null` on the failure arm — same footgun (see the boxup H3 note that already documents this). | **Breaks if undone:** interactive `fleet2 reconcile` (and every timer run) produces ZERO log output and exits 0 silently — mutation-verified: reverting the fix drops reconcile's stderr from 4 lines to 0. | `exec` with only redirections applies them to the current shell for the rest of its life — [bash exec(1p)]; brace-group scoping confines the redirect to the group. |
+| — | **No HOME dependency (VPS bring-up bug A).** grokfleet runs under `set -u`; systemd does NOT export `HOME` for a system service, so NO top-level `$HOME` expansion may be unguarded — every one is `${HOME:-}` (config-path default arm + the systemd-user-timer `UNIT_DIR`). The unit sets `Environment=HOME=/var/lib/grok-fleet` (the state tree, keeping the whole brain inside the one declared footprint — not `/root`). | (a) rely on systemd exporting HOME — LOST: it doesn't for a system unit, so a bare `$HOME` aborts at LOAD before dispatch. (b) `HOME=/root` — LOST: puts fleet activity outside the declared `/opt`+`/var/lib`+`/etc` grok-fleet footprint (one-tree rule). | **Breaks if undone:** a bare top-level `$HOME` under `set -u` with no HOME → `HOME: unbound variable`, the script aborts at load, and EVERY `grokfleet-reconcile.timer` run fails `status=1/FAILURE` before `cmd_reconcile` ever runs (proven live on the VPS). | `set -u` unbound-var semantics; systemd system units start with an empty env (no HOME) unless one is set. |
+| — | **Never `exec` with a persistent stderr redirect (VPS bring-up bug B).** An `exec N>file 2>/dev/null` (redirections + NO command) makes the `2>/dev/null` PERMANENT for the whole process — it silently swallows every subsequent `log()` (all of which write to stderr). Open a lock/log fd with the redirect SCOPED to a brace group: `{ exec 9>"$lock"; } 2>/dev/null \|\| { log ...; return 1; }`. | (a) `exec 9>"$lock" 2>/dev/null` — LOST: swallows all later stderr; interactive `reconcile` exits 0 with NO output. (b) `exec 9>&- 2>/dev/null` on the failure arm — same footgun (see the boxup H3 note that already documents this). | **Breaks if undone:** interactive `grokfleet reconcile` (and every timer run) produces ZERO log output and exits 0 silently — mutation-verified: reverting the fix drops reconcile's stderr from 4 lines to 0. | `exec` with only redirections applies them to the current shell for the rest of its life — [bash exec(1p)]; brace-group scoping confines the redirect to the group. |
 | — | **Always send `Accept: application/json` on every Tailscale API call (VPS bring-up bug D).** The ACL endpoint (`GET /tailnet/-/acl`) returns HuJSON (leading `//` comment, trailing commas) by default; `jq -e` cannot parse HuJSON (exits rc 5), so `acl_has_fleet_brain_tagowner()` fails and `enroll` refuses even when `tag:fleet-brain` IS in tagOwners. The `Accept: application/json` header is written to the curl `--config` file alongside `Authorization` for ALL `ts_api` calls, so every endpoint returns strict JSON. | (a) omit Accept (rely on the default) — LOST: default is HuJSON on the ACL endpoint, jq fails. (b) run the body through a HuJSON→JSON stripper — LOST: fragile, and the API already serves strict JSON when asked. | **Breaks if undone:** `enroll` refuses every box with "tag:fleet-brain has no tagOwners entry" even though the ACL is correct (proven live on the VPS); the failure is opaque because jq's rc 5 is masked. | Tailscale API content negotiation: `Accept: application/json` returns parsed JSON, otherwise HuJSON; [Tailscale API](https://tailscale.com/api). |
 
 Key-mint capability shape and the `expires` return field are confirmed against
@@ -159,7 +159,7 @@ row `a`/`c`, per the frozen H11 wall). Device delete: [Remove a device via API](
 - Split-brain / duplicate-node reconciliation (needs the API — never on a box).
 - Auth-key MINTING and rotation (per-box, API-driven) — replaces the shared
   90-day key and the operator-typed `.expires` file.
-- Version-drift detection + canary rollout orchestration (already fleet2's
+- Version-drift detection + canary rollout orchestration (already grokfleet's
   D7 job; now runs from the always-on brain, not the sometimes-on laptop).
 - Fleet-wide alerting (`notify()` → Telegram).
 
@@ -197,11 +197,11 @@ resurrect itself.
 Ordered, each step reversible:
 
 1. **Stand up the brain read-only.** Deploy `/opt/grok-fleet` + timer, but
-   `fleet2 reconcile --dry-run` only (log intended actions, mint/delete
+   `grokfleet reconcile --dry-run` only (log intended actions, mint/delete
    nothing). Verify the device list + tunnel liveness + `boxup check`-over-
    tunnel for all 8 boxes. **Rollback:** `systemctl disable --now
-   fleet-reconcile.timer`; nothing was mutated.
-2. **Enroll tunnels box-by-box** (`fleet2 enroll grok-box-N` over **OpenSSH on the tailnet** — `ssh box@grok-box-N …`, since Tailscale SSH is off fleet-wide) while boxes are healthy on the tailnet. Enroll writes BOTH the VPS-side `authorized_keys` line AND the box's own `[fleet]` block (`vps`/`box_index`), so the tunnel dials on the next `boxup once` with no manual edit (see Ops notes). **Rollback:** remove the
+   grokfleet-reconcile.timer`; nothing was mutated.
+2. **Enroll tunnels box-by-box** (`grokfleet enroll grok-box-N` over **OpenSSH on the tailnet** — `ssh box@grok-box-N …`, since Tailscale SSH is off fleet-wide) while boxes are healthy on the tailnet. Enroll writes BOTH the VPS-side `authorized_keys` line AND the box's own `[fleet]` block (`vps`/`box_index`), so the tunnel dials on the next `boxup once` with no manual edit (see Ops notes). **Rollback:** remove the
    box's `authorized_keys` line on the VPS; the box's `ssh -N` loop just fails
    to connect (harmless, the tick keeps retrying). (To leave the box side alone
    entirely, enroll with `--no-box-config`.)
@@ -252,7 +252,7 @@ wall above.
    minted, never printed); OAuth-client → short-lived per-run token is the
    tracked follow-up (§4 credential-shape row).
 3. **`tag:fleet-brain`:** confirmed, NO exit-node/subnet rights. Operator adds
-   `"tag:fleet-brain": ["autogroup:admin"]` to `tagOwners`. `fleet2 enroll`
+   `"tag:fleet-brain": ["autogroup:admin"]` to `tagOwners`. `grokfleet enroll`
    PRECHECKS this via `GET /acl` and refuses with a clear message if absent.
 4. **`notify()`:** real env-gated sink, not a stub — journal/stderr always;
    Telegram POST when `/etc/grok-fleet/telegram.env` (600) is present (§4 row).
@@ -265,13 +265,13 @@ wall above.
    using the VPS's own ed25519 key, enrolled into the box's `authorized_keys`
    at enroll time — NO password fallback in the reconciler — then `sudo boxup
    once/check`; the box's converge lock serializes.
-8. **#12 upgrade (drop the 8-port sshd cap):** after deploying a fleet2 that
+8. **#12 upgrade (drop the 8-port sshd cap):** after deploying a grokfleet that
    post-dates #12, re-run `vps/install-vps.sh` ONCE on the VPS (idempotent — it
-   deploys fleet2 AND rewrites the sshd drop-in to `PermitListen any`, then
+   deploys grokfleet AND rewrites the sshd drop-in to `PermitListen any`, then
    reloads sshd; a failed reload is now FATAL). This replaces any hand-widened
    `50-grok-fleet.conf` with the uncapped drop-in; per-key `permitlisten` stays
    the confinement. Prove the running daemon adopted it end-to-end with a real
-   `fleet2 enroll grok-box-N` succeeding with the tunnel-up line — `sshd -T`
+   `grokfleet enroll grok-box-N` succeeding with the tunnel-up line — `sshd -T`
    alone reads disk, not the live daemon.
 
 ## §config-truth — the brain is the source of truth for box config (Phase 2)
@@ -417,7 +417,7 @@ the canary is to catch a bad *render*, not to gate on reachability):
 **The config pass is best-effort and its rc is NOT folded into the reconcile
 service's exit code.** Each tick logs a one-line summary `config: pass done
 (dry-run|apply) ok=N skipped=N failed=N`. A failing config push therefore never
-flips `fleet-reconcile.service` to `Result=exit-code` (that Result reflects the
+flips `grokfleet-reconcile.service` to `Result=exit-code` (that Result reflects the
 per-box decision loop only). **Soak / gate criterion (by NOTIFY ORIGIN, not
 line prefix):** the config pass is healthy over the soak window when there is
 **no `notify[warn]: config push failing …` line** AND, in the `pass done`
@@ -442,10 +442,10 @@ inert — but the brain cannot make that box honour the pushed file. Roll boxup
 out first via the canary-first row-d rollout, THEN create `fleet.toml`.
 
 **Live re-gate precondition (checkfail floor).** Before deploying a branch
-`fleet2` for a live config-pass gate, verify every AWAKE enrolled box has
+`grokfleet` for a live config-pass gate, verify every AWAKE enrolled box has
 `.checkfail` ≤ 3 by reading the state file directly — `cat
 $FLEET_STATE/<box>.checkfail` (absent or `0` = healthy). Do **not** rely on the
-`fleet2 fleet-status` CHECK column: it can read OK for a box whose
+`grokfleet fleet-status` CHECK column: it can read OK for a box whose
 `.checkfail` count is already 6 (the column reflects the last check attempt,
 not the accumulated fail count), which is exactly the state that makes the
 config pass skip the canary. An awake box over the floor must be brought back
@@ -458,10 +458,10 @@ one run (ssh rc 255), never by leaning on stale checkfail state.
 ```
 # after boxup is deployed fleet-wide (see PRECONDITION):
 $EDITOR /etc/grok-fleet/fleet.toml                 # + boxes/<box>.toml as needed
-fleet2 config render grok-box-008                # inspect the merged result
-fleet2 config diff   grok-box-008                # exit 1 = drift, 0 = in sync
-fleet2 config push   grok-box-008                # push the canary first, by hand
-fleet2 config diff   grok-box-8                  # confirm in sync (exit 0)
+grokfleet config render grok-box-008                # inspect the merged result
+grokfleet config diff   grok-box-008                # exit 1 = drift, 0 = in sync
+grokfleet config push   grok-box-008                # push the canary first, by hand
+grokfleet config diff   grok-box-8                  # confirm in sync (exit 0)
 # reconcile then converges the rest under --apply (canary-first, serial)
 ```
 
@@ -471,32 +471,32 @@ path, no second implementation.
 
 ## Ops notes
 
-- **`fleet2 enroll grok-box-N` now writes the BOX side too (one-step enroll).** Enroll installs the VPS-side `authorized_keys` line AND writes the box's own `/workspace/box-setup/config.toml` `[fleet]` block (`vps` + `box_index`, plus `port` when the VPS sshd port is non-default) over the SAME OpenSSH-on-the-tailnet session it uses to read the tunnel pubkey (`box_ssh` + `sudo`). So the box starts dialing its reverse tunnel on the next `boxup once` with **no manual hand-edit** — closing the historical two-part-enroll gap where the VPS trusted the box's key but the box never dialed out (tunnel stayed dead until someone edited `config.toml`). The write is **idempotent**: same values ⇒ a byte-for-byte no-op (file + mode `600` untouched); differing values ⇒ the key lines are replaced in place (the rest of the file preserved), and the `[fleet]` block is never duplicated. After writing, enroll **reads every key back off the box and asserts it** — a mismatch is treated as a write failure. The box-config write is the **last side effect before the enrollment is recorded**: on failure enroll logs a WARNING, does **not** record the enrollment, and returns non-zero (the VPS-side key is left in place — harmless, the retry is idempotent). If the box's `config.toml` is **absent** (box never ran `install.sh`), enroll says so distinctly ("run install.sh on the box first") and never creates the file.
+- **`grokfleet enroll grok-box-N` now writes the BOX side too (one-step enroll).** Enroll installs the VPS-side `authorized_keys` line AND writes the box's own `/workspace/box-setup/config.toml` `[fleet]` block (`vps` + `box_index`, plus `port` when the VPS sshd port is non-default) over the SAME OpenSSH-on-the-tailnet session it uses to read the tunnel pubkey (`box_ssh` + `sudo`). So the box starts dialing its reverse tunnel on the next `boxup once` with **no manual hand-edit** — closing the historical two-part-enroll gap where the VPS trusted the box's key but the box never dialed out (tunnel stayed dead until someone edited `config.toml`). The write is **idempotent**: same values ⇒ a byte-for-byte no-op (file + mode `600` untouched); differing values ⇒ the key lines are replaced in place (the rest of the file preserved), and the `[fleet]` block is never duplicated. After writing, enroll **reads every key back off the box and asserts it** — a mismatch is treated as a write failure. The box-config write is the **last side effect before the enrollment is recorded**: on failure enroll logs a WARNING, does **not** record the enrollment, and returns non-zero (the VPS-side key is left in place — harmless, the retry is idempotent). If the box's `config.toml` is **absent** (box never ran `install.sh`), enroll says so distinctly ("run install.sh on the box first") and never creates the file.
   - **VPS address (D1) — REQUIRED, no baked default.** The address enroll writes into `[fleet].vps` on the box is resolved on the BRAIN side as `FLEET_VPS_ADDR` (env) → `[fleet-brain].vps` (brain config) → **REFUSE**. There is **no** hardcoded fallback: if neither is set, enroll refuses as a precheck **before any side effect** (no ACL check, no key installs). Set it once per brain. The port enroll writes (only when non-default) comes from `FLEET_VPS_PORT` (env) → `[fleet-brain].vps_port` → `22`.
-  - **`box_index = N`** is parsed from the box name. Pass **`fleet2 enroll --no-box-config grok-box-N`** to skip the box-side write and keep the old behavior (you then edit `[fleet]` by hand and run `sudo /workspace/box-setup/boxup once`); the `--no-box-config` flag is order-independent with the box-name positional. A manual edit is only needed for such special cases now.
-- **One-time migration for EXISTING brains (add `vps` under `[fleet-brain]`).** A fresh `vps/install-vps.sh` seeds the `[fleet-brain].vps` (+`vps_port`) template keys, but a brain installed **before** the D1 change has a `config.toml` without them (the installer never overwrites an operator's config). Because enroll now REFUSES without a resolved address, each existing brain needs a **one-time** operator step: either add `vps = "<this-brain's-address>"` (and optionally `vps_port = <N>`) under `[fleet-brain]` in `/opt/grok-fleet/config.toml`, **or** export `FLEET_VPS_ADDR` (and `FLEET_VPS_PORT`) in the reconcile unit's environment. Until one of these is done, `fleet2 enroll` on that brain refuses with a clear message pointing here.
-- **`~fleet/.ssh/authorized_keys` MUST be owned by the fleet user (dir `700`, file `600`, both `$FLEET_VPS_USER:$FLEET_VPS_USER`)** — sshd `StrictModes` privsep reads it AS `fleet`; a root-owned file yields "Could not open user 'fleet' authorized keys … Permission denied" and every tunnel fails `publickey`. `fleet2 enroll` now chowns it on every write (BUG-E).
+  - **`box_index = N`** is parsed from the box name. Pass **`grokfleet enroll --no-box-config grok-box-N`** to skip the box-side write and keep the old behavior (you then edit `[fleet]` by hand and run `sudo /workspace/box-setup/boxup once`); the `--no-box-config` flag is order-independent with the box-name positional. A manual edit is only needed for such special cases now.
+- **One-time migration for EXISTING brains (add `vps` under `[fleet-brain]`).** A fresh `vps/install-vps.sh` seeds the `[fleet-brain].vps` (+`vps_port`) template keys, but a brain installed **before** the D1 change has a `config.toml` without them (the installer never overwrites an operator's config). Because enroll now REFUSES without a resolved address, each existing brain needs a **one-time** operator step: either add `vps = "<this-brain's-address>"` (and optionally `vps_port = <N>`) under `[fleet-brain]` in `/opt/grok-fleet/config.toml`, **or** export `FLEET_VPS_ADDR` (and `FLEET_VPS_PORT`) in the reconcile unit's environment. Until one of these is done, `grokfleet enroll` on that brain refuses with a clear message pointing here.
+- **`~fleet/.ssh/authorized_keys` MUST be owned by the fleet user (dir `700`, file `600`, both `$FLEET_VPS_USER:$FLEET_VPS_USER`)** — sshd `StrictModes` privsep reads it AS `fleet`; a root-owned file yields "Could not open user 'fleet' authorized keys … Permission denied" and every tunnel fails `publickey`. `grokfleet enroll` now chowns it on every write (BUG-E).
 
-## Upgrades and inventory (fleet2, phase 1)
+## Upgrades and inventory (grokfleet, phase 1)
 
-`fleet2` is the fleet brain rewritten in **bun + TypeScript** (blueprint `blueprints/fleet-ts-phase1.md`). Phase 1 ships a standalone compiled binary that (a) **inventories** the fleet and (b) **upgrades boxes in batch** to a desired git ref, reusing the exact deploy sequence of bash `tunnel_deploy_one`. It runs on the VPS **alongside** bash `fleet2` (which still owns reconcile/mint/config until phase 2) and coexists safely via the shared `reconcile.lock`.
+`grokfleet` is the fleet brain rewritten in **bun + TypeScript** (blueprint `blueprints/fleet-ts-phase1.md`). Phase 1 ships a standalone compiled binary that (a) **inventories** the fleet and (b) **upgrades boxes in batch** to a desired git ref, reusing the exact deploy sequence of bash `tunnel_deploy_one`. It runs on the VPS **alongside** bash `grokfleet` (which still owns reconcile/mint/config until phase 2) and coexists safely via the shared `reconcile.lock`.
 
 ### Commands
 
-- `fleet2 version [--json]` — prints `fleet2 <version> (<git sha>) (bun <ver>)`, or `{name, version, sha, bun}`.
-- `fleet2 rc [--json]` — the exit-code table (see below). Needs no config, so it answers on any host.
-- `fleet2 ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd…]` — run one command on a box, or open a session. See "For agents" below.
-- `fleet2 list [--json]` — the tailnet peers named `grok-box-N`, with their Tailscale IP and online state.
-- `fleet2 inventory [--json] [box…]` — one row per enrolled box: `NAME API TUNNEL CHECK VERSION SHA TARGET DRIFT AUTHKEY`. `API` (online/offline + `lastSeen`) comes from the Tailscale devices endpoint (`GET /tailnet/<tailnet>/devices?fields=all`, Bearer token from the same 0600 file bash `fleet2` uses — `FLEET_API_TOKEN_FILE` > `[fleet-brain].api_token_file` > `$FLEET_ETC/api-token`); the API is unavailable ⇒ `?`. `TUNNEL` is the VPS-side `ss -tln` probe; a tunnel-down box shows `-` for CHECK/VERSION/SHA/DRIFT. From 5.9.0 it PERSISTS NOTHING: `inventory.json` is retired (state-store D3/D7) and the pass renders from the store's `boxes` rows plus the last tick's snapshot, which is also where the staleness header's previous timestamp comes from. `--json` prints the same object it always did. Always exits 0; `inventory` never fails on an unresolvable target (TARGET/DRIFT render `?`) nor on an API failure.
-- `fleet2 upgrade [--to REF] [--all | box…] [--apply] [--canary BOX] [--json]` — **dry-run by default**: prints the plan (`box  running v/sha  target v/sha  action`) and exits 0 without staging. `--apply` stages the tree once and deploys **serially**: canary first, then the rest in enrolled order. Tunnel-down non-canary ⇒ skip; in-sync ⇒ skip; **canary unreachable or verified-failure ⇒ ABORT** (zero others touched). Rollback is the same command with `--to <previous sha>` — no special path.
+- `grokfleet version [--json]` — prints `grokfleet <version> (<git sha>) (bun <ver>)`, or `{name, version, sha, bun}`.
+- `grokfleet rc [--json]` — the exit-code table (see below). Needs no config, so it answers on any host.
+- `grokfleet ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd…]` — run one command on a box, or open a session. See "For agents" below.
+- `grokfleet list [--json]` — the tailnet peers named `grok-box-N`, with their Tailscale IP and online state.
+- `grokfleet inventory [--json] [box…]` — one row per enrolled box: `NAME API TUNNEL CHECK VERSION SHA TARGET DRIFT AUTHKEY`. `API` (online/offline + `lastSeen`) comes from the Tailscale devices endpoint (`GET /tailnet/<tailnet>/devices?fields=all`, Bearer token from the same 0600 file bash `grokfleet` uses — `FLEET_API_TOKEN_FILE` > `[fleet-brain].api_token_file` > `$FLEET_ETC/api-token`); the API is unavailable ⇒ `?`. `TUNNEL` is the VPS-side `ss -tln` probe; a tunnel-down box shows `-` for CHECK/VERSION/SHA/DRIFT. From 5.9.0 it PERSISTS NOTHING: `inventory.json` is retired (state-store D3/D7) and the pass renders from the store's `boxes` rows plus the last tick's snapshot, which is also where the staleness header's previous timestamp comes from. `--json` prints the same object it always did. Always exits 0; `inventory` never fails on an unresolvable target (TARGET/DRIFT render `?`) nor on an API failure.
+- `grokfleet upgrade [--to REF] [--all | box…] [--apply] [--canary BOX] [--json]` — **dry-run by default**: prints the plan (`box  running v/sha  target v/sha  action`) and exits 0 without staging. `--apply` stages the tree once and deploys **serially**: canary first, then the rest in enrolled order. Tunnel-down non-canary ⇒ skip; in-sync ⇒ skip; **canary unreachable or verified-failure ⇒ ABORT** (zero others touched). Rollback is the same command with `--to <previous sha>` — no special path.
 
 ### Config keys
 
-`fleet2` reads `$FLEET_CONFIG` (see the FLEET_CONFIG note below) with `Bun.TOML.parse`. Existing `[fleet-brain]` keys keep the same env-over-config precedence. New table **`[rollout]`**:
+`grokfleet` reads `$FLEET_CONFIG` (see the FLEET_CONFIG note below) with `Bun.TOML.parse`. Existing `[fleet-brain]` keys keep the same env-over-config precedence. New table **`[rollout]`**:
 
 - `src` — the git checkout the brain archives from (default `/opt/grok-fleet/src`; falls back to `[fleet-brain].rollout_src` / `FLEET_ROLLOUT_SRC`). Create it once: `git clone https://github.com/chaogebaba/grok-box-setup.git /opt/grok-fleet/src`.
-- `target` — the git ref to converge to (tag, branch, or sha; default `main`). Override per-run with `--to`. **Resolved against the REMOTE (5.7.1):** after the best-effort `git fetch`, the brain probes `refs/remotes/origin/<target>` and resolves `origin/<target>` when it exists, logging `stage: target <ref> → origin/<ref> <sha> (v<version>)`. A ref with no remote-tracking counterpart — a tag, a raw sha, a purely local branch — resolves bare, as before. This is not a nicety: `src` is a checkout fleet2 never checks out or pulls, and a `git fetch` advances `refs/remotes/origin/main` while leaving the LOCAL `main` where it was. Before 5.7.1 the target sha had been frozen since 30 Aug, 77 commits behind origin, so every box read as "at target" and no boxup release could reach the fleet, with auto-rollout on or off. When the fetch fails the remote-tracking ref still resolves, to the last value this VPS actually fetched — the deliberate offline behaviour.
-- **Drift key = the boxup VERSION string (5.7.1+, D5).** Row-d drift and the `fleet2 upgrade` plan compare the box's `boxup status` VERSION (`v=<version>/<sha>`) against `git show <target sha>:VERSION` — never the stamped repo sha. The sha comparison marked the whole fleet drifted after every fleet2-only commit to `main` (a release pin, a doc, `fleet/` code), because those move the target sha without changing a byte of the box payload; with `auto = true` that re-installed boxup on every awake box for a no-op. The tri-state is unchanged (either side unknown ⇒ `unknown`, and unknown never rolls) and direction is irrelevant: a box AHEAD of target converges back, because the target is the authority. **Consequence for the operator: a change under `boxup/` reaches the fleet ONLY with a bump of the root `VERSION` file.** That is the same discipline fleet2 uses for itself (pinned release + sha in the installer); a content edit without a bump is invisible to rollout by design, because rollout is a release action, not a file sync. The stamped sha stays informational — it is what `fleet2 status`, the TUI, the snapshot and `lastUpgrade` display, and the post-deploy verify still requires `sha == target.sha` on two consecutive polls, since a fresh deploy stamps the target sha and sha equality is the right proof that THIS deploy landed. When the versions agree but the shas differ the tick logs one line per box, `drift: <box> same VERSION <v>, sha <a>≠<b> — content drift ignored (D5)`.
+- `target` — the git ref to converge to (tag, branch, or sha; default `main`). Override per-run with `--to`. **Resolved against the REMOTE (5.7.1):** after the best-effort `git fetch`, the brain probes `refs/remotes/origin/<target>` and resolves `origin/<target>` when it exists, logging `stage: target <ref> → origin/<ref> <sha> (v<version>)`. A ref with no remote-tracking counterpart — a tag, a raw sha, a purely local branch — resolves bare, as before. This is not a nicety: `src` is a checkout grokfleet never checks out or pulls, and a `git fetch` advances `refs/remotes/origin/main` while leaving the LOCAL `main` where it was. Before 5.7.1 the target sha had been frozen since 30 Aug, 77 commits behind origin, so every box read as "at target" and no boxup release could reach the fleet, with auto-rollout on or off. When the fetch fails the remote-tracking ref still resolves, to the last value this VPS actually fetched — the deliberate offline behaviour.
+- **Drift key = the boxup VERSION string (5.7.1+, D5).** Row-d drift and the `grokfleet upgrade` plan compare the box's `boxup status` VERSION (`v=<version>/<sha>`) against `git show <target sha>:VERSION` — never the stamped repo sha. The sha comparison marked the whole fleet drifted after every grokfleet-only commit to `main` (a release pin, a doc, `fleet/` code), because those move the target sha without changing a byte of the box payload; with `auto = true` that re-installed boxup on every awake box for a no-op. The tri-state is unchanged (either side unknown ⇒ `unknown`, and unknown never rolls) and direction is irrelevant: a box AHEAD of target converges back, because the target is the authority. **Consequence for the operator: a change under `boxup/` reaches the fleet ONLY with a bump of the root `VERSION` file.** That is the same discipline grokfleet uses for itself (pinned release + sha in the installer); a content edit without a bump is invisible to rollout by design, because rollout is a release action, not a file sync. The stamped sha stays informational — it is what `grokfleet status`, the TUI, the snapshot and `lastUpgrade` display, and the post-deploy verify still requires `sha == target.sha` on two consecutive polls, since a fresh deploy stamps the target sha and sha equality is the right proof that THIS deploy landed. When the versions agree but the shas differ the tick logs one line per box, `drift: <box> same VERSION <v>, sha <a>≠<b> — content drift ignored (D5)`.
 - `canary` — the first box deployed and verified (default `[fleet-brain].canary_box` else `grok-box-008`); `--canary BOX` overrides for one run.
 - `verify_interval` / `verify_tries` — the verify poll cadence (default `15` s × `8`).
 
@@ -504,87 +504,159 @@ Unknown `[rollout]` keys log one info line and are ignored.
 
 ### Verify criterion
 
-After the install command returns, fleet2 polls `/var/log/boxup-install.log` (which it truncated itself at the start of the same remote command) for this run's `DONE (rc=N)` line — `rc≠0` or no marker within `verify_tries` ⇒ verified FAILURE. It then requires `boxup check` rc 0 **and** the box's sha == target on **two consecutive** polls. Because fleet2 always passes a real `BOX_SETUP_GIT_SHA` (plus `BOX_SETUP_ONCE=1`), install.sh takes its designed detached migration path (unlike bash's `unknown` stamp, which never converges).
+After the install command returns, grokfleet polls `/var/log/boxup-install.log` (which it truncated itself at the start of the same remote command) for this run's `DONE (rc=N)` line — `rc≠0` or no marker within `verify_tries` ⇒ verified FAILURE. It then requires `boxup check` rc 0 **and** the box's sha == target on **two consecutive** polls. Because grokfleet always passes a real `BOX_SETUP_GIT_SHA` (plus `BOX_SETUP_ONCE=1`), install.sh takes its designed detached migration path (unlike bash's `unknown` stamp, which never converges).
 
 ### Exit codes
 
-Run **`fleet2 rc`** (or `fleet2 rc --json`). The table is rendered from the `RC` constant in `fleet/src/upgrade.ts`, so it cannot go stale: `0` ok · `1` verified failure / abort · `2` usage · `3` target/staging/config · `4` enroll tunnel never came up, or `config push` render refused · `5` policy precheck refused, nothing written · `6` refused, nothing done (not on the VPS / missing box key / `reconcile.lock` held / `flock` missing) · `7` recorded, but the legacy file export failed · `124` `fleet2 ssh --timeout` elapsed · `255` ssh transport failure.
+Run **`grokfleet rc`** (or `grokfleet rc --json`). The table is rendered from the `RC` constant in `fleet/src/upgrade.ts`, so it cannot go stale: `0` ok · `1` verified failure / abort · `2` usage · `3` target/staging/config · `4` enroll tunnel never came up, or `config push` render refused · `5` policy precheck refused, nothing written · `6` refused, nothing done (not on the VPS / missing box key / `reconcile.lock` held / `flock` missing) · `7` recorded, but the legacy file export failed · `124` `grokfleet ssh --timeout` elapsed · `255` ssh transport failure.
 
 ### For agents (non-interactive callers)
 
-`fleet2` is meant to be driven by a script or an agent, not only by a human at a terminal. Four rules cover it.
+`grokfleet` is meant to be driven by a script or an agent, not only by a human at a terminal. Four rules cover it.
 
-- **`fleet2 ssh <box> '<cmd>'` is a transparent remote exec.** fleet2 hands ssh its own file descriptors, so stdout and stderr stream through with no buffering, copying or reordering of fleet2's own, and the process exit code is the **remote** command's rc exactly (ssh's own `255` still means transport failure, never a remote rc). Pass **ONE quoted command string**: the remaining words are joined with a single space and handed to the remote login shell, exactly like bash's `"$*"`, so `fleet2 ssh grok-box-001 'cd /workspace && git status'` is right and relying on per-argument quoting is not. There is **no timeout by default**; `--timeout <seconds>` kills the command (SIGTERM, then SIGKILL five seconds later) and exits `124`, the `timeout(1)` convention. `--no-stdin` closes the child's stdin instead of inheriting it, and `--tty` forces a pty (`ssh -tt`) for programs that need one. Nothing of fleet2's is added to those streams, so whatever you parse is the box's output and nothing else.
-- **Ordering between the two streams is ssh's, not fleet2's.** Each stream arrives in write order. Their *relative* order does not survive a tight loop: sshd reads the remote command's stdout and stderr through separate pipes and packetises them, so writes landing in one read window arrive grouped — `for i in 1 2 3; do echo o$i; echo e$i 1>&2; done` comes back as `o1 o2 o3 e1 e2 e3`. Plain `ssh` with no fleet2 involved does exactly the same, and the same probe with a fifth of a second between writes interleaves correctly, so there is nothing on the client side to fix. If you need strict interleaving, merge on the **remote** side (`fleet2 ssh box 'cmd 2>&1'`) or ask for a pty with `--tty`, which puts both streams on one channel before they leave the box.
+- **`grokfleet ssh <box> '<cmd>'` is a transparent remote exec.** grokfleet hands ssh its own file descriptors, so stdout and stderr stream through with no buffering, copying or reordering of grokfleet's own, and the process exit code is the **remote** command's rc exactly (ssh's own `255` still means transport failure, never a remote rc). Pass **ONE quoted command string**: the remaining words are joined with a single space and handed to the remote login shell, exactly like bash's `"$*"`, so `grokfleet ssh grok-box-001 'cd /workspace && git status'` is right and relying on per-argument quoting is not. There is **no timeout by default**; `--timeout <seconds>` kills the command (SIGTERM, then SIGKILL five seconds later) and exits `124`, the `timeout(1)` convention. `--no-stdin` closes the child's stdin instead of inheriting it, and `--tty` forces a pty (`ssh -tt`) for programs that need one. Nothing of grokfleet's is added to those streams, so whatever you parse is the box's output and nothing else.
+- **Ordering between the two streams is ssh's, not grokfleet's.** Each stream arrives in write order. Their *relative* order does not survive a tight loop: sshd reads the remote command's stdout and stderr through separate pipes and packetises them, so writes landing in one read window arrive grouped — `for i in 1 2 3; do echo o$i; echo e$i 1>&2; done` comes back as `o1 o2 o3 e1 e2 e3`. Plain `ssh` with no grokfleet involved does exactly the same, and the same probe with a fifth of a second between writes interleaves correctly, so there is nothing on the client side to fix. If you need strict interleaving, merge on the **remote** side (`grokfleet ssh box 'cmd 2>&1'`) or ask for a pty with `--tty`, which puts both streams on one channel before they leave the box.
 - **The first-use host-key banner is suppressed for the non-interactive form.** `StrictHostKeyChecking=accept-new` pins an unknown key silently in every other respect, but ssh announces it once per host with `Warning: Permanently added …` on stderr, which lands in the middle of what is supposed to be the remote command's stderr and nothing else. The command form runs with `LogLevel=ERROR`, so that banner is gone while a failed connection (`ssh: connect to host … Connection timed out`, rc 255) and a **changed** host key both still print and still refuse. Opening a session (no command) keeps ssh's default log level, banner included, because a person should see it.
-- **`--json` on every read command** — `list`, `status`, `inventory`, `version`, `rc`, `state check`, `state reconcile-files`, and `upgrade` in its dry-run form. The output is ONE JSON document on stdout with no trailing prose; without the flag the human rendering is unchanged. Setting **`FLEET2_JSON=1`** in the environment is equivalent wherever `--json` exists, so an agent can set it once for a whole session.
-- **stdout is data, stderr is diagnostics.** Errors, refusals and progress never appear on stdout, so `fleet2 status --json | jq .` is always safe to pipe. The one deliberate exception is `fleet2 ssh`, where stdout belongs to the remote command.
-- **No non-zero exit is silent.** Every failing path prints one line to stderr naming the command and the reason before it returns. The single exemption is a non-zero rc coming back from `fleet2 ssh`: that rc is the remote command's, and ssh's own stderr is already inherited.
+- **`--json` on every read command** — `list`, `status`, `inventory`, `version`, `rc`, `state check`, `state reconcile-files`, and `upgrade` in its dry-run form. The output is ONE JSON document on stdout with no trailing prose; without the flag the human rendering is unchanged. Setting **`GROKFLEET_JSON=1`** in the environment is equivalent wherever `--json` exists, so an agent can set it once for a whole session.
+- **stdout is data, stderr is diagnostics.** Errors, refusals and progress never appear on stdout, so `grokfleet status --json | jq .` is always safe to pipe. The one deliberate exception is `grokfleet ssh`, where stdout belongs to the remote command.
+- **No non-zero exit is silent.** Every failing path prints one line to stderr naming the command and the reason before it returns. The single exemption is a non-zero rc coming back from `grokfleet ssh`: that rc is the remote command's, and ssh's own stderr is already inherited.
 
 ### FLEET_CONFIG default (stated deviation)
 
-fleet2 defaults `FLEET_CONFIG` to **`/opt/grok-fleet/config.toml`** (the systemd unit's value, `vps/install-vps.sh`), NOT bash `fleet2`'s `~/.config/fleet2/config.toml`. This is a deliberate deviation (blueprint S5) so a hand-run `fleet2` and the unit read the same config.
+grokfleet defaults `FLEET_CONFIG` to **`/opt/grok-fleet/config.toml`** (the systemd unit's value, `vps/install-vps.sh`), NOT bash `grokfleet`'s `~/.config/grokfleet/config.toml`. This is a deliberate deviation (blueprint S5) so a hand-run `grokfleet` and the unit read the same config.
 
 ### Coexistence via reconcile.lock
 
-`fleet2 upgrade --apply` runs its whole pass under bash `fleet2`'s `$FLEET_STATE/reconcile.lock` (non-blocking, via `flock -n`), so a reconcile tick and a fleet2 upgrade never mutate boxes at once — if the lock is held, fleet2 refuses (rc 6). `inventory` and dry-runs take no lock. The bash reconcile row-d rollout remains **unwired** (`FLEET_TARGET_SHA` is env-only) and is superseded by fleet2 in phase 2.
+`grokfleet upgrade --apply` runs its whole pass under bash `grokfleet`'s `$FLEET_STATE/reconcile.lock` (non-blocking, via `flock -n`), so a reconcile tick and a grokfleet upgrade never mutate boxes at once — if the lock is held, grokfleet refuses (rc 6). `inventory` and dry-runs take no lock. The bash reconcile row-d rollout remains **unwired** (`FLEET_TARGET_SHA` is env-only) and is superseded by grokfleet in phase 2.
 
 ### Build & deploy
 
-- `make ts-test` — the bun test suite (box-free). `make ts-build` — the compiled `fleet/dist/fleet2` (gitignored; never shipped to boxes). `make ts-deploy` — scp + atomic `mv` to `/opt/grok-fleet/fleet2`, keeping the previous binary as `fleet2.prev` (rollback = `mv fleet2.prev fleet2`).
+- `make ts-test` — the bun test suite (box-free). `make ts-build` — the compiled `fleet/dist/grokfleet` (gitignored; never shipped to boxes). `make ts-deploy` — scp + atomic `mv` to `/opt/grok-fleet/grokfleet`, keeping the previous binary as `grokfleet.prev` (rollback = `mv grokfleet.prev grokfleet`).
 
 ### Release + install
 
-Hosts do **not** build fleet2. They used to (`vps/install-vps.sh` ran `make ts-build` on the target), which meant provisioning needed bun **and** make **and** a full checkout — and the r2 gate died on the live VPS with `make: command not found`. The installer now downloads one pinned release asset with `curl`. Net host requirement: **curl + sha256sum**.
+Hosts do **not** build grokfleet. They used to (`vps/install-vps.sh` ran `make ts-build` on the target), which meant provisioning needed bun **and** make **and** a full checkout — and the r2 gate died on the live VPS with `make: command not found`. The installer now downloads one pinned release asset with `curl`. Net host requirement: **curl + sha256sum**.
 
 **Cutting a release — three operator steps, in this order** (build is split from publish so no gate can create a public release as a side effect):
 
 ```bash
-make ts-release-build              # local, network-free: builds fleet/dist/fleet2-linux-x64,
-                                   # computes the digest, and rewrites FLEET2_RELEASE +
-                                   # FLEET2_SHA256 in vps/install-vps.sh
-git commit -am 'release: bump the fleet2 pin'    # a normal commit on main
+make ts-release-build              # local, network-free: builds fleet/dist/grokfleet-linux-x64,
+                                   # computes the digest, and rewrites GROKFLEET_RELEASE +
+                                   # GROKFLEET_SHA256 in vps/install-vps.sh
+git commit -am 'release: bump the grokfleet pin'    # a normal commit on main
 make ts-release-publish CONFIRM=1  # tags THAT commit and uploads the asset
 ```
 
-The tag is created by step 3 at the commit produced by step 2, so the tag always names a commit whose installer pin matches the published bytes. `make ts-release-build` refuses if any tracked file **other than** those two constants is dirty, and refuses if `FLEET2_RELEASE` is not `v$PKG_VERSION` (`fleet/src/cli.ts`), so a version bump cannot silently leave the pin naming an older tag. `make ts-release-publish` refuses on a dirty tree, off `main`, an existing tag, a missing `CONFIRM=1`, **or** an artifact whose digest differs from the committed `FLEET2_SHA256` — the published bytes and the pin can never disagree. It prints exactly what it will do before doing it, and it is the only outward-facing target here: no gate ever runs its happy path.
+The tag is created by step 3 at the commit produced by step 2, so the tag always names a commit whose installer pin matches the published bytes. `make ts-release-build` refuses if any tracked file **other than** those two constants is dirty, and refuses if `GROKFLEET_RELEASE` is not `v$PKG_VERSION` (`fleet/src/cli.ts`), so a version bump cannot silently leave the pin naming an older tag. `make ts-release-publish` refuses on a dirty tree, off `main`, an existing tag, a missing `CONFIRM=1`, **or** an artifact whose digest differs from the committed `GROKFLEET_SHA256` — the published bytes and the pin can never disagree. It prints exactly what it will do before doing it, and it is the only outward-facing target here: no gate ever runs its happy path.
 
-**How a host installs.** `sudo bash vps/install-vps.sh` from a checkout. Its **preflight** — before `ensure_dirs`, before `ensure_fleet_user`, before anything on the host is touched — fetches `https://github.com/chaogebaba/grok-box-setup/releases/download/<FLEET2_RELEASE>/fleet2-linux-x64` and verifies it against the in-repo `FLEET2_SHA256`. A failed fetch or a failed verify exits rc 1 leaving the host **byte-identical** to before the run: no dirs created, no `fleet` user created, the incumbent engine untouched. No `gh`, no token, no credentials: the repo and the release are public. The incumbent bash `fleetctl` is retired **only after** the verified replacement is live and has passed its `version` smoke test (see the rollback note below).
+**How a host installs.** `sudo bash vps/install-vps.sh` from a checkout. Its **preflight** — before `ensure_dirs`, before `ensure_fleet_user`, before anything on the host is touched — fetches `https://github.com/chaogebaba/grok-box-setup/releases/download/<GROKFLEET_RELEASE>/grokfleet-linux-x64` and verifies it against the in-repo `GROKFLEET_SHA256`. A failed fetch or a failed verify exits rc 1 leaving the host **byte-identical** to before the run: no dirs created, no `fleet` user created, the incumbent engine untouched. No `gh`, no token, no credentials: the repo and the release are public. The incumbent bash `fleetctl` is retired **only after** the verified replacement is live and has passed its `version` smoke test (see the rollback note below).
 
-**Pin / rollback.** The pin is the **sha256, not the tag**. A git tag is mutable (`git tag -f && git push -f --tags`) and so is a release asset (`gh release upload --clobber`), so the tag pins a *name*, not bytes; `FLEET2_RELEASE` is only the fetch address and `FLEET2_SHA256` is the identity. Both are overridable by env, but only **together** — one alone is a refusal, because a rollback legitimately needs both and one alone means fetching bytes nobody pinned:
+**Pin / rollback.** The pin is the **sha256, not the tag**. A git tag is mutable (`git tag -f && git push -f --tags`) and so is a release asset (`gh release upload --clobber`), so the tag pins a *name*, not bytes; `GROKFLEET_RELEASE` is only the fetch address and `GROKFLEET_SHA256` is the identity. Both are overridable by env, but only **together** — one alone is a refusal, because a rollback legitimately needs both and one alone means fetching bytes nobody pinned:
 
 ```bash
-sudo FLEET2_RELEASE=v5.4.0 FLEET2_SHA256=<hex> bash vps/install-vps.sh
+sudo GROKFLEET_RELEASE=v5.4.0 GROKFLEET_SHA256=<hex> bash vps/install-vps.sh
 ```
 
-**Air-gapped / GitHub-unreachable.** `FLEET2_BINARY=/path/to/fleet2` short-circuits the download and installs those bytes (still smoke-tested with `version`). Checksum verification is skipped — the operator supplied the bytes deliberately — and the installer logs that it did.
+**Air-gapped / GitHub-unreachable.** `GROKFLEET_BINARY=/path/to/grokfleet` short-circuits the download and installs those bytes (still smoke-tested with `version`). Checksum verification is skipped — the operator supplied the bytes deliberately — and the installer logs that it did.
 
 **What the checksum does and does not defend against.** It *is* an integrity check against truncated downloads, disk-full writes, a captive portal or proxy answering 200-with-HTML, and a mis-uploaded asset — and, because the digest lives in the repo the operator is already executing, an authenticity control anchored to *that checkout*. It is **NOT** protection against anyone who can write to the release: a compromised GitHub account or token, a malicious collaborator, or GitHub itself. Such an adversary replaces the asset — and any same-origin `.sha256` beside it — in one `gh release upload --clobber`. That is exactly why **no `.sha256` asset is published or consulted**: it would read as supply-chain coverage while adding zero. Do not read this section as supply-chain coverage. No flag skips verification on the download path.
 
-## fleet2 reconcile (phase 2)
+### The 5.10.0 rename: `grokfleet` (formerly `fleet2`, 5.x ≤ 5.9)
 
-Phase 2 ports the **whole reconcile tick** to `fleet2 reconcile` (blueprint `blueprints/fleet-ts-phase2.md`). It is a faithful port of bash `cmd_reconcile`: device fetch + READ-ONLY latch, per-box decide/execute (mint, rotate, delete-then-rename, rollout, throttled alerts), the config-truth pass, the identity pass, notify, state files, and the exit-code map. Phase-1 modules (Runner, tunnel, DevicesApi, the upgrade engine, the flock re-exec) are reused. Both binaries coexist until phase 3: bash `fleet2` for operator commands, `fleet2` for the tick.
+The brain binary, the CLI, the units, the release asset and the API all read
+`grokfleet` from 5.10.0 on. Nothing about where state lives changed:
+`/opt/grok-fleet`, `/etc/grok-fleet`, `/var/lib/grok-fleet`, `config.toml`,
+`fleet.db`, the `[fleet-brain]` config section, every `FLEET_*` operator
+variable, port 9891, the sshd drop-in and the `fleet` ssh user are all
+untouched. Boxes reference nothing of the brain's name, so no box changed and
+no fleet-wide redeploy was needed — this was a one-host cutover.
+
+**What renamed:** the binary `/opt/grok-fleet/grokfleet`; `/usr/local/bin/grokfleet`;
+the units `grokfleet-reconcile.service`, `grokfleet-reconcile.timer` and
+`grokfleet-api.service`; the release asset `grokfleet-linux-x64`; the journal
+prefix (`grokfleet: …`); the audit `actor` on NEW rows; the `/v1/health` `name`
+field and the `server` response header; and the installer/Makefile variables
+`GROKFLEET_RELEASE`, `GROKFLEET_SHA256`, `GROKFLEET_ASSET`, `GROKFLEET_BINARY`,
+`GROKFLEET_BASE_URL`, `GROKFLEET_FETCH_ROOT`, `GROKFLEET_REMOTE`. Audit rows
+written before the rename keep `actor='fleet2'` — history is not rewritten.
+
+**What deliberately did NOT rename:** the soak marker
+`/var/lib/grok-fleet/fleet2.soak-ok`. It is state under `$FLEET_STATE` and it
+gates flipping `apply=true`; renaming it would silently reset an in-flight soak.
+
+**Compatibility, for exactly one release (removed in 5.11.0).** The installer
+writes it; it is not a systemd `Alias=` mechanism, because `Alias=` materialises
+only on `systemctl enable` and two of the three units are never enabled.
+
+| Old name | How it still answers |
+|---|---|
+| `fleet-reconcile.service` | a unit symlink → `grokfleet-reconcile.service`, written by the installer |
+| `fleet-api.service` | a unit symlink → `grokfleet-api.service`, written by the installer |
+| `fleet-reconcile.timer` | `Alias=fleet-reconcile.timer` in the new timer's `[Install]` (the timer is the one unit the installer enables) |
+| `fleet2` on `PATH` | `/usr/local/bin/fleet2` → `/opt/grok-fleet/grokfleet` |
+| `FLEET2_*` env | accepted alongside `GROKFLEET_*`: one spelling set ⇒ used; both set and equal ⇒ used and logged; both set and DIFFERENT ⇒ the installer refuses rc 1 naming both |
+
+`grokfleet serve`'s journal endpoint queries **both** generations of unit names,
+because `journalctl` matches the unit a line was logged under and never the
+alias it now answers to. A future drop-in belongs under
+`grokfleet-reconcile.service.d/` — systemd resolves drop-ins by the real unit
+name, so a directory named after the compatibility alias is silently ignored.
+
+**Rollback to 5.9.0.** There is no `grokfleet rollback-rename` command: a
+one-time path does not earn code. Rollback restores the binary **and** the unit
+files, because an alias named `fleet-reconcile.service` points at the new unit,
+whose `ExecStart` is `grokfleet` — restoring the binary alone would report
+success while still running 5.10.0. The installer preserves the pre-rename units
+at `/opt/grok-fleet/units.prev/` next to `grokfleet.prev` for exactly this:
+
+```bash
+systemctl disable --now grokfleet-reconcile.timer
+systemctl stop grokfleet-api.service
+rm -f /etc/systemd/system/grokfleet-reconcile.service \
+      /etc/systemd/system/grokfleet-reconcile.timer \
+      /etc/systemd/system/grokfleet-api.service \
+      /etc/systemd/system/fleet-reconcile.service \
+      /etc/systemd/system/fleet-api.service
+cp -P /opt/grok-fleet/units.prev/* /etc/systemd/system/
+cp -f /opt/grok-fleet/grokfleet.prev /opt/grok-fleet/fleet2
+chmod 0755 /opt/grok-fleet/fleet2
+ln -sfn /opt/grok-fleet/fleet2 /usr/local/bin/fleet2
+systemctl daemon-reload
+systemctl enable --now fleet-reconcile.timer
+systemctl start fleet-api.service      # only if it was running before
+```
+
+Then assert what actually SERVES, not merely that the units answer:
+`fleet2 version` prints `fleet2 5.9.0`, `systemctl show -p ExecStart
+fleet-reconcile.service` names `/opt/grok-fleet/fleet2`, and one tick's journal
+carries the `fleet2:` prefix. Rolling forward again is an ordinary re-run of
+`vps/install-vps.sh`. The TUI config `~/.config/grok-fleet/tui.toml` is
+unchanged in both directions.
+
+## grokfleet reconcile (phase 2)
+
+Phase 2 ports the **whole reconcile tick** to `grokfleet reconcile` (blueprint `blueprints/fleet-ts-phase2.md`). It is a faithful port of bash `cmd_reconcile`: device fetch + READ-ONLY latch, per-box decide/execute (mint, rotate, delete-then-rename, rollout, throttled alerts), the config-truth pass, the identity pass, notify, state files, and the exit-code map. Phase-1 modules (Runner, tunnel, DevicesApi, the upgrade engine, the flock re-exec) are reused. Both binaries coexist until phase 3: bash `grokfleet` for operator commands, `grokfleet` for the tick.
 
 ### Commands
-- `fleet2 reconcile [--apply | --dry-run]` — dry-run by default (M01). Takes the reconcile lock UNCONDITIONALLY (dry-run also writes `<box>.checkfail`/`<box>.cfgfail`); a held lock ⇒ rc 0 (a skipped tick is success), distinct from `upgrade`'s rc 6. Unknown arg ⇒ rc 2 (before the lock).
+- `grokfleet reconcile [--apply | --dry-run]` — dry-run by default (M01). Takes the reconcile lock UNCONDITIONALLY (dry-run also writes `<box>.checkfail`/`<box>.cfgfail`); a held lock ⇒ rc 0 (a skipped tick is success), distinct from `upgrade`'s rc 6. Unknown arg ⇒ rc 2 (before the lock).
 
 ### State-file compatibility
-`fleet2` reads and writes every `$FLEET_STATE` file byte-identically to bash (`enrolled.tsv`, `keys/<N>.json`, `<box>.expires`, `<box>.checkfail`/`.seedfail`/`.cfgfail`/`.asleep`/`.incoherent`, `api.fails`/`.backoff_min`/`.next_retry`), so bash and fleet2 can be swapped either direction mid-soak with no migration. Counters use the same read/normalise idiom (strip whitespace, non-numeric ⇒ 0; a healthy `.checkfail` is a literal `0`, gated on count not presence).
+`grokfleet` reads and writes every `$FLEET_STATE` file byte-identically to bash (`enrolled.tsv`, `keys/<N>.json`, `<box>.expires`, `<box>.checkfail`/`.seedfail`/`.cfgfail`/`.asleep`/`.incoherent`, `api.fails`/`.backoff_min`/`.next_retry`), so bash and grokfleet can be swapped either direction mid-soak with no migration. Counters use the same read/normalise idiom (strip whitespace, non-numeric ⇒ 0; a healthy `.checkfail` is a literal `0`, gated on count not presence).
 
-**Written on a dry-run tick by BOTH engines** (a `--dry-run`/`apply=false` reconcile does NOT leave `$FLEET_STATE` untouched — this is bash parity, not a fleet2 mutation): `<box>.checkfail` (reset/bump on every tunnel-up box), `<box>.cfgfail` (config-pass), `<box>.asleep` and `<box>.incoherent` (row-e alert throttles — `reconcile_alert_asleep`/`reconcile_alert_incoherent` run BEFORE the mutation gate, fleet2 main:2842/2848), and the `api.*` counters (on an API failure/backoff). Only the API/tunnel MUTATIONS (mint/rotate/dedup key + device writes) are suppressed in dry-run. A cross-engine dry-run parity diff must therefore expect these files to change under both engines.
+**Written on a dry-run tick by BOTH engines** (a `--dry-run`/`apply=false` reconcile does NOT leave `$FLEET_STATE` untouched — this is bash parity, not a grokfleet mutation): `<box>.checkfail` (reset/bump on every tunnel-up box), `<box>.cfgfail` (config-pass), `<box>.asleep` and `<box>.incoherent` (row-e alert throttles — `reconcile_alert_asleep`/`reconcile_alert_incoherent` run BEFORE the mutation gate, grokfleet main:2842/2848), and the `api.*` counters (on an API failure/backoff). Only the API/tunnel MUTATIONS (mint/rotate/dedup key + device writes) are suppressed in dry-run. A cross-engine dry-run parity diff must therefore expect these files to change under both engines.
 
 ### Cutover / soak / apply-flip / cutback
-Same unit, timer, env, and lock ⇒ bash and fleet2 never run concurrently.
-- `make ts-cutover SOAK=1` — install the SOAK drop-in (`ExecStart=/opt/grok-fleet/fleet2 reconcile --dry-run`, config ignored). This is the ONLY path into the timer during the gate/soak.
+Same unit, timer, env, and lock ⇒ bash and grokfleet never run concurrently.
+- `make ts-cutover SOAK=1` — install the SOAK drop-in (`ExecStart=/opt/grok-fleet/grokfleet reconcile --dry-run`, config ignored). This is the ONLY path into the timer during the gate/soak.
 - `make ts-cutover` (wrapper form) — REFUSES unless the soak marker `/var/lib/grok-fleet/fleet2.soak-ok` exists; only `ts-apply-flip` writes that marker.
 - `make ts-apply-flip [SOAK_SINCE=-24h] [FORCE=1]` — a **binding** check: over the trailing window it requires ≥ ⌈0.69 × (window/300)⌉ `reconcile: done (DRY-RUN)` lines (199 at 24 h) and zero non-zero `ExecMainStatus`/`Result=exit-code` runs; on pass it writes the marker (an attestation) and installs the runtime **wrapper** drop-in (`--apply` evaluated at runtime from `config.toml`'s `apply = true`). `SOAK_SINCE` may only lengthen the window (≥ 24 h). `FORCE=1` overrides the check and records `forced=1 …` INTO the marker so a skipped soak stays visible.
-- `make ts-cutback` — the phase-3 **rollback**: restore the previous fleet2 binary (`mv -f /opt/grok-fleet/fleet2.prev /opt/grok-fleet/fleet2`, kept by `ts-deploy` / the installer) AND reinstall the SOAK (dry-run) drop-in, so a bad binary cannot apply mutations while it is being diagnosed; re-flip with `ts-apply-flip` after a fresh clean soak window. REFUSES (rc 1) when there is no `.prev`. Note the semantic changed at phase 3: it used to mean "remove the drop-in, daemon-reload, back to bash `fleetctl`", which is dead now that D7 retired `fleetctl` — removing the drop-in would leave the unit pointing at a binary that no longer exists.
+- `make ts-cutback` — the phase-3 **rollback**: restore the previous grokfleet binary (`mv -f /opt/grok-fleet/grokfleet.prev /opt/grok-fleet/grokfleet`, kept by `ts-deploy` / the installer) AND reinstall the SOAK (dry-run) drop-in, so a bad binary cannot apply mutations while it is being diagnosed; re-flip with `ts-apply-flip` after a fresh clean soak window. REFUSES (rc 1) when there is no `.prev`. Note the semantic changed at phase 3: it used to mean "remove the drop-in, daemon-reload, back to bash `fleetctl`", which is dead now that D7 retired `fleetctl` — removing the drop-in would leave the unit pointing at a binary that no longer exists.
 Each target daemon-reloads and prints the resulting `systemctl cat` ExecStart. The wrapper ExecStart is byte-identical to `vps/install-vps.sh:212` with the binary swapped, and keeps `$apply` a BARE `$apply` (a `${apply}` would be expanded by systemd to empty and `--apply` lost).
 
 ### Stated deviations (phase 2)
-- **D4/F5 API backoff ENFORCED** — bash writes `api.next_retry` (5/10/20-min backoff) but never consults it (dead code, main:2767-2774). fleet2 skips the devices GET while the marker is in the future (read-only run, no `api.fails` bump); a marker more than 20 min ahead is treated as corrupt and ignored.
+- **D4/F5 API backoff ENFORCED** — bash writes `api.next_retry` (5/10/20-min backoff) but never consults it (dead code, main:2767-2774). grokfleet skips the devices GET while the marker is in the future (read-only run, no `api.fails` bump); a marker more than 20 min ahead is treated as corrupt and ignored.
 - **D5/F1-F2 dynamic canary** — if `[fleet-brain].canary_box` is set the config-pass canary is fixed (bash semantics); if absent it is DYNAMIC (the lowest-index enrolled box with a tunnel up), logged on a separate `config: canary policy=<fixed|dynamic>` line after the verbatim pass-start line. The rollout canary keeps phase-1's resolution unchanged.
-- **D10/F8 auto-rollout gated** — row d drift now WIRES the phase-1 upgrade engine, gated behind `[rollout] auto` (shipped default `false` ⇒ `WOULD rollout` lines only; `true` ⇒ the engine runs once per tick, a user-granted flip). Unresolvable `[rollout].src` degrades to drift-unknown, never rc 3. The drift decision itself is a VERSION comparison (see "Drift key" under the config keys), so a fleet2-only release does not trigger a fleet-wide rollout. **On the production VPS `auto = true` is LIVE** (flipped after the 5.7.1 gate): rollout is how a box gets new boxup code, and it is the ONLY way — nothing on the box updates itself (see the note under "Config keys" and the corrected ansible-pull comparison in `docs/DESIGN.md`).
+- **D10/F8 auto-rollout gated** — row d drift now WIRES the phase-1 upgrade engine, gated behind `[rollout] auto` (shipped default `false` ⇒ `WOULD rollout` lines only; `true` ⇒ the engine runs once per tick, a user-granted flip). Unresolvable `[rollout].src` degrades to drift-unknown, never rc 3. The drift decision itself is a VERSION comparison (see "Drift key" under the config keys), so a grokfleet-only release does not trigger a fleet-wide rollout. **On the production VPS `auto = true` is LIVE** (flipped after the 5.7.1 gate): rollout is how a box gets new boxup code, and it is the ONLY way — nothing on the box updates itself (see the note under "Config keys" and the corrected ansible-pull comparison in `docs/DESIGN.md`).
 - **D7 in-process fetch header** — the Tailscale token is passed via an in-process `fetch` `Authorization` header (never argv/env/a spawned curl), a strictly smaller exposure than bash's curl `--config` file.
 - **D12/F4 lock rc** — `reconcile` returns rc 0 when the lock is held (bash), while `upgrade --apply` keeps rc 6 (phase 1); both kept per subcommand.
 - **D3/F10-S2 rotate threshold** — row c compares whole days against `floor(FLEET_ROTATE_BEFORE_SECS/86400)`; with the 604800 default this is bash's literal `< 7` exactly.
@@ -594,11 +666,11 @@ Each target daemon-reloads and prints the resulting `systemctl cat` ExecStart. T
   - latched run (e.g. a Tailscale API 401/500 that set the read-only latch): `reconcile: <box> WOULD <action> (read-only dry-run/no-apply)`
   The config-pass (`config: <box> WOULD push …`) and rollout (`reconcile: WOULD rollout …`) WOULD lines carry no prefix and never gain one.
 
-## fleet2 API + TUI (fleet2 admin panel — phase 3.x, 5.5.0)
+## grokfleet API + TUI (grokfleet admin panel — phase 3.x, 5.5.0)
 
-The admin panel is one binary, two subcommands: `fleet2 serve` (VPS-side
+The admin panel is one binary, two subcommands: `grokfleet serve` (VPS-side
 tailnet-bound token-auth HTTP/JSON API — the single data+action surface; AI
-agents curl it) and `fleet2 tui` (a laptop admin panel that consumes only that
+agents curl it) and `grokfleet tui` (a laptop admin panel that consumes only that
 API and holds zero fleet logic). Built in two sequenced lanes: **lane A** is
 serve + API + history (this section's engine); **lane B** is the TUI. The
 decisions below are namespaced `TUI-D<n>` (the r4 blueprint's decision wall).
@@ -693,10 +765,10 @@ expected and is covered by the STALE banner (a snapshot older than 15 min goes
 yellow).
 
 ### TUI-D8 — deployment
-`fleet-api.service`: `ExecStart=/opt/grok-fleet/fleet2 serve`,
+`grokfleet-api.service`: `ExecStart=/opt/grok-fleet/grokfleet serve`,
 `Restart=on-failure`, `RestartSec=5`, `StartLimitIntervalSec=0` (slow tailscaled
 must not park the unit in `failed`), `After=network-online.target
-tailscaled.service`, env EXACTLY as fleet-reconcile INCLUDING `HOME=$STATE_DIR`
+tailscaled.service`, env EXACTLY as grokfleet-reconcile INCLUDING `HOME=$STATE_DIR`
 (the refuse-to-start + Restart IS the boot-order retry). Installed by the
 idempotent `install_fleet_api` in `vps/install-vps.sh`; **NOT enabled by
 default** — the empirical gate starts/enables it on PASS.
@@ -714,7 +786,7 @@ membership-checked (re-read per request) BEFORE reaching any argv.
 
 ### TUI-D6/D7 — TUI config + degradation (lane B)
 `~/.config/grok-fleet/tui.toml` (`url`, `token`; mode 600 enforced); env override
-`FLEET2_ADMIN_URL`/`FLEET2_ADMIN_TOKEN` (never `FLEET_API_*`, which is the
+`GROKFLEET_ADMIN_URL`/`GROKFLEET_ADMIN_TOKEN` (never `FLEET_API_*`, which is the
 Tailscale pair). Poll `GET /v1/fleet` every 5 s; API unreachable ⇒ last-good data
 greyed + red `LINK DOWN <age>`, keep retrying, never exit; snapshot older than
 15 min ⇒ yellow `STALE <age>`.
@@ -773,7 +845,7 @@ long diff never scrolls it away.
 
 ### The TUI renders through Ink (5.7.0, blueprint fleet-tui-ink)
 
-The painter is a library's job now. `fleet2 tui` is an [Ink](https://github.com/vadimdemedes/ink)
+The painter is a library's job now. `grokfleet tui` is an [Ink](https://github.com/vadimdemedes/ink)
 (React) application; the 1,300 lines of hand-rolled ANSI in `src/tui/render.ts`
 and `src/tui/term.ts` are deleted. What each file owns:
 
@@ -819,7 +891,7 @@ reach the production API.
 
 Colour is named once, in `tui/tone.ts`, and nowhere else. One **main** colour
 carries the chrome (`MAIN #7aa2f7` — the header bar, the column headers, the
-card frame, the group separators, the `fleet2` word), one **accent** carries
+card frame, the group separators, the `grokfleet` word), one **accent** carries
 everything interactive (`ACCENT #bb9af7` — the footer's key letters, the
 selected row, the canary star, the admin scope), and four semantic colours carry
 state and nothing else: `OK #9ece6a`, `WARN #e0af68`, `DOWN #f7768e`,
@@ -859,18 +931,18 @@ ts-deps` installs from the TRACKED `fleet/bun.lock` with `--frozen-lockfile`, an
 
 ## Retired: bash `fleetctl` (last at c303696)
 
-Since 5.4.0 (phase 3) the brain engine is **fleet2** (bun+TS); the bash
+Since 5.4.0 (phase 3) the brain engine is **grokfleet** (bun+TS); the bash
 `fleetctl` script is retired and `git rm`'d. The last bash version is readable at
 `git show c303696:fleetctl`.
 
-- **Locality (F2).** fleet2 is a VPS-side tool for `status`/`check`/`rollout`/
+- **Locality (F2).** grokfleet is a VPS-side tool for `status`/`check`/`rollout`/
   `fleet-status`/`config`/`enroll`/`rename`/`mint-key`; only `list`, `ssh` and
   `remove-timer` are laptop-runnable. On a host with no `FLEET_BOX_KEY` the
-  VPS-side commands refuse with `<cmd>: VPS-only in fleet2 — this command now
+  VPS-side commands refuse with `<cmd>: VPS-only in grokfleet — this command now
   runs over the reverse tunnels (docs/FLEET-BRAIN.md §retirement)` rc 6.
-- **install-timer / remove-timer (D6/F7).** `fleet2 install-timer` is retired —
-  it prints `install-timer was retired in 5.4.0 — the VPS fleet-reconcile.timer
-  alerts instead (docs/FLEET-BRAIN.md)` rc 2. `fleet2 remove-timer` is KEPT so
+- **install-timer / remove-timer (D6/F7).** `grokfleet install-timer` is retired —
+  it prints `install-timer was retired in 5.4.0 — the VPS grokfleet-reconcile.timer
+  alerts instead (docs/FLEET-BRAIN.md)` rc 2. `grokfleet remove-timer` is KEPT so
   operators can clean up the OLD laptop user timer; **run it once per laptop**.
   The manual equivalent is:
   `systemctl --user disable --now fleetctl-check.timer; rm -f ~/.config/systemd/user/fleetctl-check.{timer,service}; systemctl --user daemon-reload`.
@@ -878,22 +950,22 @@ Since 5.4.0 (phase 3) the brain engine is **fleet2** (bun+TS); the bash
   non-executable, at `$OPT_DIR/fleetctl.retired-c303696` (mode 0644) for ONE
   release (deleted in 5.5.0). To run it manually as an emergency fallback:
   `sudo install -m 0755 /opt/grok-fleet/fleetctl.retired-c303696 /opt/grok-fleet/fleetctl && /opt/grok-fleet/fleetctl reconcile`.
-- **Installer (D7).** `vps/install-vps.sh` fetches the pinned fleet2 release
-  asset and verifies it against the in-repo `FLEET2_SHA256` (§"Release +
+- **Installer (D7).** `vps/install-vps.sh` fetches the pinned grokfleet release
+  asset and verifies it against the in-repo `GROKFLEET_SHA256` (§"Release +
   install"; it used to build from the checkout with `make ts-build`, requiring
-  bun on the VPS), installs it to `/opt/grok-fleet/fleet2`, and adds a PATH
-  symlink `/usr/local/bin/fleet2`. `--uninstall` removes the symlink (only when
+  bun on the VPS), installs it to `/opt/grok-fleet/grokfleet`, and adds a PATH
+  symlink `/usr/local/bin/grokfleet`. `--uninstall` removes the symlink (only when
   it resolves to our target).
 - **Retirement ORDERING (the r2 incident).** The retirement above happens only
-  **after** `mv -f` has put a verified, smoke-tested fleet2 live. It used to run
-  first, at the top of `install_fleet2()`, and `install_fleet2 || exit 1`
+  **after** `mv -f` has put a verified, smoke-tested grokfleet live. It used to run
+  first, at the top of `install_grokfleet()`, and `install_grokfleet || exit 1`
   disables `set -e` for the whole function body — so an ENOSPC on the 80 MB
   copy, a `noexec` mount or a wrong-arch binary did not abort: control reached
-  the `version` smoke test, it failed, and the rollback restores `fleet2.prev`
+  the `version` smoke test, it failed, and the rollback restores `grokfleet.prev`
   ONLY, never `fleetctl`. Production was left with its engine renamed to a
   non-executable 0644 file and no replacement. Do not move this block back.
 - **Rollback.** FAST — restore the retired bash binary + its ExecStart and
-  `systemctl daemon-reload && systemctl restart fleet-reconcile.timer`. FULL —
+  `systemctl daemon-reload && systemctl restart grokfleet-reconcile.timer`. FULL —
   `git checkout c303696 && sudo bash vps/install-vps.sh` (after the phase-3 merge
   `main` has no `fleetctl`). State files are compatible both ways (phase-2 D2).
 
@@ -908,15 +980,15 @@ Intentional behaviour changes (the ONLY ones; everything else is byte parity):
 - **D5** — dynamic config-pass canary when `[fleet-brain].canary_box` is unset.
 - **D6/F7** — the laptop `install-timer` is retired (rc 2 notice); `remove-timer`
   is KEPT to clean up the old user timer (creation removed, cleanup kept).
-- **D7** — bash `fleetctl` retired; fleet2 is the unit engine; a `/usr/local/bin/fleet2`
+- **D7** — bash `fleetctl` retired; grokfleet is the unit engine; a `/usr/local/bin/grokfleet`
   PATH symlink is added; `--dirty` is accepted for compatibility but the dirty-tree
-  refusal is not ported (fleet2 deploys the resolved ref, never the working tree).
+  refusal is not ported (grokfleet deploys the resolved ref, never the working tree).
 
 ## Zero-touch join (discover + adopt + repair — 5.6.0)
 
 Before 5.6.0 membership was a static `enrolled.tsv`: a box that was on the
 tailnet with sshd up but not enrolled was invisible to the tick, and an operator
-had to run `fleet2 enroll <box>` on the VPS by hand. After an image swap the box
+had to run `grokfleet enroll <box>` on the VPS by hand. After an image swap the box
 came back under the same identity (because `/workspace` persists) but nothing
 repaired a lost VPS-side artefact or a lost `[fleet]` block. Since 5.6.0 the
 engine does both itself, inside the ordinary reconcile tick.
@@ -942,7 +1014,7 @@ existing mint/retag path.
   ⇒ every candidate is `skipped:no-api-token`, with no ssh and no backoff record.
 - **P2 — box ssh password.** Precedence: `FLEET_SSH_PASSWORD` env >
   `$FLEET_ETC/box_passwd` (mode 600, owned by the fleet user) > `[ssh].password`
-  in the brain config > **refuse**. fleet2's baked default password does NOT
+  in the brain config > **refuse**. grokfleet's baked default password does NOT
   count for adoption: trying a baked credential against a box the engine has
   never met is exactly what must fail closed. An EXISTING fleet must therefore
   re-run `vps/install-vps.sh` with `BOX_PASSWD=...` set before adoption does
@@ -978,7 +1050,7 @@ existing mint/retag path.
 
 ### Adoption
 
-Adoption is the ordinary `fleet2 enroll` orchestration run IN PROCESS behind the
+Adoption is the ordinary `grokfleet enroll` orchestration run IN PROCESS behind the
 same side-effect seam, over the TAILNET (`sshpass -e ssh box@<box>`, an explicit
 `ConnectTimeout=20`), with the tunnel wait set to **0**: the enrolment is
 RECORDED and tick N+1 proves the tunnel through the normal decision table. No
@@ -1021,7 +1093,7 @@ entry must match, and the box's `[fleet]` block must name this VPS and the right
 
 ### Host keys — the engine owns its `known_hosts`
 
-fleet2 used to let ssh resolve `~/.ssh/known_hosts` from the passwd entry, so
+grokfleet used to let ssh resolve `~/.ssh/known_hosts` from the passwd entry, so
 both units read `/root/.ssh/known_hosts` — a file the engine neither owns nor can
 reason about. When a port or a name is REUSED across identities (a retired
 record, or a box that lost `/workspace` and with it its persisted sshd host keys)
@@ -1037,7 +1109,7 @@ Since 5.6.0:
   ssh (`<box>`) — together with `GlobalKnownHostsFile=/dev/null`,
   `HashKnownHosts=no` and `CheckHostIP=no`, so no pin can escape the engine's own
   file, hide from `ssh-keygen -F`, or survive an `ssh-keygen -R <name>`.
-  Interactive `fleet2 ssh <box>` is UNCHANGED: it is human-invoked, often from a
+  Interactive `grokfleet ssh <box>` is UNCHANGED: it is human-invoked, often from a
   laptop where `$FLEET_STATE` does not exist, and keeps the user's own host
   verification and the visible banner. `known_hosts` is engine bookkeeping in the
   class of `discover.json`, not part of the mutation surface, and is written on
@@ -1061,9 +1133,9 @@ Since 5.6.0:
   and handing it the next secret.
 - **A foreign listener is DOWN.** `tunnelUp` now reads the owner too: an
   unaccepted `comm` reads as `tunnel: down` on every engine path AND on
-  `fleet2 config diff`, so a squatter on a member port is never dialled. An
+  `grokfleet config diff`, so a squatter on a member port is never dialled. An
   unverifiable owner reads up ONLY for a non-root caller (so a non-root
-  `fleet2 fleet-status` does not report the whole fleet as down); as root it
+  `grokfleet fleet-status` does not report the whole fleet as down); as root it
   reads DOWN, because the exception is bound to its premise.
 - **Healing takes three ticks and no human.** +1 sees the banner and marks it;
   +2 sees it again, so the counter reaches 2 and repair forgets the pins and
@@ -1095,7 +1167,7 @@ survival relies on `/workspace` persistence, and losing it needs the human URL
 dance once. No auth changes (the box password stays). No boxup delivery from
 discover. No tag gating. Nothing new is added to the Tailscale API surface.
 
-## State store (fleet2 5.8.0 Phase A, 5.9.0 Phase B)
+## State store (grokfleet 5.8.0 Phase A, 5.9.0 Phase B)
 
 Before 5.8.0 the brain kept about twenty files under `$FLEET_STATE` plus ten under
 `$FLEET_ETC`. Two of them were written atomically; every counter was a plain
@@ -1112,7 +1184,7 @@ are retired with it.
 `$FLEET_STATE/fleet.db`, opened through `bun:sqlite` by exactly one module
 (`fleet/src/store/db.ts`). WAL journalling, `synchronous=NORMAL`,
 `busy_timeout=5000`, `foreign_keys=ON`, all tables `STRICT`. The database and
-both sidecars (`fleet.db-wal`, `fleet.db-shm`) are mode `0600`; fleet2 sets
+both sidecars (`fleet.db-wal`, `fleet.db-shm`) are mode `0600`; grokfleet sets
 `umask 077` before creating them. A read-only or unwritable `$FLEET_STATE` is a
 refusal (rc 3) naming the directory and the errno — a tick that cannot persist
 must not pretend it did.
@@ -1194,9 +1266,9 @@ unchanged from 5.8.0.
 ### Retiring a box
 
 ```
-fleet2 retire <box>              phase -> retired; the name stays UN-ADOPTABLE
-fleet2 retire --forget <box>     delete the row; the name is a candidate again
-fleet2 retire --dry-run <box>    print the plan, change nothing
+grokfleet retire <box>              phase -> retired; the name stays UN-ADOPTABLE
+grokfleet retire --forget <box>     delete the row; the name is a candidate again
+grokfleet retire --dry-run <box>    print the plan, change nothing
 ```
 
 Editing `enrolled.tsv` by hand never un-enrolled anything: the discover probe
@@ -1213,7 +1285,7 @@ takes the reconcile lock like every other membership mutation, and refuses rc 6
 when the lock is busy. The `known_hosts` pin is LEFT alone: a reused name rebinds
 through the identity-binding path, which forgets the pin at the moment it rebinds.
 
-`fleet2 enroll <box>` on a retired name revives THAT row and runs the saga.
+`grokfleet enroll <box>` on a retired name revives THAT row and runs the saga.
 `--forget` deletes the row and its counters, key row and alerts; the `audit` rows
 survive, because `audit.box` is plain TEXT and not a foreign key.
 
@@ -1252,11 +1324,11 @@ The rules:
   one stage per tick it runs. That is stated behaviour, not a defect;
 - `enrol-stuck` fires at three attempted-and-failed STAGES (not three ticks),
   once, and at most every 24 h. It is the `alerts` table's first writer.
-  `fleet2 retire <box>` aborts a saga that will not finish.
+  `grokfleet retire <box>` aborts a saga that will not finish.
 
 ### The legacy files are EXPORT-ONLY
 
-fleet2 5.8.0 no longer treats these as state. It rewrites them from the store
+grokfleet 5.8.0 no longer treats these as state. It rewrites them from the store
 after every membership write and every key write, so a rollback to 5.7.1 finds
 them correct at any instant. The exact set is:
 
@@ -1278,7 +1350,7 @@ REPORTS the difference (see below) and the export overwrites the edit.
 
 `inventory.json` and `history/*.jsonl` are RETIRED in 5.9.0 and are NOT part of
 the export set. `inventory.json` was a second per-box view of the same fleet,
-written by `fleet2 inventory` while the tick wrote a snapshot line; the command
+written by `grokfleet inventory` while the tick wrote a snapshot line; the command
 now renders from the `boxes` rows plus the last tick's snapshot and writes no
 file. The applied upgrade pass's `lastUpgrade` block, which nothing read back
 except the next write of that same file, is an `audit` row now.
@@ -1307,12 +1379,12 @@ would suppress the devices GET for twenty minutes after a rollback), and
 ### Commands
 
 ```
-fleet2 retire [--forget] [--dry-run] <box>   un-enrol a box (see above)
-fleet2 state check                     schema, integrity, rows, divergence (read-only)
-fleet2 state backup                    take today's backup now
-fleet2 state restore <file>            copy a backup over fleet.db (stop the timer first)
-fleet2 state import [--force]          replay the pre-5.8.0 files into the store
-fleet2 state reconcile-files [--apply] resolve a reported divergence (dry-run by default)
+grokfleet retire [--forget] [--dry-run] <box>   un-enrol a box (see above)
+grokfleet state check                     schema, integrity, rows, divergence (read-only)
+grokfleet state backup                    take today's backup now
+grokfleet state restore <file>            copy a backup over fleet.db (stop the timer first)
+grokfleet state import [--force]          replay the pre-5.8.0 files into the store
+grokfleet state reconcile-files [--apply] resolve a reported divergence (dry-run by default)
 ```
 
 `state check` opens the store READ-ONLY: it runs no migrations and no divergence
@@ -1321,23 +1393,23 @@ under `flock -w 90` for the single statement that clears the flag.
 
 ### Backups and integrity
 
-Once per UTC day, inside the tick, fleet2 runs `PRAGMA quick_check` and then
+Once per UTC day, inside the tick, grokfleet runs `PRAGMA quick_check` and then
 `VACUUM INTO` a temporary file in `$FLEET_STATE/backup/`, chmods it `0600` and
 renames it over `backup/fleet-<date>.db`. A same-day rerun refreshes that file
 rather than adding one, and the seven newest are kept. `quick_check` also runs at
-`fleet2 serve` start and at `fleet2 state check`.
+`grokfleet serve` start and at `grokfleet state check`.
 
 A failing `quick_check` sets `meta.integrity_failed_at` and notifies. While the
 flag is set the tick refuses with one log line and no writes, no backup is taken,
 API MUTATION endpoints return 503 `integrity_failed`, and readonly endpoints and
-the TUI keep serving the last data. `fleet2 serve` STARTS in this mode rather than
+the TUI keep serving the last data. `grokfleet serve` STARTS in this mode rather than
 refusing: the unit restarts on failure with no rate limit, so a refusing serve
 would loop full scans forever. The flag is cleared only by a passing
-`fleet2 state check` or by `fleet2 state restore <file>`.
+`grokfleet state check` or by `grokfleet state restore <file>`.
 
 ### Divergence between the file and the store
 
-On the tick path only, under the reconcile lock, fleet2 compares the exported
+On the tick path only, under the reconcile lock, grokfleet compares the exported
 `enrolled.tsv` with the store's enrolled set. The check is ADVISORY: it never
 changes membership. A name in the file but not the store is `file-only`; the
 reverse is `store-only`. A new or changed finding writes an `audit` row and
@@ -1346,7 +1418,7 @@ diverging is deleted with a `divergence-cleared` audit row. A missing or
 unreadable file is reported as "cannot compare" and changes nothing at all —
 absence is never read as emptiness in either direction.
 
-`fleet2 state reconcile-files` prints the findings. With `--apply` it imports
+`grokfleet state reconcile-files` prints the findings. With `--apply` it imports
 `file-only` rows (reviving a retired row rather than inserting a second one) and
 only PRINTS `store-only` rows with the `retire` command an operator may run.
 Automatic retirement is deliberately out of scope.
@@ -1376,21 +1448,21 @@ back:
   history that no reader saw at the time.
 - **`enrolling` and `retired` names stay parked.** The candidate exclusion ships
   in Phase A, so 5.8.0 neither adopts them nor spends the mutation slot on them.
-  They wait for `fleet2 enroll` or `fleet2 retire --forget` after you re-upgrade.
+  They wait for `grokfleet enroll` or `grokfleet retire --forget` after you re-upgrade.
 - **`inventory.json` comes back** — 5.8.0 writes it again on the next
-  `fleet2 inventory` or applied upgrade pass. 5.9.0 ignores whatever it finds
+  `grokfleet inventory` or applied upgrade pass. 5.9.0 ignores whatever it finds
   there.
 
 ### Exit codes 6 and 7
 
 - **rc 6** — the reconcile lock was held for the whole 90-second wait. Nothing was
-  done. `fleet2 state check` and `fleet2 state reconcile-files --apply` use it.
-  (`fleet2 rename` returns 1 for the same condition; that inconsistency is known
+  done. `grokfleet state check` and `grokfleet state reconcile-files --apply` use it.
+  (`grokfleet rename` returns 1 for the same condition; that inconsistency is known
   and out of scope here.)
 - **rc 7** — "recorded; export failed". Every store write committed and the
   mutation succeeded; only the legacy export a rolled-back 5.7.1 would read is
-  stale. The tick, `fleet2 enroll` and the `state` subcommands all use it, and
-  `fleet-reconcile.service` carries `SuccessExitStatus=7` so a lagging export does
+  stale. The tick, `grokfleet enroll` and the `state` subcommands all use it, and
+  `grokfleet-reconcile.service` carries `SuccessExitStatus=7` so a lagging export does
   not park the oneshot unit in `failed` every five minutes. The Telegram notify is
   the signal, and the next tick's divergence check reports the lag until it
   clears. API mutation endpoints return 200 with a `warnings` entry

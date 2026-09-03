@@ -1,9 +1,9 @@
-// dispatch.ts — the fleet2 command router decisions (D1/F10), pure + testable.
+// dispatch.ts — the grokfleet command router decisions (D1/F10), pure + testable.
 //
 // Ports the bash dispatch (main:3850-3874): `cmd="${1:-help}"`; bare/`-h`/
 // `--help`/`help` ⇒ usage on STDOUT rc 0; `version|--version` ⇒ the version
 // string on stdout rc 0; a KNOWN command ⇒ routed; unknown ⇒
-// `fleet2: unknown command: <cmd>` + usage BOTH on STDERR rc 2 (m11).
+// `grokfleet: unknown command: <cmd>` + usage BOTH on STDERR rc 2 (m11).
 //
 // This module decides ROUTING + the help/version/unknown streams; the concrete
 // command implementations are wired in cli.ts main() (they need the runtime env
@@ -12,9 +12,9 @@
 
 import { USAGE } from "./usage.ts";
 
-/** Version string shape: `fleet2 <ver> (<sha>) (bun <v>)`. */
+/** Version string shape: `grokfleet <ver> (<sha>) (bun <v>)`. */
 export function versionString(pkgVersion: string, sha: string, bunVersion: string): string {
-  return `fleet2 ${pkgVersion} (${sha}) (bun ${bunVersion})`;
+  return `grokfleet ${pkgVersion} (${sha}) (bun ${bunVersion})`;
 }
 
 /** Every documented subcommand (for the router + T6 "every subcommand routes"). */
@@ -54,7 +54,7 @@ export interface DispatchDecision {
   unknownName?: string;
 }
 
-/** Decide the route for argv[0] (the subcommand). `cmd` undefined ⇒ bare fleet2. */
+/** Decide the route for argv[0] (the subcommand). `cmd` undefined ⇒ bare grokfleet. */
 export function decide(cmd: string | undefined): DispatchDecision {
   if (cmd === undefined || cmd === "help" || cmd === "-h" || cmd === "--help") {
     // bare/`help`/`-h`/`--help` ⇒ usage on STDOUT rc 0 (F10; bash `${1:-help}`).
@@ -85,7 +85,7 @@ export function emit(
       return 0;
     case "unknown":
       // BOTH lines on STDERR (m11): the error then the usage.
-      err(`fleet2: unknown command: ${decision.unknownName}\n`);
+      err(`grokfleet: unknown command: ${decision.unknownName}\n`);
       err(USAGE);
       return 2;
     case "route":

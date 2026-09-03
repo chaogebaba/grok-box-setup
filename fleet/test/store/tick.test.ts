@@ -172,7 +172,7 @@ describe("(t) the tick's divergence check and the export-lag exit code", () => {
       try {
         h.st.recordEnrolled("grok-box-005", 20005, "AAAAKEY005");
         const res = await runReconcile(h.deps({ targetBoxes: [] }));
-        // rc 7 = "recorded; export failed". `fleet-reconcile.service` carries
+        // rc 7 = "recorded; export failed". `grokfleet-reconcile.service` carries
         // SuccessExitStatus=7 so this does not park the oneshot in `failed`.
         expect(res.rc).toBe(7);
         expect(h.notes.filter((n) => n.msg.includes("export failed"))).toHaveLength(1);
@@ -240,7 +240,7 @@ describe("D4 candidate exclusion (ships in Phase A)", () => {
     expect(sel.candidates).toEqual(["grok-box-013"]);
     // A skip reason is a TRANSIENT fact. A retired box parked on the tailnet
     // would otherwise emit ~26k `snapshot_skipped` rows per retention window, so
-    // the retire audit row and `fleet2 state check` are the record instead.
+    // the retire audit row and `grokfleet state check` are the record instead.
     expect(sel.skipped).toEqual([]);
     expect(sel.errors).toEqual([]);
   });

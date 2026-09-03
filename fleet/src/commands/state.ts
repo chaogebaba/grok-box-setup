@@ -1,10 +1,10 @@
-// commands/state.ts — `fleet2 state <sub>` (blueprint fleet2-state-store D6/D8).
+// commands/state.ts — `grokfleet state <sub>` (blueprint fleet2-state-store D6/D8).
 //
-//   fleet2 state check                    read-only report + quick_check
-//   fleet2 state backup                   force today's backup now
-//   fleet2 state restore <file>           copy a backup over fleet.db
-//   fleet2 state import [--force]         replay the 5.7.1 files into the store
-//   fleet2 state reconcile-files [--apply] resolve a reported divergence
+//   grokfleet state check                    read-only report + quick_check
+//   grokfleet state backup                   force today's backup now
+//   grokfleet state restore <file>           copy a backup over fleet.db
+//   grokfleet state import [--force]         replay the 5.7.1 files into the store
+//   grokfleet state reconcile-files [--apply] resolve a reported divergence
 //
 // Exit codes: 0 ok, 2 usage, 3 config/integrity (RC.TARGET), 6 the reconcile
 // lock was busy for the whole 90 s wait (RC.LOCK_BUSY), 7 recorded but the
@@ -76,7 +76,7 @@ export async function cmdState(rest: string[], deps: StateCmdDeps): Promise<numb
       return stateReconcileFiles(args, deps);
     default:
       log(
-        "usage: fleet2 state <check|backup|restore <file>|import [--force]|reconcile-files [--apply]>",
+        "usage: grokfleet state <check|backup|restore <file>|import [--force]|reconcile-files [--apply]>",
       );
       return RC.USAGE;
   }
@@ -146,7 +146,7 @@ async function stateCheck(deps: StateCmdDeps): Promise<number> {
     );
   } else {
     out(`store         ${path}\n`);
-    out(`schema        user_version=${store.userVersion()} min_reader=${store.meta("min_reader") ?? "?"} (this fleet2 knows ${KNOWN_SCHEMA})\n`);
+    out(`schema        user_version=${store.userVersion()} min_reader=${store.meta("min_reader") ?? "?"} (this grokfleet knows ${KNOWN_SCHEMA})\n`);
     out(`legacy import ${store.meta("legacy_imported_at") ?? "never"} (source=${store.meta("legacy_import_source") ?? "-"})\n`);
     out(`last backup   ${store.meta("last_backup_date") ?? "never"} (${countBackups(deps.env.FLEET_STATE)} kept)\n`);
     out(`quick_check   ${verdict}\n`);
@@ -332,7 +332,7 @@ async function stateRestore(args: string[], deps: StateCmdDeps): Promise<number>
   const out = stdout(deps);
   const from = args[0];
   if (from === undefined) {
-    log("usage: fleet2 state restore <backup-file>");
+    log("usage: grokfleet state restore <backup-file>");
     return RC.USAGE;
   }
   const path = storePath(deps.env.FLEET_STATE);
@@ -471,7 +471,7 @@ async function stateReconcileFiles(args: string[], deps: StateCmdDeps): Promise<
   for (const f of findings) {
     if (f.kind === "store-only") {
       out(`store-only ${f.name} — the file lacks this enrolled row; the next export restores it.\n`);
-      out(`           to remove the box instead:  fleet2 retire ${f.name}\n`);
+      out(`           to remove the box instead:  grokfleet retire ${f.name}\n`);
       entries.push({ kind: "store-only", name: f.name, action: "none" });
       continue;
     }

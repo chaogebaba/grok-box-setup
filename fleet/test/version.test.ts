@@ -1,4 +1,4 @@
-// Gate-r1 finding 1 — `fleet2 version` must embed the BUILD sha, not re-run git
+// Gate-r1 finding 1 — `grokfleet version` must embed the BUILD sha, not re-run git
 // in the invocation directory. resolveGitSha(buildSha, runGit) uses the build
 // flag when set and only falls back to runtime git when it is empty (dev/test).
 

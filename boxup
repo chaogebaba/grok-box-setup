@@ -2054,7 +2054,7 @@ recycle_offline_tailscaled() {
 # Never a delete, never a path off the list, never a symlink. The result lands
 # in $RUN_DIR/disk for the operator, in the `disk=` status token, and in
 # check_reason, so the brain's existing "reachable-cannot-converge" alert fires
-# with no brain-side change at all (G4: no fleet2 code in this lane).
+# with no brain-side change at all (G4: no grokfleet code in this lane).
 #
 # Why truncation runs AS THE FILE'S OWNER: /tmp is sticky and world-writable,
 # and Linux's fs.protected_regular refuses an O_TRUNC open of a file in such a
@@ -2871,13 +2871,13 @@ print_status() {
   # `check` stays OK on tunnelfail alone; this is visibility, not a predicate.
   printf ' tunnel=%s tunnelfail=%s' "$(tunnel_state)" "$(tunnel_fail_count)"
   # boxup-disk-guard G3: root-disk pressure, appended AFTER tunnel= so nothing
-  # that already parses this line moves. fleet2's status.ts tokenizes on `k=v`
+  # that already parses this line moves. grokfleet's status.ts tokenizes on `k=v`
   # and drops unknown keys, and splitVersion only ever reads v=, so every
   # existing consumer is untouched by construction.
   printf ' disk=%s' "$(disk_status_token)"
   # boxup-keepawake K4: four tokens appended AFTER disk=, for the same reason
   # disk= was appended after tunnel= — nothing that already parses this line
-  # moves. fleet2's status.ts tokenizes on `k=v` and drops unknown keys, so
+  # moves. grokfleet's status.ts tokenizes on `k=v` and drops unknown keys, so
   # every existing consumer is untouched by construction.
   printf ' %s' "$(keepawake_status_tokens)"
   printf '\n'

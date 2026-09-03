@@ -12,13 +12,13 @@
 // D2 knob: `connectTimeoutS` prepends an explicit `-o ConnectTimeout=<n>` for
 // discover-initiated calls. It is spliced BEFORE the shared SSH_OPTS because
 // ssh takes the FIRST value it obtains for an option; SSH_OPTS (ConnectTimeout
-// 6, also used by `fleet2 ssh`) is NOT changed.
+// 6, also used by `grokfleet ssh`) is NOT changed.
 
 import type { Runner } from "../runner.ts";
 import { sshCmdArgv } from "./ssh.ts";
 import { KNOWN_HOSTS_OPTS } from "../hostkey.ts";
 
-/** Default fleet2 deadline for a box ssh call (enroll's SSH_TIMEOUT_MS). */
+/** Default grokfleet deadline for a box ssh call (enroll's SSH_TIMEOUT_MS). */
 export const BOX_SSH_TIMEOUT_MS = 20_000;
 
 export interface BoxSshOpts {
@@ -26,7 +26,7 @@ export interface BoxSshOpts {
   password: string;
   /** explicit -o ConnectTimeout=<n> (discover only). */
   connectTimeoutS?: number;
-  /** fleet2's own deadline (default BOX_SSH_TIMEOUT_MS). */
+  /** grokfleet's own deadline (default BOX_SSH_TIMEOUT_MS). */
   timeoutMs?: number;
   /** bytes for the remote command's stdin. */
   stdin?: string;
@@ -34,7 +34,7 @@ export interface BoxSshOpts {
    * D11(a): the engine's own known_hosts file (knownHostsFile(env)). REQUIRED —
    * this is the tailnet path used by enroll, the discover probes and the repair
    * inspect, i.e. every fleet-driven `<box>` contact. The interactive
-   * `fleet2 ssh` does NOT come through here and keeps ssh's defaults.
+   * `grokfleet ssh` does NOT come through here and keeps ssh's defaults.
    */
   knownHosts: string;
 }
@@ -55,7 +55,7 @@ export async function boxSsh(
   // Both go through `extraOpts`, which is spliced BEFORE SSH_OPTS — ssh takes
   // the FIRST value it obtains for an option, so this ordering is what lets the
   // known-hosts options and the discover connect timeout win without changing
-  // SSH_OPTS (which `fleet2 ssh` shares).
+  // SSH_OPTS (which `grokfleet ssh` shares).
   const extra = [
     ...KNOWN_HOSTS_OPTS(opts.knownHosts),
     ...(opts.connectTimeoutS === undefined ? [] : ["-o", `ConnectTimeout=${opts.connectTimeoutS}`]),

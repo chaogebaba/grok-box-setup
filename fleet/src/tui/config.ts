@@ -1,8 +1,8 @@
 // config.ts — the TUI's own config (TUI-D6).
 //
 // `~/.config/grok-fleet/tui.toml` carries `url` + `token`; mode 600 enforced
-// (refuse world-readable, A14). Env overrides `FLEET2_ADMIN_URL` /
-// `FLEET2_ADMIN_TOKEN` take precedence (A9 — deliberately NOT `FLEET_API_*`,
+// (refuse world-readable, A14). Env overrides `GROKFLEET_ADMIN_URL` /
+// `GROKFLEET_ADMIN_TOKEN` take precedence (A9 — deliberately NOT `FLEET_API_*`,
 // which is the Tailscale token pair). No interactive token prompt: if neither
 // the env nor a readable config yields both url+token, we refuse with a clear
 // message.
@@ -71,14 +71,14 @@ export function parseTuiToml(body: string): { url?: string; token?: string } {
 }
 
 /**
- * Resolve the TUI config: env override first (FLEET2_ADMIN_URL/TOKEN), then the
+ * Resolve the TUI config: env override first (GROKFLEET_ADMIN_URL/TOKEN), then the
  * mode-600 tui.toml. A present-but-world-readable config is REFUSED (A14). A
  * missing config is fine IF the env supplies both fields. Throws TuiConfigError
  * when the resolved url+token are not BOTH present.
  */
 export function resolveTuiConfig(fs: ConfigFs = nodeConfigFs): TuiConfig {
-  const envUrl = fs.env("FLEET2_ADMIN_URL");
-  const envToken = fs.env("FLEET2_ADMIN_TOKEN");
+  const envUrl = fs.env("GROKFLEET_ADMIN_URL");
+  const envToken = fs.env("GROKFLEET_ADMIN_TOKEN");
 
   let fileUrl: string | undefined;
   let fileToken: string | undefined;
@@ -101,7 +101,7 @@ export function resolveTuiConfig(fs: ConfigFs = nodeConfigFs): TuiConfig {
   if (url === undefined || token === undefined) {
     const missing = [url === undefined ? "url" : null, token === undefined ? "token" : null].filter(Boolean).join(", ");
     throw new TuiConfigError(
-      `tui: no ${missing} — set FLEET2_ADMIN_URL/FLEET2_ADMIN_TOKEN or add url/token to ${path} (mode 600). No interactive prompt.`,
+      `tui: no ${missing} — set GROKFLEET_ADMIN_URL/GROKFLEET_ADMIN_TOKEN or add url/token to ${path} (mode 600). No interactive prompt.`,
     );
   }
   // normalise: strip a trailing slash from the url so path joins are clean.

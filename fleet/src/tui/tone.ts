@@ -10,7 +10,7 @@
 // code here. `dim` is gone: `dimColor` renders as unreadable grey-on-grey on
 // several dark themes, so the muted tone is a real colour instead.
 
-/** Chrome: header bar, column headers, frame lines, key hints, `fleet2`. */
+/** Chrome: header bar, column headers, frame lines, key hints, `grokfleet`. */
 export const MAIN = "#7aa2f7";
 /** Interactive emphasis: key letters, the selected row, the canary star. */
 export const ACCENT = "#bb9af7";

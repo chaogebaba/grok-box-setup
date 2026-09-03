@@ -1,4 +1,4 @@
-// list.ts — `fleet2 list` (D15/F8), the laptop-side tailnet discovery.
+// list.ts — `grokfleet list` (D15/F8), the laptop-side tailnet discovery.
 //
 // Ports cmd_list (main:218-229) + fleet_discover (main:122-146) VERBATIM in
 // behaviour: `tailscale status --json`, keep every Peer whose HostName matches

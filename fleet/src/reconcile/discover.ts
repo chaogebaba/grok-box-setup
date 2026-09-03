@@ -284,7 +284,7 @@ export function selectCandidates(
     // is NOT adoptable and is dropped SILENTLY — no `skipped` entry. A skip
     // reason is a transient fact; a retired box parked on the tailnet would
     // otherwise emit ~26k `snapshot_skipped` rows per retention window. The
-    // retire audit row and `fleet2 state check` are the record instead.
+    // retire audit row and `grokfleet state check` are the record instead.
     //
     // This exclusion ships in PHASE A (the `phase` column is in schema v1), so a
     // 5.8.0 binary rolled back from Phase B never adopts an `enrolling` or

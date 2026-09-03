@@ -1,8 +1,8 @@
 // json-output.test.ts — agent-ux U2/U6: `--json` on every read command, and
-// FLEET2_JSON=1 as its environment equivalent.
+// GROKFLEET_JSON=1 as its environment equivalent.
 //
-// Mutant (b): drop the FLEET2_JSON branch from `wantsJson` ⇒ every
-// "FLEET2_JSON=1 is equivalent" case fails.
+// Mutant (b): drop the GROKFLEET_JSON branch from `wantsJson` ⇒ every
+// "GROKFLEET_JSON=1 is equivalent" case fails.
 
 import { afterAll, describe, test, expect } from "bun:test";
 import { envWantsJson, wantsJson } from "../../src/commands/json-flag.ts";
@@ -21,21 +21,21 @@ import { RC } from "../../src/upgrade.ts";
 const SCRATCH = suiteScratch("json-output");
 afterAll(() => SCRATCH.clean());
 
-describe("U2 the --json / FLEET2_JSON decision (mutant (b))", () => {
+describe("U2 the --json / GROKFLEET_JSON decision (mutant (b))", () => {
   test("--json wins on its own", () => {
     expect(wantsJson(["--json"], {})).toBe(true);
     expect(wantsJson(["status"], {})).toBe(false);
   });
 
-  test("FLEET2_JSON=1 is equivalent to --json", () => {
-    expect(wantsJson([], { FLEET2_JSON: "1" })).toBe(true);
-    expect(wantsJson(["status"], { FLEET2_JSON: "true" })).toBe(true);
-    expect(envWantsJson({ FLEET2_JSON: "1" })).toBe(true);
+  test("GROKFLEET_JSON=1 is equivalent to --json", () => {
+    expect(wantsJson([], { GROKFLEET_JSON: "1" })).toBe(true);
+    expect(wantsJson(["status"], { GROKFLEET_JSON: "true" })).toBe(true);
+    expect(envWantsJson({ GROKFLEET_JSON: "1" })).toBe(true);
   });
 
-  test("a set-but-off FLEET2_JSON does NOT force JSON", () => {
+  test("a set-but-off GROKFLEET_JSON does NOT force JSON", () => {
     for (const v of ["", "0", "false", "no", "off", " OFF "]) {
-      expect(wantsJson([], { FLEET2_JSON: v })).toBe(false);
+      expect(wantsJson([], { GROKFLEET_JSON: v })).toBe(false);
     }
     expect(wantsJson([], {})).toBe(false);
   });

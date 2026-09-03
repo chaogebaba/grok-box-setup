@@ -1,8 +1,8 @@
-// timers.ts — `fleet2 install-timer` (retired, D6) + `fleet2 remove-timer`
+// timers.ts — `grokfleet install-timer` (retired, D6) + `grokfleet remove-timer`
 // (kept, F7/M5), the laptop-side systemd USER timer commands.
 //
 // install-timer is DROPPED as a feature (D6): it printed a retirement line and
-// exits rc 2 — the VPS fleet-reconcile.timer alerts instead. It is NOT listed
+// exits rc 2 — the VPS grokfleet-reconcile.timer alerts instead. It is NOT listed
 // in usage() (M5); discoverable only by invoking it.
 //
 // remove-timer is KEPT and functional (F7/M5), a port of cmd_remove_timer
@@ -21,9 +21,9 @@ const SYSTEMCTL_TIMEOUT_MS = 15_000;
 const UNIT_TIMER = "fleetctl-check.timer";
 const UNIT_SERVICE = "fleetctl-check.service";
 
-/** The retirement line printed by `fleet2 install-timer` (D6). rc 2. */
+/** The retirement line printed by `grokfleet install-timer` (D6). rc 2. */
 export const INSTALL_TIMER_RETIRED_LINE =
-  "install-timer was retired in 5.4.0 — the VPS fleet-reconcile.timer alerts instead (docs/FLEET-BRAIN.md)";
+  "install-timer was retired in 5.4.0 — the VPS grokfleet-reconcile.timer alerts instead (docs/FLEET-BRAIN.md)";
 
 /** cmd_install_timer (retired): log the retirement line, rc 2. */
 export function cmdInstallTimer(): number {

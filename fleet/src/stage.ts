@@ -32,7 +32,7 @@ export const nodeStageFs: StageFs = {
   async mktempTar() {
     const { mkdtemp } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
-    const dir = await mkdtemp(`${tmpdir()}/fleet2-stage-`);
+    const dir = await mkdtemp(`${tmpdir()}/grokfleet-stage-`);
     return `${dir}/tree.tar`;
   },
   async sizeOf(path) {
@@ -74,7 +74,7 @@ export async function assertGitSrc(runner: Runner, src: string): Promise<void> {
  * `[rollout].target` is `main`, and `main` in `[rollout].src` is a LOCAL branch
  * that a `git fetch` never advances: fetch updates `refs/remotes/origin/main`
  * and leaves the local branch exactly where the last checkout put it. The VPS
- * source tree is never checked out or pulled by fleet2, so its `main` had been
+ * source tree is never checked out or pulled by grokfleet, so its `main` had been
  * frozen 77 commits behind `origin/main` since 30 Aug and the resolved target
  * sha never moved. Every box was therefore "at target" and no boxup release
  * could ever reach the fleet, with auto-rollout on or off.

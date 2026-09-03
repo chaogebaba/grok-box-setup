@@ -14,11 +14,11 @@ import { log } from "../log.ts";
 import type { InventoryResult, ProbeResult } from "../inventory.ts";
 import { driftCell } from "../inventory.ts";
 
-/** The bare-rollout refusal (main:636-639, fleetctl→fleet2), 3 lines, rc 2. */
+/** The bare-rollout refusal (main:636-639, fleetctl→grokfleet), 3 lines, rc 2. */
 export function rolloutRefusal(): number {
   log("rollout: refusing to guess targets. Use:");
-  log("  fleet2 rollout <box...>      deploy to explicit boxes");
-  log("  fleet2 rollout --all         deploy to the whole fleet (canary first)");
+  log("  grokfleet rollout <box...>      deploy to explicit boxes");
+  log("  grokfleet rollout --all         deploy to the whole fleet (canary first)");
   return 2;
 }
 
@@ -29,13 +29,13 @@ export function rolloutCanaryLine(box: string, policy: "config" | "dynamic"): st
 
 /** --dirty compatibility log (M4). */
 export const ROLLOUT_DIRTY_COMPAT_LINE =
-  "rollout: --dirty is accepted for compatibility; fleet2 deploys the resolved ref, never the working tree";
+  "rollout: --dirty is accepted for compatibility; grokfleet deploys the resolved ref, never the working tree";
 
 /**
  * status fleet summary lines from the inventory rows (F2 Q1 addendum, main:303/306).
  * MIXED-version when >1 distinct non-unknown boxup VERSION across probed boxes;
  * drift when any probed box's version != target version. Both halves are keyed
- * on VERSION since D5 (62eebe6/1928c26): every fleet2-only commit to main
+ * on VERSION since D5 (62eebe6/1928c26): every grokfleet-only commit to main
  * restamps each box with a fresh repo sha at the SAME boxup version, so counting
  * shas here reported a MIXED fleet with zero drift after every such commit.
  * Returns the lines to log (may be empty).

@@ -1,4 +1,4 @@
-// log.ts — journal logging (D9). Every line is `<ISO8601>Z fleet2: <msg>` to
+// log.ts — journal logging (D9). Every line is `<ISO8601>Z grokfleet: <msg>` to
 // stderr, so it lands in the systemd journal under the unit exactly like
 // fleetctl's log() (fleetctl:52).
 //
@@ -26,5 +26,5 @@ function nowIso(): string {
 }
 
 export function log(msg: string): void {
-  sink(`${nowIso()} fleet2: ${msg}`);
+  sink(`${nowIso()} grokfleet: ${msg}`);
 }

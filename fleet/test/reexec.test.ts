@@ -14,8 +14,8 @@ describe("spawnReexec (unit)", () => {
     let seenArgv: string[] = [];
     let seenOpts: ReexecOptions | undefined;
     const res = await spawnReexec(
-      ["flock", "-n", "-E", "6", "/lock", "/opt/grok-fleet/fleet2", "upgrade", "--apply"],
-      { FLEET2_LOCKED: "1" },
+      ["flock", "-n", "-E", "6", "/lock", "/opt/grok-fleet/grokfleet", "upgrade", "--apply"],
+      { GROKFLEET_LOCKED: "1" },
       async (argv, opts) => {
         seenArgv = argv;
         seenOpts = opts;
@@ -27,12 +27,12 @@ describe("spawnReexec (unit)", () => {
     expect(seenOpts!.stdin).toBe("inherit");
     expect(seenOpts!.stdout).toBe("inherit");
     expect(seenOpts!.stderr).toBe("inherit");
-    expect(seenOpts!.env["FLEET2_LOCKED"]).toBe("1");
+    expect(seenOpts!.env["GROKFLEET_LOCKED"]).toBe("1");
   });
 
   test("bunInheritSpawner returns launched:false when the executable is missing", async () => {
     const res = await bunInheritSpawner(
-      ["this-binary-does-not-exist-fleet2-xyz", "arg"],
+      ["this-binary-does-not-exist-grokfleet-xyz", "arg"],
       { stdin: "inherit", stdout: "inherit", stderr: "inherit", env: {} },
     );
     expect(res.launched).toBe(false);

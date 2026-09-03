@@ -3,7 +3,7 @@
 // `[rollout].target` is `main`, and `main` inside `[rollout].src` is a LOCAL
 // branch that a `git fetch` never advances — fetch moves
 // `refs/remotes/origin/main` and leaves the local branch where the last
-// checkout put it. fleet2 never checks the source tree out, so the VPS's local
+// checkout put it. grokfleet never checks the source tree out, so the VPS's local
 // `main` sat 77 commits behind origin and the resolved target sha had not moved
 // since 30 Aug. Every box read as "at target" and no boxup release could reach
 // the fleet, with auto-rollout on or off.

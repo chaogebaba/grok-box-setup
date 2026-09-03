@@ -1,4 +1,4 @@
-// retire.ts — `fleet2 retire [--forget] [--dry-run] <grok-box-N>` (blueprint
+// retire.ts — `grokfleet retire [--forget] [--dry-run] <grok-box-N>` (blueprint
 // fleet2-state-store D4, Phase B).
 //
 // Un-enrolling a box used to be an operator editing `enrolled.tsv` by hand and
@@ -28,7 +28,7 @@
 // again. `audit` rows are kept by design — `audit.box` is plain TEXT, not a
 // foreign key, so the history of a forgotten box survives it.
 //
-// Re-adoption is an explicit operator gesture only: `fleet2 enroll <box>` on a
+// Re-adoption is an explicit operator gesture only: `grokfleet enroll <box>` on a
 // retired name does `transition(retired -> enrolling)` on the SAME row and runs
 // the saga.
 
@@ -39,7 +39,7 @@ import type { StoreState } from "../store/state.ts";
 import { RC } from "../upgrade.ts";
 import { log } from "../log.ts";
 
-/** The message `rename` and `fleet2 state` already print for a busy lock. */
+/** The message `rename` and `grokfleet state` already print for a busy lock. */
 export const RETIRE_BUSY_LINE =
   "reconcile busy — could not acquire the reconcile lock within 90s; refusing";
 
@@ -55,7 +55,7 @@ export interface RetireOps {
   removeEtcLine(box: string): boolean;
   /** DELETE the Tailscale auth key. Best-effort: a failure is logged, never fatal. */
   revokeKey(keyId: string): Promise<{ ok: boolean; code: number }>;
-  /** `flock -w 90` on reconcile.lock, exactly as rename and `fleet2 state` probe it. */
+  /** `flock -w 90` on reconcile.lock, exactly as rename and `grokfleet state` probe it. */
   acquireLock(): Promise<"ok" | "busy" | "open-fail">;
 }
 
@@ -129,7 +129,7 @@ export async function cmdRetire(args: string[], deps: RetireDeps): Promise<numbe
   const out = deps.out ?? ((s: string) => process.stdout.write(s));
   const parsed = parseRetireArgs(args);
   if ("usage" in parsed) {
-    log("usage: fleet2 retire [--forget] [--dry-run] <grok-box-N>");
+    log("usage: grokfleet retire [--forget] [--dry-run] <grok-box-N>");
     return RC.USAGE;
   }
   const { box, forget, dryRun } = parsed;
@@ -167,7 +167,7 @@ export async function cmdRetire(args: string[], deps: RetireDeps): Promise<numbe
     }
 
     // A membership mutation takes the reconcile lock, exactly as rename and
-    // `fleet2 state reconcile-files --apply` do (r4-B4).
+    // `grokfleet state reconcile-files --apply` do (r4-B4).
     const got = await deps.ops.acquireLock();
     if (got === "open-fail") {
       log(`retire: cannot open ${deps.env.FLEET_STATE}/reconcile.lock (is util-linux flock installed?)`);
@@ -214,12 +214,12 @@ export async function cmdRetire(args: string[], deps: RetireDeps): Promise<numbe
       handle.store.audit({ actor: "operator", action: "retire-forget", box, rc: 0, detail: `was ${row.phase}` });
       out(`retire: ${box} FORGOTTEN — row deleted; the name is an ordinary discovery candidate again\n`);
     } else {
-      const t = handle.state.transition(box, row.phase, "retired", "operator", "fleet2 retire");
+      const t = handle.state.transition(box, row.phase, "retired", "operator", "grokfleet retire");
       if (t.rc !== 0) {
         log(`retire: ${t.message}`);
         return RC.FAILURE;
       }
-      out(`retire: ${box} retired (row kept; the name is NOT adoptable — 'fleet2 enroll ${box}' revives it)\n`);
+      out(`retire: ${box} retired (row kept; the name is NOT adoptable — 'grokfleet enroll ${box}' revives it)\n`);
     }
 
     const errs = handle.state.takeExportErrors();
