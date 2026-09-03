@@ -87,6 +87,11 @@
 #         while that lock is held
 #   (13)  no new setsid/nohup/disown outside spawn_detached, and the wrapper is
 #         launched with its own argv shape rather than through a shell
+#   (14)  5.5.1: after a simulated swap the guard restarts the service AND
+#         re-takes the one-job slot, so the status tokens name it again and a
+#         second start is refused rc 75                     [mutants s1, s2]
+#   (14b) a restart never steals a slot another LIVE job holds: it is deferred
+#         to a later tick and the refusal is logged          [mutants s3, s4]
 #
 # NOTE (blueprint (10d)): detecting a fast writer's regenerated log from the
 # COUNTER rather than from sizes is a BRAIN-side property — the box's job is to
@@ -110,6 +115,11 @@ bad()  { printf 'FAIL: %s\n' "$1"; fail=1; }
 # $1 = the scenario name (see the case block inside)
 # $2 = the `df` percent sequence, one per line (the last repeats); may be empty
 # $3 = DISK_GUARD_TRUNCATE for this scenario ("" => the shipped default)
+#
+# NB: the inner script below is written through an UNQUOTED heredoc, so the outer
+# shell expands it. Backticks are command substitution even inside a comment —
+# an unescaped `word` in prose runs `word`. Every $ that belongs to the inner
+# script is escaped, and prose uses 'single quotes' rather than backticks.
 # ---------------------------------------------------------------------------
 run_case() {
   local scenario="$1" dfseq="${2:-}" dgt="${3:-}" inner rc
@@ -119,7 +129,7 @@ set -u
 BOXUP="$BOXUP"
 WORK="\$(mktemp -d)"
 # Every process this scenario starts is DETACHED (that is the mechanism under
-# test), so `jobs -p` cannot see it. They are found instead by the seam they all
+# test), so 'jobs -p' cannot see it. They are found instead by the seam they all
 # inherit in their environment, and killed by process GROUP.
 cleanup(){
   local d p pg mypg
@@ -234,7 +244,8 @@ for fn in spawn_detached refresh_backoff_window \\
           disk_used_pct disk_level disk_allowlisted disk_truncate_one disk_guard \\
           is_job_wrapper_proc jobs_rec jobs_marker jobs_read jobs_read_raw \\
           jobs_valid_id jobs_live jobs_scan_wrapper jobs_terminal jobs_state \\
-          jobs_slot_id jobs_slot_release jobs_slot_held jobs_bound_logs \\
+          jobs_slot_id jobs_slot_release jobs_slot_held jobs_slot_claim \\
+          jobs_bound_logs \\
           jobs_record_truncation jobs_restart_state jobs_restart_one \\
           jobs_supervise jobs_prune jobs_guard jobs_status_tokens \\
           jobs_launch_wrapper jobs_usage jobs_cmd_start jobs_cmd_status \\
@@ -418,7 +429,7 @@ keepalive-backoff)
   sleep 0.4
   echo "r3=[\$(cat "\$(jobs_restart_state SVCBACK)")]"
   echo "restarts_total=[\$(grep -c 'job=SVCBACK restarting' "\$LOGLINES")]"
-  # One per line: the outer `field` helper anchors on the whole line, so two
+  # One per line: the outer 'field' helper anchors on the whole line, so two
   # k=[v] pairs sharing a line make the first capture swallow the rest.
   echo "window0=[\$(refresh_backoff_window 0)]"
   echo "window1=[\$(refresh_backoff_window 1)]"
@@ -636,6 +647,69 @@ tokens)
   waitfor "\$(jobs_marker TOK)" || true
   sleep 0.3
   echo "tokens_running=[\$(jobs_status_tokens)]"
+  ;;
+
+swap-retakes-slot)
+  # The 5.5.1 defect: after a swap the tick restarts the service but the slot
+  # stays gone, so 'boxup status' reports no job and the box accepts a second.
+  mkrec SVCSLOT kind=service keep_alive=1 restart_on_swap=1 cap=1
+  printf 'sleep 300' > "\$JOBS_DIR/SVCSLOT/cmd"
+  printf '%s' "\$WORK" > "\$JOBS_DIR/SVCSLOT/cwd"
+  mkdir -p "\$JOBS_SLOT"; echo SVCSLOT > "\$JOBS_SLOT/id"; date +%s > "\$JOBS_SLOT/at"
+  wp="\$(fake_wrapper SVCSLOT)"
+  echo "\$wp" > "\$(jobs_marker SVCSLOT)"
+  echo "before_state=[\$(jobs_state SVCSLOT)]"
+  echo "before_tokens=[\$(jobs_status_tokens)]"
+  # the simulated image swap: kill the group and clear the RUN dir, which is
+  # exactly what a swap does to /run (and what a reboot does too)
+  pg=\$(ps -o pgid= -p "\$wp" 2>/dev/null | tr -d ' ')
+  [ -n "\$pg" ] && command kill -9 -- "-\$pg" 2>/dev/null
+  sleep 0.3
+  rm -rf "\$JOBS_RUN_DIR"
+  echo "swap_state=[\$(jobs_state SVCSLOT)]"
+  echo "swap_slot=[\$(jobs_slot_id 2>/dev/null || echo NONE)]"
+  mkdir -p "\$JOBS_RUN_DIR"
+  jobs_guard
+  waitfor "\$(jobs_marker SVCSLOT)" || true
+  sleep 0.5
+  echo "restart_state=[\$(jobs_state SVCSLOT)]"
+  echo "restart_slot=[\$(jobs_slot_id 2>/dev/null || echo NONE)]"
+  echo "restart_tokens=[\$(jobs_status_tokens)]"
+  # THE invariant: the box must refuse a second job again
+  out="\$(jobs_cmd_start SECOND --cap 60 -- sleep 30 2>&1)"; src=\$?
+  echo "second_rc=[\$src]"
+  echo "second_out=[\$out]"
+  echo "second_created=[\$([ -d "\$JOBS_DIR/SECOND" ] && echo yes || echo no)]"
+  n=0
+  for d in /proc/[0-9]*; do
+    is_job_wrapper_proc "\${d##*/}" SECOND && n=\$((n + 1))
+  done
+  echo "second_wrappers=[\$n]"
+  ;;
+
+slot-not-stolen)
+  # A service needs a restart while ANOTHER job legitimately holds the slot.
+  # Restarting into it would be the same two-jobs-on-one-box outcome, reached
+  # from the other side, so the restart must WAIT.
+  jobs_cmd_start HOLDER --cap 120 -- sleep 120 >/dev/null 2>&1
+  waitfor "\$(jobs_marker HOLDER)" || true
+  sleep 0.3
+  mkrec SVCWAIT kind=service keep_alive=1 restart_on_swap=1 cap=1
+  printf 'sleep 300' > "\$JOBS_DIR/SVCWAIT/cmd"
+  printf '%s' "\$WORK" > "\$JOBS_DIR/SVCWAIT/cwd"
+  echo "holder_slot=[\$(jobs_slot_id)]"
+  echo "svc_state_before=[\$(jobs_state SVCWAIT)]"
+  jobs_guard
+  sleep 0.5
+  echo "slot_after=[\$(jobs_slot_id 2>/dev/null || echo NONE)]"
+  echo "holder_state=[\$(jobs_state HOLDER)]"
+  echo "svc_state_after=[\$(jobs_state SVCWAIT)]"
+  echo "refusal_logged=[\$(grep -c 'job=SVCWAIT NOT restarting' "\$LOGLINES")]"
+  n=0
+  for d in /proc/[0-9]*; do
+    is_job_wrapper_proc "\${d##*/}" SVCWAIT && n=\$((n + 1))
+  done
+  echo "svc_wrappers=[\$n]"
   ;;
 
 ls-and-usage)
@@ -1020,6 +1094,45 @@ if [ "$offenders" = 0 ] && \
   pass "(13) the job runner adds no spawn primitive outside spawn_detached, and launches the wrapper as 'bash <boxup> job-wrapper <id>' rather than through a shell"
 else
   bad  "(13) spawn discipline broken: offenders=$offenders"
+fi
+
+# ---------------------------------------------------------------------------
+# (14) after a swap the tick RE-TAKES the one-job slot, so the status tokens
+# tell the truth again and the box refuses a second job   [mutants s1, s2]
+# ---------------------------------------------------------------------------
+o="$(run_case swap-retakes-slot)"
+ok=1
+[ "$(field "$o" before_state)"   = running ]                   || ok=0
+[ "$(field "$o" before_tokens)"  = "job=SVCSLOT job_state=running" ] || ok=0
+[ "$(field "$o" swap_state)"     = "lost:image-swap" ]         || ok=0
+[ "$(field "$o" swap_slot)"      = NONE ]                      || ok=0
+[ "$(field "$o" restart_state)"  = running ]                   || ok=0
+[ "$(field "$o" restart_slot)"   = SVCSLOT ]                   || ok=0
+[ "$(field "$o" restart_tokens)" = "job=SVCSLOT job_state=running" ] || ok=0
+[ "$(field "$o" second_rc)"      = 75 ]                        || ok=0
+[ "$(field "$o" second_created)" = no ]                        || ok=0
+[ "$(field "$o" second_wrappers)" = 0 ]                        || ok=0
+printf '%s' "$(field "$o" second_out)" | grep -q 'job=busy' || ok=0
+if [ "$ok" = 1 ]; then
+  pass "(14) after a simulated swap the guard restarts the service AND re-takes the slot: the status tokens name it again and a second start is refused rc 75"
+else
+  bad  "(14) the slot was not re-taken on restart: [$(printf '%s' "$o" | tr '\n' ' ')]"
+fi
+
+# ---------------------------------------------------------------------------
+# (14b) a restart never STEALS a slot another live job holds   [mutants s3, s4]
+# ---------------------------------------------------------------------------
+o="$(run_case slot-not-stolen)"
+if [ "$(field "$o" holder_slot)"     = HOLDER ] && \
+   [ "$(field "$o" svc_state_before)" = "lost:image-swap" ] && \
+   [ "$(field "$o" slot_after)"       = HOLDER ] && \
+   [ "$(field "$o" holder_state)"     = running ] && \
+   [ "$(field "$o" svc_state_after)"  = "lost:image-swap" ] && \
+   [ "$(field "$o" svc_wrappers)"     = 0 ] && \
+   [ "$(field "$o" refusal_logged)" -ge 1 ]; then
+  pass "(14b) a service whose restart would need a slot another LIVE job holds is not restarted and does not steal it; the refusal is logged and the next tick retries"
+else
+  bad  "(14b) the restart stole or ignored a live slot: [$(printf '%s' "$o" | tr '\n' ' ')]"
 fi
 
 # ---------------------------------------------------------------------------

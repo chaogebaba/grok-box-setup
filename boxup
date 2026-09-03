@@ -32,7 +32,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.5.0
+BOXUP_VERSION=5.5.1
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -2895,6 +2895,34 @@ jobs_slot_held() {
   return 1
 }
 
+# jobs_slot_claim <id>: take the one-job slot for <id>. Returns 0 iff <id> holds
+# it afterwards.
+#
+# This exists because an image swap — or a plain reboot; both clear /run — takes
+# the slot away along with every marker, which is precisely how the swap is
+# detected. The tick then restarts a keep-alive service and, without this, the
+# slot would stay gone for the life of that job: `boxup status` would report
+# `job=-` while the service ran, and the next `boxup job start` would find no
+# slot and put a SECOND job on the box, silently disabling the rc 75 backstop
+# that J7/J9's one-job-per-box rule depends on.
+#
+# A slot naming a DIFFERENT job is offered to jobs_slot_held, which breaks it if
+# it is stale and keeps it if that job is genuinely live. A live holder is never
+# stolen from — restarting into its slot is the same two-jobs-on-one-box
+# outcome, arrived at from the other side.
+jobs_slot_claim() {
+  local id="$1" cur
+  cur="$(jobs_slot_id 2>/dev/null || true)"
+  [ "$cur" = "$id" ] && return 0
+  if [ -d "$JOBS_SLOT" ]; then
+    jobs_slot_held && return 1
+  fi
+  mkdir "$JOBS_SLOT" 2>/dev/null || return 1
+  echo "$id" > "$JOBS_SLOT/id" 2>/dev/null || true
+  date +%s > "$JOBS_SLOT/at" 2>/dev/null || true
+  return 0
+}
+
 # --- log bound (J6) ----------------------------------------------------------
 # The wrapper's stdout+stderr is ONE append descriptor, opened once by
 # spawn_detached and inherited across the exec. So the log is bounded by
@@ -2997,7 +3025,21 @@ jobs_restart_one() {
   # whole-field, so an in-flight `boxup job status <id>` poll is NOT a match.
   if pid="$(jobs_scan_wrapper "$id")"; then
     echo "$pid" > "$(jobs_marker "$id")" 2>/dev/null || true
+    # The job IS running, so the marker goes back unconditionally; the slot is
+    # best-effort here because another live job may legitimately hold it.
+    jobs_slot_claim "$id" || \
+      log "jobs_guard: WARN job=$id is live but the job slot is held by $(jobs_slot_id 2>/dev/null || echo '?')" >&2
     log "jobs_guard: job=$id wrapper already live pid=$pid — marker re-created, not restarting"
+    return 1
+  fi
+  # Re-take the slot BEFORE launching. A swap cleared it, and a service that
+  # comes back without it is invisible to `boxup status` and leaves the box
+  # accepting a second job. If it cannot be claimed, another job is genuinely
+  # running here: do NOT restart into that, log it, and let the next tick retry.
+  # The restart counter is not advanced, so a blocked service does not burn its
+  # way to a crashloop while it waits.
+  if ! jobs_slot_claim "$id"; then
+    log "jobs_guard: job=$id NOT restarting — the job slot is held by $(jobs_slot_id 2>/dev/null || echo '?')" >&2
     return 1
   fi
   [ "$first" -gt 0 ] && [ $((now - first)) -ge "$JOBS_CRASHLOOP_WINDOW_S" ] && { n=0; first=0; }
