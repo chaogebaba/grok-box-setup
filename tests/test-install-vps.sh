@@ -1292,16 +1292,16 @@ ST
     printf '[Timer]\n' > "$root/opt/units.prev/fleet-reconcile.timer"
     printf '[Service]\n' > "$root/opt/units.prev/fleet-api.service"
   fi
-  # "unitfail": an `install` shim that fails ONLY for a destination under the
-  # systemd dir. Shadowing $SYSTEMD_DIR instead would change what the step-(4)
-  # discriminator reads and would silently test the other branch; a directory at
-  # the destination does not work either, because GNU install would happily
-  # install INTO it.
+  # "unitfail": an `install` shim that fails ONLY for the first new unit write.
+  # This makes each write boundary independent: removing that line's
+  # `|| return 1` cannot fall through to another injected failure and pass for
+  # the wrong reason. Shadowing $SYSTEMD_DIR instead would change what step (4)
+  # reads; a directory destination also fails because GNU install writes into it.
   local sysdir="$root/systemd" real_install; real_install="$(command -v install)"
   if [ "$mode" = unitfail ]; then
     cat > "$d/install" <<INS
 #!/usr/bin/env bash
-for a in "\$@"; do case "\$a" in $sysdir/*) exit 1 ;; esac; done
+for a in "\$@"; do case "\$a" in $sysdir/grokfleet-reconcile.service) exit 1 ;; esac; done
 exec "$real_install" "\$@"
 INS
     chmod +x "$d/install"
