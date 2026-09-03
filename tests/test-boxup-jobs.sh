@@ -92,6 +92,15 @@
 #         second start is refused rc 75                     [mutants s1, s2]
 #   (14b) a restart never steals a slot another LIVE job holds: it is deferred
 #         to a later tick and the refusal is logged          [mutants s3, s4]
+#   (15)  5.5.2: driven through the REAL run_tick entry point the installed
+#         worker calls, with the run dir ABSENT the way a swap leaves it, the
+#         service restarts, the run dir and slot come back, and a second start
+#         is refused                                    [mutants g1, g2, g4]
+#   (15b) a tick that SKIPS on a contended converge lock has still supervised
+#         jobs, because the guard runs before the lock          [mutant g3]
+#   (15c) a slot path that cannot be created is reported as such (rc 2) and
+#         blocks the restart, instead of being reported as contention
+#                                                                [mutant g4]
 #
 # NOTE (blueprint (10d)): detecting a fast writer's regenerated log from the
 # COUNTER rather than from sizes is a BRAIN-side property — the box's job is to
@@ -665,16 +674,21 @@ swap-retakes-slot)
   pg=\$(ps -o pgid= -p "\$wp" 2>/dev/null | tr -d ' ')
   [ -n "\$pg" ] && command kill -9 -- "-\$pg" 2>/dev/null
   sleep 0.3
-  rm -rf "\$JOBS_RUN_DIR"
+  rm -rf "\$RUN_DIR"               # the swap, faithfully: ALL of /run is gone
   echo "swap_state=[\$(jobs_state SVCSLOT)]"
   echo "swap_slot=[\$(jobs_slot_id 2>/dev/null || echo NONE)]"
-  mkdir -p "\$JOBS_RUN_DIR"
+  echo "swap_rundir=[\$([ -d "\$JOBS_RUN_DIR" ] && echo present || echo ABSENT)]"
+  # The run dir is NOT re-created here. A swap deletes it outright, and every
+  # consumer below must cope with that; re-creating it first is a weaker event
+  # than the one this case is named after, and it is what let the 5.5.1 ENOENT
+  # regression reach a live box.
   jobs_guard
   waitfor "\$(jobs_marker SVCSLOT)" || true
   sleep 0.5
   echo "restart_state=[\$(jobs_state SVCSLOT)]"
   echo "restart_slot=[\$(jobs_slot_id 2>/dev/null || echo NONE)]"
   echo "restart_tokens=[\$(jobs_status_tokens)]"
+  echo "restart_rundir=[\$([ -d "\$JOBS_RUN_DIR" ] && echo present || echo ABSENT)]"
   # THE invariant: the box must refuse a second job again
   out="\$(jobs_cmd_start SECOND --cap 60 -- sleep 30 2>&1)"; src=\$?
   echo "second_rc=[\$src]"
@@ -710,6 +724,88 @@ slot-not-stolen)
     is_job_wrapper_proc "\${d##*/}" SVCWAIT && n=\$((n + 1))
   done
   echo "svc_wrappers=[\$n]"
+  ;;
+
+tick-restarts-after-swap)
+  # The entry point the installed WORKER actually calls, not jobs_guard direct.
+  # run_tick is extracted whole; only the neighbours are stubbed, so the guard's
+  # position inside it and its behaviour with an ABSENT run dir are both real.
+  eval "\$(extract_fn_from "\$BOXUP" run_tick)"
+  disk_guard(){ echo "disk_guard ran" >> "\$LOGLINES"; }
+  keepawake_guard(){ echo "keepawake_guard ran" >> "\$LOGLINES"; }
+  do_tick(){ echo "do_tick ran" >> "\$LOGLINES"; }
+  LOCK_RC=\${LOCK_RC:-0}
+  run_with_converge_lock(){ echo "converge_lock ran" >> "\$LOGLINES"; return "\$LOCK_RC"; }
+  mkrec SVCTICK kind=service keep_alive=1 restart_on_swap=1 cap=1
+  printf 'sleep 300' > "\$JOBS_DIR/SVCTICK/cmd"
+  printf '%s' "\$WORK" > "\$JOBS_DIR/SVCTICK/cwd"
+  mkdir -p "\$JOBS_SLOT"; echo SVCTICK > "\$JOBS_SLOT/id"; date +%s > "\$JOBS_SLOT/at"
+  wp="\$(fake_wrapper SVCTICK)"
+  echo "\$wp" > "\$(jobs_marker SVCTICK)"
+  pg=\$(ps -o pgid= -p "\$wp" 2>/dev/null | tr -d ' ')
+  [ -n "\$pg" ] && command kill -9 -- "-\$pg" 2>/dev/null
+  sleep 0.3
+  rm -rf "\$RUN_DIR"               # the swap, faithfully: ALL of /run is gone
+  echo "pre_rundir=[\$([ -d "\$JOBS_RUN_DIR" ] && echo present || echo ABSENT)]"
+  echo "pre_state=[\$(jobs_state SVCTICK)]"
+  run_tick; echo "tick_rc=[\$?]"
+  waitfor "\$(jobs_marker SVCTICK)" || true
+  sleep 0.5
+  echo "post_state=[\$(jobs_state SVCTICK)]"
+  echo "post_slot=[\$(jobs_slot_id 2>/dev/null || echo NONE)]"
+  echo "post_tokens=[\$(jobs_status_tokens)]"
+  echo "post_rundir=[\$([ -d "\$JOBS_RUN_DIR" ] && echo present || echo ABSENT)]"
+  out="\$(jobs_cmd_start SECOND --cap 60 -- sleep 30 2>&1)"; src=\$?
+  echo "second_rc=[\$src]"
+  echo "guard_before_lock=[\$(grep -n 'converge_lock ran\\|do_tick ran' "\$LOGLINES" | head -1 | cut -d: -f1)]"
+  echo "restart_line=[\$(grep -c 'job=SVCTICK restarting' "\$LOGLINES")]"
+  ;;
+
+tick-contended-lock)
+  # A tick that SKIPS on a contended converge lock must still have supervised
+  # jobs: the guard runs before the lock is taken, which is why it is placed
+  # where it is. rc 200 is the skip path.
+  eval "\$(extract_fn_from "\$BOXUP" run_tick)"
+  disk_guard(){ :; }
+  keepawake_guard(){ :; }
+  do_tick(){ echo "do_tick ran" >> "\$LOGLINES"; }
+  run_with_converge_lock(){ return 200; }
+  mkrec SVCLOCK kind=service keep_alive=1 restart_on_swap=1 cap=1
+  printf 'sleep 300' > "\$JOBS_DIR/SVCLOCK/cmd"
+  printf '%s' "\$WORK" > "\$JOBS_DIR/SVCLOCK/cwd"
+  rm -rf "\$RUN_DIR"
+  run_tick; echo "tick_rc=[\$?]"
+  waitfor "\$(jobs_marker SVCLOCK)" || true
+  sleep 0.5
+  echo "state=[\$(jobs_state SVCLOCK)]"
+  echo "slot=[\$(jobs_slot_id 2>/dev/null || echo NONE)]"
+  echo "do_tick_ran=[\$(grep -c 'do_tick ran' "\$LOGLINES")]"
+  echo "hb=[\$([ -f "\$RUN_DIR/hb" ] && echo written || echo missing)]"
+  ;;
+
+slot-path-unusable)
+  # The only deterministic way the slot mkdir fails once the run dir exists:
+  # something left a regular FILE where .slot must be a directory. A claim that
+  # reported success here would restart with no slot and hand the box a second
+  # job — the same invariant break, from a third direction.
+  mkrec SVCFILE kind=service keep_alive=1 restart_on_swap=1 cap=1
+  printf 'sleep 300' > "\$JOBS_DIR/SVCFILE/cmd"
+  printf '%s' "\$WORK" > "\$JOBS_DIR/SVCFILE/cwd"
+  rm -rf "\$JOBS_SLOT"
+  : > "\$JOBS_SLOT"                       # a FILE, not a directory
+  echo "slot_is_file=[\$([ -f "\$JOBS_SLOT" ] && echo yes || echo no)]"
+  jobs_slot_claim SVCFILE; echo "claim_rc=[\$?]"
+  jobs_guard
+  sleep 0.5
+  echo "state=[\$(jobs_state SVCFILE)]"
+  echo "took_slot=[\$([ -d "\$JOBS_SLOT" ] && echo yes || echo no)]"
+  echo "could_not_take=[\$(grep -c 'could not TAKE the job slot' "\$LOGLINES")]"
+  echo "wrong_held_msg=[\$(grep -c 'held by ?' "\$LOGLINES")]"
+  n=0
+  for d in /proc/[0-9]*; do
+    is_job_wrapper_proc "\${d##*/}" SVCFILE && n=\$((n + 1))
+  done
+  echo "wrappers=[\$n]"
   ;;
 
 ls-and-usage)
@@ -1109,12 +1205,14 @@ ok=1
 [ "$(field "$o" restart_state)"  = running ]                   || ok=0
 [ "$(field "$o" restart_slot)"   = SVCSLOT ]                   || ok=0
 [ "$(field "$o" restart_tokens)" = "job=SVCSLOT job_state=running" ] || ok=0
+[ "$(field "$o" swap_rundir)"    = ABSENT ]                    || ok=0
+[ "$(field "$o" restart_rundir)" = present ]                   || ok=0
 [ "$(field "$o" second_rc)"      = 75 ]                        || ok=0
 [ "$(field "$o" second_created)" = no ]                        || ok=0
 [ "$(field "$o" second_wrappers)" = 0 ]                        || ok=0
 printf '%s' "$(field "$o" second_out)" | grep -q 'job=busy' || ok=0
 if [ "$ok" = 1 ]; then
-  pass "(14) after a simulated swap the guard restarts the service AND re-takes the slot: the status tokens name it again and a second start is refused rc 75"
+  pass "(14) after a swap that DELETES the run dir the guard re-creates it, restarts the service and re-takes the slot: the tokens name it again and a second start is refused rc 75"
 else
   bad  "(14) the slot was not re-taken on restart: [$(printf '%s' "$o" | tr '\n' ' ')]"
 fi
@@ -1133,6 +1231,59 @@ if [ "$(field "$o" holder_slot)"     = HOLDER ] && \
   pass "(14b) a service whose restart would need a slot another LIVE job holds is not restarted and does not steal it; the refusal is logged and the next tick retries"
 else
   bad  "(14b) the restart stole or ignored a live slot: [$(printf '%s' "$o" | tr '\n' ' ')]"
+fi
+
+# ---------------------------------------------------------------------------
+# (15) the REAL entry point: run_tick, with the run dir ABSENT the way an image
+# swap leaves it                                        [mutants g1, g2, g4]
+# ---------------------------------------------------------------------------
+o="$(run_case tick-restarts-after-swap)"
+ok=1
+[ "$(field "$o" pre_rundir)"  = ABSENT ]  || ok=0
+[ "$(field "$o" pre_state)"   = "lost:image-swap" ] || ok=0
+[ "$(field "$o" tick_rc)"     = 0 ]       || ok=0
+[ "$(field "$o" post_state)"  = running ] || ok=0
+[ "$(field "$o" post_slot)"   = SVCTICK ] || ok=0
+[ "$(field "$o" post_tokens)" = "job=SVCTICK job_state=running" ] || ok=0
+[ "$(field "$o" post_rundir)" = present ] || ok=0
+[ "$(field "$o" second_rc)"   = 75 ]      || ok=0
+[ "$(field "$o" restart_line)" -ge 1 ]    || ok=0
+if [ "$ok" = 1 ]; then
+  pass "(15) driven through the REAL run_tick with the run dir DELETED, the guard re-creates it, restarts the service, re-takes the slot, and the box refuses a second job"
+else
+  bad  "(15) run_tick did not recover a swapped-away service: [$(printf '%s' "$o" | tr '\n' ' ')]"
+fi
+
+# ---------------------------------------------------------------------------
+# (15b) a tick that skips on a contended converge lock has still supervised
+# jobs, because the guard runs before the lock is taken        [mutant g3]
+# ---------------------------------------------------------------------------
+o="$(run_case tick-contended-lock)"
+if [ "$(field "$o" tick_rc)" = 0 ] && \
+   [ "$(field "$o" state)"   = running ] && \
+   [ "$(field "$o" slot)"    = SVCLOCK ] && \
+   [ "$(field "$o" do_tick_ran)" = 0 ] && \
+   [ "$(field "$o" hb)"      = written ]; then
+  pass "(15b) a tick that SKIPS on a contended converge lock has still restarted the service and stamped hb — the guard runs before the lock, not inside it"
+else
+  bad  "(15b) job supervision was lost to a contended lock: [$(printf '%s' "$o" | tr '\n' ' ')]"
+fi
+
+# ---------------------------------------------------------------------------
+# (15c) a claim that CANNOT take the slot is reported as such, and no restart
+# happens                                                        [mutant g4]
+# ---------------------------------------------------------------------------
+o="$(run_case slot-path-unusable)"
+if [ "$(field "$o" slot_is_file)"   = yes ] && \
+   [ "$(field "$o" claim_rc)"       = 2 ] && \
+   [ "$(field "$o" state)"          = "lost:image-swap" ] && \
+   [ "$(field "$o" took_slot)"      = no ] && \
+   [ "$(field "$o" wrappers)"       = 0 ] && \
+   [ "$(field "$o" could_not_take)" -ge 1 ] && \
+   [ "$(field "$o" wrong_held_msg)" = 0 ]; then
+  pass "(15c) a slot path that cannot be created returns 2, blocks the restart, and logs 'could not TAKE' rather than the misleading 'held by ?' that made the 5.5.1 wedge unreadable"
+else
+  bad  "(15c) an unusable slot path was reported as a success or as contention: [$(printf '%s' "$o" | tr '\n' ' ')]"
 fi
 
 # ---------------------------------------------------------------------------
