@@ -1147,17 +1147,34 @@ fi
 # 5.10.0 accepted `FLEET2_<X>` beside `GROKFLEET_<X>` and REFUSED rc 1 when both
 # were set and differed. Both halves go here: a stale `FLEET2_BINARY` export is
 # now simply ignored (the committed pin wins), and setting both no longer
-# refuses. Driven on BINARY, which needs no network.
+# refuses. Offline: the first half drives a `file://` fixture origin (D10), the
+# second the GROKFLEET_BINARY hatch.
 env_no_compat_test() {
-  local pfx out rc; pfx="$(mktemp -d)"
-  # FLEET2_BINARY alone: ignored, so the run falls through to the pinned FETCH,
-  # which has no network here and therefore fails — the point is that it did NOT
-  # install the FLEET2_BINARY bytes and did NOT mention the old spelling.
-  out="$(FLEET2_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"; rc=$?
-  local r=""
-  [ -x "$pfx/opt/grok-fleet/grokfleet" ] && r="$r honoured=YES" || r="$r honoured=no"
+  local pfx fx pinbin pin_sha out rc; pfx="$(mktemp -d)"; fx="$(mktemp -d)"
+  # A PINNED body that is byte-DIFFERENT from $STUB, served from a file:// origin.
+  # Asserting on the installed BYTES is what makes "ignored" provable: an
+  # existence check alone passes on any host where the fetch can succeed, so it
+  # read a successful download as "the old spelling was honoured" and the case
+  # failed on every networked host while passing offline.
+  mkdir -p "$fx/v9.9.9"
+  pinbin="$fx/v9.9.9/grokfleet-linux-x64"
+  printf '#!/bin/bash\n# pinned release body (test) — byte-different from the stub\n[ "${1:-}" = version ] && echo "grokfleet pinned (test)"\nexit 0\n' > "$pinbin"
+  chmod 0755 "$pinbin"
+  pin_sha="$(sha256sum "$pinbin" | cut -d' ' -f1)"
+  # FLEET2_BINARY alone: ignored, so the run falls through to the pinned FETCH
+  # and installs the PINNED bytes, not the FLEET2_BINARY ones.
+  out="$(FLEET2_BINARY="$STUB" PREFIX="$pfx" GROKFLEET_BASE_URL="file://$fx" \
+    GROKFLEET_RELEASE=v9.9.9 GROKFLEET_SHA256="$pin_sha" bash "$VPS_INSTALL" 2>&1)"; rc=$?
+  local r="" got=""
+  [ -f "$pfx/opt/grok-fleet/grokfleet" ] && got="$(sha256sum "$pfx/opt/grok-fleet/grokfleet" | cut -d' ' -f1)"
+  case "$got" in
+    "$STUB_SHA") r="$r honoured=YES" ;;
+    "$pin_sha")  r="$r honoured=no" ;;
+    "")          r="$r honoured=NOTHING-INSTALLED" ;;
+    *)           r="$r honoured=UNKNOWN-BYTES" ;;
+  esac
   case "$out" in *FLEET2_*) r="$r mentions=YES" ;; *) r="$r mentions=no" ;; esac
-  rm -rf "$pfx"
+  rm -rf "$pfx" "$fx"
   # both set and DIFFERENT: no refusal any more — GROKFLEET_BINARY simply wins.
   pfx="$(mktemp -d)"
   out="$(FLEET2_BINARY="/nonexistent/other" GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" 2>&1)"; rc=$?

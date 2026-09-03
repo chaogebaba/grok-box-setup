@@ -225,6 +225,28 @@ boxup job ls
 boxup job prune
 ```
 
+**`<cmd...>` is ONE shell command string, not an argv vector.** Everything after
+`--` is joined with single spaces and run as `sh -c "<that string>"`, which is
+also how the brain sends it (the API takes `cmd` as a string). Two consequences
+worth knowing before you hit them:
+
+- **Do not wrap it in `sh -c` yourself.** `-- sh -c 'i=0; while …; done'` puts
+  the script through *two* shells: the outer join drops the quotes around the
+  script, so the inner `sh -c` receives only `i=0` and the rest runs beside it.
+  The symptom is an immediate `sh: 1: [: -lt: unexpected operator` in the log —
+  and, because a mis-parsed loop body simply never runs, an rc of 0. Pass the
+  script directly instead:
+
+  ```
+  boxup job start J1 --cap 600 -- 'i=0; while [ $i -lt 20 ]; do date; sleep 30; i=$((i+1)); done'
+  ```
+
+- **An argument's own quoting does not survive.** `-- echo "one  two"` runs
+  `echo one  two`, and the shell collapses the run of spaces. If an argument
+  must keep its exact bytes, quote it inside the command string
+  (`-- 'echo "one  two"'`), or put the script in a file under `/workspace` and
+  run that.
+
 A box runs **one job at a time**. The slot is an atomic `mkdir` under
 `$RUN_DIR/jobs/`; a second start returns **rc 75**. Durable state lives in
 `/workspace/jobs/<id>/` (`cmd`, `cwd`, `kind`, `cap`, `pgid`, `started`, `rc`,
