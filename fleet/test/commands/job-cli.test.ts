@@ -197,4 +197,17 @@ describe("J8 — reads", () => {
     expect(await cmdJob(["wat"], deps(fakeApi()))).toBe(RC.USAGE);
     expect(await cmdJob(["help"], deps(fakeApi()))).toBe(RC.OK);
   });
+
+  test("help and a bare `job` NEVER touch the API — they must work with no tui.toml", async () => {
+    // Observed on grok-box-010: `grokfleet job help` died with
+    // "fatal: tui: no url, token" because the wiring resolved the admin config
+    // eagerly. A usage message must not require a credential.
+    const exploding = new Proxy({} as ApiClient, {
+      get() {
+        throw new Error("the API must not be reached for help");
+      },
+    });
+    expect(await cmdJob(["help"], deps(exploding))).toBe(RC.OK);
+    expect(await cmdJob([], deps(exploding))).toBe(RC.OK);
+  });
 });
