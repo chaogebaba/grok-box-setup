@@ -521,3 +521,52 @@ describe("D12 a connected box with the tunnel down is incoherent, not asleep", (
     expect(state.readRepairPending("grok-box-008")!.runs).toBe(0);
   });
 });
+
+// --- asleep-marker hygiene: a box that wakes up must stop reading asleep -----
+
+describe("a noop tick clears the row-e markers a past asleep tick left behind", () => {
+  const dev = (box: string, ctc: boolean, nowSec: number) =>
+    JSON.stringify({
+      devices: [
+        { hostname: box, nodeId: "A", connectedToControl: ctc, lastSeen: new Date(nowSec * 1000).toISOString() },
+      ],
+    });
+  const NOWS = 1_000_000;
+
+  /** The `asleep` the tick mirrored into grok-box-008's snapshot row. */
+  const snapAsleep = (lines: unknown[]): boolean | undefined => {
+    const last = lines[lines.length - 1] as { boxes: { name: string; asleep: boolean }[] } | undefined;
+    return last?.boxes.find((b) => b.name === "grok-box-008")?.asleep;
+  };
+
+  test("asleep tick sets the marker; the next HEALTHY tick clears it and the row", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    const lines: unknown[] = [];
+
+    // tick 1 — not connected to control, tunnel down ⇒ row e ⇒ alert-asleep.
+    {
+      const { keys, ctx } = fakeKeys(() => ({ code: 200, body: dev("grok-box-008", false, NOWS) }));
+      await runReconcile(baseDeps({ state, keys, ctx, nowSec: NOWS, history: (l) => lines.push(l) }));
+    }
+    expect(state.readAsleep("grok-box-008")).toBeDefined();
+
+    // tick 2 — the box is awake: connected, tunnel up, check OK ⇒ `noop`.
+    {
+      const { keys, ctx } = fakeKeys(() => ({ code: 200, body: dev("grok-box-008", true, NOWS) }));
+      const runner = new FakeRunner((argv) => {
+        if (isSs(argv))
+          return result({ stdout: "LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
+        if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND)
+          return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
+        return result({ code: 1 });
+      });
+      await runReconcile(baseDeps({ state, keys, ctx, runner, nowSec: NOWS, history: (l) => lines.push(l) }));
+    }
+
+    // The bug: `noop` used to `continue` past both reset sites, so the marker
+    // leaked and every marker-mirroring display greyed a healthy box as ☾.
+    expect(state.readAsleep("grok-box-008")).toBeUndefined();
+    expect(snapAsleep(lines)).toBe(false);
+  });
+});
