@@ -65,15 +65,15 @@ function deps(
   over: Partial<JobTickDeps> = {},
 ): JobTickDeps & { logs: ReturnType<typeof memLogs> } {
   const logs = over.logs !== undefined ? (over.logs as ReturnType<typeof memLogs>) : memLogs();
+  const { logs: _drop, ...rest } = over;
   return {
     store: s,
     state: new StoreState(s),
     runner,
     boxKey: "/k",
     knownHosts: "/kh",
-    logs,
     notify: () => {},
-    ...over,
+    ...rest,
     logs,
   } as JobTickDeps & { logs: ReturnType<typeof memLogs> };
 }

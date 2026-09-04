@@ -1611,6 +1611,133 @@ at all, so it will push config and roll boxup onto a leased box. That is the
 documented cost of the rollback. Reinstalling 5.11.0 resumes deferral from the
 same rows — nothing is lost, only ignored while the older binary runs.
 
+## Jobs — the brain side (grokfleet 5.12.0)
+
+`boxup` 5.5.x has carried the job RUNNER since 2026-09-03; this is the half that
+drives it. Blueprint `grokfleet-jobs.md` (design PASS r11).
+
+**The box is authoritative.** The brain never decides what a job is doing — it
+asks `boxup job status <id>`, which answers with one `key=value` line, and writes
+the answer down. Every failure mode follows from that: a poll that times out, a
+tick that runs out of budget, a VPS that reboots mid-job all leave the job
+running on the box under the box's OWN wall-clock cap, and the next poll catches
+up. That is also why the cap is box-side (J2) and why a rollback to 5.11.x is
+survivable: the old binary neither polls nor stops jobs, but the box still ends
+them.
+
+### Schema v4 (`jobs`), additive, `min_reader` stays 1
+
+Terminal states are `done` (rc 0), `failed`, `timeout` (the cap, `run` only),
+`stopped`, `lost` and `crashloop`. The box's vocabulary is NOT the brain's:
+`lost:died` and `lost:image-swap` are one state (`lost`) plus a `lost_reason`,
+because the difference matters to a person reading an alert, not to the state
+machine. A box state the brain does not recognise is also `lost`, carrying the
+raw string — guessing `running` would poll forever against a box saying something
+we do not understand, and guessing `failed` would invent an rc.
+
+The log needs FOUR numbers, not one, and collapsing any two of them loses the
+ability to say how much output went missing:
+
+| column | meaning |
+|---|---|
+| `log_bytes` | the size the box last reported for the CURRENT generation |
+| `log_offset` | how far into the current generation this brain has mirrored |
+| `mirrored` | cumulative bytes mirrored across ALL generations (`M`) |
+| `lost_reported` | cumulative bytes already NAMED as lost (`L`) |
+
+`owned_lease` is its own column for a reason: only a lease the JOB acquired is
+released when the job ends. A caller-supplied lease belongs to the caller and
+outlives the job (J3), and inferring ownership from the holder — the obvious
+shortcut, since they are usually the same — releases a box out from under
+whatever the caller does next.
+
+### The poll pass (`reconcile/job-tick.ts`)
+
+Runs after the lease tick, under a cumulative `JOB_POLL_BUDGET_S = 60` per tick,
+checked BEFORE each ssh (checking after has already spent the time it was meant
+to protect). The due set is every open job ordered **never-polled first**, so a
+new job cannot starve behind a long-running one. At least one job is always
+polled, so the pass cannot stall. A deferred job loses nothing: the box record is
+authoritative and a waiting CLI uses `?refresh=1`.
+
+**Pollable comes from the TUNNEL, not from the `observed` label.** The two
+disagree in both directions: `api_unknown` shadows a perfectly reachable box
+whenever the Tailscale API is down (which has nothing to do with the tunnel), and
+`unhealthy` covers both a failing `boxup check` — reachable, poll it — and a dead
+tunnel — unreachable, do not spend 20 s learning that again. Only a host-key
+mismatch overrides an up tunnel.
+
+A job on an ASLEEP box is skipped entirely and its `last_poll_at` deliberately
+does not move: the box is suspended, the process is intact, and it resumes with
+the box. Frozen is not lost. A job on a box that is GONE is closed as
+`lost:box-gone` without an ssh, because nothing will ever answer for it again.
+
+**Truncation is detected from the box's `truncations` COUNTER, never from sizes**
+(J6/r6-B1). A size comparison looks equivalent and is not: a job writing fast
+enough can have its new generation already longer than our old offset by the time
+we look, and we would splice a stale byte range into the middle of the mirror
+with nothing to show it happened. On a rise, the marker line reports the
+PER-EVENT increment `(truncated_total − M) − L` — both terms grow between polls,
+so it is the difference of two running totals, not of one of them.
+
+No transaction spans an ssh (state-store D5): every poll is one `UPDATE … WHERE
+job_id = ?` issued after the call returned.
+
+### API (J7)
+
+```
+POST   /v1/jobs                 admin     start (acquires a lease unless given one)
+GET    /v1/jobs?state=&box=     readonly  list
+GET    /v1/jobs/:id[?refresh=1] readonly  one row; refresh polls the box inline
+GET    /v1/jobs/:id/log?offset= readonly  RAW BYTES, not JSON
+POST   /v1/jobs/:id/stop        admin     TERM then KILL, idempotent
+```
+
+**The row is inserted BEFORE the box is asked to start anything**, in `starting`.
+If the ssh then fails, or the VPS dies between the two, we are left with a row
+and no process — which the next poll resolves from the box's own "no record"
+answer. The other order can leave a process running on a box with nothing in the
+store that knows it exists, and nothing would ever stop it. A row without a
+process is recoverable; a process without a row is not.
+
+The box's **rc 75** is its atomic-slot refusal and renders as 409 `box_busy`, not
+500: the fleet is fine, the box is busy. It can happen even after the brain's own
+one-job-per-box check, because the box's slot is the real authority — which is
+why that check is a plain read and not a unique index (a box accumulates terminal
+rows for its whole life, and SQLite has no partial index over a state SET that
+stays correct as rows move between states).
+
+The **reconcile registry moved to `GET /v1/reconcile/:id`**. Nothing consumed the
+old `/v1/jobs/:id` (the TUI only reads the id back from the reconcile POST).
+
+Eligibility gains ONE reason, `boxup lacks job runner`, after an explicit
+`boxup_version` requirement — a caller who asked about a version hears about
+that, not about a runner they never mentioned. It only fires during the rollout
+window.
+
+### CLI (J8)
+
+`grokfleet job run|start|ls|show|log|stop|wait`. Talks only to the admin API,
+never to a box or the store, so one code path serves the laptop and the VPS.
+
+* `job run` passes the remote rc through, 0–254, whenever a command RAN;
+* **255 = nothing ever ran** (no eligible box, the box refused, the API was
+  unreachable) — the one code a remote command cannot produce. Tell it from a
+  transport 255 by the ABSENCE of `job_id` in the `--json` envelope;
+* 124 = the box's cap fired; 130 = the CLI was interrupted, which SENDS `stop`
+  and waits for the terminal state rather than leaving the box running a job
+  nobody is watching.
+
+A `job_id` is 22 base64url characters and can begin with `-`, so put `--` first:
+`grokfleet job show -- -Ab3…`.
+
+### Not in 5.12.0
+
+**J12, the TUI jobs view** (JOB column, `jobs=<n>` header count, the `J` list and
+its log tail). The `job` field IS on `GET /v1/fleet` and `GET /v1/boxes/:name`
+already, attached at serve time from ONE query per request like `lease` — so the
+data the TUI needs is served; only the rendering is outstanding.
+
 ## Alert dedup (grokfleet 5.11.3)
 
 The incident alerts are **level** signals, not edges. `incoherent-both-dead` and

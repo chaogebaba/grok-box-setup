@@ -38,6 +38,7 @@ export const KNOWN_COMMANDS = [
   "serve", // TUI-D11: the VPS-side admin API (VPS-only, locality-guarded)
   "tui", // TUI-D11: the laptop admin panel (lane B)
   "state", // state-store D8: check/backup/restore/import/reconcile-files
+  "job", // jobs J8: run a bounded command, or a service, on a leased box
   "rc", // agent-ux U3: print the exit-code table (no env, no config)
   "lease", // lease-api L4: reserve a box (acquire/renew/release/ls/show/run)
 ] as const;

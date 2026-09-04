@@ -225,7 +225,7 @@ async function main(argv: string[]): Promise<number> {
       // API and never reads the store, so ONE code path serves both machines.
       const { makeJobDeps } = await import("./commands/job-wiring.ts");
       const { cmdJob } = await import("./commands/job.ts");
-      return cmdJob(rest, makeJobDeps(env, stdout));
+      return cmdJob(rest, makeJobDeps(stdout));
     }
     case "state": {
       // state-store D8. VPS-only for the same reason `serve` is: the store lives

@@ -4,7 +4,6 @@
 // that module takes an `ApiClient`, a clock, an interrupt registration and an
 // output sink, and every one of them is a real thing only here.
 
-import type { Env } from "../env.ts";
 import { makeApiClient } from "../tui/api-client.ts";
 import { resolveTuiConfig } from "../tui/config.ts";
 import type { JobDeps } from "./job.ts";
@@ -22,10 +21,10 @@ function onInterrupt(fn: () => void): () => void {
   };
 }
 
-export function makeJobDeps(env: Env, stdout: (s: string) => void): JobDeps {
-  const tui = resolveTuiConfig(env);
+export function makeJobDeps(stdout: (s: string) => void): JobDeps {
+  const tui = resolveTuiConfig();
   return {
-    api: makeApiClient(tui.base, tui.token),
+    api: makeApiClient(tui.url, tui.token),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     onInterrupt,
     out: stdout,

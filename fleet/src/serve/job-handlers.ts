@@ -404,23 +404,26 @@ export async function handleJobCreate(
       // taken. That is a 409, not a 500: the fleet is fine, the box is busy. It
       // can happen even after the check above, because the box's atomic slot is
       // the real authority and something else may hold it.
-      const busyBox = res.code === 75;
+      // A killed child (timeout) reports `code: null`; the audit row wants a
+      // number, and "we do not know" is not 0.
+      const rc = res.code ?? -1;
+      const busyBox = rc === 75;
       updateJob(h.store, jobId, {
         state: "lost",
         lastPollAt: now,
         endedAt: now,
-        lostReason: busyBox ? "box-slot-busy" : `start-failed-rc-${res.code}`,
+        lostReason: busyBox ? "box-slot-busy" : `start-failed-rc-${rc}`,
       });
       if (ownedLease && leaseId !== null) releaseLease(h.store, leaseId, now);
       writeAudit(
         ctx.env.FLEET_STATE,
-        { token: auth.name, action: "job-start", box, rc: res.code },
+        { token: auth.name, action: "job-start", box, rc },
         ctx.auditSink,
         ctx.now,
       );
       return busyBox
         ? jsonError(409, "box_busy", `${box} refused the job: its job slot is taken`)
-        : jsonError(502, "box_error", `${box} could not start the job (rc ${res.code})`);
+        : jsonError(502, "box_error", `${box} could not start the job (rc ${rc})`);
     }
 
     updateJob(h.store, jobId, { state: "running", lastPollAt: now, startedAt: now });
@@ -455,7 +458,7 @@ function boxFacts(
     return {
       name: r.name,
       index: boxIndex(r.name) ?? -1,
-      phase: r.phase,
+      phase: r.phase as BoxFacts["phase"],
       observed: s?.observed,
       ver: s?.ver,
       lease: leased.get(r.name),
@@ -487,7 +490,7 @@ export async function handleJobStop(ctx: ServerContext, auth: RequestAuth, id: s
     );
     writeAudit(
       ctx.env.FLEET_STATE,
-      { token: auth.name, action: "job-stop", box: row.box, rc: res.code },
+      { token: auth.name, action: "job-stop", box: row.box, rc: res.code ?? -1 },
       ctx.auditSink,
       ctx.now,
     );
