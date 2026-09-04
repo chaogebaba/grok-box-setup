@@ -1,5 +1,5 @@
-.PHONY: lint test ts-deps ts-test ts-build ts-deploy ts-cutover ts-apply-flip ts-cutback \
-        ts-release-build ts-release-publish
+.PHONY: lint test ts-deps ts-test ts-typecheck ts-lint ts-verify ts-build ts-deploy \
+        ts-cutover ts-apply-flip ts-cutback ts-release-build ts-release-publish
 
 lint:
 	bash -n boxup
@@ -40,6 +40,19 @@ ts-deps:
 
 ts-test: ts-deps
 	cd fleet && bun test
+
+# `tsc` and `oxlint` are DELIBERATELY not folded into the bash `lint` target
+# above: that one must keep running on a machine with no bun (D1). These are the
+# TS half, and `ts-verify` is the whole gate in the order a failure is cheapest
+# to read — a type error names a line, a lint warning names a line, a test
+# failure needs the suite.
+ts-typecheck: ts-deps
+	cd fleet && bun run typecheck
+
+ts-lint: ts-deps
+	cd fleet && bun run lint
+
+ts-verify: ts-typecheck ts-lint ts-test
 
 ts-build: ts-deps
 	cd fleet && bun build src/cli.ts --compile --minify --sourcemap \

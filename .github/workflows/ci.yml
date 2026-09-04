@@ -6,30 +6,25 @@ on:
   pull_request:
 
 jobs:
+  # The bash half. Deliberately bun-free (blueprint D1): this job is what proves
+  # the shell side still works on a machine that has no bun at all.
   bash:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: syntax
-        run: |
-          set -e
-          # Keep this list in step with the Makefile `lint` target. It named
-          # the retired bash `fleetctl` (deleted in the phase-3 cutover, so this
-          # step could only fail) and omitted vps/install-vps.sh and the two
-          # release scripts that the Makefile already covers.
-          bash -n boxup
-          bash -n install.sh
-          bash -n box-bootstrap.sh
-          bash -n vps/install-vps.sh
-          bash -n fleet/scripts/release-build.sh
-          bash -n fleet/scripts/release-publish.sh
-          bash -n tests/test-rename-allowlist.sh
       - name: shellcheck
-        run: |
-          set -e
-          sudo apt-get install -y -qq shellcheck
-          shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh \
-            fleet/scripts/release-build.sh fleet/scripts/release-publish.sh
+        run: sudo apt-get install -y -qq shellcheck
+      - name: lint
+        # `make lint` owns the file list. This step used to duplicate it inline
+        # with a comment asking the two to be kept in step by hand — and they had
+        # already drifted: the copy here named the retired bash `fleetctl` and
+        # omitted three scripts the Makefile covers. Calling make makes drift
+        # impossible instead of asking someone to notice it.
+        run: make lint
+      - name: shell test suite
+        # Never ran in CI before. These are the boxup / installer / rename /
+        # Makefile-binding suites; they need only bash + coreutils.
+        run: make test
       - name: version match
         run: |
           set -e
@@ -56,3 +51,46 @@ jobs:
             echo "refusing to ship box identity" >&2
             exit 1
           fi
+
+  # The grokfleet (bun + TS) half — the brain engine, the API and the TUI. None
+  # of this was gated before: a type error, a dead import or a failing unit test
+  # could reach main and only surface on the VPS.
+  ts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Pinned, not "latest": the runtime that runs the tests is part of the
+          # result. Bump it deliberately.
+          bun-version: 1.4.1
+      - name: deps
+        # --frozen-lockfile (via ts-deps): a dependency edit that forgot to
+        # commit fleet/bun.lock fails here rather than resolving something else.
+        run: make ts-deps
+      - name: typecheck
+        run: make ts-typecheck
+      - name: lint
+        run: make ts-lint
+      - name: test
+        run: make ts-test
+
+  # The release binary must actually compile. Cheap (~1 s) and it catches a
+  # bundler-level break that neither tsc nor the test runner sees.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.1
+      - name: build
+        run: make ts-build
+      - name: version smoke
+        run: ./fleet/dist/grokfleet version
+      - name: TUI pty smoke
+        # tests/test-makefile-targets.sh SKIPs its pty cases unless
+        # fleet/dist/grokfleet exists, so in the bash job (which never builds)
+        # they never run. Re-running that ONE script here — with the binary
+        # present — is what actually exercises them.
+        run: bash tests/test-makefile-targets.sh

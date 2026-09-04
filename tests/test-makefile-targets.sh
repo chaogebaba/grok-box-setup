@@ -44,6 +44,10 @@ bad()  { printf 'FAIL: %s\n' "$1"; fail=1; }
 # has_target: the Makefile defines `<name>:` at column 0.
 has_target() { grep -qE "^$1:" "$MAKEFILE"; }
 
+# Every name declared .PHONY, one per line, with backslash continuations joined.
+phony_names="$(sed -e :a -e '/\\$/N; s/\\\n//; ta' "$MAKEFILE" \
+  | grep '^\.PHONY:' | sed 's/^\.PHONY://' | tr -s '[:space:]' '\n' | grep -v '^$')"
+
 # --- 1. every `make <target>` mentioned in the docs exists --------------------
 doc_targets="$(grep -oE '`make [a-z][a-z0-9_-]*' "$DOC" | sed 's/^`make //' | sort -u)"
 if [ -z "$doc_targets" ]; then
@@ -68,7 +72,11 @@ else
   for t in $cut_targets; do
     if has_target "$t"; then pass "cutover section names $t -> Makefile defines it"
     else bad "cutover section names $t but the Makefile has no '$t:' target"; fi
-    if grep -qE '^\.PHONY:.*(^|[[:space:]])'"$t"'([[:space:]]|$)' "$MAKEFILE"; then
+    # A `.PHONY:` list may be WRAPPED over several lines with a trailing `\`.
+    # This used to grep the raw file line by line, so a target that sat on a
+    # continuation line read as absent — a false FAIL that says nothing about
+    # the Makefile. `phony_names` joins the continuations first.
+    if printf '%s\n' "$phony_names" | grep -qxF "$t"; then
       pass "$t is listed in .PHONY"
     else
       bad "$t is not listed in .PHONY"
