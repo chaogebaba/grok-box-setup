@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.11.3"; // 5.11.3: incident alerts dedup — once, then a daily digest, re-armed on clear.
+const PKG_VERSION = "5.12.0"; // 5.12.0: brain-side jobs — schema v4, the poll tick, /v1/jobs and `grokfleet job`.
 
 async function gitShaFromGit(): Promise<string> {
   try {
