@@ -136,7 +136,7 @@ describe("the deliberate no-ops reach nothing", () => {
 
   test("ctrl-r does not refresh and ctrl-t does not POST a check", async () => {
     let checks = 0;
-    const client = silentClient({ check: (async () => { checks++; return { ok: true, value: { rc: 0 } }; }) as ApiClient["check"] });
+    const client = silentClient({ check: (async () => { checks++; return { ok: true, value: { rc: 0, log: [] } }; }) as ApiClient["check"] });
     const m = mount(state({ boxes: THREE, scope: "admin" }), { client });
     await settle(40);
     const before = m.lastFrame();

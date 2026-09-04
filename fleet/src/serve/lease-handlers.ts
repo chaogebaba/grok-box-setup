@@ -416,10 +416,14 @@ export function handleLeaseRelease(ctx: ServerContext, auth: RequestAuth, id: st
       ctx.auditSink,
       ctx.now,
     );
-    // L2: the response says `released` for every terminal outcome — the DELETE
-    // ended the deferral, which is what the caller asked for. `state` in the
-    // body keeps the row's own truth (`expired` / `lost` keep their reason).
-    return jsonOk({ state: "released", ...leaseView(r.lease, limits) });
+    // L2: the DELETE always SUCCEEDS for a terminal outcome — it ended the
+    // deferral, which is what the caller asked for — but the body reports the
+    // ROW's own state, because `releaseLease` deliberately leaves `expired` /
+    // `lost` (and their reason) in place and only ends the grace. A literal
+    // `state: "released"` used to lead this object and was silently overwritten
+    // by the spread; it is gone rather than reordered, since the row's truth is
+    // what the endpoint has always actually returned.
+    return jsonOk(leaseView(r.lease, limits));
   } finally {
     h.close();
   }

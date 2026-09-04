@@ -39,7 +39,6 @@ describe("chrome arithmetic agrees with what the components emit", () => {
     test(`${g.name}: the counted chrome is the painted chrome`, async () => {
       const m = mount(g.state, { size: g.size });
       await settle(40);
-      const lines = m.lastFrame().split("\n");
       m.unmount();
 
       // Count the lines the chrome components put on screen: the header, the

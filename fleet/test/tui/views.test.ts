@@ -29,11 +29,9 @@ import { box, state, SIZE_120x40 } from "./helpers.ts";
 
 const SIZE_100x24 = { cols: 100, rows: 24 };
 const SIZE_140x40 = { cols: 140, rows: 40 };
-const SIZE_200x50 = { cols: 200, rows: 50 };
 /** Wide enough for the widest single row: the folded
  *  `asleep since · last · backoff` triple (occupancy O6), which is ~130
  *  columns of card and so needs a pane wider than 300 columns leaves. */
-const SIZE_300x50 = { cols: 300, rows: 50 };
 const SIZE_400x50 = { cols: 400, rows: 50 };
 
 const FACTS: BoxDetail = {

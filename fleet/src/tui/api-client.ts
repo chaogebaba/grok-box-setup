@@ -165,7 +165,16 @@ function failFor(status: number, message: string): ClientResult<never> {
 export function makeApiClient(base: string, token: string, fetchImpl: FetchLike = globalThis.fetch): ApiClient {
   const authHeaders = { Authorization: `Bearer ${token}`, Accept: "application/json" };
 
-  async function req(method: string, path: string, body?: unknown): Promise<{ status: number; json: unknown } | { status: 0 }> {
+  /**
+   * The two outcomes of one request. `down` is the A14 LINK DOWN path: a
+   * transport failure, or a 2xx whose body would not parse. It is a DISCRIMINATED
+   * union on `ok` — keying it on `status === 0` (as it was) narrows nothing,
+   * because the reachable arm's `status: number` already includes 0, so every
+   * `r.json` after the guard was a type error.
+   */
+  type Reply = { ok: true; status: number; json: unknown } | { ok: false; status: 0 };
+
+  async function req(method: string, path: string, body?: unknown): Promise<Reply> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), REQ_TIMEOUT_MS);
     try {
@@ -181,11 +190,11 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
         json = text === "" ? {} : JSON.parse(text);
       } catch {
         // malformed body from a 2xx ⇒ treat as transport failure (link down).
-        return { status: 0 };
+        return { ok: false, status: 0 };
       }
-      return { status: res.status, json };
+      return { ok: true, status: res.status, json };
     } catch {
-      return { status: 0 }; // transport failure ⇒ link down
+      return { ok: false, status: 0 }; // transport failure ⇒ link down
     } finally {
       clearTimeout(timer);
     }
@@ -198,7 +207,7 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
 
   async function getJson<T>(path: string, shape: (j: unknown) => T | undefined): Promise<ClientResult<T>> {
     const r = await req("GET", path);
-    if (r.status === 0) return { ok: false, kind: "link_down", message: "link down" };
+    if (!r.ok) return { ok: false, kind: "link_down", message: "link down" };
     if (r.status < 200 || r.status >= 300) {
       return failFor(r.status, errMessage(r.json, `HTTP ${r.status}`));
     }
@@ -209,7 +218,7 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
 
   async function postOp(path: string, body?: unknown): Promise<ClientResult<OpResult>> {
     const r = await req("POST", path, body);
-    if (r.status === 0) return { ok: false, kind: "link_down", message: "link down" };
+    if (!r.ok) return { ok: false, kind: "link_down", message: "link down" };
     if (r.status < 200 || r.status >= 300) {
       return failFor(r.status, errMessage(r.json, `HTTP ${r.status}`));
     }
@@ -318,7 +327,7 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
     reconcile() {
       return (async (): Promise<ClientResult<{ job_id: string }>> => {
         const r = await req("POST", "/v1/reconcile", { confirm: "fleet" });
-        if (r.status === 0) return { ok: false, kind: "link_down", message: "link down" };
+        if (!r.ok) return { ok: false, kind: "link_down", message: "link down" };
         if (r.status < 200 || r.status >= 300) return failFor(r.status, errMessage(r.json, `HTTP ${r.status}`));
         const j = r.json as { job_id?: unknown };
         if (typeof j.job_id !== "string") return { ok: false, kind: "link_down", message: "malformed response" };
@@ -335,7 +344,7 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
    */
   async function leaseCall<T>(method: string, path: string, body?: unknown): Promise<ClientResult<T>> {
     const r = await req(method, path, body);
-    if (r.status === 0) return { ok: false, kind: "link_down", message: "link down" };
+    if (!r.ok) return { ok: false, kind: "link_down", message: "link down" };
     if (r.status < 200 || r.status >= 300) {
       const fail = failFor(r.status, errMessage(r.json, `HTTP ${r.status}`));
       const j = r.json as { error?: { code?: unknown }; reasons?: unknown; cap_at?: unknown } | undefined;
@@ -353,7 +362,7 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
   // journal is a GET but shares the OpResult shape.
   async function postOpGet(path: string): Promise<ClientResult<OpResult>> {
     const r = await req("GET", path);
-    if (r.status === 0) return { ok: false, kind: "link_down", message: "link down" };
+    if (!r.ok) return { ok: false, kind: "link_down", message: "link down" };
     if (r.status < 200 || r.status >= 300) return failFor(r.status, errMessage(r.json, `HTTP ${r.status}`));
     const j = r.json as { rc?: unknown; log?: unknown };
     return { ok: true, value: { rc: typeof j.rc === "number" ? j.rc : 0, log: Array.isArray(j.log) ? (j.log as string[]) : [] } };

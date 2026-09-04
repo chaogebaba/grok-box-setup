@@ -37,7 +37,7 @@ beforeEach(() => {
 });
 afterEach(() => setLogSink(prevSink));
 
-const EMPTY_CFG = parseConfig("");
+const EMPTY_CFG = parseConfig("", "(test)");
 
 function memState(): ReconcileState {
   const store = new Map<string, string>();
@@ -61,7 +61,7 @@ describe("P2 discover password precedence", () => {
 
   test("FLEET_SSH_PASSWORD > $FLEET_ETC/box_passwd > [ssh].password > REFUSE", () => {
     const file = (p: string) => (p === "/etc/grok-fleet/box_passwd" ? "filepw\n" : undefined);
-    const cfg = parseConfig('[ssh]\npassword = "cfgpw"\n');
+    const cfg = parseConfig('[ssh]\npassword = "cfgpw"\n', "(test)");
     expect(resolveDiscoverPassword(env, cfg, file, { FLEET_SSH_PASSWORD: "envpw" })).toBe("envpw");
     expect(resolveDiscoverPassword(env, cfg, file, {})).toBe("filepw");
     expect(resolveDiscoverPassword(env, cfg, () => undefined, {})).toBe("cfgpw");
@@ -267,7 +267,7 @@ function happySE(over: Partial<EnrollSideEffects> = {}, rec?: Rec): EnrollSideEf
     async vpsBoxAccessPubkey() { return "ssh-ed25519 AAAAvps vps"; },
     async installBoxAuthorizedKey() { if (rec) rec.installedBoxKey = true; return true; },
     async writeBoxConfig() { if (rec) rec.wroteConfig = true; return 0; },
-    async recordEnrolled(box, port) { rec?.enrolled.push({ box, port }); },
+    async recordEnrolled(box, port) { rec?.enrolled.push({ box, port }); return undefined; },
     async notify() {},
     tunnelWaitBudget() { return "0"; },
     async sleep5() { if (rec) rec.waited = true; },

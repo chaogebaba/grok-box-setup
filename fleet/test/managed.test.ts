@@ -11,7 +11,7 @@ import {
   textSha256,
 } from "../src/managed/remote-script.ts";
 import { pushManaged, type ManagedSource } from "../src/actions/config-push.ts";
-import { configPass, type ConfigPassDeps } from "../src/actions/config-pass.ts";
+import { configPass } from "../src/actions/config-pass.ts";
 import { ReconcileState, type StateFs } from "../src/reconcile/state.ts";
 import { FakeRunner, result, isSs } from "./fake-runner.ts";
 import { testEnv } from "./helpers.ts";
@@ -234,7 +234,7 @@ function memState(): { fs: StateFs; store: Map<string, string> } {
 function passRunner(upPorts: number[]): FakeRunner {
   return new FakeRunner((argv) => {
     if (isSs(argv)) {
-      const lines = upPorts.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))`);
+      const lines = upPorts.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:* users:(("sshd",pid=41,fd=7))`);
       return result({ stdout: lines.join("\n") + "\n" });
     }
     // config push: emit an in-sync status line (cur==sha) so it reports rc 0.
@@ -362,7 +362,7 @@ describe("T11 config pass canary routing (F1/F2)", () => {
   function pushRunner(upPorts: number[], pushCode: number, pushOut: string): FakeRunner {
     return new FakeRunner((argv) => {
       if (isSs(argv)) {
-        const lines = upPorts.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))`);
+        const lines = upPorts.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:* users:(("sshd",pid=41,fd=7))`);
         return result({ stdout: lines.join("\n") + "\n" });
       }
       return result({ code: pushCode, stdout: pushOut });

@@ -10,7 +10,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:tes
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { runReconcile, type ReconcileDeps } from "../src/reconcile/run.ts";
-import { ReconcileState, type StateFs } from "../src/reconcile/state.ts";
+import { ReconcileState, type ReconcileStateApi, type StateFs } from "../src/reconcile/state.ts";
 import { RunContext, TailscaleKeys, type KeyTransport } from "../src/reconcile/tailscale-keys.ts";
 import type { DiscoverDeps } from "../src/reconcile/discover.ts";
 import { FakeRunner, result } from "./fake-runner.ts";
@@ -99,7 +99,7 @@ function traceDeps(trace: Trace, over: Partial<DiscoverDeps> = {}): DiscoverDeps
   };
 }
 
-function baseDeps(over: Partial<ReconcileDeps>): { deps: ReconcileDeps; lines: SnapshotLine[]; state: ReconcileState } {
+function baseDeps(over: Partial<ReconcileDeps>): { deps: ReconcileDeps; lines: SnapshotLine[]; state: ReconcileStateApi } {
   const { state } = memState();
   const transport: KeyTransport = { async request() { return { code: 200, body: '{"devices":[]}' }; } };
   const ctx = new RunContext();

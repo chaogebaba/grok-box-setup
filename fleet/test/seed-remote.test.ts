@@ -4,7 +4,7 @@
 // with SEED_SHA_MISMATCH and installs nothing.
 
 import { test, expect, describe } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { SEED_REMOTE_SCRIPT, keySha256 } from "../src/reconcile/seed-remote.ts";
 

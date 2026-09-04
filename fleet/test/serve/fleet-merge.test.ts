@@ -8,7 +8,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:tes
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { makeFetch } from "../../src/serve/server.ts";
-import { fakeContext, getReq, seedBoxRow, seedSnapshots } from "./helpers.ts";
+import { fakeContext, getReq, seedBoxRow, seedSnapshots, jsonBody, type FleetBody } from "./helpers.ts";
 import { suiteScratch } from "../store/helpers.ts";
 import type { SnapshotLine } from "../../src/history/schema.ts";
 import { setLogSink } from "../../src/log.ts";
@@ -72,8 +72,8 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
     (ctx as { now?: () => Date }).now = () => new Date("2026-04-01T00:05:00Z");
     const fetch = makeFetch(ctx);
     const r = await fetch(getReq("/v1/fleet", "READSECRET"));
-    const body = await r.json();
-    const b = body.boxes[0];
+    const body = await jsonBody<FleetBody>(r);
+    const b = body.boxes[0]!;
     // live markers WIN.
     expect(b.checkfail).toBe(true);
     expect(b.asleep).toBe(true);
@@ -101,9 +101,9 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
     const ctx = await ctxFor(state, ["grok-box-1"]);
     (ctx as { now?: () => Date }).now = () => new Date("2026-04-02T00:05:00Z");
     const fetch = makeFetch(ctx);
-    const body = await (await fetch(getReq("/v1/fleet", "ADMINSECRET"))).json();
-    expect(body.boxes[0].checkfail).toBe(false);
-    expect(body.boxes[0].config).toBeNull();
+    const body = await jsonBody<FleetBody>(await fetch(getReq("/v1/fleet", "ADMINSECRET")));
+    expect(body.boxes[0]!.checkfail).toBe(false);
+    expect(body.boxes[0]!.config).toBeNull();
     // R2: `apply` is read LIVE; ctxFor points FLEET_CONFIG at nothing, so the
     // snapshot value stands and the response SAYS so (see fleet-apply-live).
     expect(body.apply).toBe(true);
@@ -119,7 +119,7 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
     // pin the clock 90s after the snapshot ts.
     (ctx as { now?: () => Date }).now = () => new Date("2026-04-03T00:01:30Z");
     const fetch = makeFetch(ctx);
-    const body = await (await fetch(getReq("/v1/health"))).json();
+    const body = await jsonBody(await fetch(getReq("/v1/health")));
     expect(body.tick_age_s).toBe(90);
   });
 
@@ -128,7 +128,7 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
     dirs.push(s);
     const ctx = await ctxFor(s, []);
     const fetch = makeFetch(ctx);
-    const body = await (await fetch(getReq("/v1/health"))).json();
+    const body = await jsonBody(await fetch(getReq("/v1/health")));
     expect(body.tick_age_s).toBeNull();
   });
 });

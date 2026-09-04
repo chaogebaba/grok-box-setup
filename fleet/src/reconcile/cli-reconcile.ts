@@ -17,8 +17,7 @@ import { isCompiled } from "../build-flags.ts";
 import { resolveMembership } from "../boxes.ts";
 import { resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
-import { ReconcileState, nodeStateFs } from "./state.ts";
-import { ConfigError, openStore, storePath, type Store } from "../store/db.ts";
+import { ConfigError, openStore, storePath } from "../store/db.ts";
 import { StoreState } from "../store/state.ts";
 import { importLegacy } from "../store/legacy.ts";
 import { runReconcile } from "./run.ts";
@@ -319,13 +318,6 @@ function missingTokenKeys(ctx: RunContext): TailscaleKeys {
   return new TailscaleKeys(deadTransport, "", "-", "", ctx);
 }
 
-function readIfExists(p: string): string | undefined {
-  try {
-    return existsSync(p) ? readFileSync(p, "utf8") : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 /** Resolve rollout config (thin wrapper for the CLI). */
 export function reconcileRollout(cfg: ParsedConfig, env: Env): RolloutConfig {

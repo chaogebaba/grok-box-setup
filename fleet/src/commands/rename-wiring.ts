@@ -8,7 +8,7 @@ import type { Env } from "../env.ts";
 import type { ParsedConfig } from "../config.ts";
 import { tunnelUp, tunnelSsh } from "../tunnel.ts";
 import { knownHostsFile } from "../hostkey.ts";
-import { parseDevices, baseName, resolveTokenFile, fetchTransport } from "../tailscale.ts";
+import { baseName, resolveTokenFile, fetchTransport } from "../tailscale.ts";
 import { RunContext, TailscaleKeys } from "../reconcile/tailscale-keys.ts";
 import { BOX_ROOT } from "../reconcile/seed-remote.ts";
 import type { RenameDeps, RenameStore, RenameOps, PollResult } from "./rename.ts";
@@ -26,20 +26,7 @@ function makeStore(env: Env, version: string): RenameStore {
   const etc = env.FLEET_ETC;
   const akDir = process.env.FLEET_ETC_AK_DIR ?? `${etc}/authorized-keys.d`;
   const managedBoxDir = process.env.FLEET_MANAGED_BOXDIR ?? `${etc}/boxes`;
-  const enr = `${state}/enrolled.tsv`;
-  const map = `${etc}/authorized-keys.map`;
 
-  const read = (p: string): string | undefined => {
-    try {
-      const { existsSync, readFileSync } = fsMod();
-      return existsSync(p) ? readFileSync(p, "utf8") : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-  const write = (p: string, d: string): void => {
-    fsMod().writeFileSync(p, d);
-  };
   const cp = (from: string, to: string, mode?: number): void => {
     const { existsSync, copyFileSync, chmodSync, mkdirSync } = fsMod();
     if (!existsSync(from)) return;
@@ -54,14 +41,6 @@ function makeStore(env: Env, version: string): RenameStore {
     } catch {
       /* best-effort */
     }
-  };
-  const rowPort = (content: string | undefined, box: string): string | undefined => {
-    if (content === undefined) return undefined;
-    for (const l of content.split("\n")) {
-      const [n, p] = l.split("\t");
-      if (n === box) return p;
-    }
-    return undefined;
   };
 
   // state-store D4/D5: membership lives in the STORE; `enrolled.tsv` and

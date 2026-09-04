@@ -251,3 +251,28 @@ export function postReq(path: string, token?: string, body?: unknown): Request {
   if (body !== undefined) init.body = JSON.stringify(body);
   return new Request(`http://t${path}`, init);
 }
+
+// --- typed JSON bodies -------------------------------------------------------
+/**
+ * `Response.json()` is `Promise<unknown>` — correctly, since the body is
+ * whatever the server sent. These helpers give a test the SHAPE it needs
+ * without an `any`: every leaf stays `unknown`, so an assertion still has to
+ * say what it expects and a wrong one is caught by the assertion rather than
+ * hidden by the cast.
+ */
+export type JsonRecord = Record<string, unknown>;
+
+export async function jsonBody<T = JsonRecord>(r: Response): Promise<T> {
+  return (await r.json()) as T;
+}
+
+/** The `{ error: { code, message } }` envelope every 4xx/5xx carries. */
+export async function jsonError(r: Response): Promise<{ error: { code: string; message: string } }> {
+  return (await r.json()) as { error: { code: string; message: string } };
+}
+
+/** `/v1/fleet` as the merge tests read it: the box ARRAY typechecks, the fields
+ *  inside each box do not. */
+export interface FleetBody extends JsonRecord {
+  boxes: JsonRecord[];
+}

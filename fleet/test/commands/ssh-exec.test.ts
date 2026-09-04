@@ -102,7 +102,9 @@ function fakeTimers(): { seam: TimerSeam; fire: (ms: number) => void; cleared: n
   return {
     seam,
     fire(ms) {
-      for (const [h, p] of [...pending]) {
+      // The COPY is the point: the loop body deletes from `pending` while
+      // iterating it, so it must not iterate the live map.
+      for (const [h, p] of Array.from(pending)) {
         if (p.ms === ms) {
           pending.delete(h);
           p.fn();

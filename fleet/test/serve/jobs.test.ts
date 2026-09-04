@@ -5,7 +5,7 @@ import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { JobRegistry } from "../../src/serve/jobs.ts";
 import { makeFetch } from "../../src/serve/server.ts";
 import type { TickRunner } from "../../src/serve/context.ts";
-import { fakeContext, postReq, getReq, fakeSyscalls, fakeLockDeps } from "./helpers.ts";
+import { fakeContext, postReq, getReq, fakeSyscalls, fakeLockDeps, jsonBody, jsonError } from "./helpers.ts";
 import { setLogSink } from "../../src/log.ts";
 
 let restore: (l: string) => void;
@@ -64,12 +64,12 @@ describe("/v1/reconcile + /v1/jobs routes", () => {
 
     const r1 = await fetch(postReq("/v1/reconcile", "ADMINSECRET", { confirm: "fleet" }));
     expect(r1.status).toBe(202);
-    const body1 = await r1.json();
+    const body1 = await jsonBody(r1);
     expect(body1.job_id).toBe("job-fixed-1");
 
     const r2 = await fetch(postReq("/v1/reconcile", "ADMINSECRET", { confirm: "fleet" }));
     expect(r2.status).toBe(409);
-    expect((await r2.json()).error.code).toBe("job_running");
+    expect((await jsonError(r2)).error.code).toBe("job_running");
 
     release();
     await new Promise((r) => setTimeout(r, 5));
@@ -77,7 +77,7 @@ describe("/v1/reconcile + /v1/jobs routes", () => {
     // GET /v1/jobs/:id ⇒ done rc 0.
     const j = await fetch(getReq("/v1/jobs/job-fixed-1", "ADMINSECRET"));
     expect(j.status).toBe(200);
-    const jb = await j.json();
+    const jb = await jsonBody(j);
     expect(jb.state).toBe("done");
     expect(jb.rc).toBe(0);
   });

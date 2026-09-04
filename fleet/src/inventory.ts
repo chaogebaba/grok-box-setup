@@ -131,7 +131,7 @@ export async function probeBox(
 
 /** Bounded-concurrency map (limit N). Preserves input order in the output. */
 async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length);
+  const results: R[] = Array.from({ length: items.length });
   let next = 0;
   const n = Math.max(1, limit);
   async function worker(): Promise<void> {

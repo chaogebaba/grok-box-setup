@@ -10,7 +10,7 @@ import type { Env } from "../env.ts";
 import type { ParsedConfig } from "../config.ts";
 import { boxIndex, portFor } from "../boxes.ts";
 import { forgetHostKeys, isHostKeyMismatch, knownHostsFile } from "../hostkey.ts";
-import type { ReconcileState } from "./state.ts";
+import type { ReconcileStateApi } from "./state.ts";
 import { discover as listTailnet } from "../commands/list.ts";
 import { boxSsh } from "../commands/box-transport.ts";
 import { cmdEnrollResult, type EnrollSideEffects } from "../commands/enroll.ts";
@@ -162,11 +162,11 @@ export interface DiscoverWiringOpts {
   /** monotonic clock for the mutation's abort points. */
   clock?: () => number;
   /**
-   * D11(c): the tick's ReconcileState. `inspect` reads `hostkey_mismatch` from
+   * D11(c): the tick's state. `inspect` reads `hostkey_mismatch` from
    * it so a mismatched box short-circuits to the repair branch instead of
    * spending two remote reads on checks whose verdict is already known.
    */
-  state?: ReconcileState;
+  state?: ReconcileStateApi;
 }
 
 /** Build the production DiscoverDeps for one tick. */

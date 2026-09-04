@@ -4,7 +4,7 @@
 
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { makeFetch } from "../../src/serve/server.ts";
-import { fakeContext, getReq } from "./helpers.ts";
+import { fakeContext, getReq, jsonBody } from "./helpers.ts";
 import { FakeRunner, result } from "../fake-runner.ts";
 import { setLogSink } from "../../src/log.ts";
 
@@ -28,7 +28,7 @@ describe("GET /v1/boxes/:name/diff", () => {
     const fetch = makeFetch(ctx);
     const r = await fetch(getReq("/v1/boxes/grok-box-1/diff", "READSECRET"));
     expect(r.status).toBe(200);
-    const body = await r.json();
+    const body = await jsonBody<{ rc: unknown; log: unknown[] }>(r);
     expect(body.rc).not.toBe(0);
     expect(body.log.length).toBeGreaterThan(0); // a reason was re-emitted
   });

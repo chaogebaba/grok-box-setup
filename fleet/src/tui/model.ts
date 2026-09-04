@@ -89,6 +89,9 @@ export const GLYPH = {
   leased: "⚑",
 } as const;
 
+/** Any of the health/lease glyphs above. */
+export type Glyph = (typeof GLYPH)[keyof typeof GLYPH];
+
 // --- small formatters (verbatim from render.ts) ------------------------------
 function pad(s: string, w: number): string {
   // pad/truncate to EXACTLY w visible chars (the strings here carry no ANSI).
@@ -182,7 +185,7 @@ const SEP = " · "; // V5: the detail card's field separator (MUTED)
 /** Glyph + tone for a box's health (TUI-D5, V2). Order: incident > degraded >
  *  asleep > healthy > down/unknown. `☾` (asleep) is MUTED, never an error tone —
  *  a sleeping box is the normal case on this fleet, not a fault. */
-export function boxHealth(state: TuiState, b: FleetBox): { glyph: string; tone: Tone } {
+export function boxHealth(state: TuiState, b: FleetBox): { glyph: Glyph; tone: Tone } {
   void state;
   if (b.asleep) return { glyph: GLYPH.asleep, tone: "muted" }; // muted, NOT an error colour
   if (b.check === "FAIL") return { glyph: GLYPH.down, tone: "down" }; // incident

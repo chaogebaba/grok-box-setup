@@ -16,6 +16,7 @@ import {
   shouldPoll,
 } from "../../src/tui/state.ts";
 import type { FleetView } from "../../src/tui/api-client.ts";
+import type { TuiState } from "../../src/tui/state.ts";
 import { box, state } from "./helpers.ts";
 
 describe("navigation", () => {
@@ -74,8 +75,10 @@ describe("A15 selection recovery", () => {
     const view: FleetView = {
       snapshot_ts: "2026-05-01T00:01:00Z",
       apply: false,
+      apply_source: "config",
       canary: null,
       scope: "admin",
+      discover: null,
       // grok-box-3 moved to index 0 in the new view; selection should follow it.
       boxes: [box("grok-box-3"), box("grok-box-1")],
     };
@@ -85,7 +88,8 @@ describe("A15 selection recovery", () => {
   test("applyFleet after the selected box vanished falls back to first row", () => {
     const s = state({ boxes: [box("grok-box-1"), box("grok-box-2")], selected: 1 });
     const view: FleetView = {
-      snapshot_ts: "2026-05-01T00:01:00Z", apply: false, canary: null, scope: "admin",
+      snapshot_ts: "2026-05-01T00:01:00Z", apply: false, apply_source: "config", canary: null,
+      scope: "admin", discover: null,
       boxes: [box("grok-box-1")], // grok-box-2 gone (e.g. renamed)
     };
     const next = applyFleet(s, view, Date.now());
@@ -98,8 +102,10 @@ describe("the `connecting…` message is retired by the first successful poll", 
   const view = (boxes = [box("grok-box-1")]): FleetView => ({
     snapshot_ts: "2026-05-01T00:01:00Z",
     apply: false,
+    apply_source: "config",
     canary: null,
     scope: "admin",
+    discover: null,
     boxes,
   });
 

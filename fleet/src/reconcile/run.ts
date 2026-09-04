@@ -38,7 +38,6 @@ import { configPass, type ConfigPassDeps } from "../actions/config-pass.ts";
 import type { ManagedSource } from "../actions/config-push.ts";
 import type { UpgradeDeps } from "../upgrade.ts";
 import { log } from "../log.ts";
-import { splitVersion } from "../status.ts";
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
 import { DiscoverRun, type DiscoverDeps, type DiscoverSummary } from "./discover.ts";
 import type { Store } from "../store/db.ts";
