@@ -1,6 +1,6 @@
 {
   "name": "grokfleet",
-  "version": "5.11.2",
+  "version": "5.11.3",
   "bin": {
     "grokfleet": "src/cli.ts"
   },

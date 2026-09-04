@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.11.2"; // 5.11.2: a noop reconcile tick clears the row-e asleep/incoherent markers.
+const PKG_VERSION = "5.11.3"; // 5.11.3: incident alerts dedup — once, then a daily digest, re-armed on clear.
 
 async function gitShaFromGit(): Promise<string> {
   try {
