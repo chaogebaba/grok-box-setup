@@ -1,5 +1,10 @@
-// jobs.test.ts — the reconcile job registry singleton (§3, mutant: job singleton)
-// + the /v1/reconcile / /v1/jobs route behavior (202 / 409 / 404 / done).
+// jobs.test.ts — the RECONCILE job registry singleton (§3, mutant: job
+// singleton) + its route behaviour (202 / 409 / 404 / done).
+//
+// The registry's read route is `GET /v1/reconcile/:id`. It used to be
+// `GET /v1/jobs/:id`, which the real jobs feature took over (jobs J7); the two
+// are unrelated — this one is "is the reconcile tick I asked for finished", the
+// other is "what is the CI job on box 8 doing".
 
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { JobRegistry } from "../../src/serve/jobs.ts";
@@ -74,25 +79,35 @@ describe("/v1/reconcile + /v1/jobs routes", () => {
     release();
     await new Promise((r) => setTimeout(r, 5));
 
-    // GET /v1/jobs/:id ⇒ done rc 0.
-    const j = await fetch(getReq("/v1/jobs/job-fixed-1", "ADMINSECRET"));
+    // GET /v1/reconcile/:id ⇒ done rc 0.
+    const j = await fetch(getReq("/v1/reconcile/job-fixed-1", "ADMINSECRET"));
     expect(j.status).toBe(200);
     const jb = await jsonBody(j);
     expect(jb.state).toBe("done");
     expect(jb.rc).toBe(0);
   });
 
-  test("GET /v1/jobs/:unknown ⇒ 404 (TUI re-polls /v1/fleet)", async () => {
+  test("GET /v1/reconcile/:unknown ⇒ 404 (TUI re-polls /v1/fleet)", async () => {
     const ctx = await fakeContext();
     const fetch = makeFetch(ctx);
-    const r = await fetch(getReq("/v1/jobs/nope", "ADMINSECRET"));
+    const r = await fetch(getReq("/v1/reconcile/nope", "ADMINSECRET"));
     expect(r.status).toBe(404);
   });
 
-  test("readonly token cannot GET /v1/jobs (admin scope)", async () => {
+  test("readonly token cannot GET /v1/reconcile/:id (admin scope)", async () => {
     const ctx = await fakeContext();
     const fetch = makeFetch(ctx);
-    const r = await fetch(getReq("/v1/jobs/job-fixed-1", "READSECRET"));
+    const r = await fetch(getReq("/v1/reconcile/job-fixed-1", "READSECRET"));
     expect(r.status).toBe(403);
+  });
+
+  test("the OLD path is gone: GET /v1/jobs/:id is the jobs feature now, not the registry", async () => {
+    const ctx = await fakeContext();
+    const fetch = makeFetch(ctx);
+    // A readonly token reaches it (the jobs reads are readonly scope) and gets
+    // 404 from the jobs store, NOT 403 and NOT the registry's row — proof the
+    // rename actually moved the route rather than aliasing it.
+    const r = await fetch(getReq("/v1/jobs/job-fixed-1", "READSECRET"));
+    expect(r.status).toBe(404);
   });
 });

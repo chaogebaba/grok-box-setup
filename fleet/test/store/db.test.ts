@@ -54,7 +54,7 @@ describe("(a) migrations, user_version and min_reader", () => {
     s.close();
   });
 
-  test("(a) v1 -> v3 is ADDITIVE: the v1 rows survive and min_reader stays 1", () => {
+  test("(a) v1 -> v4 is ADDITIVE: the v1 rows survive and min_reader stays 1", () => {
     const dir = SCRATCH.dir("migrate-v2");
     try {
       const path = storePath(dir);
@@ -73,7 +73,7 @@ describe("(a) migrations, user_version and min_reader", () => {
       v1.close();
 
       const s = openStore({ path, dir, now: () => T0 });
-      expect(s.userVersion()).toBe(3);
+      expect(s.userVersion()).toBe(4);
       expect(s.meta("min_reader")).toBe("1");
       // Nothing v1 held was rewritten.
       expect((s.db.query("SELECT name FROM boxes").get() as { name: string }).name).toBe("grok-box-008");
@@ -85,9 +85,9 @@ describe("(a) migrations, user_version and min_reader", () => {
       s.audit({ actor: "grokfleet", action: "post-rename", at: T0 });
       const actors = (s.db.query("SELECT actor FROM audit ORDER BY actor").all() as { actor: string }[]).map((r) => r.actor);
       expect(actors).toEqual(["fleet2", "grokfleet"]);
-      // ...and the three v2 tables plus the v3 `leases` table are now there and
-      // empty (lease-api L1: additive, so min_reader still never moves).
-      for (const t of ["snapshots", "snapshot_boxes", "snapshot_skipped", "leases"]) {
+      // ...and the three v2 tables plus the v3 `leases` and v4 `jobs` tables are
+      // now there and empty (additive, so min_reader still never moves).
+      for (const t of ["snapshots", "snapshot_boxes", "snapshot_skipped", "leases", "jobs"]) {
         expect((s.db.query(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n).toBe(0);
       }
       s.close();
@@ -129,16 +129,16 @@ describe("(a) migrations, user_version and min_reader", () => {
       const path = storePath(dir);
       const a = openStore({ path, dir });
       a.close();
-      // Simulate a FUTURE additive file (v4): additive only, so min_reader
+      // Simulate a FUTURE additive file (v5): additive only, so min_reader
       // stays 1 and this binary must still operate it.
       const raw = new Database(path);
-      raw.run("PRAGMA user_version = 4");
+      raw.run("PRAGMA user_version = 5");
       raw.run("CREATE TABLE IF NOT EXISTS future_table(id INTEGER PRIMARY KEY) STRICT");
       raw.close();
 
       const b = openStore({ path, dir });
-      expect(b.userVersion()).toBe(4);
-      // It operates the file as a schema-3 reader and ignores what it does not
+      expect(b.userVersion()).toBe(5);
+      // It operates the file as a schema-4 reader and ignores what it does not
       // know — an older binary keeps working against a newer additive file (D2).
       expect(b.meta("min_reader")).toBe("1");
       b.db.run("INSERT INTO boxes(name,phase,created_at,updated_at) VALUES('grok-box-002','enrolled',1,1)");
@@ -155,8 +155,8 @@ describe("(a) migrations, user_version and min_reader", () => {
       const a = openStore({ path, dir });
       a.close();
       const raw = new Database(path);
-      raw.run("PRAGMA user_version = 4");
-      raw.run("UPDATE meta SET value = '4' WHERE key = 'min_reader'");
+      raw.run("PRAGMA user_version = 5");
+      raw.run("UPDATE meta SET value = '5' WHERE key = 'min_reader'");
       raw.close();
 
       let caught: unknown;
@@ -170,8 +170,8 @@ describe("(a) migrations, user_version and min_reader", () => {
       expect((caught as ConfigError).rc).toBe(3);
       // MUTANT (m6): drop the min_reader check in openStore ⇒ this case fails
       // (the store opens and the assertions below never run).
-      expect(msg).toContain("user_version=4");
-      expect(msg).toContain("min_reader=4");
+      expect(msg).toContain("user_version=5");
+      expect(msg).toContain("min_reader=5");
       expect(msg).toContain(path);
     } finally {
       cleanup(dir);

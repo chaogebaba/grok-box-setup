@@ -13,6 +13,7 @@
 // Eligibility is SNAPSHOT-BASED: no live probe, because the tick is the prober.
 
 import type { LeaseKind, LeaseRow } from "../store/leases.ts";
+import { JOB_RUNNER_MIN_BOXUP } from "../jobs.ts";
 
 /** The latest-snapshot age beyond which a box is not a safe lease target. */
 export const LEASE_MAX_SNAPSHOT_AGE_S = 900; // 15 minutes (L2)
@@ -48,6 +49,12 @@ export interface EligibilityInput {
   kind: LeaseKind;
   require: LeaseRequire;
   maxSnapshotAgeS?: number;
+  /**
+   * jobs J3: the caller wants to RUN A JOB on this box, so a boxup without the
+   * job runner is ineligible however healthy it is. Only the job paths set it,
+   * which is why the reason exists solely during the 5.5.0 rollout window.
+   */
+  requireJobRunner?: boolean;
 }
 
 export interface EligibilityResult {
@@ -120,6 +127,7 @@ const OBSERVED_BAD = new Set(["asleep", "incoherent", "hostkey_mismatch", "unhea
  *   > snapshot stale (<age>)
  *   > drifted (require.no_drift)
  *   > boxup <v> < required <v>
+ *   > boxup lacks job runner          (jobs J3, only when a job is being placed)
  *   > phase <p>
  *
  * DEVIATION, stated: a box the latest snapshot carries NO ROW for has no
@@ -155,6 +163,16 @@ export function ineligibleReason(b: BoxFacts, i: EligibilityInput): string | und
   if (want !== undefined && want !== "") {
     if (!versionKnown(b.ver)) return `boxup unknown < required ${want}`;
     if (compareVersions(b.ver, want) < 0) return `boxup ${b.ver} < required ${want}`;
+  }
+
+  // jobs J3: AFTER the explicit version requirement, so a caller who asked for a
+  // specific boxup version hears about THAT rather than about a runner they did
+  // not mention. The box side ships first (J10), so this arm only ever fires
+  // during the rollout window.
+  if (i.requireJobRunner === true) {
+    if (!versionKnown(b.ver) || compareVersions(b.ver, JOB_RUNNER_MIN_BOXUP) < 0) {
+      return "boxup lacks job runner";
+    }
   }
 
   // --- membership, last (L2 precedence) ---
