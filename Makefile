@@ -12,6 +12,7 @@ lint:
 	bash -n tests/test-rename-allowlist.sh
 	bash -n tests/test-boxup-jobs.sh
 	bash -n tests/keepawake-readout.sh
+	bash -n tests/test-boxup-watchdog.sh
 	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-publish.sh fleet/scripts/run-tests.sh tests/keepawake-readout.sh || echo "shellcheck not installed; skipped"
 
 test:
@@ -21,6 +22,7 @@ test:
 	bash tests/test-boxup-tunnel-stray.sh
 	bash tests/test-boxup-disk-guard.sh
 	bash tests/test-boxup-keepawake.sh
+	bash tests/test-boxup-watchdog.sh
 	bash tests/test-boxup-jobs.sh
 	bash tests/test-install-boxup-symlink.sh
 	bash tests/test-makefile-targets.sh

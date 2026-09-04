@@ -129,6 +129,46 @@ last-exitnode-set) is deliberately ephemeral bookkeeping.
   locked and `/etc/shadow` dies on swap; `sshd=up` is not a working login.
   Non-printable config passwords are refused (they would lock the box out).
 
+## The tick is BOUNDED (boxup 5.6.0)
+
+`worker_loop` used to call `run_tick` inline, so ONE command that never returned
+blocked the self-heal loop forever. Everything else followed from that: `hb` went
+stale, no repair ran, and the box sat half-dead with its reverse tunnel STILL UP,
+because the tunnel is a separate `ssh -N` process that survives a wedged worker.
+
+That is grok-box-009 on 2026-09-02. The VPS session stayed alive with keepalives
+flowing at 1.4 s rtt while sshd hung at banner and tailscaled was offline. The
+brain could see the box (the port was listening) and could not do anything with
+it (every command through the tunnel needed the hung sshd), and the box could not
+repair itself because the thing that repairs the box was the thing that was
+stuck. It needed a console action.
+
+`run_tick_bounded` runs the tick as a background job and polls it against
+`BOXUP_TICK_DEADLINE` (900 s — far past any legitimate tick, far short of
+forever). `timeout(1)` is not usable: `run_tick` is a shell function and
+`timeout` needs a command; backgrounding it also yields the pid the kill needs.
+
+**`kill_tree` kills the tick AND every descendant, leaves first.** Killing only
+the tick's own shell would be worse than doing nothing — the command it is
+blocked on gets reparented, keeps running, and keeps holding the converge lock's
+fd, so every later tick would skip on contention forever. The walk uses
+`pgrep -P` (whole-field PARENT matching), never `pgrep -f`.
+
+`$RUN_DIR/tickwedge` counts the kills; `boxup status` shows `tickwedge=N` when
+non-zero and is silent at 0. Under `$RUN_DIR`, so an image swap clears it for
+free — the same reason `WORKER_PID` and `TUNNEL_PID` live there.
+
+**What this does NOT cover, stated:** the `sleep $INTERVAL` BETWEEN ticks. A
+stopped or hung `sleep` stalls the loop with no tick in flight, and the deadline
+never applies. Observed while canarying this on grok-box-007 — by stopping the
+wrong child — and left alone deliberately: `sleep` is a kernel timer, and a
+realistic hang is a command inside the tick, which is what the deadline covers.
+
+Proven live on grok-box-007 (boxup 5.6.0 installed under a lease, so the engine
+could not roll it back mid-test): SIGSTOP the tick subshell, and 20 s later
+`worker: tick WEDGED — no completion in 20s; killing it and its children`,
+`hb=1s` (the loop recovered) and `tickwedge=1` on the status line.
+
 ## Security posture
 
 - The tailnet is the trust boundary. sshd listens everywhere, but the WAN
