@@ -20,7 +20,7 @@ import type { ServerContext } from "./context.ts";
 import type { RequestAuth } from "./http.ts";
 import { err, jsonError, jsonOk } from "./http.ts";
 import { writeAudit } from "./audit.ts";
-import { isValidBoxName } from "../boxes.ts";
+import { boxIndex, isValidBoxName } from "../boxes.ts";
 import { openLeaseStore, openLeaseStoreRo } from "../store/membership.ts";
 import { readLatestBoxFacts } from "../store/snapshots.ts";
 import { acquireLease, deferringLeases, leaseById, releaseLease } from "../store/leases.ts";
@@ -318,10 +318,10 @@ export async function handleJobCreate(
       leaseId = lease.lease_id;
       ownedLease = false; // the caller's lease; the job must not release it (J3)
     } else {
-      const facts = boxFacts(h, rows, now);
+      const { facts, snapshotTs } = boxFacts(h, rows);
       const choice = chooseBox({
         boxes: facts,
-        snapshotTs: latestSnapshotTs(h),
+        snapshotTs,
         now,
         rolloutCanary: ctx.rollout.canary,
         named,
@@ -412,14 +412,24 @@ export async function handleJobCreate(
         lostReason: busyBox ? "box-slot-busy" : `start-failed-rc-${res.code}`,
       });
       if (ownedLease && leaseId !== null) releaseLease(h.store, leaseId, now);
-      writeAudit(ctx, { actor: auth.name, action: "job-start", box, rc: res.code, detail: jobId });
+      writeAudit(
+        ctx.env.FLEET_STATE,
+        { token: auth.name, action: "job-start", box, rc: res.code },
+        ctx.auditSink,
+        ctx.now,
+      );
       return busyBox
         ? jsonError(409, "box_busy", `${box} refused the job: its job slot is taken`)
         : jsonError(502, "box_error", `${box} could not start the job (rc ${res.code})`);
     }
 
     updateJob(h.store, jobId, { state: "running", lastPollAt: now, startedAt: now });
-    writeAudit(ctx, { actor: auth.name, action: "job-start", box, rc: 0, detail: jobId });
+    writeAudit(
+      ctx.env.FLEET_STATE,
+      { token: auth.name, action: "job-start", box, rc: 0 },
+      ctx.auditSink,
+      ctx.now,
+    );
     return new Response(
       JSON.stringify({ job_id: jobId, box, lease_id: leaseId, state: "running" }),
       { status: 201, headers: { "content-type": "application/json", server: "grokfleet" } },
@@ -429,29 +439,29 @@ export async function handleJobCreate(
   }
 }
 
-/** The snapshot facts eligibility reads, in the shape it wants. */
+/**
+ * The snapshot facts eligibility reads, in the shape it wants — the same
+ * assembly the lease acquire path does, from the same one snapshot read, so a
+ * job and a lease can never disagree about which boxes are eligible.
+ */
 function boxFacts(
   h: Handle,
   rows: Array<{ box_id: number; name: string; phase: string }>,
-  _now: number,
-): BoxFacts[] {
+): { facts: BoxFacts[]; snapshotTs: number | null } {
   const snap = readLatestBoxFacts(h.store);
   const leased = deferringLeases(h.store);
-  return rows.map((r) => {
-    const s = snap.get(r.name);
+  const facts: BoxFacts[] = rows.map((r) => {
+    const s = snap?.boxes.get(r.name);
     return {
       name: r.name,
+      index: boxIndex(r.name) ?? -1,
       phase: r.phase,
-      ver: s?.ver ?? "?",
       observed: s?.observed,
+      ver: s?.ver,
       lease: leased.get(r.name),
-    } as BoxFacts;
+    };
   });
-}
-
-function latestSnapshotTs(h: Handle): number | null {
-  const r = h.store.db.query("SELECT MAX(at) AS at FROM snapshots").get() as { at: number | null } | null;
-  return r?.at ?? null;
+  return { facts, snapshotTs: snap?.ts ?? null };
 }
 
 // --- POST /v1/jobs/:id/stop --------------------------------------------------
@@ -475,7 +485,12 @@ export async function handleJobStop(ctx: ServerContext, auth: RequestAuth, id: s
       boxupJobCommand(["job", "stop", id]),
       { timeoutMs: JOB_SSH_TIMEOUT_MS, knownHosts: knownHostsFile(ctx.env) },
     );
-    writeAudit(ctx, { actor: auth.name, action: "job-stop", box: row.box, rc: res.code, detail: id });
+    writeAudit(
+      ctx.env.FLEET_STATE,
+      { token: auth.name, action: "job-stop", box: row.box, rc: res.code },
+      ctx.auditSink,
+      ctx.now,
+    );
     if (res.code !== 0) {
       return jsonError(502, "box_error", `${row.box} could not stop job ${id} (rc ${res.code})`);
     }

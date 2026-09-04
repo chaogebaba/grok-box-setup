@@ -20,6 +20,18 @@ export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
  */
 export interface FleetBox extends SnapshotBox {
   lease?: BoxLease | null;
+  /** jobs J12: the open job on this box, attached at serve time like `lease`. */
+  job?: BoxJob | null;
+}
+
+/** The compact per-box job field on `/v1/fleet` and `/v1/boxes/:name`. */
+export interface BoxJob {
+  job_id: string;
+  kind: "run" | "service";
+  state: string;
+  holder: string;
+  purpose: string;
+  started_at: string | null;
 }
 
 /** The compact per-box lease field on `/v1/fleet` and `/v1/boxes/:name`. */
@@ -144,6 +156,53 @@ export interface ApiClient {
   releaseLease(id: string): Promise<ClientResult<Lease>>;
   getLease(id: string): Promise<ClientResult<Lease>>;
   listLeases(opts?: { all?: boolean; state?: string }): Promise<ClientResult<Lease[]>>;
+  // --- jobs J7/J8: the job surface, on the SAME typed client ------------------
+  startJob(body: {
+    cmd: string;
+    purpose: string;
+    kind?: "run" | "service";
+    box?: string;
+    cwd?: string;
+    wall_cap_s?: number;
+    lease_id?: string;
+  }): Promise<ClientResult<StartedJob>>;
+  /** `refresh` polls the box inline, so a waiting CLI is not tied to the tick. */
+  getJob(id: string, refresh?: boolean): Promise<ClientResult<Job>>;
+  listJobs(opts?: { state?: string; box?: string }): Promise<ClientResult<Job[]>>;
+  stopJob(id: string): Promise<ClientResult<Job>>;
+  /** RAW log bytes from `offset`; the reply carries the next offset. */
+  jobLog(id: string, offset: number): Promise<ClientResult<{ text: string; next: number; truncated: boolean }>>;
+}
+
+/** The `POST /v1/jobs` reply (J7). */
+export interface StartedJob {
+  job_id: string;
+  box: string;
+  lease_id: string | null;
+  state: string;
+}
+
+/** One job row as every JSON surface renders it (J7). */
+export interface Job {
+  job_id: string;
+  box: string;
+  kind: "run" | "service";
+  state: string;
+  rc: number | null;
+  holder: string;
+  purpose: string;
+  cmd: string;
+  cwd: string;
+  wall_cap_s: number | null;
+  keep_alive: boolean;
+  lease_id: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  last_poll_at: string | null;
+  log_bytes: number;
+  log_truncated: boolean;
+  lost_reason: string | null;
 }
 
 const REQ_TIMEOUT_MS = 8_000;
@@ -322,6 +381,58 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
         return Array.isArray(r.value.leases)
           ? { ok: true, value: r.value.leases as Lease[] }
           : { ok: false, kind: "link_down", message: "malformed response" };
+      })();
+    },
+    // --- jobs J8: the same `leaseCall` envelope, so the 409 `code`/`reasons` a
+    // job start comes back with reach the CLI exactly as a lease's do.
+    startJob(body) {
+      return leaseCall<StartedJob>("POST", "/v1/jobs", body);
+    },
+    getJob(id, refresh) {
+      const q = refresh === true ? "?refresh=1" : "";
+      return leaseCall<Job>("GET", `/v1/jobs/${encodeURIComponent(id)}${q}`);
+    },
+    stopJob(id) {
+      return leaseCall<Job>("POST", `/v1/jobs/${encodeURIComponent(id)}/stop`, {});
+    },
+    listJobs(opts) {
+      const q = new URLSearchParams();
+      if (opts?.state !== undefined) q.set("state", opts.state);
+      if (opts?.box !== undefined) q.set("box", opts.box);
+      const qs = q.toString();
+      return (async (): Promise<ClientResult<Job[]>> => {
+        const r = await leaseCall<{ jobs?: unknown }>("GET", `/v1/jobs${qs === "" ? "" : `?${qs}`}`);
+        if (!r.ok) return r;
+        return Array.isArray(r.value.jobs)
+          ? { ok: true, value: r.value.jobs as Job[] }
+          : { ok: false, kind: "link_down", message: "malformed response" };
+      })();
+    },
+    jobLog(id, offset) {
+      // NOT `leaseCall`: this endpoint answers with raw bytes, not JSON, and the
+      // next offset rides in a header. Parsing it as JSON would fail on the
+      // first log line that is not a JSON document, which is all of them.
+      return (async (): Promise<ClientResult<{ text: string; next: number; truncated: boolean }>> => {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), REQ_TIMEOUT_MS);
+        try {
+          const res = await fetchImpl(`${base}/v1/jobs/${encodeURIComponent(id)}/log?offset=${offset}`, {
+            method: "GET",
+            headers: { ...authHeaders },
+            signal: ctrl.signal,
+          });
+          if (res.status < 200 || res.status >= 300) {
+            return failFor(res.status, `HTTP ${res.status}`);
+          }
+          const text = await res.text();
+          const nextRaw = res.headers.get("x-job-log-offset");
+          const next = nextRaw !== null && /^[0-9]+$/.test(nextRaw) ? Number.parseInt(nextRaw, 10) : offset + text.length;
+          return { ok: true, value: { text, next, truncated: res.headers.get("x-job-log-truncated") === "1" } };
+        } catch {
+          return { ok: false, kind: "link_down", message: "link down" };
+        } finally {
+          clearTimeout(timer);
+        }
       })();
     },
     reconcile() {
