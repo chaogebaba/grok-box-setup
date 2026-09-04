@@ -32,7 +32,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.5.2
+BOXUP_VERSION=5.6.0
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -3552,6 +3552,77 @@ stop_workers() {
   done
 }
 
+# --- the tick deadline (half-dead watchdog) ----------------------------------
+#
+# How long ONE tick may take before the worker gives up on it. A tick that has
+# not finished in this long is not slow, it is WEDGED.
+#
+# Why this exists. `worker_loop` used to call `run_tick` inline, so a single
+# command that never returned — a `tailscale` call into a hung daemon, an ssh
+# spawn against a stuck sshd, a `df` on a wedged mount — blocked the loop
+# FOREVER. Everything downstream then followed: `hb` went stale, no repair ran,
+# and the box sat there half-dead with its reverse tunnel still up because the
+# tunnel is a separate `ssh -N` process that survives a wedged worker. That is
+# exactly what grok-box-009 did on 2026-09-02 — the VPS session stayed alive
+# with keepalives flowing while sshd hung at banner and tailscaled was offline,
+# and nothing on the box could recover it because the one thing that repairs the
+# box is the loop that was stuck.
+#
+# 900 s is far past any legitimate tick (a full converge including `boxup once`
+# is minutes at worst) and far short of forever.
+BOXUP_TICK_DEADLINE="${BOXUP_TICK_DEADLINE:-900}"
+
+# kill_tree <pid>: TERM then KILL a process and every descendant, children first.
+#
+# Killing only the tick's own shell is NOT enough and would make things worse:
+# the command it is blocked on would be reparented and keep running, still
+# holding the converge lock's fd, so every later tick would skip on contention
+# forever. Walk the tree with `pgrep -P` (whole-field PARENT matching — never
+# `pgrep -f`, which is the substring rule the rest of this file follows) and
+# kill the leaves first so a parent cannot spawn a replacement on the way down.
+kill_tree() {
+  local pid="$1" child
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    kill_tree "$child"
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+# run_tick_bounded: run ONE tick with a deadline. rc 124 iff it was killed.
+#
+# `timeout` cannot be used: `run_tick` is a shell function, and `timeout` needs
+# a command. So the tick goes into the background and the loop polls for it,
+# which also gives us the pid needed to kill its whole subtree.
+run_tick_bounded() {
+  local deadline="$1" pid waited=0 rc
+  run_tick >> "$WORKER_LOG" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    [ "$waited" -ge "$deadline" ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    log "worker: tick WEDGED — no completion in ${deadline}s; killing it and its children (pid=$pid)" \
+      >> "$WORKER_LOG" 2>&1
+    kill_tree "$pid"
+    sleep 2
+    kill -KILL "$pid" 2>/dev/null || true
+    # Count it durably: a box that keeps wedging is a different fault from one
+    # that wedged once, and `boxup status` is where the brain can see it.
+    local n=0
+    [ -f "$RUN_DIR/tickwedge" ] && n=$(tr -d '[:space:]' < "$RUN_DIR/tickwedge" 2>/dev/null || echo 0)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    echo $((n + 1)) > "$RUN_DIR/tickwedge" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 124
+  fi
+  wait "$pid"
+  rc=$?
+  return "$rc"
+}
+
 worker_loop() {
   local trc
   ensure_dirs
@@ -3563,7 +3634,10 @@ worker_loop() {
     # NON-zero here means run_tick itself errored unexpectedly — log it rather
     # than discard it silently. Never break the loop (the self-heal must keep
     # ticking past a transient failure — D8 `set -u` not blanket `set -e`).
-    run_tick >> "$WORKER_LOG" 2>&1
+    #
+    # BOUNDED since 5.6.0: the loop must outlive any single tick. See
+    # BOXUP_TICK_DEADLINE above for the failure this closes.
+    run_tick_bounded "$BOXUP_TICK_DEADLINE"
     trc=$?
     [ "$trc" -ne 0 ] && log "worker: run_tick returned rc=$trc (unexpected; loop continues)" >> "$WORKER_LOG" 2>&1
     if [ "$(wc -c < "$WORKER_LOG" 2>/dev/null || echo 0)" -gt 10485760 ]; then
@@ -3656,6 +3730,14 @@ print_status() {
   local rp
   rp=$(repair_fail_count)
   [ "$rp" -ge 1 ] && printf ' repair=failing:%s' "$rp"
+  # The half-dead watchdog's counter. Silent at 0 so a healthy box's status line
+  # is unchanged; non-zero means the worker had to kill a tick that never
+  # returned, which is a different fault from a tick that ran and failed and is
+  # worth the brain seeing. It lives under $RUN_DIR, so an image swap clears it.
+  local tw=0
+  [ -f "$RUN_DIR/tickwedge" ] && tw=$(tr -d '[:space:]' < "$RUN_DIR/tickwedge" 2>/dev/null || echo 0)
+  case "$tw" in ''|*[!0-9]*) tw=0 ;; esac
+  [ "$tw" -ge 1 ] && printf ' tickwedge=%s' "$tw"
   [ -n "${auth:-}" ] && printf ' auth=%s' "$auth"
   # H11: surface auth-key expiry (warn/expired only; ok/none stay silent so a
   # healthy box's status line is unchanged).
