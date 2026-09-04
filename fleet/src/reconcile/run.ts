@@ -636,6 +636,22 @@ async function reconcileOne(
       drift,
     }),
   );
+  // Row-e marker hygiene, hoisted OUT of the action loop below and placed
+  // ABOVE the snapshot push. Both timers belong to row e, so ANY tick that does
+  // not emit a row-e alert must clear them — including a `noop` tick, which is
+  // the ordinary healthy case and which the loop's `continue` used to skip.
+  // That skip leaked: a box that slept once kept its `<box>.asleep` marker for
+  // good, and every display that mirrors the marker (this row, and
+  // `GET /v1/fleet`'s live override) greyed a healthy box as `☾` until some
+  // unrelated action happened to reset it. Clearing HERE also means the row
+  // mirrors THIS tick, not the preceding one.
+  const rowEAlert =
+    actions.includes("alert-asleep") || actions.includes("alert-incident:incoherent-both-dead");
+  if (!rowEAlert) {
+    deps.state.resetAsleep(box);
+    deps.state.resetIncoherent(box);
+  }
+
   snapshots.push({
     name: box,
     tunnel,
@@ -673,15 +689,11 @@ async function reconcileOne(
       continue;
     }
     if (a.startsWith("alert-")) {
-      // other incidents are immediate + reset both timers
-      deps.state.resetAsleep(box);
-      deps.state.resetIncoherent(box);
+      // other incidents are immediate; the row-e timers were already cleared
+      // above, for this and for every other non-row-e verdict.
       await deps.notify("warn", `${box}: ${a.slice("alert-".length)}`);
       continue;
     }
-    // non-alert observation clears row-e timers.
-    deps.state.resetAsleep(box);
-    deps.state.resetIncoherent(box);
 
     // D11(c) tunnel-write gate. While the marker is set, EVERY action that
     // writes over this box's tunnel is deferred — including row d, which is
