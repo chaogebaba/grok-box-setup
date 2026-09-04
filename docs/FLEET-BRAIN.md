@@ -1611,6 +1611,51 @@ at all, so it will push config and roll boxup onto a leased box. That is the
 documented cost of the rollback. Reinstalling 5.11.0 resumes deferral from the
 same rows — nothing is lost, only ignored while the older binary runs.
 
+## Alert dedup (grokfleet 5.11.3)
+
+The incident alerts are **level** signals, not edges. `incoherent-both-dead` and
+`reachable-cannot-converge` name a condition that persists until a person acts on
+it, and the tick evaluates it every 5 minutes — so before 5.11.3 one unresolved
+incident sent **288 identical messages a day**, for as many days as it lasted.
+grok-box-009 half-dead over 2026-09-02 is the worked example.
+
+`ReconcileStateApi` now carries the two calls the `alerts` table was created for
+in schema v1 (which shipped deliberately with no writer, "so the alert-dedup
+blueprint has a table to stand on"):
+
+- `alertDue(box, kind, renotifySecs, now?)` — `true` means SEND, and recording
+  the send is part of the call. First occurrence fires; a repeat is suppressed
+  until `renotifySecs` (`INCIDENT_RENOTIFY_SECS` = 86400, the cadence the
+  `asleep` digest already uses) have passed. The throttle is STATE, not process
+  memory: the tick is a fresh process every 5 minutes.
+- `alertClear(box, kind)` — the condition went away; the next occurrence fires
+  immediately.
+
+`StoreState` implements them on the `alerts` table. `ReconcileState` (the legacy
+file reader) implements them as `<box>.alert-<kind>` holding
+`<first_seen> <last_sent>`, the same shape as `.asleep`. Those files have **no
+bash counterpart** — bash never deduped — so the D2 byte-parity set is untouched
+and a bash reader ignores them.
+
+Three properties worth keeping when this is edited:
+
+1. **The counter is not throttled, only the send.** `bumpIncoherent` still runs
+   every tick, so the daily digest reports "for 289 consecutive runs" instead of
+   repeating the `2` the first message carried.
+2. **The re-arm runs on `noop` ticks.** It sits with the row-e marker hygiene
+   ABOVE the action loop, because a recovered box's verdict is `noop` and the
+   loop `continue`s past those. Putting it in the loop reproduces the 5.11.2
+   asleep-marker leak exactly: the window would outlive the incident and a box
+   that recovered and broke again would be silent for a day.
+3. **Both lookups fail OPEN.** An unknown box or an unreadable throttle row
+   SENDS. A dedup layer that cannot find its state must page twice, never go
+   quiet. (`StoreState.alertDue` used to return `false` for an unknown box.)
+
+`INCIDENT_KINDS` must stay exhaustive over `decide.ts`'s `alert-incident:*`
+tokens — a kind missing from it still dedups but never re-arms, which is the
+quiet failure. `test/reconcile-alerts.test.ts` greps decide.ts for the token list
+and asserts it.
+
 ## Prior art / reference URLs
 
 (Consolidated; also inline above.)

@@ -99,6 +99,23 @@ export interface ReconcileStateApi {
   readAsleep(box: string): { since: number; last: number } | undefined;
   writeAsleep(box: string, since: number, last: number): void;
   resetAsleep(box: string): void;
+  /**
+   * Alert dedup. `true` means SEND, and recording the send is part of the call:
+   * the first occurrence of `kind` on `box` fires, and a repeat is suppressed
+   * until `renotifySecs` have passed. The throttle is STATE, not per-process
+   * memory, because the reconcile tick is a fresh process every 5 minutes.
+   *
+   * Fails OPEN: when the box has no row to hang the throttle on, the alert is
+   * sent and nothing is recorded. A dedup layer that cannot find its state must
+   * page twice, never go silent.
+   */
+  alertDue(box: string, kind: string, renotifySecs: number, now?: number): boolean;
+  /**
+   * The condition went away. The NEXT occurrence fires immediately instead of
+   * waiting out the renotify window — dedup suppresses repeats of a CONTINUING
+   * incident, not a fresh one.
+   */
+  alertClear(box: string, kind: string): void;
   writeExpires(box: string, date: string): void;
   readExpiresDate(box: string): string | undefined;
   /**
@@ -211,6 +228,38 @@ export class ReconcileState implements ReconcileStateApi {
   }
   resetAsleep(box: string): void {
     this.fs.remove(this.p(`${box}.asleep`)); // reset = rm -f
+  }
+
+  // --- alert dedup — "<first_seen> <last_sent>\n", same shape as `.asleep` ---
+  //
+  // These files have NO bash counterpart: bash never deduped, which is the whole
+  // point of the change. They are namespaced `<box>.alert-<kind>` so the D2
+  // byte-parity set (`.checkfail`/`.seedfail`/`.cfgfail`/`.asleep`/`.incoherent`
+  // and friends) is untouched and a bash reader simply ignores them.
+  private alertPath(box: string, kind: string): string {
+    // `kind` carries a colon (`incident:reachable-cannot-converge`); flatten
+    // every non-alphanumeric run to a single dash so the name is a plain path
+    // segment. Distinct kinds stay distinct — no two differ only in punctuation.
+    return this.p(`${box}.alert-${kind.replace(/[^A-Za-z0-9]+/g, "-")}`);
+  }
+  alertDue(box: string, kind: string, renotifySecs: number, now: number = Math.floor(Date.now() / 1000)): boolean {
+    const path = this.alertPath(box, kind);
+    const raw = this.fs.read(path);
+    let first = now;
+    if (raw !== undefined) {
+      const parts = raw.trim().split(/\s+/);
+      const f = parts[0] ?? "";
+      const l = parts[1] ?? "";
+      if (/^[0-9]+$/.test(f)) first = Number.parseInt(f, 10);
+      // A row whose last_sent is unreadable is treated as never sent, so the
+      // alert fires. Same fail-open rule as a missing row.
+      if (/^[0-9]+$/.test(l) && now - Number.parseInt(l, 10) < renotifySecs) return false;
+    }
+    this.fs.write(path, `${first} ${now}\n`);
+    return true;
+  }
+  alertClear(box: string, kind: string): void {
+    this.fs.remove(this.alertPath(box, kind));
   }
 
   // --- <box>.expires (main:1714) — "<box>\t<YYYY-MM-DD>\n" ---

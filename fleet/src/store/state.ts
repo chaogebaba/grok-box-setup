@@ -418,7 +418,11 @@ export class StoreState implements ReconcileStateApi {
    */
   alertDue(box: string, kind: string, renotifySecs: number, now: number = this.store.now()): boolean {
     const id = this.boxId(box);
-    if (id === undefined) return false;
+    // FAIL OPEN. There is no row to hang a throttle on, so the send cannot be
+    // recorded and the next tick will ask again — but a dedup layer that cannot
+    // find its state must page twice rather than go quiet. (Unreachable from
+    // today's callers: every one of them iterates rows the store handed back.)
+    if (id === undefined) return true;
     const row = this.store.db
       .query("SELECT first_seen, last_sent, count FROM alerts WHERE box_id=? AND kind=?")
       .get(id, kind) as { first_seen: number; last_sent: number | null; count: number } | null;

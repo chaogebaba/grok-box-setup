@@ -570,3 +570,71 @@ describe("a noop tick clears the row-e markers a past asleep tick left behind", 
     expect(snapAsleep(lines)).toBe(false);
   });
 });
+
+describe("an unresolved incident alerts once a day, and re-arms when it clears", () => {
+  const NOWS = 2_000_000;
+  const dev = (ctc: boolean) =>
+    JSON.stringify({
+      devices: [
+        {
+          hostname: "grok-box-008",
+          nodeId: "A",
+          connectedToControl: ctc,
+          lastSeen: new Date(NOWS * 1000).toISOString(),
+        },
+      ],
+    });
+  const LISTEN = 'LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:(("sshd",pid=41,fd=7))\n';
+
+  /** tunnel UP, `boxup check` FAILING — the N-1 reachable-cannot-converge shape. */
+  const cannotConverge = () =>
+    new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: LISTEN });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 1, stdout: "check=FAIL" });
+      return result({ code: 1 });
+    });
+  /** tunnel up and healthy again. */
+  const healthy = () =>
+    new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: LISTEN });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND)
+        return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
+      return result({ code: 1 });
+    });
+
+  const tick = async (state: ReconcileState, runner: FakeRunner, notes: string[], nowSec: number) => {
+    const { keys, ctx } = fakeKeys(() => ({ code: 200, body: dev(true) }));
+    await runReconcile(
+      baseDeps({ state, keys, ctx, runner, nowSec, notify: (_l, m) => void notes.push(m) }),
+    );
+  };
+  const converge = (notes: string[]) => notes.filter((m) => m.includes("reachable-cannot-converge"));
+
+  test("twelve hours of an unfixed incident is ONE message, not one per tick", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    const notes: string[] = [];
+    // The gate is checkfail > 3, so the first three ticks only accumulate.
+    for (let i = 0; i < 24; i++) await tick(state, cannotConverge(), notes, NOWS + i * 300);
+    // 24 ticks = two hours at the real 5-minute timer. Before dedup this was 20
+    // identical messages; the operator learns nothing from 19 of them.
+    expect(converge(notes).length).toBe(1);
+  });
+
+  test("a recovered box that breaks again alerts AGAIN, inside the renotify window", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    const notes: string[] = [];
+    for (let i = 0; i < 8; i++) await tick(state, cannotConverge(), notes, NOWS + i * 300);
+    expect(converge(notes).length).toBe(1);
+
+    // It recovers. The healthy tick must re-arm the throttle — and it is a tick
+    // whose verdict is `noop`, which the action loop skips, so the re-arm has to
+    // live outside that loop or this is silence for a day.
+    await tick(state, healthy(), notes, NOWS + 8 * 300);
+
+    // It breaks again, minutes later and far inside the 24 h window.
+    for (let i = 9; i < 17; i++) await tick(state, cannotConverge(), notes, NOWS + i * 300);
+    expect(converge(notes).length).toBe(2);
+  });
+});
