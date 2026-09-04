@@ -28,7 +28,7 @@ import type { ReconcileStateApi } from "./state.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
 import { decide } from "./decide.ts";
 import { devFields, daysUntil } from "./inputs.ts";
-import { alertAsleep, alertIncoherent } from "./alerts.ts";
+import { alertAsleep, alertIncoherent, INCIDENT_KINDS, INCIDENT_RENOTIFY_SECS } from "./alerts.ts";
 import { identityPass } from "./identity.ts";
 import { mintKey, mintWindowValid, type MintDeps } from "../actions/mint.ts";
 import { rotate } from "../actions/rotate.ts";
@@ -651,6 +651,21 @@ async function reconcileOne(
     deps.state.resetIncoherent(box);
   }
 
+  // Alert-dedup re-arming, and it lives HERE for the same reason the block above
+  // does: it must run on EVERY tick including a `noop` one, and the action loop
+  // below `continue`s past `noop`. An incident that clears has to clear its
+  // throttle row too, or the recurrence an hour later is swallowed by a window
+  // opened for the incident that already ended.
+  //
+  // Derived from THIS tick's verdict rather than from a separate probe, so the
+  // set that fires and the set that re-arms cannot disagree.
+  const raised = new Set(
+    actions.filter((a) => a.startsWith("alert-")).map((a) => a.slice("alert-".length)),
+  );
+  for (const kind of INCIDENT_KINDS) {
+    if (!raised.has(kind)) deps.state.alertClear(box, kind);
+  }
+
   snapshots.push({
     name: box,
     tunnel,
@@ -688,9 +703,14 @@ async function reconcileOne(
       continue;
     }
     if (a.startsWith("alert-")) {
-      // other incidents are immediate; the row-e timers were already cleared
-      // above, for this and for every other non-row-e verdict.
-      await deps.notify("warn", `${box}: ${a.slice("alert-".length)}`);
+      // The other incidents: first occurrence fires immediately, then at most
+      // once per INCIDENT_RENOTIFY_SECS while the condition persists. The
+      // re-arm for the ones NOT raised this tick happened above, together with
+      // the row-e timers.
+      const kind = a.slice("alert-".length);
+      if (deps.state.alertDue(box, kind, INCIDENT_RENOTIFY_SECS, nowS)) {
+        await deps.notify("warn", `${box}: ${kind}`);
+      }
       continue;
     }
 
