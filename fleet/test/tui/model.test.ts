@@ -25,6 +25,7 @@ import {
   segText,
   tableLines,
 } from "../../src/tui/model.ts";
+import type { SnapshotBox } from "../../src/history/schema.ts";
 import { MUTED, toneProps } from "../../src/tui/tone.ts";
 import { box, state, SIZE_80x24, SIZE_120x40 } from "./helpers.ts";
 
@@ -74,7 +75,9 @@ describe("box health (all states, V2 glyphs)", () => {
       box("b", { drift: "yes" }),
       box("b", { config: "drift" }),
       box("b", { tunnel: "down", check: "-" }),
-      box("b", { tunnel: "-", check: "-", drift: "unknown", config: null }),
+      // deliberately OUT OF CONTRACT: `tunnel` is "up" | "down" on the wire.
+      // The row proves the fallback arm is reachable if the engine ever widens it.
+      box("b", { tunnel: "-" as SnapshotBox["tunnel"], check: "-", drift: "unknown", config: null }),
     ];
     expect(every.length).toBe(8); // the V8(c) table: eight states, one row each
     for (const b of every) expect(boxHealth(s, b).glyph).not.toBe("!");
@@ -94,7 +97,8 @@ describe("V3 cell tones", () => {
   test("TUNNEL: up OK, down DOWN, anything else MUTED", () => {
     expect(cellTones(box("b", { tunnel: "up" })).tunnel).toBe("ok");
     expect(cellTones(box("b", { tunnel: "down" })).tunnel).toBe("down");
-    expect(cellTones(box("b", { tunnel: "-" })).tunnel).toBe("muted");
+    // out of contract on purpose — see the V8(c) table above.
+    expect(cellTones(box("b", { tunnel: "-" as SnapshotBox["tunnel"] })).tunnel).toBe("muted");
   });
   test("CHECK: OK ok, FAIL down, anything else MUTED", () => {
     expect(cellTones(box("b", { check: "OK" })).check).toBe("ok");
@@ -319,7 +323,7 @@ describe("table column gaps", () => {
   });
 
   test("every DRIFT value the engine emits leaves at least one space", () => {
-    for (const drift of ["yes", "no", "unknown"]) {
+    for (const drift of ["yes", "no", "unknown"] as const) {
       const row = tableLines(state({ boxes: [box("b", { drift, config: "in-sync" })] }), SIZE_120x40)
         .map((l) => l.text)
         .find((r) => r.includes(" b "))!;

@@ -13,7 +13,7 @@ import type { Env } from "./env.ts";
 import type { RolloutConfig } from "./config.ts";
 import type { Target } from "./stage.ts";
 import { classify } from "./runner.ts";
-import { tunnelUp, tunnelScp, tunnelSsh } from "./tunnel.ts";
+import { tunnelScp, tunnelSsh } from "./tunnel.ts";
 import { knownHostsFile } from "./hostkey.ts";
 import {
   REMOTE_TAR,

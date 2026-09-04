@@ -533,6 +533,10 @@ grokfleet defaults `FLEET_CONFIG` to **`/opt/grok-fleet/config.toml`** (the syst
 
 - `make ts-test` — the bun test suite (box-free). `make ts-build` — the compiled `fleet/dist/grokfleet` (gitignored; never shipped to boxes). `make ts-deploy` — scp + atomic `mv` to `/opt/grok-fleet/grokfleet`, keeping the previous binary as `grokfleet.prev` (rollback = `mv grokfleet.prev grokfleet`).
 
+- `make ts-verify` — the whole TS gate, in the order a failure is cheapest to read: `make ts-typecheck` (`tsc --noEmit`), then `make ts-lint` (`oxlint --deny-warnings`), then `make ts-test`. All three run in CI (`.github/workflows/ci.yml`, job `ts`) alongside the bash job's `make lint` + `make test` and a `make ts-build` smoke.
+
+  `tsc` and `oxlint` are deliberately **not** part of the bash `make lint` target: that one must keep working on a machine with no bun (D1). Until 5.11.3 neither ran anywhere at all — `tsc` could not even parse the tree, because `fleet/tsconfig.json` never declared `"types": ["bun"]`, so every `process`, `Bun`, `fetch` and `bun:test` reference was an error and the real findings were buried under ~500 of them. With the types declared it found 23 genuine defects in `src/`, including a free `SERVE_VERSION` identifier in `serve/server.ts` that would have thrown `ReferenceError` on the API's own tick path.
+
 ### Release + install
 
 Hosts do **not** build grokfleet. They used to (`vps/install-vps.sh` ran `make ts-build` on the target), which meant provisioning needed bun **and** make **and** a full checkout — and the r2 gate died on the live VPS with `make: command not found`. The installer now downloads one pinned release asset with `curl`. Net host requirement: **curl + sha256sum**.

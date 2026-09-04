@@ -1,6 +1,10 @@
 {
   "compilerOptions": {
     "lib": ["ESNext"],
+    // The runtime is bun: without this the whole tree fails to typecheck on
+    // `process`, `Bun`, `fetch`, `bun:test` and friends, which is why `tsc` was
+    // never wired into a gate. @types/bun pulls @types/node in transitively.
+    "types": ["bun"],
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",

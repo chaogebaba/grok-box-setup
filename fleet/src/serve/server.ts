@@ -33,6 +33,7 @@ import {
   handleJob,
   boxGuard,
   fsEnrolledBoxes,
+  SERVE_VERSION,
 } from "./handlers.ts";
 import {
   handleLeaseAcquire,
@@ -113,8 +114,6 @@ export function parseServeArgs(rest: string[]): ServeArgs | { err: string } {
   return out;
 }
 
-/** The scope each route requires (undefined ⇒ no auth). */
-type RouteScope = "none" | "readonly" | "admin";
 
 /** Danger classification: mutations require {confirm} (TUI-D10). */
 const CONFIRM_ACTIONS = new Set(["config-push", "rotate-key", "rename", "reconcile"]);

@@ -5,7 +5,7 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { makeFetch } from "../../src/serve/server.ts";
 import { TokenStore, TOKEN_NAME_RE, parseTokens } from "../../src/serve/tokens.ts";
-import { fakeContext, memTokenFs, getReq, postReq, TWO_TOKENS, fakeSyscalls, fakeLockDeps, memAudit } from "./helpers.ts";
+import { fakeContext, memTokenFs, getReq, postReq, TWO_TOKENS, fakeSyscalls, fakeLockDeps, memAudit, jsonBody, jsonError } from "./helpers.ts";
 import { setLogSink } from "../../src/log.ts";
 import { SERVE_NAME, SERVE_VERSION } from "../../src/serve/handlers.ts";
 import { SERVER_HEADER } from "../../src/serve/http.ts";
@@ -99,7 +99,7 @@ describe("confirm guard server-side (§7.5; mutant: confirm compare)", () => {
     // missing confirm
     let r = await fetch(postReq("/v1/boxes/grok-box-1/config-push", "ADMINSECRET", {}));
     expect(r.status).toBe(400);
-    expect((await r.json()).error.code).toBe("confirm_mismatch");
+    expect((await jsonError(r)).error.code).toBe("confirm_mismatch");
     // wrong confirm
     r = await fetch(postReq("/v1/boxes/grok-box-1/config-push", "ADMINSECRET", { confirm: "grok-box-2" }));
     expect(r.status).toBe(400);
@@ -147,7 +147,7 @@ describe("rc→HTTP table (mutant: map a domain rc to a non-200)", () => {
     const fetch = makeFetch(ctx);
     const r = await fetch(postReq("/v1/boxes/grok-box-1/check", "ADMINSECRET"));
     expect(r.status).toBe(200);
-    const body = await r.json();
+    const body = await jsonBody(r);
     expect(body.rc).toBe(1);
     expect(Array.isArray(body.log)).toBe(true);
   });
@@ -157,7 +157,7 @@ describe("rc→HTTP table (mutant: map a domain rc to a non-200)", () => {
     const fetch = makeFetch(ctx);
     const r = await fetch(getReq("/v1/health"));
     expect(r.status).toBe(200);
-    const body = await r.json();
+    const body = await jsonBody(r);
     expect(body.ok).toBe(true);
     expect(body.version).toBe(SERVE_VERSION);
     expect(body).toHaveProperty("tick_age_s");
@@ -171,7 +171,7 @@ describe("rc→HTTP table (mutant: map a domain rc to a non-200)", () => {
     const ctx = await fakeContext();
     const fetch = makeFetch(ctx);
     const r = await fetch(getReq("/v1/health"));
-    const body = await r.json();
+    const body = await jsonBody(r);
     expect(body.name).toBe("grokfleet");
     expect(SERVE_NAME).toBe("grokfleet");
   });
@@ -190,9 +190,9 @@ describe("rc→HTTP table (mutant: map a domain rc to a non-200)", () => {
   test("GET /v1/fleet carries the calling token's scope (R3-A1)", async () => {
     const ctx = await fakeContext();
     const fetch = makeFetch(ctx);
-    const ro = await (await fetch(getReq("/v1/fleet", "READSECRET"))).json();
+    const ro = await jsonBody(await fetch(getReq("/v1/fleet", "READSECRET")));
     expect(ro.scope).toBe("readonly");
-    const ad = await (await fetch(getReq("/v1/fleet", "ADMINSECRET"))).json();
+    const ad = await jsonBody(await fetch(getReq("/v1/fleet", "ADMINSECRET")));
     expect(ad.scope).toBe("admin");
   });
 });

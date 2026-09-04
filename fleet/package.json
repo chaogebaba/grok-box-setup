@@ -8,7 +8,9 @@
   "private": true,
   "scripts": {
     "start": "bun run src/cli.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "oxlint --deny-warnings src test"
   },
   "type": "module",
   "dependencies": {
@@ -17,6 +19,9 @@
     "react-devtools-core": "^7.0.1"
   },
   "devDependencies": {
-    "@types/react": "^19.2.18"
+    "@types/bun": "^1.4.0",
+    "@types/react": "^19.2.18",
+    "oxlint": "^1.0.0",
+    "typescript": "^5.9.0"
   }
 }

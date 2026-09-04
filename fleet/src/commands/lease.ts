@@ -533,8 +533,10 @@ async function runCmd(f: AcquireFlags, deps: LeaseRunDeps): Promise<number> {
   }
 
   // L4 poll rule: on a LOST lease the rc is the command's own when the remote
-  // returned one, else 255 (the connection dropped under the command).
-  if (state === "lost" && rc === RC.TRANSPORT) rc = RC.TRANSPORT;
+  // returned one, else 255 (the connection dropped under the command). That is
+  // already exactly what `deps.exec` returns, so there is nothing to correct
+  // here — the line that used to sit here re-assigned RC.TRANSPORT to an rc
+  // that already equalled RC.TRANSPORT.
 
   const env: RunEnvelope = {
     rc,

@@ -79,15 +79,23 @@ describe("resolveTokenFile (fleetctl:938 precedence)", () => {
 });
 
 function transport(over: Partial<TailscaleTransport>): TailscaleTransport {
-  return {
+  const base: TailscaleTransport = {
     async readToken() {
       return "SECRET-PAT";
     },
     async get() {
       return { code: 200, body: FIXTURE };
     },
-    ...over,
+    // `request` is REQUIRED by the interface and no probe test overrides it —
+    // the fake used to omit it entirely, so a probe path that reached it would
+    // have died on `not a function`. Throwing names the fake instead.
+    async request(method, url) {
+      throw new Error(`tailscale fake: unexpected request ${method} ${url}`);
+    },
   };
+  // The spread of a Partial widens each overridden member to `| undefined`,
+  // which is a TS spread limitation, not a hole: `base` supplies every member.
+  return { ...base, ...over } as TailscaleTransport;
 }
 
 describe("tailscaleDevicesApi request wiring", () => {

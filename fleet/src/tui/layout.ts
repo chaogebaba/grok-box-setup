@@ -8,7 +8,6 @@
 
 import type { TuiState } from "./state.ts";
 import {
-  DETAIL_GAP,
   DETAIL_ROWS,
   bannerText,
   clipSegments,

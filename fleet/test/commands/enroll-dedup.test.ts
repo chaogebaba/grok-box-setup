@@ -59,7 +59,7 @@ describe("D5 dedup by permitlisten port OR key material", () => {
 
   test("re-adopting after a ROTATED box pubkey leaves exactly ONE line for that port", async () => {
     const { env, ak, map } = scratch();
-    const se = makeEnrollSideEffects(env, parseConfig(""), new FakeRunner(() => result({})), { password: "pw" });
+    const se = makeEnrollSideEffects(env, parseConfig("", "(test)"), new FakeRunner(() => result({})), { password: "pw" });
     expect(vpsAuthorizedKeysPath()).toBe(ak);
 
     const oldLine = authorizedKeysLine(20003, `ssh-ed25519 ${OLD_KEY} grok-tunnel`);
@@ -82,7 +82,7 @@ describe("D5 dedup by permitlisten port OR key material", () => {
 
   test("an unrelated box's line for a DIFFERENT port survives untouched", async () => {
     const { env, ak } = scratch();
-    const se = makeEnrollSideEffects(env, parseConfig(""), new FakeRunner(() => result({})), { password: "pw" });
+    const se = makeEnrollSideEffects(env, parseConfig("", "(test)"), new FakeRunner(() => result({})), { password: "pw" });
     const other = authorizedKeysLine(20009, "ssh-ed25519 AAAAother grok-tunnel");
     writeFileSync(ak, other + "\n");
     await se.installVpsAuthorizedKey(authorizedKeysLine(20003, `ssh-ed25519 ${NEW_KEY} grok-tunnel`));
@@ -93,7 +93,7 @@ describe("D5 dedup by permitlisten port OR key material", () => {
 
   test("the /etc map keeps ONE entry per port even if a port changed hands", async () => {
     const { env, map } = scratch();
-    const se = makeEnrollSideEffects(env, parseConfig(""), new FakeRunner(() => result({})), { password: "pw" });
+    const se = makeEnrollSideEffects(env, parseConfig("", "(test)"), new FakeRunner(() => result({})), { password: "pw" });
     await se.recordEtcMapping("grok-box-3", 20003, authorizedKeysLine(20003, `ssh-ed25519 ${OLD_KEY} c`));
     await se.recordEtcMapping("grok-box-003", 20003, authorizedKeysLine(20003, `ssh-ed25519 ${NEW_KEY} c`));
     const rows = readFileSync(map, "utf8").split("\n").filter((l) => l !== "");

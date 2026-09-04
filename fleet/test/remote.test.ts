@@ -14,7 +14,7 @@
 // the real poll command reads the tail with offset-free semantics (H1).
 
 import { test, expect, describe } from "bun:test";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
   renderInstallCommand,
@@ -63,7 +63,6 @@ function wrapRun(sha: string, seedTarball: boolean): {
 } {
   const dir = mkScratch();
   const bin = `${dir}/bin`;
-  const workspace = `${dir}/workspace/box-setup`;
   // Redirect the fixed remote paths into the scratch dir by symlinking? No —
   // we cannot change the constants. Instead we run the command with a fake
   // `sudo`, and provide fake tools; the constant paths (/tmp/…, /var/log/…) are

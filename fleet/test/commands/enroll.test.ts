@@ -46,7 +46,7 @@ function happySE(over: Partial<EnrollSideEffects> = {}, rec?: Recorder): EnrollS
     async vpsBoxAccessPubkey() { return "ssh-ed25519 AAAAvpskey vps"; },
     async installBoxAuthorizedKey() { if (rec) rec.installedBoxKey = true; return true; },
     async writeBoxConfig() { if (rec) rec.wrote = true; return 0; },
-    async recordEnrolled(box, port) { rec?.enrolled.push({ box, port }); },
+    async recordEnrolled(box, port) { rec?.enrolled.push({ box, port }); return undefined; },
     async notify() {},
     tunnelWaitBudget() { return "0"; }, // skip the wait by default
     async sleep5() {},

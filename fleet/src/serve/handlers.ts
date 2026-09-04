@@ -19,7 +19,6 @@ import type { Observed } from "../reconcile/observe.ts";
 import type { Phase } from "../store/state.ts";
 import { pushManaged } from "../actions/config-push.ts";
 import { fsManagedSource, cmdConfig } from "../commands/config.ts";
-import { mintKey } from "../actions/mint.ts";
 import { rotate } from "../actions/rotate.ts";
 import { ReconcileState, nodeStateFs } from "../reconcile/state.ts";
 import { integrityBlocked, openReadHandle, openReadState, openWriteState, readMembership } from "../store/membership.ts";

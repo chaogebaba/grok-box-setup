@@ -65,17 +65,23 @@ export function openLibcFlock(): FlockSyscalls {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { dlopen, FFIType, suffix } = require("bun:ffi") as typeof import("bun:ffi");
   const candidates = ["libc.so.6", "libc.so", `libc.${suffix}`];
-  let lib: ReturnType<typeof dlopen> | undefined;
-  let lastErr = "";
   const symbols = {
     open: { args: [FFIType.cstring, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
     flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
     close: { args: [FFIType.i32], returns: FFIType.i32 },
   } as const;
+  // `dlopen` is generic over the symbol map: without the instantiation the
+  // resolved symbols lose their signatures and every argument types as `never`.
+  let lib: ReturnType<typeof dlopen<typeof symbols>> | undefined;
+  let lastErr = "";
   for (const name of candidates) {
     try {
       lib = dlopen(name, symbols);
-      if (lib.symbols.open && lib.symbols.flock && lib.symbols.close) break;
+      // The runtime guard stays (a libc that resolved but is missing a symbol
+      // must fall through to the next candidate); `typeof` rather than
+      // truthiness because the typed symbols are declared always-defined.
+      const { open, flock, close } = lib.symbols;
+      if (typeof open === "function" && typeof flock === "function" && typeof close === "function") break;
       lib = undefined;
     } catch (e) {
       lastErr = e instanceof Error ? e.message : String(e);

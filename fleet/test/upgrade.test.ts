@@ -108,7 +108,7 @@ function responder(scripts: Record<string, BoxScript>) {
       for (const [box, s] of Object.entries(scripts)) {
         if (s.tunnel !== false) {
           const port = 20000 + Number(box.slice("grok-box-".length));
-          lines.push(`LISTEN 0 128 127.0.0.1:${port} 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))`);
+          lines.push(`LISTEN 0 128 127.0.0.1:${port} 0.0.0.0:* users:(("sshd",pid=41,fd=7))`);
         }
       }
       return result({ stdout: lines.join("\n") + "\n" });
