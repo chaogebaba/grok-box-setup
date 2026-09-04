@@ -7,10 +7,11 @@ lint:
 	bash -n box-bootstrap.sh
 	bash -n vps/install-vps.sh
 	bash -n fleet/scripts/release-build.sh
+	bash -n fleet/scripts/run-tests.sh
 	bash -n fleet/scripts/release-publish.sh
 	bash -n tests/test-rename-allowlist.sh
 	bash -n tests/test-boxup-jobs.sh
-	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-publish.sh || echo "shellcheck not installed; skipped"
+	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-publish.sh fleet/scripts/run-tests.sh || echo "shellcheck not installed; skipped"
 
 test:
 	bash tests/test-iter3-fixes.sh
@@ -38,8 +39,11 @@ GROKFLEET_REMOTE ?= /opt/grok-fleet/grokfleet
 ts-deps:
 	cd fleet && bun install --frozen-lockfile
 
+# One bun process per test FILE — see fleet/scripts/run-tests.sh for why a
+# single-process `bun test` dies silently part-way through on every machine but
+# the laptop this was written on, and why per-file is better diagnostics anyway.
 ts-test: ts-deps
-	cd fleet && bun test
+	bash fleet/scripts/run-tests.sh
 
 # `tsc` and `oxlint` are DELIBERATELY not folded into the bash `lint` target
 # above: that one must keep running on a machine with no bun (D1). These are the

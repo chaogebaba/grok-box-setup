@@ -88,9 +88,11 @@ jobs:
         run: make ts-build
       - name: version smoke
         run: ./fleet/dist/grokfleet version
-      - name: TUI pty smoke
-        # tests/test-makefile-targets.sh SKIPs its pty cases unless
-        # fleet/dist/grokfleet exists, so in the bash job (which never builds)
-        # they never run. Re-running that ONE script here — with the binary
-        # present — is what actually exercises them.
-        run: bash tests/test-makefile-targets.sh
+      # NOT run here: tests/test-makefile-targets.sh with the binary present, to
+      # pick up its seven TUI pty cases (they SKIP unless fleet/dist/grokfleet
+      # exists, so the bash job never reaches them). It was tried and reverted:
+      # the crash-barrier case captures NO pty bytes at all on ubuntu-latest
+      # (ALT_ON=-1 ALT_OFF=-1 CURSOR_ON=-1) while passing on grok-box-010 and
+      # locally, and its rc assertion passes vacuously when the fixture never
+      # starts. Re-add it only with that understood — a green rc there does not
+      # mean the barrier ran.
