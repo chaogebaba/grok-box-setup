@@ -36,6 +36,13 @@ import {
   SERVE_VERSION,
 } from "./handlers.ts";
 import {
+  handleJobCreate,
+  handleJobGet,
+  handleJobList,
+  handleJobLog,
+  handleJobStop,
+} from "./job-handlers.ts";
+import {
   handleLeaseAcquire,
   handleLeaseGet,
   handleLeaseList,
@@ -215,10 +222,32 @@ async function route(ctx: ServerContext, req: Request): Promise<Response> {
     const mLease = path.match(/^\/v1\/leases\/([^/]+)$/);
     if (mLease) return handleLeaseGet(ctx, decodeURIComponent(mLease[1]!));
 
+    // The RECONCILE registry moved here (jobs J7). It used to be
+    // `GET /v1/jobs/:id`, which the real jobs feature needs; nothing consumed
+    // the old path (the TUI only reads the id back from the reconcile POST), so
+    // this is a rename with no client change.
+    const mRec = path.match(/^\/v1\/reconcile\/([^/]+)$/);
+    if (mRec) {
+      if (auth.scope !== "admin") return err.forbidden();
+      return handleJob(ctx, decodeURIComponent(mRec[1]!));
+    }
+
+    // jobs J7: the READS are readonly scope, like the lease reads.
+    if (path === "/v1/jobs") {
+      return handleJobList(ctx, url.searchParams.get("state"), url.searchParams.get("box"));
+    }
+    const mJobLog = path.match(/^\/v1\/jobs\/([^/]+)\/log$/);
+    if (mJobLog) {
+      return handleJobLog(
+        ctx,
+        decodeURIComponent(mJobLog[1]!),
+        url.searchParams.get("offset"),
+        url.searchParams.get("limit"),
+      );
+    }
     const mJob = path.match(/^\/v1\/jobs\/([^/]+)$/);
     if (mJob) {
-      if (auth.scope !== "admin") return err.forbidden();
-      return handleJob(ctx, decodeURIComponent(mJob[1]!));
+      return handleJobGet(ctx, decodeURIComponent(mJob[1]!), url.searchParams.get("refresh") === "1");
     }
     return err.notFound("unknown route");
   }
@@ -240,6 +269,16 @@ async function route(ctx: ServerContext, req: Request): Promise<Response> {
       if ("bad" in c) return err.badBody();
       return handleLeaseRenew(ctx, auth, decodeURIComponent(mRenew[1]!), c.body);
     }
+
+    // jobs J7: start a job. No confirm — starting a bounded command on a leased
+    // box is not fleet-destructive, and CONFIRM_ACTIONS is unchanged.
+    if (path === "/v1/jobs") {
+      const c = await readConfirm(req);
+      if ("bad" in c) return err.badBody();
+      return handleJobCreate(ctx, auth, c.body);
+    }
+    const mJobStop = path.match(/^\/v1\/jobs\/([^/]+)\/stop$/);
+    if (mJobStop) return handleJobStop(ctx, auth, decodeURIComponent(mJobStop[1]!));
 
     // reconcile (no box).
     if (path === "/v1/reconcile") {

@@ -67,10 +67,10 @@ function acquire(store: Store, box: string, over: Partial<{ kind: "ephemeral" | 
 }
 
 describe("L1 — the schema", () => {
-  test("v3 exists, is additive, and min_reader is still 1", () => {
+  test("the schema is additive and min_reader is still 1", () => {
     const s = memStore();
-    expect(KNOWN_SCHEMA).toBe(3);
-    expect(s.userVersion()).toBe(3);
+    expect(KNOWN_SCHEMA).toBe(4);
+    expect(s.userVersion()).toBe(4);
     expect(s.meta("min_reader")).toBe("1");
     expect(leasesAvailable(s)).toBe(true);
     s.close();

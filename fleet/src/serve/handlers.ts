@@ -30,6 +30,7 @@ import { knownHostsFile } from "../hostkey.ts";
 import { CHECK_COMMAND } from "../remote.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { boxLeaseField, fleetLeaseMap, type BoxLeaseField } from "./lease-handlers.ts";
+import { fleetJobMap } from "./job-handlers.ts";
 import { deferringLeaseFor } from "../store/leases.ts";
 import { openLeaseStore } from "../store/membership.ts";
 import { resolveLeaseLimits } from "../config.ts";
@@ -261,9 +262,15 @@ export function handleFleet(ctx: ServerContext, auth: RequestAuth): Response {
   // round-trip are untouched, and `GET /v1/history` does NOT carry it (history
   // is what was OBSERVED, not who held what).
   const leases = fleetLeaseMap(ctx);
+  // jobs J7/J12: the `job` field rides the SAME single-endpoint rule as `lease`
+  // — one `SELECT … WHERE state IN ('starting','running')` per request, not one
+  // per box — so the TUI's JOB column and its `jobs=<n>` count come from the
+  // poll it already makes. `SnapshotBox`/`SnapshotLine`/`/v1/history` untouched.
+  const jobs = fleetJobMap(ctx);
   const boxes = (latest?.boxes ?? []).map((b) => ({
     ...mergeBox(ctx.env, b),
     lease: leases.get(b.name) ?? null,
+    job: jobs.get(b.name) ?? null,
   }));
   // `apply` is read LIVE from the config; every OTHER field still comes from the
   // snapshot (and tick_age_s / staleness are unchanged).
@@ -298,6 +305,7 @@ export function handleBox(ctx: ServerContext, box: string): Response {
     // `expired` in grace). Filtering on `state IN ('active','lost')` here is
     // mutant (l21) and the expired-grace test catches it.
     lease: boxLease(ctx, box),
+    job: fleetJobMap(ctx).get(box) ?? null,
     // D1 (5.7.0): the facts the engine records and the TUI never showed. All
     // read-only; a client that predates them simply ignores them.
     ...boxDetailFacts(ctx.env, box),

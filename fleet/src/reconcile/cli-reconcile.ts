@@ -27,6 +27,9 @@ import type { EnrolSurface } from "./discover.ts";
 import { writeSnapshot } from "../store/snapshots.ts";
 import { leasesAvailable } from "../store/leases.ts";
 import { LeaseTick } from "./lease-tick.ts";
+import { JobTick, nodeJobLogs } from "./job-tick.ts";
+import { jobsAvailable } from "../store/jobs.ts";
+import { knownHostsFile } from "../hostkey.ts";
 import { ENROL_STUCK_RENOTIFY_SECS, ENROL_STUCK_STREAK } from "../store/state.ts";
 import { resolveTarget } from "../stage.ts";
 import { fsTelegramSource, fetchPoster, notify as notifyFn } from "../notify.ts";
@@ -204,6 +207,22 @@ export async function assembleTickDeps(
     // store carries the v3 table, so a Phase A/B file (or a rollback) simply
     // has no lease layer and the tick behaves exactly as 5.10.0 did.
     leases: leasesAvailable(store) ? new LeaseTick({ store, state, notify, limits: resolveLeaseLimits(cfg) }) : undefined,
+    // jobs J5: same shape as the lease tick — wired only when the store carries
+    // the v4 table, so an older file (or a rollback to 5.11.x) simply has no job
+    // layer. Rolled back, running jobs are NOT polled and NOT stopped; the box's
+    // own wall-clock cap is what keeps them bounded, which is exactly why J2 put
+    // the cap on the box.
+    jobs: jobsAvailable(store)
+      ? new JobTick({
+          store,
+          state,
+          runner,
+          boxKey: env.FLEET_BOX_KEY,
+          knownHosts: knownHostsFile(env),
+          logs: nodeJobLogs(env.FLEET_STATE),
+          notify,
+        })
+      : undefined,
     // TUI-D4 + state-store D3: the production tick writes ONE snapshot into the
     // three `snapshots` tables, in ONE transaction. `history/*.jsonl` is no
     // longer written — a 5.8.0 binary rolled back onto this file resumes

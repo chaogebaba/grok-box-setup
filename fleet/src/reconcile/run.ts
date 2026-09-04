@@ -48,6 +48,7 @@ import { AUDIT_RETENTION_DAYS, SNAPSHOT_RETENTION_DAYS } from "../store/schema.t
 import { pruneSnapshots } from "../store/snapshots.ts";
 import { observe, type Observed } from "./observe.ts";
 import type { DeferringLease, LeaseTickApi } from "./lease-tick.ts";
+import type { JobTickApi } from "./job-tick.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
@@ -155,6 +156,7 @@ export interface ReconcileDeps {
    * tests hermetic.
    */
   leases?: LeaseTickApi;
+  jobs?: JobTickApi;
 }
 
 export interface ReconcileResult {
@@ -419,6 +421,32 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   // write, so the two-consecutive-tick reading of `unhealthy` compares the
   // in-memory label against the row at `tick - 1`.
   await deps.leases?.detectLoss(observed, tick, nowS);
+
+  // jobs J5: poll after the lease pass, because a job's lease may have just
+  // been lost and the job's own terminal handling must see the current row.
+  //
+  // The POLLABLE set is not "every box": a job on an asleep box is FROZEN, not
+  // lost — the box is suspended, the process is intact, and it resumes with the
+  // box — so those jobs are skipped entirely rather than polled and misread.
+  // `observed` names exactly the boxes this tick found reachable and coherent.
+  //
+  // Pollable is derived from THE TUNNEL, not from the `observed` label. The
+  // tunnel is the channel a poll actually uses, and the two disagree in both
+  // directions: `api_unknown` shadows a perfectly reachable box whenever the
+  // Tailscale API is down (which has nothing to do with the tunnel), and
+  // `unhealthy` covers both a failing `boxup check` — reachable, poll it — and
+  // a dead tunnel — unreachable, do not spend 20 s learning that again. Only a
+  // host-key mismatch overrides an up tunnel, because then the machine
+  // answering is not known to be ours.
+  await deps.jobs?.poll(
+    new Set(
+      snapshots
+        .filter((sb) => sb.tunnel === "up" && observed.get(sb.name) !== "hostkey_mismatch")
+        .map((sb) => sb.name),
+    ),
+    new Set(deps.targetBoxes),
+    nowS,
+  );
 
   // TUI-D4: fold the config-pass verdict into the per-box snapshot + record the
   // config-pass canary, then append the snapshot line (finally-path).

@@ -17,7 +17,7 @@
 // `enrol_stage`, `retired_at`) so v2 adds only tables — see D2/D3.
 
 /** The highest schema this binary knows how to create and operate. */
-export const KNOWN_SCHEMA = 3;
+export const KNOWN_SCHEMA = 4;
 
 /** Timestamps everywhere in the store are integer epoch SECONDS, UTC. */
 export const AUDIT_RETENTION_DAYS = 92;
@@ -260,10 +260,76 @@ const V3: string[] = [
   `CREATE INDEX IF NOT EXISTS leases_expires_at ON leases(expires_at)`,
 ];
 
+// --- v4: jobs (J4) -----------------------------------------------------------
+//
+// ADDITIVE ONLY, so `min_reader` STAYS 1 for the same reason v3 did — and with
+// the same documented limitation, one step worse: a 5.11.x binary opens a v4
+// file and ignores `jobs`, so it will neither poll a running job nor stop one.
+// What keeps that safe is that the WALL-CLOCK CAP IS BOX-SIDE (J2): the box's
+// own `timeout` ends a `run` job whether or not any brain is watching. The rows
+// go stale, not the boxes.
+//
+// `job_id` is the same 22-char base64url as `lease_id`, which means it can start
+// with `-`; every CLI that takes one accepts `--` first.
+//
+// The state set is the brain's, not the box's: the box reports `lost:died` and
+// `lost:image-swap`, which land here as `state='lost'` plus `lost_reason`.
+// `timeout` is `run`-only — a service has no cap, so a 124 from a service is an
+// ordinary non-zero rc and reads as `failed` (the box derives this too).
+const V4: string[] = [
+  `CREATE TABLE IF NOT EXISTS jobs(
+     job_id        TEXT PRIMARY KEY,
+     box_id        INTEGER NOT NULL REFERENCES boxes(box_id) ON DELETE CASCADE,
+     lease_id      TEXT REFERENCES leases(lease_id),
+     -- Did this JOB acquire the lease, or did the caller hand one in? Only a
+     -- lease the job acquired is released when the job ends (J3). Releasing a
+     -- caller's lease would pull the box out from under whatever they do next,
+     -- so ownership is RECORDED, never inferred.
+     owned_lease   INTEGER NOT NULL DEFAULT 0,
+     kind          TEXT NOT NULL CHECK(kind IN ('run','service')),
+     holder        TEXT NOT NULL,
+     purpose       TEXT NOT NULL,
+     cmd           TEXT NOT NULL,
+     cwd           TEXT NOT NULL,
+     wall_cap_s    INTEGER,
+     keep_alive    INTEGER NOT NULL DEFAULT 0,
+     state         TEXT NOT NULL CHECK(state IN
+                     ('starting','running','done','failed','timeout','stopped','lost','crashloop')),
+     rc            INTEGER,
+     created_at    INTEGER NOT NULL,
+     started_at    INTEGER,
+     ended_at      INTEGER,
+     last_poll_at  INTEGER,
+     -- The log accounting needs FOUR numbers, not one, because the box may
+     -- truncate its copy underneath us (J6):
+     --   log_bytes     the size the box last reported for the CURRENT generation
+     --   log_offset    how far into the current generation we have mirrored
+     --   mirrored      cumulative bytes mirrored across ALL generations ("M")
+     --   lost_reported cumulative bytes we have already NAMED as lost ("L")
+     -- Collapsing any two of them loses the ability to state how much output
+     -- went missing, which is the difference between a bounded log and a silent one.
+     log_bytes     INTEGER NOT NULL DEFAULT 0,
+     log_offset    INTEGER NOT NULL DEFAULT 0,
+     log_truncated INTEGER NOT NULL DEFAULT 0,
+     truncations   INTEGER NOT NULL DEFAULT 0,
+     lost_reported INTEGER NOT NULL DEFAULT 0,
+     mirrored      INTEGER NOT NULL DEFAULT 0,
+     lost_reason   TEXT
+   ) STRICT`,
+
+  // The due-set query (J5) is "every starting|running job on this box", and the
+  // one-job-per-box check is the same query. Both ride this index.
+  `CREATE INDEX IF NOT EXISTS jobs_box_state ON jobs(box_id, state)`,
+  // The poll order is `last_poll_at` ascending with NULLs first, so a job that
+  // has never been polled cannot starve behind one that is polled every tick.
+  `CREATE INDEX IF NOT EXISTS jobs_poll_order ON jobs(last_poll_at)`,
+];
+
 export const MIGRATIONS: Migration[] = [
   { to: 1, minReader: 1, statements: V1 },
   { to: 2, minReader: 1, statements: V2 },
   { to: 3, minReader: 1, statements: V3 },
+  { to: 4, minReader: 1, statements: V4 },
 ];
 
 /** Every v1 table, in the order a full replay must DELETE them (children first). */
