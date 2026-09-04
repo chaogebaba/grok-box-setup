@@ -11,7 +11,8 @@ lint:
 	bash -n fleet/scripts/release-publish.sh
 	bash -n tests/test-rename-allowlist.sh
 	bash -n tests/test-boxup-jobs.sh
-	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-publish.sh fleet/scripts/run-tests.sh || echo "shellcheck not installed; skipped"
+	bash -n tests/keepawake-readout.sh
+	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-publish.sh fleet/scripts/run-tests.sh tests/keepawake-readout.sh || echo "shellcheck not installed; skipped"
 
 test:
 	bash tests/test-iter3-fixes.sh

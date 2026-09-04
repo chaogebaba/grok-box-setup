@@ -4,7 +4,16 @@
 # acceptance 3). Lives in tests/ because it is gate tooling, not box code: it
 # never runs on a box and boxup never calls it.
 #
-#   bash tests/keepawake-readout.sh <dir> [--interval-min N]
+#   bash tests/keepawake-readout.sh <dir> [--interval-min N] [--since <ISO>]
+#
+# --since <ISO> (e.g. 2026-09-03T05:27:00Z) DISCARDS every attempt line and
+# every time-jump BEFORE that instant. Pass the moment the mechanism went live.
+# Without it the readout charges the experiment with sleeps that predate it: day
+# classification is by whole CALENDAR day, so on the day the window opened, the
+# hours before it are missing slots (harmless) but the jumps in those hours are
+# still attributed to that box-day (not harmless). Measured 2026-09-04: three of
+# grok-box-007's sleeps happened before the 05:27Z rollout and turned a 0.83
+# rate into 1.17 — the difference between "some effect" and "none".
 #
 # <dir> holds one subdirectory per box:
 #
@@ -63,17 +72,31 @@ set -u
 DIR="${1:-}"
 shift 2>/dev/null || true
 INTERVAL_MIN=20
+SINCE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --interval-min) INTERVAL_MIN="${2:-20}"; shift 2 ;;
     --interval-min=*) INTERVAL_MIN="${1#*=}"; shift ;;
+    --since) SINCE="${2:-}"; shift 2 ;;
+    --since=*) SINCE="${1#*=}"; shift ;;
     *) echo "keepawake-readout: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
 
 if [ -z "$DIR" ] || [ ! -d "$DIR" ]; then
-  echo "usage: bash tests/keepawake-readout.sh <dir> [--interval-min N]" >&2
+  echo "usage: bash tests/keepawake-readout.sh <dir> [--interval-min N] [--since <ISO>]" >&2
   exit 2
+fi
+SINCE_EPOCH=-1
+if [ -n "$SINCE" ]; then
+  # Refuse an unparseable --since rather than silently reading the window as
+  # unbounded: a typo there quietly re-admits the pre-window sleeps this flag
+  # exists to exclude, and the table gives no sign of it.
+  SINCE_EPOCH="$(date -u -d "$SINCE" +%s 2>/dev/null || echo "")"
+  if [ -z "$SINCE_EPOCH" ]; then
+    echo "keepawake-readout: --since '$SINCE' is not a timestamp date(1) understands" >&2
+    exit 2
+  fi
 fi
 case "$INTERVAL_MIN" in ''|*[!0-9]*|0) echo "keepawake-readout: --interval-min must be a positive integer" >&2; exit 2 ;; esac
 if [ $((1440 % INTERVAL_MIN)) -ne 0 ]; then
@@ -115,7 +138,7 @@ for boxdir in "$DIR"/*/; do
   fi
 
   awk -v box="$box" -v interval_min="$INTERVAL_MIN" -v origin="${origin:-}" \
-      -v tslog="$tslog" -v offdays="$offdays" '
+      -v tslog="$tslog" -v offdays="$offdays" -v since="$SINCE_EPOCH" '
 function floor(x) { return (x >= 0) ? int(x) : -int(-x + 0.999999) }
 # days_from_civil / civil_from_days: Howard Hinnants proleptic Gregorian
 # algorithms. Used instead of gawks mktime/strftime so the readout runs on
@@ -189,6 +212,9 @@ BEGIN {
     else if (i == 1)  ts = iso2epoch($i)
   }
   if (ts < 0 || rc == "") { malformed++; next }
+  # Outside the window: not a defect, just not this experiment. Dropped before
+  # the slot map so it can neither create a day nor pad one.
+  if (since >= 0 && ts < since) { dropped_attempts++; next }
   if (rank(rc) == 0) { unknown_rc[rc]++; malformed++; next }
   lines++
   if (min_epoch < 0 || ts < min_epoch) min_epoch = ts
@@ -227,6 +253,17 @@ END {
       if (match(l, /[0-9][0-9][0-9][0-9][\/-][0-9][0-9][\/-][0-9][0-9]/)) {
         jd = substr(l, RSTART, RLENGTH)
         gsub(/\//, "-", jd)
+        # The `--since` cut is per-JUMP, not per-day: the day the window opened
+        # is a real exercised day, and only the sleeps in the hours before the
+        # opening instant have to go. Cutting whole days instead would throw
+        # away the day with the most evidence in it.
+        if (since >= 0) {
+          jt = "00:00:00"
+          if (match(l, /[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) jt = substr(l, RSTART, RLENGTH)
+          je = days_from_civil(substr(jd, 1, 4) + 0, substr(jd, 6, 2) + 0, substr(jd, 9, 2) + 0) * 86400 \
+               + substr(jt, 1, 2) * 3600 + substr(jt, 4, 2) * 60 + substr(jt, 7, 2)
+          if (je < since) { dropped_jumps++; continue }
+        }
         jumps[jd]++
         jump_day_seen[jd] = 1
       } else undated_jumps++
@@ -279,6 +316,11 @@ END {
     n_out++
   }
   if (malformed > 0) printf "%s MALFORMED %d lines could not be parsed\n", box, malformed > "/dev/stderr"
+  # Say what --since removed. A silent filter is how a wrong window start goes
+  # unnoticed; the operator should see the size of the cut it made.
+  if (dropped_attempts > 0 || dropped_jumps > 0)
+    printf "%s --since dropped %d attempt line(s) and %d jump(s) before the window\n", \
+      box, dropped_attempts + 0, dropped_jumps + 0 > "/dev/stderr"
   if (conflict) exit 3
 }
 ' "$log" >> "$ROWS"
