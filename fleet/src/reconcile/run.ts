@@ -23,12 +23,12 @@ import { tunnelUp, tunnelSsh, makeWarnOnce, type TunnelDeps } from "../tunnel.ts
 import { isHostKeyMismatch, knownHostsFile } from "../hostkey.ts";
 import { boxIndex, portFor } from "../boxes.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../remote.ts";
-import { parseCheck, parseStatusLine } from "../status.ts";
+import { parseCheck, parseStatusLine, toReport, type BoxReport } from "../status.ts";
 import type { ReconcileStateApi } from "./state.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
 import { decide } from "./decide.ts";
 import { devFields, daysUntil } from "./inputs.ts";
-import { alertAsleep, alertIncoherent, INCIDENT_KINDS, INCIDENT_RENOTIFY_SECS } from "./alerts.ts";
+import { alertAsleep, alertIncoherent, alertBoxConditions, INCIDENT_KINDS, INCIDENT_RENOTIFY_SECS } from "./alerts.ts";
 import { identityPass } from "./identity.ts";
 import { mintKey, mintWindowValid, type MintDeps } from "../actions/mint.ts";
 import { rotate } from "../actions/rotate.ts";
@@ -533,6 +533,11 @@ async function reconcileOne(
   // tick makes no call at all and therefore reads false, which is what clears
   // the marker below.
   let hostkeyMismatch = false;
+  // D1b: the typed box report for THIS tick, set only when the box is
+  // status-seen — it printed a status line we actually read. `undefined` ⇒ not
+  // status-seen ⇒ the box-condition pass does not run for this box, so nothing
+  // raises and nothing clears (a condition survives a box being unreachable).
+  let report: BoxReport | undefined;
   if (tunnel === "up") {
     const chk = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, CHECK_COMMAND, {
       timeoutMs: CHECK_TIMEOUT_MS,
@@ -552,11 +557,23 @@ async function reconcileOne(
       const sl = parseStatusLine(st.stdout);
       checkSha = sl.sha;
       checkVersion = sl.version;
+      // D1b: status-seen on the unhealthy branch ONLY when the re-probe rc is 0
+      // AND the parsed line carries a `v=` token. `parseStatusLine` never throws
+      // and returns an all-defaulted object for ""/garbage — a defaulted report
+      // reads as tickwedge 0, disk unknown, keepawake null, indistinguishable
+      // from healthy, and would CLEAR every condition on a box the brain could
+      // not reach. That is the fail-open violation the guard exists to prevent.
+      // Note the box is `unhealthy` here (a disk=…/fail flips check to FAIL), so
+      // this branch is exactly where condition:disk-fail must still be seen.
+      if (st.code === 0 && sl.version !== "unknown") report = toReport(sl);
     } else {
       deps.state.resetCheckfail(box);
       checkHealthy = true;
       checkSha = parsed.status?.sha ?? "unknown";
       checkVersion = parsed.status?.version ?? "unknown";
+      // D1b: the healthy branch always has a real status line (rc-0 boxup check
+      // output is `check=OK ` + the line), so it is always status-seen.
+      if (parsed.status !== undefined) report = toReport(parsed.status);
     }
   }
 
@@ -694,6 +711,25 @@ async function reconcileOne(
     if (!raised.has(kind)) deps.state.alertClear(box, kind);
   }
 
+  // Box-reported conditions (5.13.0 D2/D3a): a POST-VERDICT pass, run HERE — for
+  // the same reason the re-arm above is hoisted out of the action loop — for
+  // every STATUS-SEEN box (D1b), after the incident re-arm and BEFORE the
+  // snapshot push, which needs `conditions`. A box that is NOT status-seen
+  // (tunnel down, or an unhealthy re-probe that returned rc≠0 / no `v=`) skips
+  // the pass entirely: nothing raises, nothing clears, no streak/delta moves,
+  // and the snapshot omits both `report` and `conditions` (D3b) rather than
+  // carrying a stale set forward. `alertBoxConditions` clears each kind that did
+  // not fire this tick itself, so CONDITION_KINDS needs no entry in the loop
+  // above.
+  let conditions: string[] | undefined;
+  if (report !== undefined) {
+    conditions = await alertBoxConditions(box, report, {
+      state: deps.state,
+      notify: deps.notify,
+      nowSec: nowS,
+    });
+  }
+
   snapshots.push({
     name: box,
     tunnel,
@@ -704,6 +740,10 @@ async function reconcileOne(
     checkfail: deps.state.checkfailCount(box) > 0,
     asleep: deps.state.readAsleep(box) !== undefined,
     expiry_days: expiryDays === "unknown" ? null : expiryDays,
+    // D3b: OPTIONAL, absent when the box was not status-seen. `SnapshotLine.v`
+    // stays 1 — the precedent is `SnapshotDiscover` (absence tolerated, no bump).
+    ...(report === undefined ? {} : { report }),
+    ...(conditions === undefined ? {} : { conditions }),
   });
 
   let repairRuns = 0;
