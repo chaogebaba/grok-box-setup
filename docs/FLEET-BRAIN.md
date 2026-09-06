@@ -1770,10 +1770,37 @@ A `job_id` is 22 base64url characters and can begin with `-`, so put `--` first:
 
 ### Not in 5.12.0
 
-**J12, the TUI jobs view** (JOB column, `jobs=<n>` header count, the `J` list and
-its log tail). The `job` field IS on `GET /v1/fleet` and `GET /v1/boxes/:name`
-already, attached at serve time from ONE query per request like `lease` — so the
-data the TUI needs is served; only the rendering is outstanding.
+**J12, the TUI jobs view — SHIPPED in 5.14.0.** The fleet table gained a `JOB`
+column (`run 12m` / `svc 2d3h` / `-`), a zero-suppressed `▶ <n> jobs` header
+counter, and a read-only fleet-wide jobs list on the `B` key (`GET /v1/jobs`,
+scroll-only). The `job` field was already on `GET /v1/fleet` and
+`GET /v1/boxes/:name`, attached at serve time from ONE query per request like
+`lease`, so 5.14.0 was rendering only. Still OUTSTANDING for 5.14.1: `Enter`
+(log tail) and `s` (stop) on a row, which need a view cursor, a modal painted
+under a view, and a parent view. The `J` key stays journal; the jobs list is
+`B`.
+
+Two 5.14.0 width rules the column forced, recorded because a later reader will
+re-derive them: the JOB column is 9 wide and is OMITTED (never clipped) below
+110 columns — a 9-wide cell takes the row past `tableWidth({cols:100})` and
+`layout.ts` would clip EXPIRY away — and COND, which the 5.13.0 row already
+degraded to an unreadable stub at 100 columns, is now OMITTED below 8 surviving
+columns rather than shown as a stub (present and clipped between 124 and 136).
+
+### `[jobs] retain_days` — brain-side job retention (5.14.0)
+
+Before 5.14.0 a box accumulated terminal job rows AND their mirrored log files
+(`$FLEET_STATE/jobs/<job_id>.log`) on the VPS for its whole life — no
+`DELETE FROM jobs` existed; only boxes pruned their own records (7 d / 20 rows).
+5.14.0 adds `[jobs] retain_days` to `config.toml`, default **30**, and prunes
+TERMINAL rows and their log files older than that once per tick, next to the
+92-day audit and snapshot prunes. `retain_days = 0` DISABLES pruning entirely.
+An invalid value FALLS BACK to 30 with no error (the house rule). The prune
+removes the log file BEFORE the row so a crash between the two leaves a row with
+no log (recoverable) rather than a file with no row (unrecoverable); it is
+guarded so a pre-v4 store ticks without touching it, and non-terminal rows are
+never touched. It is a store-only pass — no schema change, `KNOWN_SCHEMA` stays
+5.
 
 ## Audit fixes (grokfleet 5.12.1)
 

@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.13.0"; // 5.13.0: box-reported conditions become brain alerts and a COND column.
+const PKG_VERSION = "5.14.0"; // 5.14.0: TUI jobs view (JOB column, header counter, read-only B list) + brain-side job retention.
 
 async function gitShaFromGit(): Promise<string> {
   try {
