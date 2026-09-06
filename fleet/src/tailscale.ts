@@ -12,8 +12,23 @@
 //    `api_token_file`). The token value is NEVER logged or placed on argv.
 //  - per-box derivation mirrors fleetctl:3206 `dev_field`: a device matches a
 //    box when its hostname (or name), with a trailing `-1` split-brain suffix
-//    folded off, equals the box; `online` = ANY matching device online==true;
+//    folded off, equals the box; `online` = ANY matching device LIVE;
 //    `lastSeen` = the most recent lastSeen across matching devices.
+//
+// A2 (5.12.1) — "LIVE" is `connectedToControl`, not `online`.
+//
+// The bash brain read `.online` and this port copied it faithfully. The
+// Tailscale v2 devices API has never returned an `online` field
+// (tailscale/tailscale#7004 is still an open feature request; `online` exists
+// only in `tailscale status --json`). So `d.online === true` was ALWAYS false
+// and the API column read `offline` for every box, forever, including boxes
+// that were plainly up. `reconcile/inputs.ts` already keys on
+// `connectedToControl` (D12/r14, measured on the production VPS); this is the
+// same fix for the read-only inventory / fleet-status surface, so both halves
+// of the brain now agree on what "live" means.
+//
+// `online` is still honoured if the API ever grows it, exactly as inputs.ts
+// does — that day needs no further change here.
 //
 // Any failure (no token, non-2xx, malformed JSON, timeout) ⇒ the probe returns
 // `undefined`, so inventory renders API `?` and still writes inventory.json
@@ -42,8 +57,21 @@ export function baseName(h: string): string {
 interface RawDevice {
   hostname?: string;
   name?: string;
+  /** A2: the field the API actually returns for "this device is live". */
+  connectedToControl?: boolean;
+  /** Legacy/aspirational (tailscale#7004); honoured if it ever appears. */
   online?: boolean;
+  /**
+   * A2: OMITTED for a device that is currently connected
+   * (tailscale/tailscale#17504), which is why `lastSeen` can never carry the
+   * liveness answer on its own.
+   */
   lastSeen?: string;
+}
+
+/** A2: is this device LIVE, per the fields the API actually returns? */
+function isLive(d: RawDevice): boolean {
+  return d.connectedToControl === true || d.online === true;
 }
 
 /**
@@ -77,7 +105,7 @@ export function parseDevices(body: string, boxes: string[]): Map<string, DeviceI
   for (const box of boxes) {
     const ds = byBox.get(box) ?? [];
     if (ds.length === 0) continue; // not present ⇒ leave out; caller renders offline
-    const online = ds.some((d) => d.online === true);
+    const online = ds.some(isLive);
     // most recent lastSeen across matching devices
     let lastSeen: string | null = null;
     for (const d of ds) {

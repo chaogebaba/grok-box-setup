@@ -98,7 +98,7 @@ GROKFLEET_FETCH_ROOT_ENV="${GROKFLEET_FETCH_ROOT-}"
 
 # `make ts-release-build` rewrites EXACTLY these two lines (fleet/scripts/
 # release-build.sh); keep them at column 0 in `NAME=value` form.
-GROKFLEET_RELEASE=v5.12.0
+GROKFLEET_RELEASE=v5.12.1
 # Placeholder until the first `make ts-release-build` writes the real digest.
 # Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
 GROKFLEET_SHA256=ade2bce83b7944304dbe9e2113cc193ee7044a1bb8113a0a4e1ed53c786fab8f
@@ -482,6 +482,13 @@ Description=grok-fleet admin API (grokfleet serve — tailnet-bound token-auth H
 After=network-online.target tailscaled.service
 Wants=network-online.target
 
+# A6 (5.12.1): StartLimitIntervalSec belongs to [Unit], NOT [Service]. systemd
+# has parsed the rate-limit pair (StartLimitIntervalSec / StartLimitBurst) out of
+# [Unit] since v229; a copy in [Service] is not honoured and logs "Unknown key
+# name 'StartLimitIntervalSec' in section 'Service', ignoring" on every start —
+# which also meant the unlimited-restart intent below was never in force.
+StartLimitIntervalSec=0
+
 [Service]
 Type=simple
 # Same env as the reconcile unit INCLUDING HOME=$STATE_DIR (A18): grokfleet's
@@ -496,9 +503,6 @@ Environment=FLEET_STATE=$STATE_DIR
 ExecStart=$OPT_DIR/grokfleet serve
 Restart=on-failure
 RestartSec=5
-# Never park the unit in 'failed' while tailscaled is slow to bring the tailnet
-# IP up (R2-A9): unlimited restart attempts within any interval.
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target

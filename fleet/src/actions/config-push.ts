@@ -45,6 +45,23 @@ export interface PushDeps {
   source: ManagedSource;
   /** run-scoped dedup sink for unknown keys (undefined ⇒ log here per-call). */
   unknownSink?: Set<string>;
+  /**
+   * A3 (5.12.1): run-scoped sink for boxes that were already in sync.
+   *
+   * `config: <box> in sync` was one line per box per tick — eleven boxes times
+   * 288 ticks a day is 3168 lines that say nothing happened, and they bury the
+   * drift/push/skip lines an operator is actually reading the journal for. The
+   * pass collects the quiet boxes here and prints ONE line at the end.
+   *
+   * ONLY the unannotated case is collected. An in-sync line that carries an
+   * annotation (`[IGNORED locally: ...]`, `[enabled UNKNOWN: ...]`,
+   * `[inert: ...]`) is a WARNING wearing an in-sync line's clothes — the file
+   * matches but the box is not honouring it — so it keeps its own line.
+   *
+   * Undefined ⇒ log per-box exactly as before, which is what a standalone
+   * `pushManaged` outside a pass wants.
+   */
+  inSyncSink?: Set<string>;
 }
 
 export interface PushResult {
@@ -129,8 +146,15 @@ export async function pushManaged(box: string, dry: boolean, deps: PushDeps): Pr
     ann += " [enabled UNKNOWN: box managed-status probe failed — cannot confirm the file is honoured]";
   if (support === "no") ann += " [inert: boxup lacks managed support — deploy boxup first]";
 
+  // A3: the quiet case goes to the sink when there is one AND the line carries
+  // no annotation; everything else logs verbatim, as before.
+  const logInSync = (): void => {
+    if (ann === "" && deps.inSyncSink !== undefined) deps.inSyncSink.add(box);
+    else log(`config: ${box} in sync${ann}`);
+  };
+
   if (dry) {
-    if (cur === wantSha) log(`config: ${box} in sync${ann}`);
+    if (cur === wantSha) logInSync();
     else log(`config: ${box} WOULD push (${cur || "none"}->${wantSha})${ann}`);
     return { rc: 0, cur, want: wantSha };
   }
@@ -139,7 +163,7 @@ export async function pushManaged(box: string, dry: boolean, deps: PushDeps): Pr
     log(`config: ${box} push read-back MISMATCH (got ${nowSha || "none"}, want ${wantSha})`);
     return { rc: 5, cur, want: wantSha };
   }
-  if (cur === wantSha) log(`config: ${box} in sync${ann}`);
+  if (cur === wantSha) logInSync();
   else log(`config: ${box} pushed (${cur || "none"}->${wantSha})${ann}`);
   return { rc: 0, cur, want: wantSha };
 }

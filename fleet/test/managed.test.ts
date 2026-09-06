@@ -70,6 +70,49 @@ describe("T11 validate_managed (D4 refusals, tests:2456-2483)", () => {
   test("known + unknown-but-well-formed keys allowed", () => {
     expect(validateManaged("[ssh]\npassword = x\n[update]\nnewkey = y\n").ok).toBe(true);
   });
+  // ---- A8 (5.12.1): [keepawake] -------------------------------------------
+  //
+  // The keep-awake experiment was ABANDONED, and the way to switch it off on
+  // every box at once is one line in /etc/grok-fleet/fleet.toml. D4 used to
+  // refuse that line, and a D4 refusal is rc 4 for EVERY box — so the line meant
+  // to disable one feature would have stopped config pushes fleet-wide.
+  //
+  // The mutant these kill: drop "keepawake" from ALLOWED_TABLES, or drop the
+  // KEEPAWAKE_KEYS check.
+  test("A8: the fleet-wide abandon line is ACCEPTED", () => {
+    const r = validateManaged("[keepawake]\ninterval_min = 0\n");
+    expect(r).toEqual({ ok: true, reasons: [] });
+  });
+
+  test("A8: a non-zero cadence is accepted too (the table is not a kill switch)", () => {
+    expect(validateManaged("[keepawake]\ninterval_min = 20\n").ok).toBe(true);
+  });
+
+  test("A8: any OTHER key under [keepawake] is REFUSED, not forward-compat", () => {
+    // `interval` parses, would log as "unknown but allowed", leave interval_min
+    // unset, and boxup would fall back to its 20-minute default — the feature
+    // stays on, at a model turn per fire, while the operator reads a clean push.
+    const r = validateManaged("[keepawake]\ninterval = 0\n");
+    expect(r.ok).toBe(false);
+    expect(r.reasons).toEqual([
+      "refuse: [keepawake].interval is not a boxup keep-awake key (only interval_min)",
+    ]);
+    expect(validateManaged("[keepawake]\nfoo = 1\n").ok).toBe(false);
+  });
+
+  test("A8: the closed key set is scoped to [keepawake] alone", () => {
+    // Every other table keeps the forward-compat rule.
+    expect(validateManaged("[update]\ninterval = 0\n").ok).toBe(true);
+    // ...and a key named interval_min elsewhere is not special either way.
+    expect(validateManaged("[update]\ninterval_min = 0\n").ok).toBe(true);
+  });
+
+  test("A8: keepawake.interval_min is a KNOWN key, so it logs no forward-compat noise", () => {
+    // Otherwise every config pass on the abandoned fleet would print
+    // `unknown-but-well-formed keys ... keepawake.interval_min` every tick.
+    expect(unknownManagedKeys("[keepawake]\ninterval_min = 0\n")).toEqual([]);
+  });
+
   test("unknownManagedKeys lists forward-compat keys (known excluded)", () => {
     const keys = unknownManagedKeys("[ssh]\npassword = x\n[update]\nnewkey = y\nrepo = m\n");
     expect(keys).toEqual(["update.newkey"]);
@@ -202,6 +245,35 @@ describe("T11 push_managed rc classifier (E2, tests:3240-3277)", () => {
     expect(r.rc).toBe(4);
     expect(runner.calls.length).toBe(0); // never reached the tunnel
   });
+  // A8: the same real entry point, with the fleet-wide abandon line. Before
+  // 5.12.1 this returned 4 and never reached the tunnel — for EVERY box, on
+  // every tick, for as long as the line was in fleet.toml.
+  test("A8: the abandon line reaches the tunnel instead of being refused", async () => {
+    const runner = new FakeRunner(() => result({ code: 0, stdout: "sha=S cur=S support=yes enabled=true" }));
+    const src: ManagedSource = {
+      fleetToml: () => "[ssh]\npassword = x\n\n[keepawake]\ninterval_min = 0\n",
+      boxToml: () => undefined,
+    };
+    const r = await pushManaged("grok-box-8", true, { runner, env: testEnv(), source: src });
+    expect(r.rc).not.toBe(4);
+    expect(runner.calls.length).toBeGreaterThan(0); // it DID reach the tunnel
+    // ...and the rendered bytes the box would hash carry the line.
+    const stdin = runner.calls[0]!.opts.stdin as string;
+    expect(stdin).toContain("[keepawake]");
+    expect(stdin).toContain("interval_min = 0");
+  });
+
+  test("A8: a bad keepawake key is still a D4 refusal, with no ssh call", async () => {
+    const runner = new FakeRunner(() => result({ code: 0 }));
+    const src: ManagedSource = {
+      fleetToml: () => "[keepawake]\ninterval = 0\n",
+      boxToml: () => undefined,
+    };
+    const r = await pushManaged("grok-box-8", true, { runner, env: testEnv(), source: src });
+    expect(r.rc).toBe(4);
+    expect(runner.calls.length).toBe(0);
+  });
+
   test("dry-run in-sync ⇒ 0", async () => {
     const text = "[ssh]\npassword = x\n";
     const want = await textSha256(renderManaged("[ssh]\npassword = x\n", undefined));
@@ -463,5 +535,106 @@ describe("T11 config pass canary routing (F1/F2)", () => {
       });
       expect(notes.some((m) => m.includes("config push failing for grok-box-002") && m.includes("config pass aborted"))).toBe(true);
     }
+  });
+});
+
+// ---- A3 (5.12.1): the in-sync summary line -----------------------------------
+//
+// `config: <box> in sync` fired once per box per tick — eleven boxes across 288
+// ticks is 3168 journal lines a day that say nothing happened, and they bury the
+// drift/push/skip lines the journal is read for. The pass collects the quiet
+// boxes and prints ONE line.
+//
+// The mutant these kill: restore the per-box `log(...)` in `pushManaged`. Then
+// the summary is missing and the per-box lines are back, and every assertion
+// below fails.
+describe("A3 in-sync log spam", () => {
+  const FLEET_TOML = "[ssh]\npassword = x\n";
+
+  /** A runner where every listed box's tunnel is up and every push is in sync. */
+  async function syncRunner(ports: number[], ann?: string): Promise<FakeRunner> {
+    const want = await textSha256(renderManaged(FLEET_TOML, undefined));
+    const extra = ann ?? "support=yes enabled=true";
+    return new FakeRunner((argv) => {
+      if (isSs(argv)) {
+        const lines = ports.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:* users:(("sshd",pid=41,fd=7))`);
+        return result({ stdout: lines.join("\n") + "\n" });
+      }
+      return result({ code: 0, stdout: `sha=${want} cur=${want} ${extra}` });
+    });
+  }
+
+  /** The log sink sees `<ts> grokfleet: <line>`; assertions want the line. */
+  const bare = (lines: string[]): string[] => lines.map((l) => l.replace(/^\S+ grokfleet: /, ""));
+
+  async function passLogs(runner: FakeRunner, boxes: string[]): Promise<string[]> {
+    const { fs } = memState();
+    return bare(await withLogs(async () => {
+      await configPass({
+        runner,
+        env: testEnv(),
+        source: { fleetToml: () => FLEET_TOML, boxToml: () => undefined },
+        state: new ReconcileState("/s", fs),
+        notify: () => {},
+        targetBoxes: boxes,
+        configCanary: undefined,
+        managedFilesPresent: true,
+        apply: false,
+      });
+    }));
+  }
+
+  test("a quiet fleet costs ONE line, not one per box", async () => {
+    const boxes = ["grok-box-002", "grok-box-004", "grok-box-011"];
+    const logs = await passLogs(await syncRunner([20002, 20004, 20011]), boxes);
+    const summary = logs.filter((l) => l.startsWith("config: in sync "));
+    expect(summary).toEqual(["config: in sync grok-box-002,grok-box-004,grok-box-011 (3)"]);
+    // Not one of the three per-box lines survives.
+    for (const b of boxes) expect(logs).not.toContain(`config: ${b} in sync`);
+  });
+
+  test("the summary is greppable for a single box, and lands before `pass done`", async () => {
+    const logs = await passLogs(await syncRunner([20002, 20004]), ["grok-box-002", "grok-box-004"]);
+    const summary = logs.findIndex((l) => l.startsWith("config: in sync "));
+    const done = logs.findIndex((l) => l.startsWith("config: pass done"));
+    expect(summary).toBeGreaterThanOrEqual(0);
+    expect(summary).toBeLessThan(done);
+    expect(logs[summary]).toContain("grok-box-004");
+  });
+
+  test("no in-sync box ⇒ NO summary line (an empty one is its own noise)", async () => {
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20002 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
+      return result({ code: 0, stdout: "sha=WANT cur=OTHER support=yes enabled=true" });
+    });
+    const logs = await passLogs(runner, ["grok-box-002"]);
+    expect(logs.some((l) => l.startsWith("config: in sync "))).toBe(false);
+    // The drift line is untouched.
+    expect(logs.some((l) => l.startsWith("config: grok-box-002 WOULD push"))).toBe(true);
+  });
+
+  test("an ANNOTATED in-sync line keeps its own line — it is a warning", async () => {
+    // enabled=false: the file matches but the box ignores it. Folding that into
+    // a count called "in sync" would hide the one thing an operator must see.
+    const runner = await syncRunner([20002], "support=yes enabled=false");
+    const logs = await passLogs(runner, ["grok-box-002"]);
+    expect(logs.some((l) => l.startsWith("config: in sync "))).toBe(false);
+    expect(
+      logs.some((l) => l.startsWith("config: grok-box-002 in sync") && l.includes("IGNORED locally")),
+    ).toBe(true);
+  });
+
+  test("a standalone pushManaged (no pass) still logs per box", async () => {
+    // `grokfleet config push <box>` has no pass to summarise into; it must keep
+    // printing the answer for the one box the operator asked about.
+    const runner = await syncRunner([20002]);
+    const logs = bare(await withLogs(async () => {
+      await pushManaged("grok-box-002", true, {
+        runner,
+        env: testEnv(),
+        source: { fleetToml: () => FLEET_TOML, boxToml: () => undefined },
+      });
+    }));
+    expect(logs).toContain("config: grok-box-002 in sync");
   });
 });

@@ -92,7 +92,16 @@ export async function configPass(deps: ConfigPassDeps): Promise<ConfigPassResult
   }
   const mode = deps.apply ? "apply" : "dry-run";
   const unknownSink = new Set<string>();
-  const pushDeps: PushDeps = { runner: deps.runner, env: deps.env, source: deps.source, unknownSink };
+  // A3 (5.12.1): the pass collects its in-sync boxes and prints ONE line, so a
+  // quiet fleet costs one journal line a tick instead of one per box.
+  const inSyncSink = new Set<string>();
+  const pushDeps: PushDeps = {
+    runner: deps.runner,
+    env: deps.env,
+    source: deps.source,
+    unknownSink,
+    inSyncSink,
+  };
 
   const { canary, policy } = await chooseCanary(deps);
 
@@ -196,6 +205,7 @@ export async function configPass(deps: ConfigPassDeps): Promise<ConfigPassResult
         }
         failed++;
         rc = 1;
+        logInSyncSummary(inSyncSink);
         logUnknown(unknownSink);
         log(`config: pass done (${mode}) ok=${ok} skipped=${skipped} failed=${failed}`);
         return { rc, ok, skipped, failed, canary, policy, perBox };
@@ -252,9 +262,24 @@ export async function configPass(deps: ConfigPassDeps): Promise<ConfigPassResult
     }
   }
 
+  logInSyncSummary(inSyncSink);
   logUnknown(unknownSink);
   log(`config: pass done (${mode}) ok=${ok} skipped=${skipped} failed=${failed}`);
   return { rc, ok, skipped, failed, canary, policy, perBox };
+}
+
+/**
+ * A3: the one line that replaces the per-box `config: <box> in sync` spam.
+ *
+ * Names are FULL and comma-separated so the line stays greppable for any single
+ * box (`grep grok-box-004`), and the count is repeated at the end so an operator
+ * can read "how many were quiet" without counting commas. Emitted in the boxes'
+ * push order, which is target order. Nothing is printed when no box was in
+ * sync — an empty summary line would be its own kind of noise.
+ */
+function logInSyncSummary(sink: Set<string>): void {
+  if (sink.size === 0) return;
+  log(`config: in sync ${[...sink].join(",")} (${sink.size})`);
 }
 
 function logUnknown(sink: Set<string>): void {

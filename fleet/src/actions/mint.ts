@@ -27,6 +27,7 @@ import {
   BOX_AUTHKEY_EXPIRES,
   BOX_ROOT,
 } from "../reconcile/seed-remote.ts";
+import { keyStale } from "../keystale.ts";
 import { log } from "../log.ts";
 
 const SEED_TIMEOUT_MS = 20_000;
@@ -161,6 +162,18 @@ export async function revokeMintedKey(
 /**
  * mint_window_valid (main:1724-1736): true (skip re-mint) iff <box>.expires
  * exists AND key_meta_id non-empty AND date parses AND daysUntil >= 7.
+ *
+ * A1 (5.12.1) adds one more clause: the key must have been minted AT OR AFTER
+ * the box's current binding. An expiry date says when a key STOPS being valid;
+ * it says nothing about whether the key is still ON the box. A re-imaged box
+ * keeps its store row and loses `secrets/ts-authkey`, so the date alone answers
+ * "valid" for up to 90 days while the box cannot rejoin at all — that is how
+ * `grok-box-011` was left unrecoverable on 2026-09-06.
+ *
+ * The clause is only applied when the implementation KNOWS both instants. The
+ * 5.7.1 file layout records neither and a legacy-imported row has no
+ * `enrolled_at`, and in those cases the guard keeps its pre-5.12.1 answer
+ * rather than re-minting a fleet it cannot reason about.
  */
 export function mintWindowValid(box: string, deps: { state: ReconcileStateApi; nowSec?: number }): boolean {
   const d = deps.state.readExpiresDate(box);
@@ -168,6 +181,14 @@ export function mintWindowValid(box: string, deps: { state: ReconcileStateApi; n
   const idx = boxIndex(box);
   if (idx === undefined) return false;
   if (deps.state.keyMetaId(idx, box) === undefined) return false;
+  // A1(b): a key from BEFORE the current binding belongs to the previous
+  // incarnation of this box. Not a valid window, whatever its expiry says.
+  //
+  // r2/R2(a): the predicate lives in keystale.ts because the AUTHKEY column now
+  // asks the SAME question. The r1 gate found the column printing a date for a
+  // key this function would refuse; sharing one function is what makes that
+  // disagreement impossible rather than merely unlikely.
+  if (keyStale(deps.state, box)) return false;
   // daysUntil >= 7 (import here to avoid a cycle at module top)
   const t = /^\d{4}-\d{2}-\d{2}$/.test(d) ? Date.parse(`${d}T00:00:00Z`) : Date.parse(d);
   if (Number.isNaN(t)) return false;

@@ -86,7 +86,17 @@ export function renderManaged(fleetToml: string | undefined, boxToml: string | u
   return body === "" ? header : header + body + "\n";
 }
 
-const KNOWN_KEYS = new Set(["ssh\u0001password", "tailscale\u0001version", "update\u0001repo"]);
+// A8 (5.12.1): `keepawake.interval_min` joins the known set. Without it every
+// config pass on a fleet carrying the abandon line would log
+// `config: unknown-but-well-formed keys (allowed, forward-compat):
+// keepawake.interval_min` forever — the same per-tick noise A3 just removed,
+// for a key the validator now knows by name.
+const KNOWN_KEYS = new Set([
+  "ssh\u0001password",
+  "tailscale\u0001version",
+  "update\u0001repo",
+  "keepawake\u0001interval_min",
+]);
 
 /** unknown_managed_keys (main:1990-2013): well-formed but unknown table.key list. */
 export function unknownManagedKeys(text: string): string[] {

@@ -230,6 +230,29 @@ describe("J7 — reads", () => {
     expect((await jsonBody(r)).jobs as unknown[]).toHaveLength(1);
   });
 
+  // A7 (5.12.1) — the /v1/jobs wire timestamps are SECOND precision, like every
+  // other timestamp in the same body. This is the mutant guard: restoring
+  // `new Date(t * 1000).toISOString()` puts `.000` back and every one of these
+  // assertions fails.
+  test("A7: job timestamps carry no milliseconds", async () => {
+    const dir = seedFleet("iso-secs", [{ name: "grok-box-001" }]);
+    const fetch = makeFetch(await ctxFor(dir));
+    const started = await jsonBody(await fetch(postReq("/v1/jobs", ADMIN, START)));
+    const id = started.job_id as string;
+    const j = await jsonBody(await fetch(getReq(`/v1/jobs/${encodeURIComponent(id)}`, READ)));
+    const SECONDS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+    for (const field of ["created_at", "started_at"]) {
+      const v = j[field];
+      expect(typeof v === "string" || v === null).toBe(true);
+      if (typeof v === "string") expect(v).toMatch(SECONDS);
+    }
+    expect(JSON.stringify(j)).not.toMatch(/\d{2}:\d{2}:\d{2}\.\d{3}Z/);
+
+    // The same shape on the per-box `job` field of GET /v1/fleet (J7/J12).
+    const fleet = await jsonBody(await fetch(getReq("/v1/fleet", READ)));
+    expect(JSON.stringify(fleet)).not.toMatch(/\d{2}:\d{2}:\d{2}\.\d{3}Z/);
+  });
+
   test("GET /v1/jobs/:id?refresh=1 polls the box inline", async () => {
     const dir = seedFleet("refresh", [{ name: "grok-box-001" }]);
     const ctx = await ctxFor(

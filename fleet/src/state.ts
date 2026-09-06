@@ -23,6 +23,14 @@ export interface BoxEntry {
   boxTunnel?: string | null;
   checkReason?: string | null;
   expires?: string | null;
+  /**
+   * r2/R2(a): true when the recorded key was minted BEFORE the box's current
+   * binding, so the engine would refuse it. `expires` KEEPS the recorded date
+   * — the two together say "this is the date on file, and it is worthless",
+   * which is strictly more than either could say alone. The human AUTHKEY
+   * column prints `stale` instead of the date.
+   */
+  keyStale?: boolean;
   checkedAt: string;
   /** reason string when a field is `?`/null (F7.3). */
   reason?: string | null;

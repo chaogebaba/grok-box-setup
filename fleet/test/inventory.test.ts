@@ -5,7 +5,7 @@
 //  - API unavailable ⇒ API `?`; `inventory.json` is retired (state-store D3/D7).
 
 import { test, expect, describe } from "bun:test";
-import { probeBox, runInventory, driftCell, type DevicesApi } from "../src/inventory.ts";
+import { probeBox, runInventory, renderTable, driftCell, type DevicesApi } from "../src/inventory.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../src/remote.ts";
 import { FakeRunner, result, isSs } from "./fake-runner.ts";
 import { testEnv, testRollout, FULL_STATUS_LINE } from "./helpers.ts";
@@ -168,5 +168,92 @@ describe("driftCell", () => {
         version: "unknown",
       }),
     ).toBe("?");
+  });
+});
+
+// ---- r2/R2(a): `status` AUTHKEY column ---------------------------------------
+//
+// `grokfleet status` renders the same AUTHKEY fact as `fleet-status` and had the
+// same defect: it printed the recorded date for a key the engine would refuse.
+// Both surfaces now ask the ONE predicate in keystale.ts.
+describe("A1/r2 — the status AUTHKEY column marks a stale key", () => {
+  async function inv(stale: string[]) {
+    const r = new FakeRunner(
+      sshResponder({
+        ssListens: [20008],
+        onCheck: () => ({ code: 0, stdout: "check=OK " + FULL_STATUS_LINE }),
+      }),
+    );
+    return runInventory(["grok-box-008"], {
+      runner: r,
+      env: testEnv(),
+      rollout: testRollout(),
+      api: { async probe() { return undefined; } } as DevicesApi,
+      readExpires: async () => "2026-11-28",
+      previousTs: () => null,
+      keyStale: (b) => stale.includes(b),
+    });
+  }
+
+  test("the rendered table prints `stale` instead of the date", async () => {
+    const res = await inv(["grok-box-008"]);
+    const table = renderTable(res);
+    expect(table).toContain("stale");
+    expect(table).not.toContain("2026-11-28");
+  });
+
+  test("a healthy key still renders its date", async () => {
+    const res = await inv([]);
+    expect(renderTable(res)).toContain("2026-11-28");
+  });
+
+  test("the JSON view keeps the recorded date AND says the key is stale", async () => {
+    // The two facts together — "this is the date on file, and it is worthless" —
+    // say strictly more than either could alone, and no in-repo consumer of
+    // `expires` has to learn a new sentinel value.
+    const res = await inv(["grok-box-008"]);
+    const e = res.inventory.boxes["grok-box-008"]!;
+    expect(e.expires).toBe("2026-11-28");
+    expect(e.keyStale).toBe(true);
+  });
+
+  test("a healthy key leaves keyStale off the JSON entirely", async () => {
+    const res = await inv([]);
+    expect(res.inventory.boxes["grok-box-008"]!.keyStale).toBeUndefined();
+  });
+
+  test("the three states are distinct here too: date / stale / -", async () => {
+    // `status` renders the same three-valued column as `fleet-status`, and the
+    // empty marker already means "absent, unreadable or unparsable". `stale`
+    // must be tellable from all of that.
+    const mk = async (expires: string | undefined, stale: boolean) => {
+      const r = new FakeRunner(
+        sshResponder({
+          ssListens: [20008],
+          onCheck: () => ({ code: 0, stdout: "check=OK " + FULL_STATUS_LINE }),
+        }),
+      );
+      const res = await runInventory(["grok-box-008"], {
+        runner: r,
+        env: testEnv(),
+        rollout: testRollout(),
+        api: { async probe() { return undefined; } } as DevicesApi,
+        readExpires: async () => expires,
+        previousTs: () => null,
+        keyStale: () => stale,
+      });
+      // the AUTHKEY cell is the LAST column of the row line
+      return renderTable(res).split("\n")[2]!.trim().split(/\s+/).pop();
+    };
+
+    const date = await mk("2026-11-28", false);
+    const stale = await mk("2026-11-28", true);
+    const none = await mk(undefined, false);
+    expect([date, stale, none]).toEqual(["2026-11-28", "stale", "-"]);
+    expect(new Set([date, stale, none]).size).toBe(3);
+
+    // A probe failure reads `-`, never `stale`; a stale box with nothing
+    // recorded still reads `stale`.
+    expect(await mk(undefined, true)).toBe("stale");
   });
 });
