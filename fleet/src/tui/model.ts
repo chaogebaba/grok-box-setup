@@ -14,7 +14,7 @@
 // concatenation of `segments`, which the model tests pin.
 
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
-import type { BoxJob, BoxLease, FleetBox, Lease } from "./api-client.ts";
+import type { BoxJob, BoxLease, FleetBox, Job, Lease } from "./api-client.ts";
 import type { TuiState } from "./state.ts";
 import type { Tone } from "./tone.ts";
 
@@ -1122,8 +1122,14 @@ export function statusLine(state: TuiState, opts: { view?: boolean } = {}): Seg[
 // EXACTLY 120 characters, so these +18 make it two lines at 120 columns and one
 // line only at ≥ 138 — which costs every 120-wide admin frame one table row and
 // collapses the `fleet30-admin-120x12` windows onto the readonly ones.
+//
+// jobs J12: `B jobs` joins VIEW_KEYS. The nav line grows from 87 to 95 visible
+// columns; the combined one-line form (nav │ actions) is 138 columns today and
+// 146 with `B jobs`, both above 120, so the footer STAYS two lines at 100 and at
+// 120 and no row budget moves — every existing fixture changes by exactly this
+// one legend line.
 const NAV_KEYS: [string, string][] = [["↑↓", "select"], ["/", "filter"], ["f", "free"], ["r", "refresh"], ["q", "quit"]];
-const VIEW_KEYS: [string, string][] = [["D", "diff"], ["J", "journal"], ["H", "history"], ["L", "leases"]];
+const VIEW_KEYS: [string, string][] = [["D", "diff"], ["J", "journal"], ["H", "history"], ["L", "leases"], ["B", "jobs"]];
 const ACTION_KEYS: [string, string][] = [
   ["P", "push"],
   ["M", "rotate"],
@@ -1264,7 +1270,8 @@ export function viewLines(state: TuiState, size: Size): ToneLine[] {
   const rows: ToneLine[] = [];
   // O5: the leases view is FLEET-WIDE, so its `box` is `""` and the title says
   // just `── leases ──` rather than the double space `${kind} ${box}` gives.
-  const title = v.kind === "leases" ? "── leases ──" : `── ${v.kind} ${v.box} ──`;
+  // jobs J12: the jobs view is fleet-wide too and gets the same treatment.
+  const title = v.kind === "leases" || v.kind === "jobs" ? `── ${v.kind} ──` : `── ${v.kind} ${v.box} ──`;
   rows.push({
     text: pad(stripToWidth(`${title}  ${indicator}`, size.cols), size.cols),
     tone: "main",
@@ -1333,6 +1340,64 @@ export function leaseRows(leases: Lease[], nowMs: number): string[] {
 
 /** O5: an empty leases list is an ANSWER, not an empty screen. */
 export const NO_OPEN_LEASES = "no open leases";
+
+// --- the jobs view's rows (jobs J12) -----------------------------------------
+/** jobs J12: fixed widths totalling 79 — the SAME budget as `LEASE_COLS`, so
+ *  both views clip identically at every width. Each width is its longest real
+ *  value + one column of gap (the O1 rule): `id` 12 chars of a 22-char base64url
+ *  id + 1; `box` 14 as `LEASE_COLS.box`; `kind` holds `service` (7) + 1; `state`
+ *  holds `crashloop` (9) + 1; `rc` holds `143` (3) + gap; `age` holds `100d5h`
+ *  (6) + 1; `purpose` 22 as `LEASE_COLS.purpose`. Every text cell that would
+ *  fill its column is cut to width−2 + `…` through the shared `cut` helper. */
+const JOB_COLS = { id: 13, box: 14, kind: 8, state: 10, rc: 5, age: 7, purpose: 22 };
+
+/** jobs J12: an empty jobs list is an ANSWER, not an empty screen. */
+export const NO_JOBS = "no jobs";
+
+/** jobs J12: `listJobs` caps at 200 rows; when exactly 200 come back this MUTED
+ *  line is appended so `rows a–b of N` is never read as the fleet total. */
+export const JOBS_CAP_NOTE = "(newest 200 shown)";
+
+/**
+ * jobs J12: the jobs view's content rows — the header line, then one row per
+ * job, sorted starting|running FIRST and then by `created_at` desc. Formatted
+ * ONCE when the response lands and frozen into `ViewState.lines`, exactly as the
+ * leases view's rows are; nothing in 5.14.0 acts on a row, so no `Job[]` is
+ * retained. `JOB_ID` shows the first 12 chars; `RC` is `-` when null; `AGE` is
+ * `age(nowMs, started_at ?? created_at)` (the list DOES have `created_at`, so
+ * `?` is never needed). When exactly 200 rows come back the cap note is
+ * appended.
+ */
+export function jobRows(jobs: Job[], nowMs: number): string[] {
+  const head =
+    `${pad("JOB_ID", JOB_COLS.id)}${pad("BOX", JOB_COLS.box)}${pad("KIND", JOB_COLS.kind)}` +
+    `${pad("STATE", JOB_COLS.state)}${pad("RC", JOB_COLS.rc)}${pad("AGE", JOB_COLS.age)}` +
+    `${pad("PURPOSE", JOB_COLS.purpose)}`;
+  const rank = (s: string): number => (s === "starting" || s === "running" ? 0 : 1);
+  const sorted = [...jobs].sort(
+    (a, b) => rank(a.state) - rank(b.state) || tsDesc(a.created_at) - tsDesc(b.created_at),
+  );
+  const rows = [head];
+  for (const j of sorted) {
+    const rc = j.rc === null ? "-" : String(j.rc);
+    rows.push(
+      `${pad(j.job_id.slice(0, 12), JOB_COLS.id)}${pad(cut(j.box, JOB_COLS.box), JOB_COLS.box)}` +
+        `${pad(cut(j.kind, JOB_COLS.kind), JOB_COLS.kind)}${pad(cut(j.state, JOB_COLS.state), JOB_COLS.state)}` +
+        `${pad(rc, JOB_COLS.rc)}${pad(age(nowMs, j.started_at ?? j.created_at), JOB_COLS.age)}` +
+        `${pad(cut(j.purpose, JOB_COLS.purpose), JOB_COLS.purpose)}`,
+    );
+  }
+  if (jobs.length === 200) rows.push(JOBS_CAP_NOTE);
+  return rows;
+}
+
+/** A parsed ms for the DESC sort, or −∞ so an unparseable/absent value sorts
+ *  last within its rank. */
+function tsDesc(iso: string | null | undefined): number {
+  if (iso === null || iso === undefined || iso === "") return Number.NEGATIVE_INFINITY;
+  const ms = tsMillis(iso);
+  return ms === undefined ? Number.NEGATIVE_INFINITY : ms;
+}
 
 // --- modal -------------------------------------------------------------------
 export function modalLines(state: TuiState): ToneLine[] {
