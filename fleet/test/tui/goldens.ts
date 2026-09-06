@@ -11,10 +11,10 @@
 // whitespace is stripped.
 
 import type { SnapshotBox, SnapshotLine } from "../../src/history/schema.ts";
-import type { BoxLease, FleetBox, Lease } from "../../src/tui/api-client.ts";
+import type { BoxJob, BoxLease, FleetBox, Job, Lease } from "../../src/tui/api-client.ts";
 import type { TuiState } from "../../src/tui/state.ts";
 import type { Size } from "../../src/tui/model.ts";
-import { leaseRows } from "../../src/tui/model.ts";
+import { jobRows, leaseRows, NO_JOBS } from "../../src/tui/model.ts";
 import { box, state } from "./helpers.ts";
 
 /**
@@ -158,6 +158,74 @@ const LEASE_VIEW_LINES: string[] = leaseRows(
 
 const DIFF_LINES = Array.from({ length: 200 }, (_, i) => `--- diff line ${i} for the config push`);
 const JOURNAL_LINES_CONTENT = Array.from({ length: 200 }, (_, i) => `Apr 30 12:${String(i % 60).padStart(2, "0")}:00 box grok-agent[1]: line ${i}`);
+
+// --- jobs (5.14.0, J12) ------------------------------------------------------
+/** The per-box `job` field, attached at serve time like `lease`. */
+const boxJob = (over: Partial<BoxJob> = {}): BoxJob => ({
+  job_id: "JOBID000000000000000A",
+  kind: "run",
+  state: "running",
+  holder: "ci:runner-3",
+  purpose: "gate-5.14.0",
+  started_at: "2026-04-30T23:48:00Z", // 12m before NOW ⇒ `run 12m`
+  ...over,
+});
+
+const jobbed = (b: SnapshotBox, j: BoxJob): FleetBox => ({ ...b, job: j });
+
+/**
+ * Eight boxes exercising the JOB column and its counter in one frame: a `run`
+ * running (`run 12m`), a `service` running (`svc 2d3h`), a `starting` job
+ * (`run ?`, null started_at), and five with no job (`-`). The counter is
+ * `▶ 3 jobs` (three boxes in starting|running).
+ */
+const JOBBED: FleetBox[] = [
+  jobbed(box("grok-box-001"), boxJob()),
+  jobbed(box("grok-box-002"), boxJob({ job_id: "JOBID000000000000000B", kind: "service", state: "running", holder: "svc:brain", purpose: "keep-awake", started_at: "2026-04-28T21:00:10Z" })),
+  jobbed(box("grok-box-003"), boxJob({ job_id: "JOBID000000000000000C", state: "starting", purpose: "provision", started_at: null })),
+  box("grok-box-004"),
+  box("grok-box-005", { drift: "yes" }),
+  box("grok-box-006", { asleep: true }),
+  box("grok-box-007", { tunnel: "down", check: "FAIL", expiry_days: 3 }),
+  box("grok-box-008"),
+];
+
+/** A jobs list for the `B` view — one `run` running, one `service` running, one
+ *  terminal `done`, one terminal `failed` with a long purpose that must be cut,
+ *  so the sort (starting|running first, then created_at desc), the RC/`-` and
+ *  AGE columns all show. Frozen the way `app.tsx` freezes them at fetch. */
+const job = (over: Partial<Job> = {}): Job => ({
+  job_id: "JOBID000000000000000A",
+  box: "grok-box-001",
+  kind: "run",
+  state: "running",
+  rc: null,
+  holder: "ci:runner-3",
+  purpose: "gate-5.14.0",
+  cmd: "sleep 300",
+  cwd: "/workspace",
+  wall_cap_s: 300,
+  keep_alive: false,
+  lease_id: "LEASEID0000000000000A",
+  created_at: "2026-04-30T23:48:00Z",
+  started_at: "2026-04-30T23:48:00Z",
+  ended_at: null,
+  last_poll_at: "2026-05-01T00:00:00Z",
+  log_bytes: 128,
+  log_truncated: false,
+  lost_reason: null,
+  ...over,
+});
+
+const JOB_VIEW_LINES: string[] = jobRows(
+  [
+    job({ job_id: "DONEJOB0000000000000A", box: "grok-box-004", state: "done", rc: 0, purpose: "smoke", created_at: "2026-04-30T22:00:00Z", started_at: "2026-04-30T22:00:00Z", ended_at: "2026-04-30T22:05:00Z" }),
+    job(),
+    job({ job_id: "SVCJOB00000000000000B", box: "grok-box-002", kind: "service", state: "running", holder: "svc:brain", purpose: "keep-awake", created_at: "2026-04-28T21:00:10Z", started_at: "2026-04-28T21:00:10Z" }),
+    job({ job_id: "FAILJOB0000000000000C", box: "grok-box-007", state: "failed", rc: 1, purpose: "a purpose long enough to be cut", created_at: "2026-04-30T21:00:00Z", started_at: "2026-04-30T21:00:00Z", ended_at: "2026-04-30T21:03:00Z" }),
+  ],
+  NOW,
+);
 
 export const GOLDENS: Golden[] = [
   // --- the table frame -------------------------------------------------------
@@ -364,4 +432,56 @@ export const GOLDENS: Golden[] = [
       exceptions: [] as GoldenException[],
     },
   ]),
+
+  // --- jobs (5.14.0, J12) ----------------------------------------------------
+  // The JOB column across the width rule. No detail/detailFacts, so the Detail
+  // pane is empty and these are plain table frames (no detail-column exception).
+  //   137x40: JOB shown AND COND shown (full row).
+  //   120x40: JOB shown, COND OMITTED (72 − 66 = 6 < 8).
+  //   110x40: JOB shown, COND OMITTED (66 − 66 = 0).
+  //   100x40: JOB OMITTED (cols < 110), COND OMITTED, EXPIRY intact.
+  {
+    name: "jobs-column-137x40",
+    size: SIZE(137, 40),
+    state: state({ boxes: JOBBED, selected: 0 }),
+    exceptions: [],
+  },
+  {
+    name: "jobs-column-120x40",
+    size: SIZE(120, 40),
+    state: state({ boxes: JOBBED, selected: 0 }),
+    exceptions: [],
+  },
+  {
+    name: "jobs-column-110x40",
+    size: SIZE(110, 40),
+    state: state({ boxes: JOBBED, selected: 0 }),
+    exceptions: [],
+  },
+  {
+    name: "jobs-column-100x40",
+    size: SIZE(100, 40),
+    state: state({ boxes: JOBBED, selected: 0 }),
+    exceptions: [],
+  },
+
+  // The B jobs view, frozen rows and empty.
+  ...([40, 20] as const).map((rows) => ({
+    name: `view-jobs-120x${rows}`,
+    size: SIZE(120, rows),
+    state: state({
+      boxes: JOBBED,
+      view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES },
+    }),
+    exceptions: [] as GoldenException[],
+  })),
+  {
+    name: "view-jobs-empty-120x20",
+    size: SIZE(120, 20),
+    state: state({
+      boxes: JOBBED,
+      view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: [NO_JOBS] },
+    }),
+    exceptions: [],
+  },
 ];

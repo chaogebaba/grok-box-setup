@@ -1,0 +1,16 @@
+grokfleet 8 boxes  ● 5  ◆ 1  ✖ 1  ☾ 1 · free 5 · ▶ 3 jobs  apply off  tick 10s   admin  link ● up                       
+
+  NAME          WHO         JOB      VER     DRIFT   CONFIG  EXP                                                          ╭─ grok-box-001 ─────────────────────────────╮
+> grok-box-001  -           run 12m  5.3.0   no      in-sync 40d          │tunnel up · check OK · ver 5.3.0            │
+● grok-box-002  -           svc 2d3h 5.3.0   no      in-sync 40d          │drift no · config in-sync · expiry 40d      │
+● grok-box-003  -           run ?    5.3.0   no      in-sync 40d          │checkfail no · asleep no · canary none      │
+● grok-box-004  -           -        5.3.0   no      in-sync 40d          │checkfail# — · expires —                    │
+◆ grok-box-005  -           -        5.3.0   yes     in-sync 40d          │phase — · observed —                        │
+☾ grok-box-006  -           -        5.3.0   no      in-sync 40d          │free                                        │
+✖ grok-box-007  -           -        5.3.0   no      in-sync 3d           │  acquire may still refuse: /v1/leases 409 r│
+● grok-box-008  -           -        5.3.0   no      in-sync 40d          │asleep since — · last — · backoff —         │
+                                                                          │24h (loading…)                              │
+                                                                          ╰────────────────────────────────────────────╯
+
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs                         
+P push  M rotate  R rename  T check  C reconcile                                                                        
