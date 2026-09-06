@@ -133,9 +133,27 @@ describe("the table's row budget", () => {
   });
 
   test("the unclipped header is the same row, just padded to the terminal", () => {
+    // No Detail pane (cols < 100) ⇒ the header clips to the FULL terminal width,
+    // which comfortably holds the row (NAME…EXP COND), so the view header is the
+    // model header merely padded — nothing is lost. 5.13.0's COND column widened
+    // the row past tableWidth(100), so at 100 cols WITH the Detail pane the
+    // header is legitimately clipped to the narrower table region (asserted
+    // separately below); this invariant is about the no-Detail case.
+    const size = { cols: 99, rows: 40 };
+    const s = state({ boxes: thirty });
+    expect(showDetail(s, size)).toBe(false);
+    expect(tableLines(s, size)[0]!.text.trimEnd()).toBe(tableViewLines(s, size)[0]!.text.trimEnd());
+  });
+
+  test("with the Detail pane (cols >= 100) the wider COND table clips to the table region", () => {
+    // 5.13.0 D3e: the COND column pushes the untruncated table past
+    // tableWidth(100)=60, so the shared-row header is clipped to the table
+    // region rather than padded. The `cols >= 100` detail cutoff itself is
+    // unchanged (the detail-cutoff-99/100 fixtures prove it).
     const size = { cols: 100, rows: 40 };
     const s = state({ boxes: thirty });
-    expect(tableLines(s, size)[0]!.text.trimEnd()).toBe(tableViewLines(s, size)[0]!.text.trimEnd());
+    expect(showDetail(s, size)).toBe(true);
+    expect(tableViewLines(s, size)[0]!.text.length).toBeLessThanOrEqual(tableWidth(size));
   });
 
   test("the Detail pane is omitted, never clipped, when the budget is short", () => {
