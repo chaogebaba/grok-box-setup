@@ -209,21 +209,27 @@ export async function alertBoxConditions(box: string, report: BoxReport, deps: A
   }
 
   // 3. tick-wedged (warn) — a DELTA, not a level: raised when tickwedge exceeds
-  //    the highest this brain has recorded, then the record advances. A box
-  //    seen for the first time records the value silently; a reboot/image-swap
-  //    resets the box counter to 0 and a lower value overwrites the record
-  //    without alerting. `$RUN_DIR/tickwedge` is never reset by boxup, so a
-  //    level rule would page forever for one old wedge.
+  //    the highest this brain has recorded, then the record advances. A28: a box
+  //    whose tickwedge was NEVER recorded (lastTickwedge === null) is seen for
+  //    the FIRST time — record the value silently and neither raise nor clear,
+  //    so a latched non-zero counter (007's tickwedge=1) does not page on the
+  //    first post-deploy tick. A recorded 0 is distinct and a real 0→1 wedge
+  //    still pages. A reboot/image-swap lowers the value and overwrites the
+  //    record without alerting. `$RUN_DIR/tickwedge` is never reset by boxup, so
+  //    a level rule would page forever for one old wedge.
   const lastWedge = deps.state.lastTickwedge(box);
-  const wedgeIncreased = report.tickwedge > lastWedge;
-  if (wedgeIncreased) {
+  if (lastWedge === null) {
+    // first sight: record silently, no alert, no clear.
+    deps.state.setTickwedge(box, report.tickwedge);
+  } else if (report.tickwedge > lastWedge) {
     active.push(shortCondition("condition:tick-wedged"));
     if (deps.state.alertDue(box, "condition:tick-wedged", renotify, deps.nowSec)) {
       await deps.notify("warn", `${box}: condition:tick-wedged (${report.tickwedge}, was ${lastWedge})`);
     }
     deps.state.setTickwedge(box, report.tickwedge);
   } else {
-    // A lower or equal value overwrites the record (down is silent) and clears.
+    // last !== null && report.tickwedge <= last: a lower/equal value overwrites
+    // the record (down is silent) and clears.
     if (report.tickwedge !== lastWedge) deps.state.setTickwedge(box, report.tickwedge);
     deps.state.alertClear(box, "condition:tick-wedged");
   }

@@ -176,7 +176,14 @@ export interface ReconcileStateApi {
    */
   bumpKeepawakeFail(box: string): number;
   resetKeepawakeFail(box: string): void;
-  lastTickwedge(box: string): number;
+  /**
+   * A28: `null` means the box's tickwedge has NEVER been recorded (first sight),
+   * which the delta rule treats as "record silently, do not alert" — otherwise
+   * a box whose FIRST observation is a latched non-zero counter (grok-box-007's
+   * `tickwedge=1`) would page on the first post-deploy tick. Distinct from a
+   * recorded 0, which a real 0→1 wedge must still page against.
+   */
+  lastTickwedge(box: string): number | null;
   setTickwedge(box: string, n: number): void;
   recordApiFailure(nowSec: number): { n: number; mins: number };
   resetApiFailure(): void;
@@ -272,8 +279,15 @@ export class ReconcileState implements ReconcileStateApi {
   resetKeepawakeFail(box: string): void {
     this.fs.remove(this.p(`${box}.keepawake-fail`)); // reset = rm -f
   }
-  lastTickwedge(box: string): number {
-    return this.readCounter(`${box}.tickwedge`);
+  lastTickwedge(box: string): number | null {
+    // A28: absent ⇒ null (never recorded), not 0. `readCounter` cannot express
+    // that, so read the raw file: a missing file is null, a present bare int is
+    // its value, and any garbage reads as 0 (recorded, but unparseable).
+    const raw = this.fs.read(this.p(`${box}.tickwedge`));
+    if (raw === undefined) return null;
+    const stripped = raw.replace(/\s+/g, "");
+    if (stripped === "" || !/^[0-9]+$/.test(stripped)) return 0;
+    return Number.parseInt(stripped, 10);
   }
   setTickwedge(box: string, n: number): void {
     this.fs.write(this.p(`${box}.tickwedge`), `${n}\n`);

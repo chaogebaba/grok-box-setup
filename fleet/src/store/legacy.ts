@@ -248,8 +248,8 @@ export function importLegacy(store: Store, opts: ImportOptions): ImportOutcome {
     const insCounters = store.db.query(
       `INSERT INTO box_counters(box_id,checkfail,seedfail,cfgfail,incoherent,
                                 repair_pending_runs,repair_pending_tick,hostkey_mismatch,
-                                asleep_since,asleep_last_alert)
-       VALUES(?,?,?,?,?,?,?,?,?,?)`,
+                                asleep_since,asleep_last_alert,keepawake_fail,tickwedge_seen)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
     );
     const insKey = store.db.query(
       "INSERT INTO box_keys(box_id,key_id,expires_raw,expires_date,minted_at) VALUES(?,?,?,?,?)",
@@ -272,6 +272,11 @@ export function importLegacy(store: Store, opts: ImportOptions): ImportOutcome {
         b.counters.hostkey_mismatch,
         b.counters.asleep_since,
         b.counters.asleep_last,
+        // A28: the legacy files never recorded these two 5.13.0 counters, so a
+        // keep-awake streak imports as 0 and tickwedge imports as NULL (never
+        // recorded ⇒ first sight stays silent, not a page on the first tick).
+        0,
+        null,
       );
       if (b.key !== undefined) {
         insKey.run(id, b.key.key_id, b.key.expires_raw, b.key.expires_date, b.key.minted_at);

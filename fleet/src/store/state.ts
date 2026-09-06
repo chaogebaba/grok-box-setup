@@ -292,7 +292,7 @@ export class StoreState implements ReconcileStateApi {
         this.store.db
           .query(
             `UPDATE box_counters SET checkfail=0, seedfail=0, cfgfail=0, incoherent=0,
-                                     keepawake_fail=0, tickwedge_seen=0,
+                                     keepawake_fail=0, tickwedge_seen=NULL,
                                      repair_pending_runs=0, repair_pending_tick=NULL,
                                      hostkey_mismatch=0, asleep_since=NULL, asleep_last_alert=NULL
              WHERE box_id=?`,
@@ -641,8 +641,17 @@ export class StoreState implements ReconcileStateApi {
   resetKeepawakeFail(box: string): void {
     this.setCounter(box, "keepawake_fail", 0);
   }
-  lastTickwedge(box: string): number {
-    return this.readCounter(box, "tickwedge_seen");
+  lastTickwedge(box: string): number | null {
+    // A28: NULL column ⇒ null (never recorded, first sight is silent). Distinct
+    // from a recorded 0, which a real 0→1 wedge pages against. `readCounter`
+    // collapses NULL to 0, so read the column directly.
+    const id = this.boxId(box);
+    if (id === undefined) return null;
+    const r = this.store.db.query("SELECT tickwedge_seen AS v FROM box_counters WHERE box_id = ?").get(id) as
+      | { v?: number | null }
+      | null;
+    if (r === null || r === undefined || r.v === null || r.v === undefined) return null;
+    return r.v;
   }
   setTickwedge(box: string, n: number): void {
     this.setCounter(box, "tickwedge_seen", n);

@@ -342,13 +342,17 @@ const V4: string[] = [
 // `IF NOT EXISTS` buys is redundant with the transaction, not lost.
 //
 //   - `box_counters.keepawake_fail`  — the D1a keep-awake failure streak;
-//   - `box_counters.tickwedge_seen`  — the D1a tickwedge high-water mark;
+//   - `box_counters.tickwedge_seen`  — the D1a tickwedge high-water mark. A28:
+//                                       NULLABLE, DEFAULT NULL — NULL means
+//                                       "never recorded" so first sight is
+//                                       silent (a recorded 0 still pages a
+//                                       real 0→1 wedge);
 //   - `snapshot_boxes.report`        — the per-tick BoxReport blob (D3b), which
 //                                       also carries `conditions`. Read-gated on
 //                                       userVersion() >= 5 (store/snapshots.ts).
 const V5: string[] = [
   `ALTER TABLE box_counters ADD COLUMN keepawake_fail INTEGER NOT NULL DEFAULT 0`,
-  `ALTER TABLE box_counters ADD COLUMN tickwedge_seen INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE box_counters ADD COLUMN tickwedge_seen INTEGER`,
   `ALTER TABLE snapshot_boxes ADD COLUMN report TEXT`,
 ];
 
