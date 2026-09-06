@@ -1412,6 +1412,41 @@ case "$dp" in
   *) bad "r2-n1 disk precheck wrong: [$dp]" ;;
 esac
 
+# --- A6 (5.12.1): StartLimitIntervalSec lives in [Unit], not [Service] --------
+#
+# systemd has parsed the start rate-limit pair out of [Unit] since v229. A copy
+# in [Service] is not honoured — it logs "Unknown key name
+# 'StartLimitIntervalSec' in section 'Service', ignoring" on every single start,
+# and the unlimited-restart intent it was written for was never in force. The
+# API unit needs that intent: it refuses to start until the tailnet IPv4
+# resolves, so a slow tailscaled means several restarts at boot and a rate limit
+# would park the unit in `failed`.
+#
+# The assertion reads the INSTALLED unit and asks which section the key landed
+# in, not whether the file contains the string anywhere — a key in the wrong
+# section would pass a plain grep while doing nothing.
+section_of_key() {
+  awk -v key="$2" '
+    /^\[/ { section = $0; gsub(/[][]/, "", section); next }
+    index($0, key "=") == 1 { print section; exit }
+  ' "$1"
+}
+startlimit_test() {
+  local pfx sd sec n; pfx="$(mktemp -d)"
+  GROKFLEET_BINARY="$STUB" PREFIX="$pfx" bash "$VPS_INSTALL" >/dev/null 2>&1
+  sd="$pfx/etc/systemd/system"
+  sec="$(section_of_key "$sd/grokfleet-api.service" StartLimitIntervalSec)"
+  n="$(grep -c '^StartLimitIntervalSec=' "$sd/grokfleet-api.service" 2>/dev/null | tr -d ' ')"
+  rm -rf "$pfx"
+  printf 'section=%s count=%s\n' "${sec:-ABSENT}" "${n:-0}"
+}
+sl="$(startlimit_test)"
+if [ "$sl" = "section=Unit count=1" ]; then
+  pass "A6: the API unit's StartLimitIntervalSec=0 is in [Unit] (systemd ignores it in [Service])"
+else
+  bad "A6: StartLimitIntervalSec is in the wrong section or duplicated: [$sl] want [section=Unit count=1]"
+fi
+
 echo "-----"
 if [ "$fail" = 0 ]; then echo "ALL INSTALL-VPS TESTS PASSED"; else echo "SOME INSTALL-VPS TESTS FAILED"; fi
 exit "$fail"
