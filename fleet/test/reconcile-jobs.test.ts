@@ -37,6 +37,9 @@ function memLogs(): JobLogSink & { text(id: string): string } {
     append: (id, t) => m.set(id, (m.get(id) ?? "") + t),
     size: (id) => (m.get(id) ?? "").length,
     read: (id, off, lim) => (m.get(id) ?? "").slice(off, off + lim),
+    remove: (id) => {
+      m.delete(id);
+    },
     text: (id) => m.get(id) ?? "",
   };
 }

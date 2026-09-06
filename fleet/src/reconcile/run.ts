@@ -46,6 +46,7 @@ import { checkDivergence } from "../store/divergence.ts";
 import { dailyMaintenance } from "../store/backup.ts";
 import { AUDIT_RETENTION_DAYS, SNAPSHOT_RETENTION_DAYS } from "../store/schema.ts";
 import { pruneSnapshots } from "../store/snapshots.ts";
+import { jobsAvailable, pruneJobs } from "../store/jobs.ts";
 import { observe, type Observed } from "./observe.ts";
 import type { DeferringLease, LeaseTickApi } from "./lease-tick.ts";
 import type { JobTickApi } from "./job-tick.ts";
@@ -157,6 +158,21 @@ export interface ReconcileDeps {
    */
   leases?: LeaseTickApi;
   jobs?: JobTickApi;
+  /**
+   * jobs J12 (D3): the log-mirror sink for the retention pass. Omitted ⇒ the
+   * pass prunes ROWS ONLY and logs `… (log files not reachable)`, which is what
+   * keeps box-free `runReconcile` tests hermetic. Production supplies the SAME
+   * `nodeJobLogs` instance the job tick uses (assembleTickDeps).
+   */
+  jobLogs?: import("../jobs.ts").JobLogSink;
+  /**
+   * jobs J12 (D3): the terminal-job retention window in days (resolved from
+   * `[jobs] retain_days`, default 30; 0 disables). Omitted ⇒ 30, so a tick that
+   * did not resolve config still prunes at the default. Threaded here rather
+   * than through a tick object because `pruneJobs` is a free function called at
+   * the prune site, exactly like `pruneSnapshots`.
+   */
+  jobRetentionDays?: number;
 }
 
 export interface ReconcileResult {
@@ -264,6 +280,22 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
     if (deps.store.userVersion() >= 2) {
       const old = pruneSnapshots(deps.store, SNAPSHOT_RETENTION_DAYS, now(deps));
       if (old > 0) log(`reconcile: pruned ${old} snapshot(s) older than ${SNAPSHOT_RETENTION_DAYS} days`);
+    }
+    // jobs J12 (D3): terminal-job retention, once per tick, next to the audit
+    // and snapshot prunes. Guarded by `jobsAvailable` (NOT a bare
+    // `userVersion() >= 4`) so a v3 store ticks without throwing. `retain_days`
+    // 0 disables it (pruneJobs returns 0 before any query). The log line fires
+    // only when N > 0; its second form names the sink-absent (rows-only) path.
+    if (jobsAvailable(deps.store)) {
+      const retainDays = deps.jobRetentionDays ?? 30;
+      const n = pruneJobs(deps.store, retainDays, now(deps), deps.jobLogs);
+      if (n > 0) {
+        log(
+          deps.jobLogs === undefined
+            ? `jobs: pruned ${n} terminal row(s) older than ${retainDays}d (log files not reachable)`
+            : `jobs: pruned ${n} terminal row(s) and ${n} log file(s) older than ${retainDays}d`,
+        );
+      }
     }
   }
 

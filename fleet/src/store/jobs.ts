@@ -21,7 +21,7 @@
 
 import { randomBytes } from "node:crypto";
 import type { Store } from "./db.ts";
-import type { JobKind, JobState } from "../jobs.ts";
+import { TERMINAL_STATES, type JobKind, type JobLogSink, type JobState } from "../jobs.ts";
 
 /** One `jobs` row, joined to its box NAME (every caller wants the name). */
 export interface JobRow {
@@ -278,4 +278,52 @@ export function loseJob(store: Store, id: string, reason: string, now: number): 
        WHERE job_id=? AND state IN ('starting','running')`,
     )
     .run(reason, now, now, id);
+}
+
+/** jobs J12 (D3): the terminal states, as a SQL literal for the prune's IN (…). */
+const TERMINAL_STATES_SQL = TERMINAL_STATES.map((s) => `'${s}'`).join(",");
+
+/**
+ * jobs J12 (D3): brain-side retention. Delete TERMINAL job rows — and their
+ * mirrored log files — older than `retentionDays`, keyed on
+ * `COALESCE(ended_at, last_poll_at)`. Non-terminal rows are NEVER touched.
+ * Returns the number of rows deleted (0 when nothing matched).
+ *
+ * ORDERING, and it is the point: the doomed `job_id`s are SELECTed first, then
+ * `logs.remove(id)` is called for each, and only THEN is the DELETE issued. A
+ * crash between the two leaves a row with no log (recoverable — the file was
+ * only a mirror) rather than a file with no row (unrecoverable — nothing points
+ * at it any more), the row-first reasoning of the whole jobs feature.
+ *
+ * `retentionDays === 0` DISABLES pruning: return 0 before any query runs, so a
+ * disabled config touches neither rows nor files. `logs === undefined` prunes
+ * ROWS ONLY and skips the unlink loop — never the DELETE — which is what keeps
+ * box-free `runReconcile` tests hermetic.
+ *
+ * Guarded by `jobsAvailable` (a v3 store has no `jobs` table): a pre-v4 store
+ * returns 0 without throwing. Deleting `jobs` rows is FK-safe — `jobs`
+ * references `boxes`/`leases` outward, nothing references `jobs` inward.
+ */
+export function pruneJobs(store: Store, retentionDays: number, at: number, logs: JobLogSink | undefined): number {
+  if (retentionDays === 0) return 0;
+  if (!jobsAvailable(store)) return 0;
+  const cutoff = at - retentionDays * 86400;
+  const doomed = store.db
+    .query(
+      `SELECT job_id FROM jobs
+        WHERE state IN (${TERMINAL_STATES_SQL})
+          AND COALESCE(ended_at, last_poll_at) < ?`,
+    )
+    .all(cutoff) as { job_id: string }[];
+  if (doomed.length === 0) return 0;
+  // logs BEFORE the DELETE — a row with no log is recoverable, a file with no
+  // row is not.
+  if (logs !== undefined) {
+    for (const { job_id } of doomed) logs.remove(job_id);
+  }
+  store.tx(() => {
+    const del = store.db.query(`DELETE FROM jobs WHERE job_id = ?`);
+    for (const { job_id } of doomed) del.run(job_id);
+  });
+  return doomed.length;
 }
