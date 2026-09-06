@@ -465,3 +465,104 @@ describe("T11 config pass canary routing (F1/F2)", () => {
     }
   });
 });
+
+// ---- A3 (5.12.1): the in-sync summary line -----------------------------------
+//
+// `config: <box> in sync` fired once per box per tick — eleven boxes across 288
+// ticks is 3168 journal lines a day that say nothing happened, and they bury the
+// drift/push/skip lines the journal is read for. The pass collects the quiet
+// boxes and prints ONE line.
+//
+// The mutant these kill: restore the per-box `log(...)` in `pushManaged`. Then
+// the summary is missing and the per-box lines are back, and every assertion
+// below fails.
+describe("A3 in-sync log spam", () => {
+  const FLEET_TOML = "[ssh]\npassword = x\n";
+
+  /** A runner where every listed box's tunnel is up and every push is in sync. */
+  async function syncRunner(ports: number[], ann?: string): Promise<FakeRunner> {
+    const want = await textSha256(renderManaged(FLEET_TOML, undefined));
+    const extra = ann ?? "support=yes enabled=true";
+    return new FakeRunner((argv) => {
+      if (isSs(argv)) {
+        const lines = ports.map((p) => `LISTEN 0 128 127.0.0.1:${p} 0.0.0.0:* users:(("sshd",pid=41,fd=7))`);
+        return result({ stdout: lines.join("\n") + "\n" });
+      }
+      return result({ code: 0, stdout: `sha=${want} cur=${want} ${extra}` });
+    });
+  }
+
+  /** The log sink sees `<ts> grokfleet: <line>`; assertions want the line. */
+  const bare = (lines: string[]): string[] => lines.map((l) => l.replace(/^\S+ grokfleet: /, ""));
+
+  async function passLogs(runner: FakeRunner, boxes: string[]): Promise<string[]> {
+    const { fs } = memState();
+    return bare(await withLogs(async () => {
+      await configPass({
+        runner,
+        env: testEnv(),
+        source: { fleetToml: () => FLEET_TOML, boxToml: () => undefined },
+        state: new ReconcileState("/s", fs),
+        notify: () => {},
+        targetBoxes: boxes,
+        configCanary: undefined,
+        managedFilesPresent: true,
+        apply: false,
+      });
+    }));
+  }
+
+  test("a quiet fleet costs ONE line, not one per box", async () => {
+    const boxes = ["grok-box-002", "grok-box-004", "grok-box-011"];
+    const logs = await passLogs(await syncRunner([20002, 20004, 20011]), boxes);
+    const summary = logs.filter((l) => l.startsWith("config: in sync "));
+    expect(summary).toEqual(["config: in sync grok-box-002,grok-box-004,grok-box-011 (3)"]);
+    // Not one of the three per-box lines survives.
+    for (const b of boxes) expect(logs).not.toContain(`config: ${b} in sync`);
+  });
+
+  test("the summary is greppable for a single box, and lands before `pass done`", async () => {
+    const logs = await passLogs(await syncRunner([20002, 20004]), ["grok-box-002", "grok-box-004"]);
+    const summary = logs.findIndex((l) => l.startsWith("config: in sync "));
+    const done = logs.findIndex((l) => l.startsWith("config: pass done"));
+    expect(summary).toBeGreaterThanOrEqual(0);
+    expect(summary).toBeLessThan(done);
+    expect(logs[summary]).toContain("grok-box-004");
+  });
+
+  test("no in-sync box ⇒ NO summary line (an empty one is its own noise)", async () => {
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: "LISTEN 0 128 127.0.0.1:20002 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
+      return result({ code: 0, stdout: "sha=WANT cur=OTHER support=yes enabled=true" });
+    });
+    const logs = await passLogs(runner, ["grok-box-002"]);
+    expect(logs.some((l) => l.startsWith("config: in sync "))).toBe(false);
+    // The drift line is untouched.
+    expect(logs.some((l) => l.startsWith("config: grok-box-002 WOULD push"))).toBe(true);
+  });
+
+  test("an ANNOTATED in-sync line keeps its own line — it is a warning", async () => {
+    // enabled=false: the file matches but the box ignores it. Folding that into
+    // a count called "in sync" would hide the one thing an operator must see.
+    const runner = await syncRunner([20002], "support=yes enabled=false");
+    const logs = await passLogs(runner, ["grok-box-002"]);
+    expect(logs.some((l) => l.startsWith("config: in sync "))).toBe(false);
+    expect(
+      logs.some((l) => l.startsWith("config: grok-box-002 in sync") && l.includes("IGNORED locally")),
+    ).toBe(true);
+  });
+
+  test("a standalone pushManaged (no pass) still logs per box", async () => {
+    // `grokfleet config push <box>` has no pass to summarise into; it must keep
+    // printing the answer for the one box the operator asked about.
+    const runner = await syncRunner([20002]);
+    const logs = bare(await withLogs(async () => {
+      await pushManaged("grok-box-002", true, {
+        runner,
+        env: testEnv(),
+        source: { fleetToml: () => FLEET_TOML, boxToml: () => undefined },
+      });
+    }));
+    expect(logs).toContain("config: grok-box-002 in sync");
+  });
+});
