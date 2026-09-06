@@ -32,7 +32,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.6.0
+BOXUP_VERSION=5.6.1
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -2086,6 +2086,22 @@ DISK_GUARD_TRUNCATE="${DISK_GUARD_TRUNCATE:-/tmp/sand-host.log}"
 DISK_GUARD_BUILTIN_TRUNCATE="${BOX_SETUP_JOBS:-/workspace/jobs}/*/log"
 # The tick is 15s; re-reading df four times a minute buys nothing.
 BOXUP_DISK_INTERVAL="${BOXUP_DISK_INTERVAL:-60}"
+# boxup 5.6.1 (blueprint boxup-5.6.1-sandlog-size-cap): a SIZE cap, independent
+# of disk level. The 90 % pressure path above reclaims too late — the sandbox
+# host's unrotated /tmp/sand-host.log held 42 GB on 008 and 35 GB on 004 while
+# root sat below fail, and on 2026-09-02 the same file took 006 to 100 % and
+# broke a rollout. Above this many bytes, a file on DISK_GUARD_TRUNCATE is
+# truncated on the guard's normal cadence whatever df says.
+#
+# It applies to DISK_GUARD_TRUNCATE ONLY and NEVER to
+# DISK_GUARD_BUILTIN_TRUNCATE: job logs already carry their own 64 MiB bound
+# (grokfleet-jobs J6), and a second, sixty-four-times-larger cap walking the
+# same list would only confuse which bound applies.
+#
+# 0, empty, and any non-numeric value DISABLE the cap. That sanitising happens
+# in disk_guard before the value is used as a floor — see the note there for
+# why handing the raw value to disk_truncate_one is the dangerous mistake.
+BOXUP_SANDLOG_MAX_BYTES="${BOXUP_SANDLOG_MAX_BYTES:-4294967296}"  # 4 GiB
 DISK_STATE="$RUN_DIR/disk"                  # "<pct>% <level> <epoch>"
 DISK_STAMP="$RUN_DIR/last-disk-guard"       # rate-limit stamp
 DISK_WARN_STAMP="$RUN_DIR/last-disk-warn"   # once/hour WARN stamp (check)
@@ -2218,12 +2234,14 @@ disk_truncate_one() {
 }
 
 # disk_guard: the per-tick entry point (G1). Rate-limited, reads usage once,
-# and only at FAIL level walks the allowlist. It re-reads df afterwards so the
-# state it records is the POST-truncation truth, which is what makes the check
-# reason honest. ALWAYS returns 0 — a disk watcher that can break the self-heal
-# tick is worse than no disk watcher.
+# and walks the allowlist on TWO independent triggers: the SIZE cap of 5.6.1
+# (any level, any percent, DISK_GUARD_TRUNCATE only) and the FAIL-level
+# pressure reclaim (both lists). It re-reads df after either one so the state it
+# records is the POST-truncation truth, which is what makes the check reason
+# honest. ALWAYS returns 0 — a disk watcher that can break the self-heal tick is
+# worse than no disk watcher.
 disk_guard() {
-  local now last pct level f
+  local now last pct level f cap capped
   now=$(date +%s)
   last=0
   [ -f "$DISK_STAMP" ] && last=$(tr -d '[:space:]' < "$DISK_STAMP" 2>/dev/null || echo 0)
@@ -2235,6 +2253,41 @@ disk_guard() {
 
   pct=$(disk_used_pct)
   level=$(disk_level "$pct")
+
+  # --- the SIZE cap (5.6.1) -------------------------------------------------
+  # Runs BEFORE the level branch and at EVERY level, including ok: waiting for
+  # 90 % is what let /tmp/sand-host.log reach 42 GB on a 126 GB overlay.
+  #
+  # `capped` is initialised here and not merely assigned inside the `if`
+  # because boxup runs under `set -u` (line 33): on the common under-cap path
+  # the `if [ "$capped" = 1 ]` below would read an unset variable, abort the
+  # backgrounded tick subshell with no output, and reproduce exactly the
+  # half-dead tick 5.6.0 went to the trouble of bounding. It is not tidy-up,
+  # it is the difference between a working guard and a silent one.
+  capped=0
+  cap="$BOXUP_SANDLOG_MAX_BYTES"
+  case "$cap" in ''|*[!0-9]*) cap=0 ;; esac   # empty or "4G" => DISABLED, never the 1 GiB floor
+  if [ "$cap" -gt 0 ]; then
+    # The THIRD consumer of the allowlists, and the only one that walks the
+    # overridable list ALONE. Adding $DISK_GUARD_BUILTIN_TRUNCATE here would
+    # put job logs under a 4 GiB cap that contradicts their own 64 MiB bound.
+    # shellcheck disable=SC2086  # word splitting is the point: the list is space-separated
+    for f in $DISK_GUARD_TRUNCATE; do
+      [ -n "$f" ] || continue
+      # The third argument is the SANITISED $cap and never the raw knob: the
+      # callee fails a non-numeric floor OPEN to BOXUP_DISK_TRUNCATE_MIN_BYTES
+      # (1 GiB), so `BOXUP_SANDLOG_MAX_BYTES=4G` would silently truncate the
+      # live platform log every 60 s at `ok`.
+      disk_truncate_one "$f" "$pct" "$cap" sandlog-cap && capped=1
+    done
+  fi
+  if [ "$capped" = 1 ]; then
+    # Same contract as the pressure path below: the recorded state and the
+    # `disk=` token must be the POST-truncation truth.
+    pct=$(disk_used_pct)
+    level=$(disk_level "$pct")
+  fi
+
   if [ "$level" = fail ]; then
     # shellcheck disable=SC2086  # word splitting is the point (space-separated list)
     # BOTH lists (J6, r10-B1): disk_allowlisted is the checker, this is the
@@ -4228,6 +4281,7 @@ require_root() {
         BOXUP_DISK_FAIL_PCT="$BOXUP_DISK_FAIL_PCT" \
         BOXUP_DISK_TRUNCATE_MIN_BYTES="$BOXUP_DISK_TRUNCATE_MIN_BYTES" \
         BOXUP_DISK_INTERVAL="$BOXUP_DISK_INTERVAL" \
+        BOXUP_SANDLOG_MAX_BYTES="$BOXUP_SANDLOG_MAX_BYTES" \
         DISK_GUARD_TRUNCATE="$DISK_GUARD_TRUNCATE" \
         BOXUP_GATEWAY_URL="$BOXUP_GATEWAY_URL" \
         BOXUP_GATEWAY_JSON="$BOXUP_GATEWAY_JSON" \
