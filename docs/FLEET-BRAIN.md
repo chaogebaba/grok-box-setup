@@ -1738,6 +1738,97 @@ its log tail). The `job` field IS on `GET /v1/fleet` and `GET /v1/boxes/:name`
 already, attached at serve time from ONE query per request like `lease` — so the
 data the TUI needs is served; only the rendering is outstanding.
 
+## Audit fixes (grokfleet 5.12.1)
+
+Seven findings from the fleet audit of 2026-09-06. None changes the tick's
+decision model; two change what the brain BELIEVES, and one changes a wire shape.
+
+**A1 — a re-imaged box loses its recorded key.** `grok-box-011` was re-imaged on
+2026-09-06 and became unrecoverable without a human. Enrol never touched
+`box_keys`, so the row from 2026-08-30 survived the re-image, `mintWindowValid`
+read its 90-day expiry and answered "already seeded this window", and the tick
+skipped the mint 288 times a day while the box had no `secrets/ts-authkey` at
+all. The AUTHKEY column showed the dead key's expiry throughout.
+
+The fix has two independent halves, and both are needed:
+
+- A box's tunnel keypair is generated once, on the box, by boxup's first run.
+  The only way it changes is a re-image — which also destroys the authkey. So
+  `beginEnrol` now treats a pubkey that differs from the recorded one as proof
+  the box is new: it FORGETS the key (`forgetKey`, which drops the row and
+  removes `<box>.expires` and `keys/<idx>.json`) and re-dates `boxes.enrolled_at`
+  to now. This covers the manual `grokfleet enroll` and the zero-touch
+  adopt/repair path together, because both run `cmdEnrollResult`.
+- `boxes.enrolled_at` now means "when the CURRENT binding was established", not
+  "first ever enrolled", and `mintWindowValid` requires the key's `minted_at` to
+  be at or after it. An expiry date says when a key stops being valid; it says
+  nothing about whether the key is still ON the box. The clause is skipped when
+  either instant is unknown — a legacy-imported row has a NULL `enrolled_at` on
+  purpose, and a whole imported fleet must not re-mint on the first tick after an
+  upgrade.
+
+**A2 — the API column read `offline` for every box, forever.** `tailscale.ts`
+keyed on `d.online`, a field the Tailscale v2 devices endpoint has never returned
+(tailscale/tailscale#7004 is still an open feature request; `online` exists only
+in `tailscale status --json`). `reconcile/inputs.ts` had already been corrected
+to `connectedToControl` in D12/r14; the read-only surface had not, so `grokfleet
+status` and `fleet-status` disagreed with the engine about which boxes were up.
+Both halves now use `connectedToControl`, with `online` still honoured should the
+API ever grow it. The recorded fixture was re-shaped to what the endpoint really
+returns, including a connected device with NO `lastSeen` (the API omits it for
+connected devices, tailscale/tailscale#17504).
+
+**A3 — the tick's in-sync log spam.** `config: <box> in sync` fired once per box
+per tick: eleven boxes across 288 ticks is 3168 journal lines a day that say
+nothing happened, burying the drift and failure lines the journal is read for.
+The pass now collects the quiet boxes and prints ONE line,
+`config: in sync grok-box-002,grok-box-004,… (n)`, immediately before
+`config: pass done`. Every drift, push, skip, deferred and unreachable line is
+unchanged, and so is an in-sync line that carries an annotation
+(`[IGNORED locally: …]`, `[enabled UNKNOWN: …]`, `[inert: …]`) — those are
+warnings wearing an in-sync line's clothes and they keep their own line. A
+standalone `pushManaged` outside a pass still logs per box.
+
+**A4 — `make release-check`.** The repo carries SIX copies of two version
+numbers in five file formats, and nothing compared more than two of them. The new
+target asserts each SET is internally consistent, and prints the whole set when
+one member is behind:
+
+- brain: `PKG_VERSION` (`fleet/src/cli.ts`), `version` (`fleet/package.json`),
+  `GROKFLEET_RELEASE` (`vps/install-vps.sh`);
+- box: `BOXUP_VERSION` (`boxup`), `VERSION`, the F1 tripwire literals in
+  `tests/test-iter3-fixes.sh`.
+
+The two sets version SEPARATELY and deliberately, so it must never assert them
+equal. `make test` and `make ts-verify` both depend on it, and CI calls it in
+place of the ad-hoc VERSION/BOXUP_VERSION comparison it used to inline.
+`GROKFLEET_SHA256` is NOT checked: it is the identity of published bytes and
+`make ts-release-build` rewrites it at release time, so on a branch that has
+bumped the tag it correctly still names the previous release's digest.
+
+**A5 — `fleet-status` probes in parallel.** Eleven boxes were probed serially at
+up to two 20 s ssh timeouts each, which is minutes in front of a blank terminal
+when a couple are unreachable. Four at a time now, through the same order-
+preserving `mapLimit` the inventory uses (lifted into `fleet/src/maplimit.ts` so
+both can reach it). The rows stay in reconcile-target order — that is box-index
+order, and a sort by NAME would put `grok-box-011` ahead of `grok-box-8`.
+
+**A6 — `StartLimitIntervalSec` in the API unit.** It was in `[Service]`; systemd
+has parsed the start rate-limit pair out of `[Unit]` since v229, so it was
+ignored with an "Unknown key name" warning on every start and the unlimited-
+restart intent it was written for was never in force. That intent matters: the
+API refuses to start until the tailnet IPv4 resolves, so a slow tailscaled means
+several restarts at boot and a rate limit would park the unit in `failed`.
+
+**A7 — `/v1/jobs` timestamps (WIRE CHANGE).** `created_at`, `started_at`,
+`ended_at` and the per-box `job.started_at` on `GET /v1/fleet` and
+`GET /v1/boxes/:name` emitted milliseconds (`…T10:11:12.000Z`) while every other
+timestamp in the same bodies is second-precision. The store holds epoch SECONDS,
+so those three digits were fabricated. They are now `isoSec` like everything
+else. A client that parsed both shapes with one format string no longer needs to
+special-case `/v1/jobs`; one that matched the millisecond form exactly must be
+updated.
+
 ## Alert dedup (grokfleet 5.11.3)
 
 The incident alerts are **level** signals, not edges. `incoherent-both-dead` and
