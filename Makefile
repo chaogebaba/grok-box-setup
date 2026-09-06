@@ -1,4 +1,4 @@
-.PHONY: lint test ts-deps ts-test ts-typecheck ts-lint ts-verify ts-build ts-deploy \
+.PHONY: lint test release-check ts-deps ts-test ts-typecheck ts-lint ts-verify ts-build ts-deploy \
         ts-cutover ts-apply-flip ts-cutback ts-release-build ts-release-publish
 
 lint:
@@ -7,15 +7,23 @@ lint:
 	bash -n box-bootstrap.sh
 	bash -n vps/install-vps.sh
 	bash -n fleet/scripts/release-build.sh
+	bash -n fleet/scripts/release-check.sh
 	bash -n fleet/scripts/run-tests.sh
 	bash -n fleet/scripts/release-publish.sh
 	bash -n tests/test-rename-allowlist.sh
 	bash -n tests/test-boxup-jobs.sh
 	bash -n tests/keepawake-readout.sh
 	bash -n tests/test-boxup-watchdog.sh
-	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-publish.sh fleet/scripts/run-tests.sh tests/keepawake-readout.sh || echo "shellcheck not installed; skipped"
+	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-check.sh fleet/scripts/release-publish.sh fleet/scripts/run-tests.sh tests/keepawake-readout.sh || echo "shellcheck not installed; skipped"
 
-test:
+# A4 (5.12.1): the version constants must agree BEFORE anything else runs. Six
+# copies of two numbers lived in five file formats and only two of them were
+# ever compared; `release-build.sh` caught the installer pin, but only at
+# release time. Bash-only, so it stays inside the bun-free `test` target (D1).
+release-check:
+	@bash fleet/scripts/release-check.sh
+
+test: release-check
 	bash tests/test-iter3-fixes.sh
 	bash tests/test-install-vps.sh
 	bash tests/test-boxup-config.sh
@@ -59,7 +67,7 @@ ts-typecheck: ts-deps
 ts-lint: ts-deps
 	cd fleet && bun run lint
 
-ts-verify: ts-typecheck ts-lint ts-test
+ts-verify: release-check ts-typecheck ts-lint ts-test
 
 ts-build: ts-deps
 	cd fleet && bun build src/cli.ts --compile --minify --sourcemap \

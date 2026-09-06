@@ -26,14 +26,14 @@ jobs:
         # Makefile-binding suites; they need only bash + coreutils.
         run: make test
       - name: version match
-        run: |
-          set -e
-          # VERSION file and boxup's BOXUP_VERSION are two independent copies;
-          # they must not drift (D10).
-          file_v="$(tr -d '[:space:]' < VERSION)"
-          boxup_v="$(sed -n 's/^BOXUP_VERSION=//p' boxup | head -1 | tr -d '[:space:]')"
-          echo "VERSION=$file_v BOXUP_VERSION=$boxup_v"
-          test "$file_v" = "$boxup_v" || { echo "VERSION ($file_v) != BOXUP_VERSION ($boxup_v)" >&2; exit 1; }
+        # A4 (5.12.1): this step used to compare VERSION against BOXUP_VERSION
+        # inline and nothing else — two of the SIX version constants in the repo.
+        # `make release-check` owns the whole comparison now, both the box set
+        # (VERSION / BOXUP_VERSION / the F1 tripwire literals) and the brain set
+        # (PKG_VERSION / package.json / GROKFLEET_RELEASE), which nothing checked
+        # until release time. `make test` depends on it too, so this step is
+        # belt-and-braces and names the failure without the suite's noise.
+        run: make release-check
       - name: boxup tail sentinel
         run: |
           set -e
