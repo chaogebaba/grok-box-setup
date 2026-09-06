@@ -90,7 +90,9 @@ esac
 # bump_case <label> <expect-substring> <mutate-fn>
 bump_case() {
   local label="$1" want="$2" fn="$3"
-  local d="$WORK/$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '_')"
+  local slug d
+  slug="$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '_')"
+  d="$WORK/$slug"
   mkdir -p "$d"
   scratch_copy "$d"
   "$fn" "$d"
