@@ -13,6 +13,7 @@
 // D3/D7): the pass writes no file and renders from the store's `boxes` rows plus
 // the last tick's snapshot.
 
+import { mapLimit } from "./maplimit.ts";
 import type { Runner } from "./runner.ts";
 import type { Env } from "./env.ts";
 import type { RolloutConfig } from "./config.ts";
@@ -127,22 +128,6 @@ export async function probeBox(
     checkReason: checkRes.reason,
     expires,
   };
-}
-
-/** Bounded-concurrency map (limit N). Preserves input order in the output. */
-async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = Array.from({ length: items.length });
-  let next = 0;
-  const n = Math.max(1, limit);
-  async function worker(): Promise<void> {
-    for (;;) {
-      const i = next++;
-      if (i >= items.length) return;
-      results[i] = await fn(items[i]!);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
-  return results;
 }
 
 export interface InventoryDeps {

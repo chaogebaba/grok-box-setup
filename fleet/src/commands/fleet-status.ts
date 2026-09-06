@@ -19,9 +19,26 @@ import { parseEnrolled } from "../boxes.ts";
 import { parseDevices } from "../tailscale.ts";
 import { splitVersion } from "../status.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../remote.ts";
+import { mapLimit } from "../maplimit.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
+
+/**
+ * A5 (5.12.1): how many boxes are probed at once.
+ *
+ * Each row costs a `tunnelUp` plus up to TWO 20 s ssh round trips, and the loop
+ * used to be SERIAL: eleven boxes with a couple of unreachable ones put the
+ * operator in front of a blank terminal for minutes. Four at a time turns that
+ * into roughly a quarter of the wall time.
+ *
+ * This deliberately does NOT ride `FLEET_MAX_CONCURRENCY`. That knob bounds the
+ * reconcile tick, which runs unattended every five minutes and shares the VPS
+ * with everything else; its default of 2 is a politeness budget for a
+ * background job. `fleet-status` is a read-only command an operator is sitting
+ * in front of, and it opens no more connections in total — only sooner.
+ */
+const PROBE_CONCURRENCY = 4;
 
 export interface FleetStatusRow {
   box: string;
@@ -92,8 +109,12 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
   const devMap = body !== undefined ? parseDevices(body, boxes) : undefined;
   const readExp = deps.readExpires ?? ((b: string) => fsReadExpiresField2(deps.env, b));
 
-  const rows: FleetStatusRow[] = [];
-  for (const box of boxes) {
+  // A5: probe up to PROBE_CONCURRENCY boxes at once. `mapLimit` writes results
+  // by INDEX, so the rows come back in reconcile-target order (box-index order)
+  // however the probes interleave — which is the order the table has always had
+  // and the order the ported bash printed. It is NOT re-sorted by name: a
+  // lexicographic sort would put `grok-box-011` ahead of `grok-box-8`.
+  const rows = await mapLimit(boxes, PROBE_CONCURRENCY, async (box): Promise<FleetStatusRow> => {
     let api: FleetStatusRow["api"] = "?";
     if (devMap !== undefined) api = devMap.get(box)?.online ? "online" : "offline";
 
@@ -115,15 +136,15 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
       version = splitVersion(v?.slice(2)).sha;
     }
 
-    rows.push({
+    return {
       box,
       api,
       tunnel: up ? "up" : "down",
       check,
       authkey: readExp(box) ?? "-",
       version,
-    });
-  }
+    };
+  });
   return rows;
 }
 
