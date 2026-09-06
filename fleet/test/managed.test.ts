@@ -245,6 +245,35 @@ describe("T11 push_managed rc classifier (E2, tests:3240-3277)", () => {
     expect(r.rc).toBe(4);
     expect(runner.calls.length).toBe(0); // never reached the tunnel
   });
+  // A8: the same real entry point, with the fleet-wide abandon line. Before
+  // 5.12.1 this returned 4 and never reached the tunnel — for EVERY box, on
+  // every tick, for as long as the line was in fleet.toml.
+  test("A8: the abandon line reaches the tunnel instead of being refused", async () => {
+    const runner = new FakeRunner(() => result({ code: 0, stdout: "sha=S cur=S support=yes enabled=true" }));
+    const src: ManagedSource = {
+      fleetToml: () => "[ssh]\npassword = x\n\n[keepawake]\ninterval_min = 0\n",
+      boxToml: () => undefined,
+    };
+    const r = await pushManaged("grok-box-8", true, { runner, env: testEnv(), source: src });
+    expect(r.rc).not.toBe(4);
+    expect(runner.calls.length).toBeGreaterThan(0); // it DID reach the tunnel
+    // ...and the rendered bytes the box would hash carry the line.
+    const stdin = runner.calls[0]!.opts.stdin as string;
+    expect(stdin).toContain("[keepawake]");
+    expect(stdin).toContain("interval_min = 0");
+  });
+
+  test("A8: a bad keepawake key is still a D4 refusal, with no ssh call", async () => {
+    const runner = new FakeRunner(() => result({ code: 0 }));
+    const src: ManagedSource = {
+      fleetToml: () => "[keepawake]\ninterval = 0\n",
+      boxToml: () => undefined,
+    };
+    const r = await pushManaged("grok-box-8", true, { runner, env: testEnv(), source: src });
+    expect(r.rc).toBe(4);
+    expect(runner.calls.length).toBe(0);
+  });
+
   test("dry-run in-sync ⇒ 0", async () => {
     const text = "[ssh]\npassword = x\n";
     const want = await textSha256(renderManaged("[ssh]\npassword = x\n", undefined));
