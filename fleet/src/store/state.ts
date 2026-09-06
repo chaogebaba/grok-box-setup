@@ -353,14 +353,66 @@ export class StoreState implements ReconcileStateApi {
       }
       return { stage: 0 };
     }
-    if (row.phase === "enrolled") return { stage: 0 };
+    if (row.phase === "enrolled") {
+      this.rebindIfNewKeypair(row, pubkey, port, at);
+      return { stage: 0 };
+    }
     // An `enrolling` row: refresh the pubkey/port the probe just read and resume.
+    this.rebindIfNewKeypair(row, pubkey, port, at);
     if (pubkey !== undefined || row.port !== port) {
       this.store.db
         .query("UPDATE boxes SET pubkey=COALESCE(?,pubkey), port=?, updated_at=? WHERE box_id=?")
         .run(pubkey ?? null, port, at, row.box_id);
     }
     return { stage: row.enrol_stage };
+  }
+
+  /**
+   * A1 (5.12.1) — a box that presents a NEW tunnel keypair is a NEW box.
+   *
+   * A box's tunnel keypair is generated once, on the box, by boxup's first run.
+   * The only way it changes is that the box was re-imaged (or its state was
+   * wiped), which also destroys `secrets/ts-authkey`. So a pubkey that differs
+   * from the one on file is proof that whatever key the brain thinks it seeded
+   * no longer exists on the box. Keeping the `box_keys` row across that is what
+   * made `grok-box-011` unrecoverable on 2026-09-06: the row said "minted
+   * 2026-08-30, expires in 80 days", `mintWindowValid` agreed, the tick skipped
+   * the mint every 5 minutes, and the box had no authkey to rejoin with.
+   *
+   * Two things happen here, and BOTH are load-bearing:
+   *   (a) the stale key is FORGOTTEN, so nothing claims a key exists;
+   *   (b) `enrolled_at` moves to now, so `bindingAt` marks the new binding and
+   *       `mintWindowValid` rejects any key row minted before it. (b) is the
+   *       belt to (a)'s braces: it also catches a key row that survives by some
+   *       other route, e.g. a mint that lands between the forget and the seed.
+   *
+   * A row with a NULL `pubkey` (imported by `store/legacy.ts`, which has no
+   * pubkey to import) is treated as a mismatch and forgotten ONCE — the same
+   * enrol records the material, so it cannot repeat. `undefined` pubkey means
+   * the caller did not read one, which proves nothing and changes nothing.
+   */
+  private rebindIfNewKeypair(row: BoxRow, pubkey: string | undefined, port: number, at: number): void {
+    if (pubkey === undefined) return;
+    if (row.pubkey === pubkey) return; // same keypair — same box, same key
+    this.store.tx(() => {
+      this.store.db.query("DELETE FROM box_keys WHERE box_id=?").run(row.box_id);
+      this.store.db
+        .query("UPDATE boxes SET pubkey=?, port=?, enrolled_at=?, updated_at=? WHERE box_id=?")
+        .run(pubkey, port, at, at, row.box_id);
+      this.store.audit({
+        actor: "grokfleet",
+        action: "rebind",
+        box: row.name,
+        rc: 0,
+        at,
+        detail:
+          row.pubkey === null
+            ? "no recorded tunnel pubkey — key forgotten, binding re-dated"
+            : "new tunnel pubkey — key forgotten, binding re-dated",
+      });
+    });
+    this.runExport("keys", row.name);
+    log(`state store: ${row.name} presented a new tunnel pubkey — forgot its recorded key; the next tick re-mints`);
   }
 
   /**
@@ -724,6 +776,45 @@ export class StoreState implements ReconcileStateApi {
     const id = this.boxId(box);
     if (id === undefined) return;
     this.store.db.query("DELETE FROM box_keys WHERE box_id = ?").run(id);
+  }
+
+  /**
+   * A1: forget the key AND export, so `<box>.expires` and `keys/<idx>.json`
+   * go away with the row. `dropKeyRow` deliberately does not export because
+   * the retire path exports once at the end; the enrol path has no such
+   * follow-up, so forget owns its export.
+   */
+  forgetKey(box: string): void {
+    if (this.boxId(box) === undefined) return;
+    this.dropKeyRow(box);
+    this.runExport("keys", box);
+  }
+
+  /** A1: when the current key row was minted (epoch seconds). */
+  keyMintedAt(box: string): number | undefined {
+    const id = this.boxId(box);
+    if (id === undefined) return undefined;
+    const r = this.store.db.query("SELECT minted_at AS t FROM box_keys WHERE box_id = ?").get(id) as
+      | { t?: number }
+      | null;
+    return typeof r?.t === "number" ? r.t : undefined;
+  }
+
+  /**
+   * A1: when the box's CURRENT tunnel binding was established.
+   *
+   * `boxes.enrolled_at` is that instant. It used to mean "first ever enrolled"
+   * (every write was `COALESCE(enrolled_at, now)`), which made it useless for
+   * this: a re-imaged box keeps its row and its `enrolled_at`. `beginEnrol`
+   * now moves it forward whenever the box presents a tunnel pubkey that is not
+   * the one on file, so the column means what its name says — the start of the
+   * binding that is in force. A legacy-imported row has NULL here (legacy.ts
+   * imports leave it NULL on purpose) and yields `undefined`, which makes the
+   * guard fall open rather than re-mint a whole imported fleet.
+   */
+  bindingAt(box: string): number | undefined {
+    const r = this.boxRow(box);
+    return r?.enrolled_at ?? undefined;
   }
 
   private boxIdByIndex(index: number): number | undefined {

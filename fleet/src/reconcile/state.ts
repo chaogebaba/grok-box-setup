@@ -133,6 +133,35 @@ export interface ReconcileStateApi {
    * the next tick re-mint. The store does it in one statement.
    */
   recordKey(box: string, meta: { keyId: string; expiresRaw: string; expiresDate: string }): boolean;
+  /**
+   * A1 (5.12.1): FORGET the box's key. Drops the recorded key id and both
+   * expiry forms, and removes the exported `<box>.expires` / `keys/<idx>.json`
+   * artefacts.
+   *
+   * This is what a re-image needs. `grok-box-011` was re-imaged on 2026-09-06
+   * with its 2026-08-30 `box_keys` row intact, so `mintWindowValid` answered
+   * "a valid key was already seeded this window", the tick skipped the mint,
+   * and the box sat with no `secrets/ts-authkey` at all while the AUTHKEY
+   * column still showed the old expiry. Enrol is the only place that learns a
+   * box is a NEW box, so enrol is where the old key has to be dropped.
+   */
+  forgetKey(box: string): void;
+  /**
+   * A1: epoch SECONDS at which the CURRENT key row was minted, or undefined
+   * when there is no key row (or the implementation does not record it — the
+   * 5.7.1 file layout has no such timestamp).
+   */
+  keyMintedAt(box: string): number | undefined;
+  /**
+   * A1: epoch SECONDS at which the box's CURRENT tunnel binding was
+   * established — `boxes.enrolled_at`, which `beginEnrol` now REFRESHES when a
+   * box (re)binds a tunnel pubkey different from the recorded one. Undefined
+   * when unknown (a legacy-imported row, or the file implementation).
+   *
+   * A key minted BEFORE this instant belongs to the previous incarnation of
+   * the box, whatever its expiry date says.
+   */
+  bindingAt(box: string): number | undefined;
   recordApiFailure(nowSec: number): { n: number; mins: number };
   resetApiFailure(): void;
   apiFails(): number;
@@ -324,6 +353,32 @@ export class ReconcileState implements ReconcileStateApi {
     if (!this.recordKeyMeta(idx, meta.keyId, meta.expiresRaw)) return false;
     this.writeExpires(box, meta.expiresDate);
     return true;
+  }
+
+  /**
+   * A1: the FILE implementation of forget — remove both artefacts. `remove` on
+   * an absent path is a no-op in every StateFs, so this is idempotent.
+   */
+  forgetKey(box: string): void {
+    const idx = boxIndexForKeys(box);
+    if (idx !== undefined) this.fs.remove(`${this.keysDir()}/${idx}.json`);
+    this.fs.remove(this.p(`${box}.expires`));
+  }
+
+  /**
+   * A1: the 5.7.1 file layout records NO mint timestamp and NO enrol
+   * timestamp — `keys/<idx>.json` carries `{id, expires}` and nothing else.
+   * Both are therefore `undefined` here, and the mint-window guard falls back
+   * to its expiry-date test alone. That is the legacy reader's behaviour on
+   * purpose: this class is off the tick path since 5.8.0.
+   */
+  keyMintedAt(box: string): number | undefined {
+    void box;
+    return undefined;
+  }
+  bindingAt(box: string): number | undefined {
+    void box;
+    return undefined;
   }
 
   // --- api backoff (main:2739-2778) ---
