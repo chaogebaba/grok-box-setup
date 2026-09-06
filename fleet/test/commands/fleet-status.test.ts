@@ -2,14 +2,17 @@
 // down) + API '?' on failure (D14).
 
 import { describe, test, expect } from "bun:test";
-import { fleetStatusRows, formatFleetStatus, cmdFleetStatus, storeKeyStale } from "../../src/commands/fleet-status.ts";
+import { fleetStatusRows, formatFleetStatus, cmdFleetStatus } from "../../src/commands/fleet-status.ts";
 import { testEnv } from "../helpers.ts";
 import { FakeRunner, isSs } from "../fake-runner.ts";
 import type { Runner, RunOpts, RunResult } from "../../src/runner.ts";
-import { keyStale, STALE_AUTHKEY } from "../../src/keystale.ts";
+import { keyStale, storeKeyStale, STALE_AUTHKEY } from "../../src/keystale.ts";
 import { openStore, storePath } from "../../src/store/db.ts";
 import { StoreState } from "../../src/store/state.ts";
 import { suiteScratch, cleanup } from "../store/helpers.ts";
+import { openReadHandle } from "../../src/store/membership.ts";
+import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
 import { afterAll } from "bun:test";
 
 const env = testEnv();
@@ -345,6 +348,88 @@ describe("r2 — storeKeyStale reads the real store", () => {
       expect(isStale("grok-box-008")).toBe(false);
       // A box that was never asked about is not claimed either way.
       expect(isStale("grok-box-099")).toBe(false);
+    } finally {
+      cleanup(f.dir);
+    }
+  });
+
+  // r4/N4 — the fail-open catch, and the ONLY input that reaches it.
+  //
+  // The r3 gate found that replacing storeKeyStale's `catch` with a rethrow
+  // passed the whole suite. The hypothesis was that the catch guards a store
+  // file that exists but cannot be OPENED. It does not: `openStore` wraps every
+  // open-time failure — a directory where the file should be, a non-database
+  // file, unwritable pragmas — in `ConfigError`, and `openReadHandle` swallows
+  // exactly that class and returns a file-backed handle with `store` undefined.
+  // I verified all three of those inputs; none throws, and the "no store" case
+  // below already covers where they land.
+  //
+  // What DOES escape is a store that OPENS cleanly, reports a schema version
+  // this binary knows, and then throws on the first QUERY — `no such table:
+  // box_keys` from a truncated file, an interrupted `state restore`, or a
+  // hand-made database. That throw happens inside the per-box loop, and without
+  // the catch it propagates out of `grokfleet fleet-status` and takes the whole
+  // table with it. This is the surface an operator reaches for WHEN something is
+  // wrong, so it has to render what it can (F7.2).
+  function corruptStore(prefix: string): { dir: string; state: string } {
+    const dir = WSCRATCH.dir(prefix);
+    const state = `${dir}/state`;
+    mkdirSync(state, { recursive: true });
+    // Opens fine, claims schema v4, and `box_keys` is simply not there.
+    const db = new Database(`${state}/fleet.db`, { create: true });
+    db.run("PRAGMA user_version = 4");
+    db.run("CREATE TABLE boxes(box_id INTEGER PRIMARY KEY, name TEXT, idx INTEGER, port INTEGER, enrolled_at INTEGER)");
+    db.run("INSERT INTO boxes VALUES(1,'grok-box-011',11,20011,200)");
+    db.close();
+    return { dir, state };
+  }
+
+  test("N4: a store that opens but cannot be QUERIED throws — and is caught", () => {
+    const f = corruptStore("corrupt-probe");
+    try {
+      // First prove the premise rather than assume it: the read really does
+      // throw, so the catch below is not guarding a path that cannot happen.
+      const h = openReadHandle(testEnv({ FLEET_STATE: f.state }));
+      expect(h.store).toBeDefined();
+      expect(() => keyStale(h.state, "grok-box-011")).toThrow();
+      h.close();
+
+      // ...and storeKeyStale absorbs it into "no staleness claim".
+      const isStale = storeKeyStale(testEnv({ FLEET_STATE: f.state }), ["grok-box-011"]);
+      expect(isStale("grok-box-011")).toBe(false);
+    } finally {
+      cleanup(f.dir);
+    }
+  });
+
+  test("N4: the table still renders, AUTHKEY `-`, rc 0", async () => {
+    const f = corruptStore("corrupt-render");
+    try {
+      const e = testEnv({ FLEET_STATE: f.state });
+      const rows = await fleetStatusRows({
+        runner: runnerFor(),
+        env: e,
+        devices: { async body() { return undefined; } },
+        boxes: ["grok-box-011"],
+        readExpires: () => undefined,
+      });
+      expect(rows[0]!.authkey).toBe("-");
+
+      // The whole command, not just the row builder: rc 0 and a real table.
+      let out = "";
+      const rc = await cmdFleetStatus(
+        {
+          runner: runnerFor(),
+          env: e,
+          devices: { async body() { return undefined; } },
+          boxes: ["grok-box-011"],
+          readExpires: () => undefined,
+        },
+        (x) => (out += x),
+      );
+      expect(rc).toBe(0);
+      expect(out).toContain("NAME");
+      expect(out).toContain("grok-box-011");
     } finally {
       cleanup(f.dir);
     }
