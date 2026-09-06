@@ -59,6 +59,13 @@ export function oldFrame(state: TuiState, size: Size): string[] {
   const status = statusLine(state);
   if (viewOpen) {
     for (const l of viewLines(state, size)) out.push(l.text);
+    // 5.14.1 D3: the stop modal is painted UNDER the view, between the body and
+    // the status line, and ADDITIVELY — unlike the table branch below, where the
+    // modal REPLACES the status line because the two share one slot there.
+    if (state.modal !== undefined) {
+      out.push("");
+      for (const m of modalLines(state)) out.push(m.text);
+    }
     if (viewStatus !== null) {
       out.push("");
       out.push(segText(viewStatus));

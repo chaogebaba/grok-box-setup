@@ -38,6 +38,10 @@ export interface ToneLine {
   bold?: boolean;
   /** per-cell colouring; when present the component paints these, not `text`. */
   segments?: Seg[];
+  /** 5.14.1 D1: the CURSOR row. It lives on `ToneLine` rather than on
+   *  `TableLine` because the jobs view's content lines carry it too, and `View`
+   *  paints a bare `ToneLine`. `Modal` and `Detail` never set it. */
+  selected?: boolean;
 }
 
 /** A table line additionally knows whether it is the selected row. */
@@ -1202,6 +1206,13 @@ export function viewChromeRows(state: TuiState, size: Size): number {
   n += 1; // the view title (carries the `rows a–b of N` indicator)
   // O4a: under a full-screen view the status line carries ONLY the message, so
   // a view's row budget stays independent of the table's filter and badge.
+  // 5.14.1 D3: the stop modal is painted UNDER the view, between the body and
+  // the status line, and its rows are charged ADDITIVELY — on top of the status
+  // charge below, never instead of it. The table's `else if` exists because the
+  // modal and the status line share ONE slot there; the view frame has no such
+  // slot, and a mismatched confirm keeps the modal open AND sets a message, so
+  // both are on screen at once.
+  if (state.modal !== undefined) n += 1 + modalLines(state).length; // blank spacer + the modal
   if (statusLine(state, { view: true }) !== null) n += 2; // blank spacer + the status line
   n += 1; // blank spacer before the footer
   n += footerLines(state, size).length;
@@ -1254,8 +1265,10 @@ export function viewContent(state: TuiState): string[] {
     return historyRows(lines, v.box);
   }
   const lines = v.lines ?? [];
-  // D2: an empty diff is not an empty screen — it is the answer.
-  if (lines.length === 0) return v.kind === "diff" ? ["in sync"] : ["(no output)"];
+  // D2: an empty diff is not an empty screen — it is the answer. 5.14.1 D2: the
+  // runner already substitutes `NO_JOB_LOG`, so this arm is the belt-and-braces
+  // one — named here so a `joblog` view can never fall through to `(no output)`.
+  if (lines.length === 0) return v.kind === "diff" ? ["in sync"] : v.kind === "joblog" ? [NO_JOB_LOG] : ["(no output)"];
   return lines;
 }
 
@@ -1264,20 +1277,53 @@ export function viewLines(state: TuiState, size: Size): ToneLine[] {
   const v = state.view;
   if (v === undefined) return [];
   const content = viewContent(state);
-  const win = viewportWindow(content.length, v.offset, viewRowsAvailable(state, size));
+  const rowsAvailable = viewRowsAvailable(state, size);
+  // 5.14.1 D1: the jobs view's window is DERIVED from the cursor rather than
+  // scrolled, with the same bottom-anchored rule `tableWindow` uses, applied
+  // over the content lines INCLUDING the column header at index 0 — so cursor
+  // `i` is content line `i + 1`. Evaluated ONLY for a DEFINED cursor: loading,
+  // error and the empty list have none, and `viewportWindow` does not guard
+  // NaN — it would return an empty window and paint nothing.
+  const cursorLine = v.kind === "jobs" && v.cursor !== undefined ? v.cursor + 1 : undefined;
+  const offset =
+    cursorLine === undefined ? v.offset : cursorLine < rowsAvailable ? 0 : cursorLine - rowsAvailable + 1;
+  const win = viewportWindow(content.length, offset, rowsAvailable);
   const from = content.length === 0 ? 0 : win.start + 1;
   const indicator = `rows ${from}–${win.end} of ${content.length}`;
   const rows: ToneLine[] = [];
   // O5: the leases view is FLEET-WIDE, so its `box` is `""` and the title says
   // just `── leases ──` rather than the double space `${kind} ${box}` gives.
   // jobs J12: the jobs view is fleet-wide too and gets the same treatment.
-  const title = v.kind === "leases" || v.kind === "jobs" ? `── ${v.kind} ──` : `── ${v.kind} ${v.box} ──`;
+  // 5.14.1 D2: `joblog`'s subject is a JOB, and its title names the job's first
+  // 12 characters — the same prefix the list's JOB_ID column shows.
+  const title =
+    v.kind === "leases" || v.kind === "jobs"
+      ? `── ${v.kind} ──`
+      : v.kind === "joblog"
+        ? `── job ${v.box.slice(0, 12)} ──`
+        : `── ${v.kind} ${v.box} ──`;
   rows.push({
     text: pad(stripToWidth(`${title}  ${indicator}`, size.cols), size.cols),
     tone: "main",
     bold: true,
   });
-  for (const line of content.slice(win.start, win.end)) rows.push({ text: stripToWidth(line, size.cols), tone: "plain" });
+  for (let i = win.start; i < win.end; i++) {
+    const line = content[i]!;
+    if (i !== cursorLine) {
+      rows.push({ text: stripToWidth(line, size.cols), tone: "plain" });
+      continue;
+    }
+    // NO_COLOR: the marker is PREPENDED and the row re-clipped, deliberately
+    // NOT overwriting column 0 the way `tableLines` does — the jobs row's first
+    // column is the 12-char job id, and overwriting would render `>OBID0000000`,
+    // mangling the one field that identifies the row `Enter` and `s` act on.
+    rows.push({
+      text: state.noColor ? stripToWidth(`>${line}`, size.cols) : stripToWidth(line, size.cols),
+      tone: "plain",
+      bold: true,
+      selected: true,
+    });
+  }
   return rows;
 }
 
@@ -1354,9 +1400,26 @@ const JOB_COLS = { id: 13, box: 14, kind: 8, state: 10, rc: 5, age: 7, purpose: 
 /** jobs J12: an empty jobs list is an ANSWER, not an empty screen. */
 export const NO_JOBS = "no jobs";
 
+/** 5.14.1 D2: an empty job log is an ANSWER too. Applied in the runner's
+ *  `joblog` arm exactly as `NO_JOBS` is, so it arrives as `payload.lines` and
+ *  `viewContent` never sees an empty array. */
+export const NO_JOB_LOG = "(empty log)";
+
 /** jobs J12: `listJobs` caps at 200 rows; when exactly 200 come back this MUTED
  *  line is appended so `rows a–b of N` is never read as the fleet total. */
 export const JOBS_CAP_NOTE = "(newest 200 shown)";
+
+/**
+ * 5.14.1 D1: THE ordering of the jobs view, in one exported place — rank
+ * `starting`/`running` first, then `created_at` DESC. `jobRows` renders this
+ * array and the reducer stores it, so row `i` of the table and `jobs[i]` are
+ * the same job by construction; two independent sorts could not guarantee that.
+ * Returns a new array; the caller's input is never mutated.
+ */
+export function sortJobs(jobs: Job[]): Job[] {
+  const rank = (s: string): number => (s === "starting" || s === "running" ? 0 : 1);
+  return [...jobs].sort((a, b) => rank(a.state) - rank(b.state) || tsDesc(b.created_at) - tsDesc(a.created_at));
+}
 
 /**
  * jobs J12: the jobs view's content rows — the header line, then one row per
@@ -1373,10 +1436,7 @@ export function jobRows(jobs: Job[], nowMs: number): string[] {
     `${pad("JOB_ID", JOB_COLS.id)}${pad("BOX", JOB_COLS.box)}${pad("KIND", JOB_COLS.kind)}` +
     `${pad("STATE", JOB_COLS.state)}${pad("RC", JOB_COLS.rc)}${pad("AGE", JOB_COLS.age)}` +
     `${pad("PURPOSE", JOB_COLS.purpose)}`;
-  const rank = (s: string): number => (s === "starting" || s === "running" ? 0 : 1);
-  const sorted = [...jobs].sort(
-    (a, b) => rank(a.state) - rank(b.state) || tsDesc(b.created_at) - tsDesc(a.created_at),
-  );
+  const sorted = sortJobs(jobs);
   const rows = [head];
   for (const j of sorted) {
     const rc = j.rc === null ? "-" : String(j.rc);
@@ -1404,13 +1464,26 @@ export function modalLines(state: TuiState): ToneLine[] {
   const m = state.modal;
   if (m === undefined) return [];
   const rows: ToneLine[] = [];
+  const activeConfirm = m.field === "confirm";
+  if (m.kind === "stop-job") {
+    // 5.14.1 D3: a job, not a box — the title names the job's first 12
+    // characters and the prompt asks for the first 6. Only the hint line is
+    // shared with the box-action modal.
+    rows.push({ text: `┌─ stop job ${(m.jobId ?? "").slice(0, 12)} ─┐`, tone: "main", bold: true });
+    if (m.note) rows.push({ text: m.note, tone: "muted" });
+    rows.push({
+      text: `type the first 6 characters of the job id to confirm: ${m.typed}${activeConfirm ? "_" : ""}`,
+      tone: "plain",
+    });
+    rows.push({ text: `(expect "${m.expect}")   Enter=confirm  Esc=cancel`, tone: "muted" });
+    return rows;
+  }
   rows.push({ text: `┌─ ${m.actionLabel} ${m.box} ─┐`, tone: "main", bold: true });
   if (m.note) rows.push({ text: m.note, tone: "muted" });
   if (m.target !== undefined) {
     const active = m.field === "target";
     rows.push({ text: `new name: ${m.target}${active ? "_" : ""}`, tone: "plain" });
   }
-  const activeConfirm = m.field === "confirm";
   rows.push({ text: `type box name to confirm: ${m.typed}${activeConfirm ? "_" : ""}`, tone: "plain" });
   rows.push({ text: `(expect "${m.expect}")   Enter=confirm  Esc=cancel`, tone: "muted" });
   return rows;

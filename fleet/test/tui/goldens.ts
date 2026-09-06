@@ -279,6 +279,7 @@ export const GOLDENS: Golden[] = [
       selected: 0,
       detail: { box: "grok-box-001", lines: HISTORY },
       modal: {
+        kind: "action" as const,
         actionLabel: "config-push",
         box: "grok-box-001",
         typed: "grok-box",

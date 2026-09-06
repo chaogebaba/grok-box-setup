@@ -170,8 +170,10 @@ export interface ApiClient {
   getJob(id: string, refresh?: boolean): Promise<ClientResult<Job>>;
   listJobs(opts?: { state?: string; box?: string }): Promise<ClientResult<Job[]>>;
   stopJob(id: string): Promise<ClientResult<Job>>;
-  /** RAW log bytes from `offset`; the reply carries the next offset. */
-  jobLog(id: string, offset: number): Promise<ClientResult<{ text: string; next: number; truncated: boolean }>>;
+  /** RAW log bytes from `offset`; the reply carries the next offset. 5.14.1 D2:
+   *  an optional `limit` bounds the window — `handleJobLog` already accepts and
+   *  caps one, so this is a client-side change only. */
+  jobLog(id: string, offset: number, limit?: number): Promise<ClientResult<{ text: string; next: number; truncated: boolean }>>;
 }
 
 /** The `POST /v1/jobs` reply (J7). */
@@ -408,7 +410,7 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
           : { ok: false, kind: "link_down", message: "malformed response" };
       })();
     },
-    jobLog(id, offset) {
+    jobLog(id, offset, limit) {
       // NOT `leaseCall`: this endpoint answers with raw bytes, not JSON, and the
       // next offset rides in a header. Parsing it as JSON would fail on the
       // first log line that is not a JSON document, which is all of them.
@@ -416,7 +418,8 @@ export function makeApiClient(base: string, token: string, fetchImpl: FetchLike 
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), REQ_TIMEOUT_MS);
         try {
-          const res = await fetchImpl(`${base}/v1/jobs/${encodeURIComponent(id)}/log?offset=${offset}`, {
+          const lim = limit === undefined ? "" : `&limit=${limit}`;
+          const res = await fetchImpl(`${base}/v1/jobs/${encodeURIComponent(id)}/log?offset=${offset}${lim}`, {
             method: "GET",
             headers: { ...authHeaders },
             signal: ctrl.signal,

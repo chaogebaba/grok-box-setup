@@ -231,7 +231,7 @@ describe("footer scope-aware dimming (R3-A1)", () => {
 describe("modal (typed-name confirm, TUI-D10)", () => {
   test("push modal states 'single box, no canary gate' and asks for the box name", () => {
     const s = state({
-      modal: { actionLabel: "config-push", box: "grok-box-1", typed: "grok", field: "confirm", note: "single box, no canary gate", expect: "grok-box-1" },
+      modal: { kind: "action" as const, actionLabel: "config-push", box: "grok-box-1", typed: "grok", field: "confirm", note: "single box, no canary gate", expect: "grok-box-1" },
     });
     const joined = modalLines(s).map((l) => l.text).join("\n");
     expect(joined).toContain("single box, no canary gate");
@@ -240,7 +240,7 @@ describe("modal (typed-name confirm, TUI-D10)", () => {
   });
   test("rename modal shows the new-name field", () => {
     const s = state({
-      modal: { actionLabel: "rename", box: "grok-box-3", typed: "", target: "grok-box-003", field: "target", expect: "grok-box-3" },
+      modal: { kind: "action" as const, actionLabel: "rename", box: "grok-box-3", typed: "", target: "grok-box-003", field: "target", expect: "grok-box-3" },
     });
     expect(modalLines(s).map((l) => l.text).join("\n")).toContain("new name: grok-box-003");
   });
@@ -273,7 +273,7 @@ describe("no ANSI escapes leave the model", () => {
       canary: "grok-box-1",
       discover: { candidates: 1, adopted: 1, repaired: 0, skipped: [] },
       message: "hi",
-      modal: { actionLabel: "check", box: "grok-box-1", typed: "", field: "confirm", expect: "grok-box-1" },
+      modal: { kind: "action" as const, actionLabel: "check", box: "grok-box-1", typed: "", field: "confirm", expect: "grok-box-1" },
     });
     const all = [
       headerText(s, SIZE_120x40),

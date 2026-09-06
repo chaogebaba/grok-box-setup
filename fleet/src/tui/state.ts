@@ -6,17 +6,20 @@
 // directly. `TuiState` is unchanged from the hand-rolled TUI.
 
 import type { SnapshotDiscover, SnapshotLine } from "../history/schema.ts";
-import type { BoxDetail, FleetBox, FleetView } from "./api-client.ts";
+import type { BoxDetail, FleetBox, FleetView, Job } from "./api-client.ts";
 import type { Scope } from "../serve/tokens.ts";
 import type { ActionSpec } from "./actions.ts";
 import { actionForKey, RECONCILE_ACTION, confirmValue, needsTarget } from "./actions.ts";
 import { filteredBoxes, viewContent, viewRowsAvailable, viewportWindow, type Size } from "./model.ts";
+// `fleet/src/jobs.ts` has no imports of its own, so the pure reducer may read
+// the terminal-state list straight from the one place that defines it.
+import { TERMINAL_STATES } from "../jobs.ts";
 
 export const POLL_INTERVAL_MS = 5000; // TUI-D7
 
 /** The full-frame views: D2/D3/D4, O5's fleet-wide leases list, and jobs J12's
  *  fleet-wide read-only jobs list. */
-export type ViewKind = "diff" | "journal" | "history" | "leases" | "jobs";
+export type ViewKind = "diff" | "journal" | "history" | "leases" | "jobs" | "joblog";
 
 /**
  * An OPEN full-frame view. Everything here is a COPY captured at open (D6): the
@@ -26,11 +29,14 @@ export type ViewKind = "diff" | "journal" | "history" | "leases" | "jobs";
  */
 export interface ViewState {
   kind: ViewKind;
-  /** the box captured at OPEN — NOT the current selection. O5's `leases` view
-   *  is fleet-wide and carries `""` here, in the effect and in the result, so
-   *  `applyViewResult`'s box guard is satisfied trivially. */
+  /** the view's SUBJECT, captured at OPEN — NOT the current selection — and the
+   *  guard `applyViewResult` matches a result against. It is the BOX NAME for
+   *  diff/journal/history, `""` for the fleet-wide leases and jobs lists (so
+   *  the guard is satisfied trivially), and the JOB ID for 5.14.1's joblog. */
   box: string;
-  /** scroll offset in content rows; clamped at paint time (D5b). */
+  /** scroll offset in content rows; clamped at paint time (D5b). For the jobs
+   *  view it is unused: 5.14.1 D1 DERIVES that window from `cursor` at paint
+   *  time so a reload after `s` keeps the operator's row. */
   offset: number;
   /** true between open/`r` and the response landing. */
   loading: boolean;
@@ -38,12 +44,30 @@ export interface ViewState {
   lines?: string[];
   /** captured history copy, newest-first (D4). */
   history?: SnapshotLine[];
+  /** 5.14.1 D1: the jobs view's ROW CURSOR — an index into `jobs`, and so into
+   *  content line `cursor + 1` (line 0 is the column header). Set ONLY for
+   *  `kind === "jobs"`; undefined while loading, on an error, and on an empty
+   *  list. Every other kind stays scroll-only. */
+  cursor?: number;
+  /** 5.14.1 D1: the SORTED jobs the rows were rendered from, so row `i` and
+   *  `jobs[i]` are the same job by construction. Set ONLY for the jobs view. */
+  jobs?: Job[];
+  /** 5.14.1 D2: the view to return to on `Esc`/`q` — a COPY of the jobs list
+   *  taken when `Enter` opened the joblog. One link, not a stack: every other
+   *  view leaves it undefined and still closes to the table. */
+  parent?: ViewState;
   /** a rendered failure line (403 text, link error, …) instead of content. */
   error?: string;
 }
 
 /** A modal in progress (typed-name confirm, TUI-D10). */
 export interface ModalState {
+  /** 5.14.1 D3: which confirm this is. `"action"` is every box action;
+   *  `"stop-job"` is the jobs view's stop, whose title, prompt and expected
+   *  value name a JOB rather than a box. */
+  kind: "action" | "stop-job";
+  /** 5.14.1 D3: the job `"stop-job"` acts on. Absent for `"action"`. */
+  jobId?: string;
   actionLabel: string;
   box: string;
   /** what the user has typed so far (the confirm/box-name). */
@@ -116,7 +140,10 @@ export type Effect =
   | { type: "load-detail"; box: string }
   /** fetch (or refetch) an open view's content for its CAPTURED box (D2/D3/D4). */
   | { type: "load-view"; kind: ViewKind; box: string }
-  | { type: "run-action"; spec: ActionSpec; box: string; to?: string };
+  | { type: "run-action"; spec: ActionSpec; box: string; to?: string }
+  /** 5.14.1 D3: stop ONE job, then re-fetch the open jobs list (never `poll`,
+   *  which refreshes the table the operator is not looking at). */
+  | { type: "stop-job"; jobId: string };
 
 /** The default size used when a caller does not supply one (tests, headless). */
 const DEFAULT_SIZE: Size = { cols: 120, rows: 40 };
@@ -167,22 +194,39 @@ export function applyViewResult(
   state: TuiState,
   kind: ViewKind,
   box: string,
-  payload: { lines?: string[]; history?: SnapshotLine[]; error?: string },
+  payload: { lines?: string[]; history?: SnapshotLine[]; jobs?: Job[]; error?: string },
+  size: Size = DEFAULT_SIZE,
 ): TuiState {
   const v = state.view;
   if (v === undefined || v.kind !== kind || v.box !== box) return state;
-  return {
-    ...state,
-    view: {
-      ...v,
-      loading: false,
-      error: payload.error,
-      lines: payload.error === undefined && payload.lines !== undefined ? payload.lines : v.lines,
-      history: payload.error === undefined && payload.history !== undefined ? payload.history : v.history,
-      // a refetch starts the reader at the top of the new content.
-      offset: 0,
-    },
+  const view: ViewState = {
+    ...v,
+    loading: false,
+    error: payload.error,
+    lines: payload.error === undefined && payload.lines !== undefined ? payload.lines : v.lines,
+    history: payload.error === undefined && payload.history !== undefined ? payload.history : v.history,
+    jobs: payload.error === undefined && payload.jobs !== undefined ? payload.jobs : v.jobs,
+    // a refetch starts the reader at the top of the new content.
+    offset: 0,
   };
+  if (kind === "jobs") {
+    // 5.14.1 D1: the jobs view keeps the OPERATOR'S ROW across a reload — the
+    // `r` refetch and the one `s` triggers both land here. `offset` is left
+    // alone because the jobs window is derived from the cursor at paint time.
+    const n = view.jobs?.length ?? 0;
+    return {
+      ...state,
+      view: { ...view, offset: v.offset, cursor: n === 0 ? undefined : Math.min(Math.max(v.cursor ?? 0, 0), n - 1) },
+    };
+  }
+  if (kind === "joblog") {
+    // 5.14.1 D2: a log is read from its END. Anchoring on the last screenful is
+    // what makes `Enter` (and `r`) show the TAIL rather than the top of it.
+    const anchored: TuiState = { ...state, view };
+    const total = viewContent(anchored).length;
+    return { ...state, view: { ...view, offset: Math.max(0, total - viewRowsAvailable(anchored, size)) } };
+  }
+  return { ...state, view };
 }
 
 /**
@@ -389,9 +433,12 @@ export function handleKey(state: TuiState, key: string, size: Size = DEFAULT_SIZ
 function handleViewKey(state: TuiState, key: string, size: Size): { state: TuiState; effect: Effect } {
   const v = state.view!;
   if (key === "\x1b" || key === "q") {
-    // close. The app then re-evaluates the detail effect: if the selection
-    // moved while the view was open, it fires exactly once (D6).
-    return { state: { ...state, view: undefined }, effect: { type: "none" } };
+    // close. 5.14.1 D2: a view with a PARENT (only the joblog has one) returns
+    // to that parent — the jobs list with its cursor intact, and no re-fetch.
+    // Every other view leaves `parent` undefined, so this is still the table,
+    // and the app then re-evaluates the detail effect: if the selection moved
+    // while the view was open, it fires exactly once (D6).
+    return { state: { ...state, view: v.parent }, effect: { type: "none" } };
   }
   if (key === "\x03") return { state, effect: { type: "quit" } }; // Ctrl-C still quits
   if (key === "r") {
@@ -402,6 +449,39 @@ function handleViewKey(state: TuiState, key: string, size: Size): { state: TuiSt
   }
   const down = key === "j" || key === "\x1b[B";
   const up = key === "k" || key === "\x1b[A";
+  // --- the jobs view: a CURSOR, not a scroll offset (5.14.1 D1/D2/D3) --------
+  if (v.kind === "jobs") {
+    const jobs = v.jobs;
+    const live = jobs !== undefined && jobs.length > 0 && v.cursor !== undefined;
+    if (down || up) {
+      // inert while loading, on an error and on an empty list — all of which
+      // are ONE content line with no row under the cursor.
+      if (!live) return { state, effect: { type: "none" } };
+      const cursor = Math.min(Math.max(v.cursor! + (down ? 1 : -1), 0), jobs!.length - 1);
+      return { state: { ...state, view: { ...v, cursor } }, effect: { type: "none" } };
+    }
+    if (key === "\r" || key === "\n") {
+      // D2: the `loading` guard is load-bearing, not defensive. D1 preserves the
+      // cursor across `r`, so mid-reload the cursor is DEFINED and `loading` is
+      // true; opening the joblog then would capture a parent with `loading:
+      // true`, the in-flight jobs result would be dropped by the kind guard in
+      // `applyViewResult`, and `Esc` would restore a list stuck on `(loading…)`
+      // with no request outstanding.
+      if (v.loading || !live) return { state, effect: { type: "none" } };
+      const job = jobs![v.cursor!]!;
+      return {
+        state: {
+          ...state,
+          // a shallow COPY of the list as it stands, cursor and jobs included —
+          // never a reference to the live view object.
+          view: { kind: "joblog", box: job.job_id, offset: 0, loading: true, parent: { ...v } },
+        },
+        effect: { type: "load-view", kind: "joblog", box: job.job_id },
+      };
+    }
+    if (key === "s") return stopSelectedJob(state, v);
+    return { state, effect: { type: "none" } };
+  }
   if (down || up) {
     const total = viewContent(state).length;
     const rows = viewRowsAvailable(state, size);
@@ -411,11 +491,43 @@ function handleViewKey(state: TuiState, key: string, size: Size): { state: TuiSt
   return { state, effect: { type: "none" } };
 }
 
+/**
+ * 5.14.1 D3: `s` on the selected job. The scope gate comes FIRST and emits the
+ * same sentence every other action emits under a readonly token; a terminal job
+ * is refused with its own sentence rather than a modal that could not do
+ * anything; only `starting`/`running` open the typed confirm.
+ */
+function stopSelectedJob(state: TuiState, v: ViewState): { state: TuiState; effect: Effect } {
+  if (state.scope !== "admin") {
+    return { state: { ...state, message: "admin token required for that action" }, effect: { type: "none" } };
+  }
+  const job = v.cursor === undefined ? undefined : v.jobs?.[v.cursor];
+  if (job === undefined) return { state, effect: { type: "none" } };
+  // `TERMINAL_STATES` is `readonly JobState[]` and `Job.state` is a plain
+  // string, so the membership test widens rather than casting the job's state.
+  if ((TERMINAL_STATES as readonly string[]).includes(job.state)) {
+    return { state: { ...state, message: "job already finished" }, effect: { type: "none" } };
+  }
+  const modal: ModalState = {
+    kind: "stop-job",
+    jobId: job.job_id,
+    actionLabel: "stop job",
+    box: "",
+    typed: "",
+    // the job id's FIRST 6 CHARACTERS: an id may begin with `-`, and a box name
+    // would be meaningless as the confirm for a fleet-wide list.
+    field: "confirm",
+    expect: job.job_id.slice(0, 6),
+  };
+  return { state: { ...state, modal, message: undefined }, effect: { type: "none" } };
+}
+
 function openActionModal(state: TuiState, spec: ActionSpec, box: string): { state: TuiState; effect: Effect } {
   if (state.scope !== "admin") {
     return { state: { ...state, message: "admin token required for that action" }, effect: { type: "none" } };
   }
   const modal: ModalState = {
+    kind: "action",
     actionLabel: spec.label,
     box,
     typed: "",
@@ -442,6 +554,15 @@ function handleModalKey(state: TuiState, key: string): { state: TuiState; effect
     // confirm field: the typed value must equal the expected confirm.
     if (m.typed !== m.expect) {
       return { state: { ...state, message: `confirm mismatch (expected "${m.expect}")` }, effect: { type: "none" } };
+    }
+    // 5.14.1 D3: branch BEFORE `specKeyFromLabel` — "stop job" is not a box
+    // action and has no trigger key to reverse-map.
+    if (m.kind === "stop-job") {
+      const jobId = m.jobId ?? "";
+      return {
+        state: { ...state, modal: undefined, message: `stopping ${jobId.slice(0, 12)}…` },
+        effect: { type: "stop-job", jobId },
+      };
     }
     const spec = m.actionLabel === RECONCILE_ACTION.label ? RECONCILE_ACTION : actionForKey(specKeyFromLabel(m.actionLabel))!;
     const to = m.target;
