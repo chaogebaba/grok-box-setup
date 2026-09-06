@@ -2,7 +2,7 @@
 // D9 (u) read-write reopen, (t) reconcile-files, (p) import --force).
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { cmdState, RECONCILE_BUSY_LINE } from "../../src/commands/state.ts";
 import { openStore, storePath } from "../../src/store/db.ts";
 import { StoreState } from "../../src/store/state.ts";
@@ -342,6 +342,177 @@ describe("state backup / restore", () => {
       const { d } = deps(f.state, f.etc);
       expect(await cmdState(["restore"], d)).toBe(RC.USAGE);
     } finally {
+      cleanup(f.dir);
+    }
+  });
+});
+
+// ---- r2/R2(b): state forget-key ---------------------------------------------
+//
+// A1's automatic forget fires on a NEW tunnel pubkey, which is the re-image
+// signal. It cannot help a box that was already re-enrolled before 5.12.1
+// shipped: the r1 gate found grok-box-011 on the production VPS with a key
+// minted 2026-08-30 against a binding of 2026-09-06, no secrets/ts-authkey on
+// the box, and the post-re-image pubkey already recorded. No tick repairs that.
+// This command is the remediation half.
+
+const DAY = 86_400;
+
+/** A box enrolled at `bound` whose key was minted at `minted`. */
+function staleFixture(prefix: string, minted: number, bound: number) {
+  const f = fixture(prefix);
+  f.st.recordEnrolled("grok-box-011", 20011, "AAAAKEY011");
+  // recordKey EXPORTS, so `<box>.expires` and `keys/11.json` really exist on
+  // disk before the forget — otherwise asserting their absence afterwards
+  // proves nothing at all.
+  f.st.recordKey("grok-box-011", {
+    keyId: "k56iJtXxsJ11CNTRL",
+    expiresRaw: "2026-11-28T00:00:00Z",
+    expiresDate: "2026-11-28",
+  });
+  f.store.db.query("UPDATE boxes SET enrolled_at=? WHERE name='grok-box-011'").run(bound);
+  f.store.db.query("UPDATE box_keys SET minted_at=?").run(minted);
+  return f;
+}
+
+function quietLogs(): { lines: string[]; restore: () => void } {
+  const lines: string[] = [];
+  const prev = setLogSink((l) => lines.push(l));
+  return { lines, restore: () => setLogSink(prev) };
+}
+
+describe("state forget-key (r2/R2(b))", () => {
+  test("a STALE key is forgotten: rc 0, the row goes, and the log names both instants", async () => {
+    // 011's real production numbers, seven days apart.
+    const f = staleFixture("forget-stale", T0, T0 + 7 * DAY);
+    const cap = quietLogs();
+    try {
+      f.store.close();
+      const { out, d } = deps(f.state, f.etc);
+      const rc = await cmdState(["forget-key", "grok-box-011"], d);
+      expect(rc).toBe(RC.OK);
+
+      const line = out.join("");
+      expect(line).toContain("state: forgot key k56iJtXxsJ11CNTRL for grok-box-011");
+      // Both instants, so the record says WHY it was safe to drop.
+      expect(line).toContain("minted 2026-05-28T20:26:40Z < bound 2026-06-04T20:26:40Z");
+
+      // The row is gone, and so is the exported artefact ON DISK. Asserting
+      // `readExpiresDate` alone is not enough: that reads the ROW, so it answers
+      // undefined even when the file survives. A forget that drops the row and
+      // leaves `<box>.expires` behind is a file describing a key that no longer
+      // exists — most of the lie this command exists to clear — and a mutant
+      // that skipped the export survived until this assertion existed.
+      expect(existsSync(`${f.state}/grok-box-011.expires`)).toBe(false);
+      expect(existsSync(`${f.state}/keys/11.json`)).toBe(false);
+
+      const store = openStore({ path: storePath(f.state), dir: f.state, now: () => T0 });
+      const row = store.db.query("SELECT COUNT(*) AS n FROM box_keys").get() as { n: number };
+      expect(row.n).toBe(0);
+      const st = new StoreState(store);
+      expect(st.readExpiresDate("grok-box-011")).toBeUndefined();
+      // ...and the delete carries an audit row, committed with it.
+      const audit = store.db
+        .query("SELECT COUNT(*) AS n FROM audit WHERE action='forget-key' AND box='grok-box-011'")
+        .get() as { n: number };
+      expect(audit.n).toBe(1);
+      store.close();
+    } finally {
+      cap.restore();
+      cleanup(f.dir);
+    }
+  });
+
+  test("a LIVE key is REFUSED rc 1, names --force, and is still there afterwards", async () => {
+    // Minted AFTER the binding: exactly the key the tick just seeded.
+    const f = staleFixture("forget-live", T0 + 7 * DAY, T0);
+    const cap = quietLogs();
+    try {
+      f.store.close();
+      const { d } = deps(f.state, f.etc);
+      const rc = await cmdState(["forget-key", "grok-box-011"], d);
+      expect(rc).toBe(RC.FAILURE);
+      const msg = cap.lines.join("\n");
+      expect(msg).toContain("is NOT stale");
+      expect(msg).toContain("--force");
+      // The refusal names the numbers it rests on, not just the verdict.
+      expect(msg).toContain("minted 2026-06-04T20:26:40Z");
+      expect(msg).toContain("bound 2026-05-28T20:26:40Z");
+
+      const store = openStore({ path: storePath(f.state), dir: f.state, now: () => T0 });
+      expect((store.db.query("SELECT COUNT(*) AS n FROM box_keys").get() as { n: number }).n).toBe(1);
+      store.close();
+    } finally {
+      cap.restore();
+      cleanup(f.dir);
+    }
+  });
+
+  test("--force drops a live key, and says so in the reason", async () => {
+    const f = staleFixture("forget-force", T0 + 7 * DAY, T0);
+    const cap = quietLogs();
+    try {
+      f.store.close();
+      const { out, d } = deps(f.state, f.etc);
+      const rc = await cmdState(["forget-key", "grok-box-011", "--force"], d);
+      expect(rc).toBe(RC.OK);
+      expect(out.join("")).toContain("--force");
+
+      const store = openStore({ path: storePath(f.state), dir: f.state, now: () => T0 });
+      expect((store.db.query("SELECT COUNT(*) AS n FROM box_keys").get() as { n: number }).n).toBe(0);
+      store.close();
+    } finally {
+      cap.restore();
+      cleanup(f.dir);
+    }
+  });
+
+  test("no box name ⇒ usage; a bad name ⇒ usage; both write nothing", async () => {
+    const f = staleFixture("forget-usage", T0, T0 + 7 * DAY);
+    const cap = quietLogs();
+    try {
+      f.store.close();
+      const { d } = deps(f.state, f.etc);
+      expect(await cmdState(["forget-key"], d)).toBe(RC.USAGE);
+      expect(await cmdState(["forget-key", "not-a-box"], d)).toBe(RC.USAGE);
+      expect(await cmdState(["forget-key", "--force"], d)).toBe(RC.USAGE);
+
+      const store = openStore({ path: storePath(f.state), dir: f.state, now: () => T0 });
+      expect((store.db.query("SELECT COUNT(*) AS n FROM box_keys").get() as { n: number }).n).toBe(1);
+      store.close();
+    } finally {
+      cap.restore();
+      cleanup(f.dir);
+    }
+  });
+
+  test("a box with no key row, and a box with no store row, each fail rc 1", async () => {
+    const f = fixture("forget-absent");
+    const cap = quietLogs();
+    try {
+      f.st.recordEnrolled("grok-box-011", 20011, "AAAAKEY011");
+      f.store.close();
+      const { d } = deps(f.state, f.etc);
+      expect(await cmdState(["forget-key", "grok-box-011"], d)).toBe(RC.FAILURE);
+      expect(cap.lines.join("\n")).toContain("has no recorded key");
+      expect(await cmdState(["forget-key", "grok-box-099"], d)).toBe(RC.FAILURE);
+      expect(cap.lines.join("\n")).toContain("has no store row");
+    } finally {
+      cap.restore();
+      cleanup(f.dir);
+    }
+  });
+
+  test("the usage line for `state` with no subcommand advertises forget-key", async () => {
+    const f = fixture("forget-usage-line");
+    const cap = quietLogs();
+    try {
+      f.store.close();
+      const { d } = deps(f.state, f.etc);
+      expect(await cmdState([], d)).toBe(RC.USAGE);
+      expect(cap.lines.join("\n")).toContain("forget-key <box> [--force]");
+    } finally {
+      cap.restore();
       cleanup(f.dir);
     }
   });

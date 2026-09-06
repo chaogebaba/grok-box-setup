@@ -192,3 +192,36 @@ describe("(d) box_keys constraints", () => {
     store.close();
   });
 });
+
+// ---- r2/R3: forgetKey, on BOTH implementations -------------------------------
+//
+// The r1 gate found `forgetKey` declared on the interface, implemented twice,
+// and called by nothing — while the docs named it as the re-image mechanism,
+// which it was not. r2 gave it its one caller (`grokfleet state forget-key`)
+// and this exercises both implementations on the same script, the way every
+// other accessor in this file is covered. A method two classes must implement
+// deserves at least one test each.
+describe("r2/R3 forgetKey removes the key on both implementations", () => {
+  for (const impl of bothImplementations()) {
+    test(`${impl.label}: the key row and its exported artefacts go`, () => {
+      const s = impl.state;
+      expect(s.recordKey(BOX, { keyId: "kSTALE", expiresRaw: "2026-11-28T00:00:00Z", expiresDate: "2026-11-28" })).toBe(true);
+      expect(s.keyMetaId(3, BOX)).toBe("kSTALE");
+      expect(s.readExpiresDate(BOX)).toBe("2026-11-28");
+
+      s.forgetKey(BOX);
+
+      expect(s.keyMetaId(3, BOX)).toBeUndefined();
+      expect(s.readExpiresDate(BOX)).toBeUndefined();
+      impl.close();
+    });
+  }
+
+  for (const impl of bothImplementations()) {
+    test(`${impl.label}: forgetting a box with no key is a silent no-op`, () => {
+      expect(() => impl.state.forgetKey(BOX)).not.toThrow();
+      expect(impl.state.keyMetaId(3, BOX)).toBeUndefined();
+      impl.close();
+    });
+  }
+});

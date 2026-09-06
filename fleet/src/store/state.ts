@@ -779,14 +779,43 @@ export class StoreState implements ReconcileStateApi {
   }
 
   /**
-   * A1: forget the key AND export, so `<box>.expires` and `keys/<idx>.json`
-   * go away with the row. `dropKeyRow` deliberately does not export because
-   * the retire path exports once at the end; the enrol path has no such
-   * follow-up, so forget owns its export.
+   * A1/r2-R3: forget the key AND export, so `<box>.expires` and
+   * `keys/<idx>.json` go away with the row. `dropKeyRow` deliberately does not
+   * export because the retire path exports once at the end; forget owns its
+   * export.
+   *
+   * The r1 gate found this method declared on both implementations, described
+   * in the docs as the re-image mechanism, and called by nothing — the actual
+   * forget on the enrol path is an inline DELETE inside `rebindIfNewKeypair`'s
+   * transaction, which is the better implementation there because it commits
+   * with the `enrolled_at` re-dating in one go. Rather than delete a method
+   * with a real use, r2 gave it its ONE caller:
+   * `grokfleet state forget-key <box>`, the operator repair for a box the tick
+   * cannot fix on its own. If that command ever goes away, so should this.
+   *
+   * The DELETE and the audit row commit TOGETHER. The export follows the
+   * commit, not inside it: `runExport` writes files, and a transaction that
+   * rolled back after removing them would leave the row without its artefacts.
+   * A crash between commit and export leaves a stale `<box>.expires` on disk
+   * with no row behind it, which the next export removes — the safe direction,
+   * because a file with no row is inert while a row with no file is a key the
+   * engine believes in.
    */
   forgetKey(box: string): void {
-    if (this.boxId(box) === undefined) return;
-    this.dropKeyRow(box);
+    const row = this.boxRow(box);
+    if (row === undefined) return;
+    const at = this.store.now();
+    this.store.tx(() => {
+      this.store.db.query("DELETE FROM box_keys WHERE box_id=?").run(row.box_id);
+      this.store.audit({
+        actor: "grokfleet",
+        action: "forget-key",
+        box,
+        rc: 0,
+        at,
+        detail: "key row dropped",
+      });
+    });
     this.runExport("keys", box);
   }
 

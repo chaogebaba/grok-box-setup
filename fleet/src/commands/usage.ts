@@ -48,6 +48,7 @@ VPS-side (refuse rc 6 elsewhere):
   grokfleet state restore <file>              — copy a backup over fleet.db (stop the timer first)
   grokfleet state import [--force]            — replay the pre-5.8.0 files into the store
   grokfleet state reconcile-files [--apply]   — resolve a reported enrolled.tsv divergence
+  grokfleet state forget-key <box> [--force]  — drop a key row minted before the box's current binding
   grokfleet lease acquire|renew|release|ls|show|run — reserve a box so the tick leaves it alone
   grokfleet job run|start|ls|show|log|stop|wait — run a bounded command, or a service, on a box
 

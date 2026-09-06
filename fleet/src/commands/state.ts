@@ -5,6 +5,7 @@
 //   grokfleet state restore <file>           copy a backup over fleet.db
 //   grokfleet state import [--force]         replay the 5.7.1 files into the store
 //   grokfleet state reconcile-files [--apply] resolve a reported divergence
+//   grokfleet state forget-key <box> [--force] drop a STALE key row (r2/R2(b))
 //
 // Exit codes: 0 ok, 2 usage, 3 config/integrity (RC.TARGET), 6 the reconcile
 // lock was busy for the whole 90 s wait (RC.LOCK_BUSY), 7 recorded but the
@@ -19,7 +20,8 @@ import { StoreState, resolvePort } from "../store/state.ts";
 import { exportAll, importLegacy, parseAuthorizedKeysMap } from "../store/legacy.ts";
 import { currentFindings } from "../store/divergence.ts";
 import { backupDir, dailyMaintenance, restoreFile } from "../store/backup.ts";
-import { boxIndex } from "../boxes.ts";
+import { boxIndex, isValidBoxName } from "../boxes.ts";
+import { keyStale } from "../keystale.ts";
 import { log } from "../log.ts";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 
@@ -74,9 +76,11 @@ export async function cmdState(rest: string[], deps: StateCmdDeps): Promise<numb
       return stateImport(args, deps);
     case "reconcile-files":
       return stateReconcileFiles(args, deps);
+    case "forget-key":
+      return stateForgetKey(args, deps);
     default:
       log(
-        "usage: grokfleet state <check|backup|restore <file>|import [--force]|reconcile-files [--apply]>",
+        "usage: grokfleet state <check|backup|restore <file>|import [--force]|reconcile-files [--apply]|forget-key <box> [--force]>",
       );
       return RC.USAGE;
   }
@@ -566,3 +570,93 @@ function readIf(p: string): string | undefined {
 
 /** Re-exported so the CLI can print `exportAll` results without importing legacy. */
 export { exportAll };
+
+// --- forget-key (r2/R2(b)) ---------------------------------------------------
+
+/**
+ * `grokfleet state forget-key <box> [--force]` — the operator repair for a box
+ * whose recorded key belongs to a previous incarnation of that box.
+ *
+ * WHY THIS EXISTS. A1's automatic forget fires when a box presents a tunnel
+ * pubkey different from the recorded one, which is the re-image signal. It
+ * cannot help a box that was ALREADY re-enrolled before 5.12.1 shipped: the r1
+ * gate found `grok-box-011` on the production VPS with a key minted
+ * 2026-08-30 against a binding of 2026-09-06, no `secrets/ts-authkey` on the
+ * box, and the new pubkey already recorded by the enrol that followed the
+ * re-image. No tick repairs that. A1 is prevention; this is remediation, and
+ * without it the only fix is retiring and re-adopting the box or editing the
+ * database by hand.
+ *
+ * REFUSES a key that is not stale (rc 1) unless `--force`, because the default
+ * case for this command is "the engine already agrees the key is dead". Forcing
+ * it on a LIVE key throws away a key the box is really using, so the refusal
+ * names `--force` rather than silently obeying.
+ *
+ * VPS-only comes for free: `cli.ts` refuses the whole `state` command with rc 6
+ * when the box key is absent, exactly as it does for every other subcommand
+ * that mutates the store.
+ */
+async function stateForgetKey(args: string[], deps: StateCmdDeps): Promise<number> {
+  const out = stdout(deps);
+  const force = args.includes("--force");
+  const box = args.find((a) => !a.startsWith("--"));
+  if (box === undefined) {
+    log("usage: grokfleet state forget-key <box> [--force]");
+    return RC.USAGE;
+  }
+  if (!isValidBoxName(box)) {
+    log(`state forget-key: '${box}' is not a valid box name`);
+    return RC.USAGE;
+  }
+
+  const store = openStore({ path: storePath(deps.env.FLEET_STATE), dir: deps.env.FLEET_STATE, now: deps.now });
+  try {
+    // The export paths are NOT optional here. `runExport` is a silent no-op on a
+    // StoreState built without them, so a forget without paths would drop the
+    // row and leave `<box>.expires` sitting on disk — a file describing a key
+    // that no longer exists, which is most of the lie this command exists to
+    // clear. A surviving mutant found exactly that.
+    const st = new StoreState(store, {
+      paths: { fleetState: deps.env.FLEET_STATE, etc: deps.env.FLEET_ETC, version: deps.version },
+    });
+    if (st.boxRow(box) === undefined) {
+      log(`state forget-key: ${box} has no store row — nothing to forget`);
+      return RC.FAILURE;
+    }
+    const keyId = st.keyMetaId(boxIndex(box) ?? -1, box);
+    if (keyId === undefined) {
+      log(`state forget-key: ${box} has no recorded key — nothing to forget`);
+      return RC.FAILURE;
+    }
+    const mintedAt = st.keyMintedAt(box);
+    const boundAt = st.bindingAt(box);
+    const stale = keyStale(st, box);
+
+    if (!stale && !force) {
+      // Name BOTH instants: an operator refusing to be talked out of this needs
+      // to see the numbers the refusal rests on, not just the verdict.
+      log(
+        `state forget-key: ${box} key ${keyId} is NOT stale (minted ${iso(mintedAt)}, bound ${iso(boundAt)}) — refusing; re-run with --force to drop a live key`,
+      );
+      return RC.FAILURE;
+    }
+
+    st.forgetKey(box);
+
+    const why = stale
+      ? `minted ${iso(mintedAt)} < bound ${iso(boundAt)}`
+      : `--force, minted ${iso(mintedAt)}, bound ${iso(boundAt)}`;
+    const line = `state: forgot key ${keyId} for ${box} (${why})`;
+    log(line);
+    out(`${line}\n`);
+    return RC.OK;
+  } finally {
+    store.close();
+  }
+}
+
+/** Epoch seconds as ISO8601Z, or `unknown` — a NULL enrolled_at is legal. */
+function iso(sec: number | undefined): string {
+  if (sec === undefined) return "unknown";
+  return new Date(sec * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
