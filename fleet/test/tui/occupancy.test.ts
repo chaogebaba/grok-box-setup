@@ -162,19 +162,31 @@ describe("O1 — the WHO cell", () => {
     expect(seg.text).toBe(`${GLYPH.leased} svc:brain `);
   });
 
-  test("the row carries the COND column after EXP, and the canary C stays last", () => {
-    // 5.13.0 D3e adds a 16-wide COND column after EXP. That widens the
-    // UNtruncated table row past the old 60 (= tableWidth(100)); the pane
-    // windows it, so the visible width is still bounded by layout.ts — the
-    // detail-cutoff-99x40/100x40 fixtures prove the `cols >= 100` boundary did
-    // not move. Here we pin the new header geometry: EXP, then COND, then the
-    // canary `C` last.
+  test("the row carries JOB and COND after their widths allow, canary C stays last", () => {
+    // jobs J12 (D1): the row gained a JOB column after WHO, and COND is now
+    // OMITTED (never a stub) below 8 surviving columns. So the header geometry
+    // is width-dependent:
+    //   100: no JOB (cols < 110), no COND (60−57 = 3 < 8) — EXP then C.
+    //   120: JOB shown, COND omitted (72−66 = 6 < 8).
+    //   137: JOB shown AND COND shown — WHO, JOB, …, EXP, COND, then C last.
     const withCanary = state({ boxes: [box("grok-box-001")], canary: "grok-box-001" });
-    const head = tableLines(withCanary, SIZE_100x40)[0]!.text;
-    expect(head.trimEnd()).toBe("  NAME          WHO         VER     DRIFT   CONFIG  EXP  COND              C");
-    // COND sits between EXP and the canary column, and C is still the last cell.
-    expect(head).toContain("EXP  COND");
-    expect(head.trimEnd().endsWith("C")).toBe(true);
+    const head100 = tableLines(withCanary, SIZE_100x40)[0]!.text;
+    expect(head100.trimEnd()).toBe("  NAME          WHO         VER     DRIFT   CONFIG  EXP    C");
+    expect(head100).not.toContain("JOB");
+    expect(head100).not.toContain("COND");
+
+    const head120 = tableLines(withCanary, SIZE_120x40)[0]!.text;
+    expect(head120).toContain("JOB");
+    expect(head120).not.toContain("COND");
+
+    const head137 = tableLines(withCanary, { cols: 137, rows: 40 })[0]!.text;
+    expect(head137.trimEnd()).toBe(
+      "  NAME          WHO         JOB      VER     DRIFT   CONFIG  EXP  COND              C",
+    );
+    // JOB sits after WHO, COND between EXP and the canary column, C still last.
+    expect(head137).toContain("WHO         JOB");
+    expect(head137).toContain("EXP  COND");
+    expect(head137.trimEnd().endsWith("C")).toBe(true);
   });
 
   // m9: an EXPIRY narrower than 5 cuts `-365d` to `-365`, which reads as a
@@ -184,13 +196,18 @@ describe("O1 — the WHO cell", () => {
     expect(tableLines(s, SIZE_120x40)[1]!.text).toContain("-365d");
   });
 
-  // 5.13.0 D3e: COND carries the same short names /v1/fleet does.
+  // 5.13.0 D3e: COND carries the same short names /v1/fleet does. jobs J12 (D1):
+  // COND is only shown where >= 8 of its columns survive, so this now asserts at
+  // 137 (both JOB and COND present); at 120 COND is legitimately omitted.
   test("the COND column shows a box's conditions, comma-joined, and `-` when none", () => {
+    const S137 = { cols: 137, rows: 40 };
     const withConds = state({ boxes: [box("grok-box-001", { conditions: ["disk-fail"] })] });
-    expect(tableLines(withConds, SIZE_120x40)[1]!.text).toContain("disk-fail");
+    expect(tableLines(withConds, S137)[1]!.text).toContain("disk-fail");
     const none = state({ boxes: [box("grok-box-001")] });
     // the EXP cell is `40d`, then the COND cell is `-`.
-    expect(tableLines(none, SIZE_120x40)[1]!.text).toContain("40d  -");
+    expect(tableLines(none, S137)[1]!.text).toContain("40d  -");
+    // …and at 120 COND is omitted entirely (JOB shown, COND < 8 cols).
+    expect(tableLines(withConds, SIZE_120x40)[0]!.text).not.toContain("COND");
   });
 });
 

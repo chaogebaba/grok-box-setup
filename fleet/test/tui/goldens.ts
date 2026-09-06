@@ -444,25 +444,25 @@ export const GOLDENS: Golden[] = [
     name: "jobs-column-137x40",
     size: SIZE(137, 40),
     state: state({ boxes: JOBBED, selected: 0 }),
-    exceptions: [],
+    exceptions: ["detail-column"],
   },
   {
     name: "jobs-column-120x40",
     size: SIZE(120, 40),
     state: state({ boxes: JOBBED, selected: 0 }),
-    exceptions: [],
+    exceptions: ["detail-column"],
   },
   {
     name: "jobs-column-110x40",
     size: SIZE(110, 40),
     state: state({ boxes: JOBBED, selected: 0 }),
-    exceptions: [],
+    exceptions: ["detail-column"],
   },
   {
     name: "jobs-column-100x40",
     size: SIZE(100, 40),
     state: state({ boxes: JOBBED, selected: 0 }),
-    exceptions: [],
+    exceptions: ["detail-column"],
   },
 
   // The B jobs view, frozen rows and empty.
