@@ -162,13 +162,19 @@ describe("O1 — the WHO cell", () => {
     expect(seg.text).toBe(`${GLYPH.leased} svc:brain `);
   });
 
-  test("the row is 57 columns, or 60 with the canary — exactly tableWidth(100)", () => {
+  test("the row carries the COND column after EXP, and the canary C stays last", () => {
+    // 5.13.0 D3e adds a 16-wide COND column after EXP. That widens the
+    // UNtruncated table row past the old 60 (= tableWidth(100)); the pane
+    // windows it, so the visible width is still bounded by layout.ts — the
+    // detail-cutoff-99x40/100x40 fixtures prove the `cols >= 100` boundary did
+    // not move. Here we pin the new header geometry: EXP, then COND, then the
+    // canary `C` last.
     const withCanary = state({ boxes: [box("grok-box-001")], canary: "grok-box-001" });
-    const row = tableLines(withCanary, SIZE_100x40)[1]!.text;
-    expect(row.trimEnd().length).toBeLessThanOrEqual(60);
     const head = tableLines(withCanary, SIZE_100x40)[0]!.text;
-    expect(head.trimEnd()).toBe("  NAME          WHO         VER     DRIFT   CONFIG  EXP    C");
-    expect(head.trimEnd().length).toBe(60);
+    expect(head.trimEnd()).toBe("  NAME          WHO         VER     DRIFT   CONFIG  EXP  COND              C");
+    // COND sits between EXP and the canary column, and C is still the last cell.
+    expect(head).toContain("EXP  COND");
+    expect(head.trimEnd().endsWith("C")).toBe(true);
   });
 
   // m9: an EXPIRY narrower than 5 cuts `-365d` to `-365`, which reads as a
@@ -176,6 +182,15 @@ describe("O1 — the WHO cell", () => {
   test("EXPIRY holds the widest real value, a NEGATIVE day count, uncut", () => {
     const s = state({ boxes: [box("grok-box-001", { expiry_days: -365 })] });
     expect(tableLines(s, SIZE_120x40)[1]!.text).toContain("-365d");
+  });
+
+  // 5.13.0 D3e: COND carries the same short names /v1/fleet does.
+  test("the COND column shows a box's conditions, comma-joined, and `-` when none", () => {
+    const withConds = state({ boxes: [box("grok-box-001", { conditions: ["disk-fail"] })] });
+    expect(tableLines(withConds, SIZE_120x40)[1]!.text).toContain("disk-fail");
+    const none = state({ boxes: [box("grok-box-001")] });
+    // the EXP cell is `40d`, then the COND cell is `-`.
+    expect(tableLines(none, SIZE_120x40)[1]!.text).toContain("40d  -");
   });
 });
 

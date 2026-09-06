@@ -50,10 +50,11 @@ describe("T5 fleet-status (main:3410-3437, m13)", () => {
       boxes: ["grok-box-3", "grok-box-5"],
       readExpires: (b) => (b === "grok-box-3" ? "2026-12-01" : undefined),
     });
-    // grok-box-3: tunnel up ⇒ CHECK OK, VERSION=sha abc1234.
-    expect(rows[0]).toEqual({ box: "grok-box-3", api: "online", tunnel: "up", check: "OK", authkey: "2026-12-01", version: "abc1234" });
-    // grok-box-5: tunnel down ⇒ CHECK '-' (NOT probed, m13), VERSION '-'.
-    expect(rows[1]).toEqual({ box: "grok-box-5", api: "offline", tunnel: "down", check: "-", authkey: "-", version: "-" });
+    // grok-box-3: tunnel up ⇒ CHECK OK, VERSION=sha abc1234, COND `-` (a clean
+    // status line carries no condition tokens).
+    expect(rows[0]).toEqual({ box: "grok-box-3", api: "online", tunnel: "up", check: "OK", authkey: "2026-12-01", version: "abc1234", cond: "-" });
+    // grok-box-5: tunnel down ⇒ CHECK '-' (NOT probed, m13), VERSION '-', COND '-'.
+    expect(rows[1]).toEqual({ box: "grok-box-5", api: "offline", tunnel: "down", check: "-", authkey: "-", version: "-", cond: "-" });
     // m13: no boxup check/status ssh was ever issued for grok-box-5 (port 20005).
     const box5calls = runner.joined().filter((c) => c.includes("20005") || c.includes("grok-box-5"));
     expect(box5calls.filter((c) => c.includes("boxup"))).toEqual([]);
@@ -72,11 +73,40 @@ describe("T5 fleet-status (main:3410-3437, m13)", () => {
 
   test("golden header + row format", async () => {
     const out = formatFleetStatus([
-      { box: "grok-box-3", api: "online", tunnel: "up", check: "OK", authkey: "2026-12-01", version: "abc1234" },
+      { box: "grok-box-3", api: "online", tunnel: "up", check: "OK", authkey: "2026-12-01", version: "abc1234", cond: "-" },
     ]);
     const lines = out.split("\n");
-    expect(lines[0]).toBe("NAME           API     TUNNEL  CHECK   AUTHKEY      VERSION   ");
-    expect(lines[1]).toBe("grok-box-3     online  up      OK      2026-12-01   abc1234   ");
+    expect(lines[0]).toBe("NAME           API     TUNNEL  CHECK   AUTHKEY      VERSION    COND            ");
+    expect(lines[1]).toBe("grok-box-3     online  up      OK      2026-12-01   abc1234    -               ");
+  });
+
+  test("golden row with populated COND (stateless names joined; stateful get ?)", async () => {
+    const out = formatFleetStatus([
+      { box: "grok-box-4", api: "online", tunnel: "up", check: "FAIL", authkey: "-", version: "abc1234", cond: "disk-warn,tick-wedged?" },
+    ]);
+    const lines = out.split("\n");
+    // `disk-warn,tick-wedged?` is 22 chars — wider than the 16-col field, so it
+    // overflows rather than truncating (pad only pads, never cuts).
+    expect(lines[1]).toContain("disk-warn,tick-wedged?");
+    expect(lines[1]).toStartWith("grok-box-4     online  up      FAIL");
+  });
+
+  test("COND: a disk=93%/fail status line yields disk-fail in the column", async () => {
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv)) return { code: 0, stdout: "LISTEN 0 0 127.0.0.1:20003 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" };
+      const cmd = argv[argv.length - 1] ?? "";
+      if (cmd.includes("boxup check")) return { code: 1 }; // disk=/fail flips check to FAIL
+      if (cmd.includes("boxup status")) return { code: 0, stdout: "name=grok-box-3 v=5.3.0/abc1234 tunnel=up disk=93%/fail\n" };
+      return { code: 0 };
+    });
+    const rows = await fleetStatusRows({
+      runner,
+      env,
+      devices: { async body() { return DEVICES; } },
+      boxes: ["grok-box-3"],
+      readExpires: () => undefined,
+    });
+    expect(rows[0]!.cond).toBe("disk-fail");
   });
 
   test("cmdFleetStatus writes the table, rc 0", async () => {

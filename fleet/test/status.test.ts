@@ -134,3 +134,106 @@ describe("T1b check interpretation", () => {
     expect(c.status?.tokens["disk"]).toBe("22%");
   });
 });
+
+
+// --- toReport (5.13.0 box-conditions D1) -------------------------------------
+
+import { toReport } from "../src/status.ts";
+
+describe("toReport — the typed BoxReport", () => {
+  // The real grok-box-011 line from the 2026-09-06 audit raw pull: it carries
+  // NO tickwedge, NO refresh=, NO repair= (those tokens are conditional), and a
+  // healthy disk=5% keepawake=on/ok. It is the ABSENT-form fixture.
+  const LINE_011 =
+    "backend=Running online=yes exit-node=yes sshd=up ipfwd=4:1,6:1 " +
+    "tailscaled=4499 selfheal=11022 worker=11022 hb=14s name=grok-box-011 " +
+    "v=5.6.0/ed2834e tags=tag:grok-box keyexpiry=disabled tunnel=up " +
+    "tunnelfail=0 disk=5% keepawake=on keepawake_last=2026-09-06T05:52:58Z " +
+    "keepawake_rc=ok jumps=0 job=- job_state=-";
+
+  test("the real 011 line: absent conditional tokens default SAFE", () => {
+    const r = toReport(parseStatusLine(LINE_011));
+    expect(r.tickwedge).toBe(0); // absent ⇒ 0
+    expect(r.tunnelfail).toBe(0);
+    expect(r.disk).toEqual({ pct: 5, level: "ok" });
+    expect(r.keepawakeOn).toBe(true);
+    expect(r.keepawakeRc).toBe("ok");
+    expect(r.keepawakeLast).toBe("2026-09-06T05:52:58Z");
+    expect(r.jumps).toBe(0);
+    expect(r.jobState).toBe("-"); // job_state=- ⇒ the literal "-" (a value)
+    expect(r.refreshFailing).toBe(0); // absent ⇒ 0
+    expect(r.repairFailing).toBe(0);
+  });
+
+  test("a synthesised line carrying every PRESENT form", () => {
+    const line =
+      "name=grok-box-000 v=5.6.0/abc tunnel=up tunnelfail=7 disk=93%/fail " +
+      "tickwedge=4 keepawake=on keepawake_last=2026-09-06T05:52:58Z " +
+      "keepawake_rc=refused jumps=3 job=j1 job_state=running " +
+      "refresh=failing:5 repair=failing:2";
+    const r = toReport(parseStatusLine(line));
+    expect(r.tickwedge).toBe(4);
+    expect(r.tunnelfail).toBe(7);
+    expect(r.disk).toEqual({ pct: 93, level: "fail" });
+    expect(r.keepawakeOn).toBe(true);
+    expect(r.keepawakeRc).toBe("refused");
+    expect(r.keepawakeLast).toBe("2026-09-06T05:52:58Z");
+    expect(r.jumps).toBe(3);
+    expect(r.jobState).toBe("running");
+    expect(r.refreshFailing).toBe(5);
+    expect(r.repairFailing).toBe(2);
+  });
+
+  test("disk in all four shapes", () => {
+    expect(toReport(parseStatusLine("v=5/a disk=unknown")).disk).toEqual({ pct: null, level: "unknown" });
+    expect(toReport(parseStatusLine("v=5/a disk=5%")).disk).toEqual({ pct: 5, level: "ok" });
+    expect(toReport(parseStatusLine("v=5/a disk=82%/warn")).disk).toEqual({ pct: 82, level: "warn" });
+    expect(toReport(parseStatusLine("v=5/a disk=93%/fail")).disk).toEqual({ pct: 93, level: "fail" });
+    // absent disk= ⇒ unknown
+    expect(toReport(parseStatusLine("v=5/a tunnel=up")).disk).toEqual({ pct: null, level: "unknown" });
+    // garbage disk= ⇒ unknown
+    expect(toReport(parseStatusLine("v=5/a disk=weird")).disk).toEqual({ pct: null, level: "unknown" });
+  });
+
+  test("keepawake_rc domain: `-` and absence and off-domain values ⇒ null", () => {
+    for (const rc of ["ok", "inert", "refused", "skip", "unreachable", "parked-ok", "parked-blocked"]) {
+      expect(toReport(parseStatusLine(`v=5/a keepawake=on keepawake_rc=${rc}`)).keepawakeRc).toBe(rc);
+    }
+    // `-` ⇒ null (initialiser), absence ⇒ null, `off`/`error` are NOT this token
+    expect(toReport(parseStatusLine("v=5/a keepawake=on keepawake_rc=-")).keepawakeRc).toBeNull();
+    expect(toReport(parseStatusLine("v=5/a keepawake=on")).keepawakeRc).toBeNull();
+    expect(toReport(parseStatusLine("v=5/a keepawake_rc=off")).keepawakeRc).toBeNull();
+    expect(toReport(parseStatusLine("v=5/a keepawake_rc=error")).keepawakeRc).toBeNull();
+  });
+
+  test("keepawakeOn: only `keepawake=on` is true; off/absent ⇒ false", () => {
+    expect(toReport(parseStatusLine("v=5/a keepawake=on")).keepawakeOn).toBe(true);
+    expect(toReport(parseStatusLine("v=5/a keepawake=off")).keepawakeOn).toBe(false);
+    expect(toReport(parseStatusLine("v=5/a")).keepawakeOn).toBe(false);
+  });
+
+  test("keepawake_last: `never`, garbage, and absence all ⇒ null", () => {
+    expect(toReport(parseStatusLine("v=5/a keepawake_last=never")).keepawakeLast).toBeNull();
+    expect(toReport(parseStatusLine("v=5/a keepawake_last=not-a-date")).keepawakeLast).toBeNull();
+    expect(toReport(parseStatusLine("v=5/a")).keepawakeLast).toBeNull();
+    expect(toReport(parseStatusLine("v=5/a keepawake_last=2026-09-06T05:52:58Z")).keepawakeLast).toBe(
+      "2026-09-06T05:52:58Z",
+    );
+  });
+
+  test("a defaulted status (garbage line) is all-clear — the D1b guard relies on this", () => {
+    const r = toReport(parseStatusLine(""));
+    expect(r.tickwedge).toBe(0);
+    expect(r.disk.level).toBe("unknown");
+    expect(r.keepawakeRc).toBeNull();
+    expect(r.keepawakeOn).toBe(false);
+    expect(r.repairFailing).toBe(0);
+  });
+
+  test("refresh=/repair= only match the failing:N shape", () => {
+    expect(toReport(parseStatusLine("v=5/a refresh=failing:3")).refreshFailing).toBe(3);
+    expect(toReport(parseStatusLine("v=5/a repair=failing:1")).repairFailing).toBe(1);
+    // a non-failing value ⇒ 0
+    expect(toReport(parseStatusLine("v=5/a refresh=ok")).refreshFailing).toBe(0);
+  });
+});
