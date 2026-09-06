@@ -156,6 +156,17 @@ describe("D1 — showCondColumn (COND omitted, never a stub)", () => {
     expect(showCondColumn({ cols: 123, rows: 40 })).toBe(false);
     expect(showCondColumn({ cols: 124, rows: 40 })).toBe(true);
   });
+
+  // MUTANT: showCondColumn hard-codes 66 for condStart instead of deriving it
+  // from TABLE_HEADER_COLS. Below 110 the JOB column is off, so condStart is 57,
+  // not 66; a hard-coded 66 would omit COND at 65..73 columns where the derived
+  // 57 keeps it (65−57=8 ≥ 8, but 65−66 < 0). These widths pin the derivation.
+  test("condStart is derived (57 with JOB off): COND shown at 65..73, not omitted", () => {
+    for (const cols of [65, 70, 73]) {
+      expect(showJobColumn({ cols, rows: 40 })).toBe(false); // JOB off ⇒ condStart 57
+      expect(showCondColumn({ cols, rows: 40 })).toBe(true); // hard-coded-66 would be false
+    }
+  });
 });
 
 // --- D1: the header counter --------------------------------------------------
