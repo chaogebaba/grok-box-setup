@@ -118,3 +118,23 @@ test("V4: the header bar paints its ground", async () => {
   m.unmount();
   expect(first).toContain(bg("#1f2335"));
 });
+
+describe("5.14.1 D1: the jobs view's cursor is a real selection bar", () => {
+  // MUTANT 20: `View.tsx` never applies `selectionProps`, so the cursor row
+  // paints as a plain line. NO fixture moves — a golden is built from `l.text`
+  // and the colour selection leaves the text alone — so this mounted assertion
+  // is the ONLY thing that catches it. Same shape as the table's bar above.
+  test("the cursor row carries the SELECTION background, never `inverse`", async () => {
+    const g = GOLDENS.find((x) => x.name === "view-jobs-cursor-120x20")!;
+    const frame = await frameOf(g.state, g.size);
+    expect(frame).toContain(bg(SELECTION_BG));
+    expect(frame).not.toContain("\x1b[7m");
+  });
+
+  test("with NO_COLOR the same view emits no ANSI at all — the `>` marker is the whole signal", async () => {
+    const g = GOLDENS.find((x) => x.name === "view-jobs-cursor-nocolor-120x20")!;
+    const frame = await frameOf(g.state, g.size);
+    expect(frame).not.toContain("\x1b[");
+    expect(frame).toContain(">DONEJOB00000");
+  });
+});

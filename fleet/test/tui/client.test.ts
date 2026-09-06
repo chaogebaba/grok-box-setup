@@ -223,3 +223,40 @@ describe("GET /v1/boxes/:name/journal wired to the J key (D3)", () => {
     if (!r.ok) expect(r.kind).toBe("link_down");
   });
 });
+
+describe("GET /v1/jobs/:id/log (5.14.1 D2 — the optional limit)", () => {
+  /** The log endpoint answers raw bytes, not JSON, so it needs its own fake. */
+  function logFetch(): { fetch: FetchLike; urls: string[] } {
+    const urls: string[] = [];
+    const fetch: FetchLike = async (url) => {
+      urls.push(url);
+      return new Response("line\n", { status: 200, headers: { "x-job-log-offset": "5" } });
+    };
+    return { fetch, urls };
+  }
+
+  test("the TWO-argument form is unchanged: `…/log?offset=N` with no limit", async () => {
+    const f = logFetch();
+    const c = makeApiClient("http://h", "TOK", f.fetch);
+    const r = await c.jobLog("JOBID000000000000000A", 42);
+    expect(r.ok).toBe(true);
+    expect(f.urls[0]).toBe("http://h/v1/jobs/JOBID000000000000000A/log?offset=42");
+    expect(f.urls[0]).not.toContain("limit=");
+  });
+
+  // MUTANT 9: the three-argument form drops `&limit=`, so the brain answers with
+  // its own default window instead of the 64 KiB tail the view asked for.
+  test("the THREE-argument form appends `&limit=M`", async () => {
+    const f = logFetch();
+    const c = makeApiClient("http://h", "TOK", f.fetch);
+    await c.jobLog("JOBID000000000000000A", 34464, 65536);
+    expect(f.urls[0]).toBe("http://h/v1/jobs/JOBID000000000000000A/log?offset=34464&limit=65536");
+  });
+
+  test("a job id that begins with `-` is still encoded, limit and all", async () => {
+    const f = logFetch();
+    const c = makeApiClient("http://h", "TOK", f.fetch);
+    await c.jobLog("-Ab3/x", 0, 65536);
+    expect(f.urls[0]).toBe("http://h/v1/jobs/-Ab3%2Fx/log?offset=0&limit=65536");
+  });
+});

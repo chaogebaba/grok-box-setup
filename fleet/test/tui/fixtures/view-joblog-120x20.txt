@@ -1,0 +1,20 @@
+grokfleet 8 boxes  ● 5  ◆ 1  ✖ 1  ☾ 1 · free 5 · ▶ 3 jobs  apply off  tick 10s   admin  link ● up                       
+
+── job JOBID0000000 ──  rows 18–31 of 31                                                                                
+2026-04-30T23:48:16Z  worker: step 16 of the gate run
+2026-04-30T23:48:17Z  worker: step 17 of the gate run
+2026-04-30T23:48:18Z  worker: step 18 of the gate run
+2026-04-30T23:48:19Z  worker: step 19 of the gate run
+2026-04-30T23:48:20Z  worker: step 20 of the gate run
+2026-04-30T23:48:21Z  worker: step 21 of the gate run
+2026-04-30T23:48:22Z  worker: step 22 of the gate run
+2026-04-30T23:48:23Z  worker: step 23 of the gate run
+2026-04-30T23:48:24Z  worker: step 24 of the gate run
+2026-04-30T23:48:25Z  worker: step 25 of the gate run
+2026-04-30T23:48:26Z  worker: step 26 of the gate run
+2026-04-30T23:48:27Z  worker: step 27 of the gate run
+2026-04-30T23:48:28Z  worker: step 28 of the gate run
+2026-04-30T23:48:29Z  worker: step 29 of the gate run
+
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs                         
+P push  M rotate  R rename  T check  C reconcile                                                                        

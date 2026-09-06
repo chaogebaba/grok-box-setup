@@ -24,6 +24,9 @@ import {
   modalLines,
   segText,
   tableLines,
+  viewChromeRows,
+  viewContent,
+  NO_JOB_LOG,
 } from "../../src/tui/model.ts";
 import { tableWidth, showJobColumn } from "../../src/tui/model.ts";
 import type { SnapshotBox } from "../../src/history/schema.ts";
@@ -548,5 +551,101 @@ describe("D1 — the JOB column width rule (66 <= tableWidth(110))", () => {
     // … and EXP still fits (the width rule's whole point) within tableWidth(110)
     expect(iExp).toBeGreaterThan(iVer);
     expect(iExp + "EXP".length).toBeLessThanOrEqual(tableWidth({ cols: 110, rows: 40 }));
+  });
+});
+
+// --- 5.14.1: the stop modal, the joblog, and the view's chrome budget --------
+describe("5.14.1 D3 — modalLines branches on the modal's kind", () => {
+  const stopModal = (over = {}) =>
+    state({
+      modal: {
+        kind: "stop-job" as const,
+        jobId: "RUNJOB00000000000000B",
+        actionLabel: "stop job",
+        box: "",
+        typed: "",
+        field: "confirm" as const,
+        expect: "RUNJOB",
+        ...over,
+      },
+    });
+
+  test("`stop-job` names the JOB in all three lines", () => {
+    const text = modalLines(stopModal()).map((l) => l.text);
+    expect(text).toEqual([
+      "┌─ stop job RUNJOB000000 ─┐",
+      "type the first 6 characters of the job id to confirm: _",
+      '(expect "RUNJOB")   Enter=confirm  Esc=cancel',
+    ]);
+  });
+
+  test("what has been typed is echoed with the cursor", () => {
+    expect(modalLines(stopModal({ typed: "RUN" })).map((l) => l.text)[1]).toBe(
+      "type the first 6 characters of the job id to confirm: RUN_",
+    );
+  });
+
+  // MUTANT 18: the `"action"` branch is changed and an existing modal golden
+  // fails. Pinned here as an exact expectation as well as by the fixture.
+  test("`action` is byte-for-byte what it always was", () => {
+    const s = state({
+      modal: { kind: "action" as const, actionLabel: "config-push", box: "grok-box-1", typed: "grok", field: "confirm", note: "single box, no canary gate", expect: "grok-box-1" },
+    });
+    expect(modalLines(s).map((l) => l.text)).toEqual([
+      "┌─ config-push grok-box-1 ─┐",
+      "single box, no canary gate",
+      "type box name to confirm: grok_",
+      '(expect "grok-box-1")   Enter=confirm  Esc=cancel',
+    ]);
+  });
+});
+
+describe("5.14.1 D2 — a joblog with no content is `(empty log)`", () => {
+  test("viewContent never falls through to `(no output)` for a joblog", () => {
+    const s = state({ view: { kind: "joblog", box: "JOBID000000000000000A", offset: 0, loading: false, lines: [] } });
+    expect(viewContent(s)).toEqual([NO_JOB_LOG]);
+    // … while the other kinds keep their own answers.
+    expect(viewContent(state({ view: { kind: "diff", box: "b", offset: 0, loading: false, lines: [] } }))).toEqual(["in sync"]);
+    expect(viewContent(state({ view: { kind: "journal", box: "b", offset: 0, loading: false, lines: [] } }))).toEqual(["(no output)"]);
+  });
+});
+
+describe("5.14.1 D3 — viewChromeRows charges the modal ADDITIVELY", () => {
+  const viewState = (over = {}) =>
+    state({ view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: ["h", "a"] }, ...over });
+
+  const MODAL = {
+    kind: "stop-job" as const,
+    jobId: "RUNJOB00000000000000B",
+    actionLabel: "stop job",
+    box: "",
+    typed: "",
+    field: "confirm" as const,
+    expect: "RUNJOB",
+  };
+
+  // MUTANT 17: the modal's rows are not charged at all, so the view paints more
+  // content lines than the terminal has and the frame overflows.
+  test("a modal under a view adds `1 + modalLines.length` rows", () => {
+    const plain = viewState();
+    const withModal = viewState({ modal: MODAL });
+    expect(viewChromeRows(withModal, SIZE_120x40) - viewChromeRows(plain, SIZE_120x40)).toBe(
+      1 + modalLines(withModal).length,
+    );
+  });
+
+  // MUTANT 21: the modal is charged as an `else if` against the status line,
+  // the way the TABLE frame's single shared slot works. Under a view the two
+  // are stacked, so a mismatched confirm — modal open AND a message set — must
+  // charge BOTH, or the frame runs two rows past the terminal.
+  test("with a message set as well, BOTH the modal and the status line are charged", () => {
+    const quiet = viewState();
+    const both = viewState({ modal: MODAL, message: 'confirm mismatch (expected "RUNJOB")' });
+    const messageOnly = viewState({ message: 'confirm mismatch (expected "RUNJOB")' });
+    // the status line's own 2 rows are still there on top of the modal's.
+    expect(viewChromeRows(both, SIZE_120x40)).toBe(
+      viewChromeRows(messageOnly, SIZE_120x40) + 1 + modalLines(both).length,
+    );
+    expect(viewChromeRows(both, SIZE_120x40)).toBe(viewChromeRows(quiet, SIZE_120x40) + 2 + 1 + modalLines(both).length);
   });
 });
