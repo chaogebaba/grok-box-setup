@@ -347,6 +347,43 @@ hatch below; do not hand-edit `managed.toml`.
   failure) yields `enabled=unknown` (annotated, never reported in-sync). You do
   NOT need to add a `[managed]` table to opt in — the default is on.
 
+### The managed subset (what D4 accepts)
+
+The D4 validator accepts exactly five tables and REFUSES a render containing any
+other, because a table boxup does not read is a push that changes nothing while
+reporting success:
+
+| Table | Keys | What |
+|---|---|---|
+| `[ssh]` | `password` | the box login the brain owns |
+| `[tailscale]` | `version` (NOT `tags`) | the client version to converge to |
+| `[update]` | `repo` | the box-setup source the box updates from |
+| `[managed]` | `enabled` | the box-side gate for this whole feature |
+| `[keepawake]` | `interval_min` ONLY | the keep-awake cadence in minutes; `0` is off |
+
+Unknown-but-well-formed keys are ALLOWED under the first four, so the brain can
+push a key a newer boxup understands and an older one ignores. `[keepawake]` is
+the one exception: its key set is CLOSED and any other key is refused. The
+forward-compat rule is safe when the worst case is an ignored line, and here it
+is not — this guard spends a model turn per fire, so a typo like
+`[keepawake] interval = 0` would parse, log as "unknown but allowed", leave
+`interval_min` unset, and let boxup fall back to its 20-minute DEFAULT. The
+feature would stay on, at cost, while the operator read a successful push.
+
+`[keepawake]` was added in 5.12.1 (A8) because the keep-awake experiment was
+ABANDONED on 2026-09-06 — 0.83-1.02 exercised box-days against a 1.15 control —
+and the way to switch it off everywhere at once is one line in
+`$FLEET_ETC/fleet.toml`:
+
+```toml
+[keepawake]
+interval_min = 0
+```
+
+Before 5.12.1 that line was refused as "table [keepawake] is outside the boxup
+config subset". A D4 refusal is rc 4 for EVERY box, so the single line meant to
+disable one feature would instead have stopped config pushes fleet-wide.
+
 ### Tags unsupported in Phase 2
 
 `[tailscale].tags` is **not** brain-managed: it is first-login-only on the box
@@ -1819,6 +1856,15 @@ ignored with an "Unknown key name" warning on every start and the unlimited-
 restart intent it was written for was never in force. That intent matters: the
 API refuses to start until the tailnet IPv4 resolves, so a slow tailscaled means
 several restarts at boot and a rate limit would park the unit in `failed`.
+
+**A8 — `[keepawake]` joins the managed subset.** The keep-awake experiment was
+abandoned, and the fleet-wide off switch is `[keepawake] interval_min = 0` in
+`$FLEET_ETC/fleet.toml`. D4 refused that table, and a D4 refusal is rc 4 for
+every box, so the line meant to disable one feature would have stopped config
+pushes fleet-wide. The table is now allowed with a CLOSED key set — see "The
+managed subset" above for why that one table is not forward-compatible.
+`keepawake.interval_min` also joins `KNOWN_KEYS` in the renderer, or every pass
+on the abandoned fleet would log a forward-compat notice for it every tick.
 
 **A7 — `/v1/jobs` timestamps (WIRE CHANGE).** `created_at`, `started_at`,
 `ended_at` and the per-box `job.started_at` on `GET /v1/fleet` and

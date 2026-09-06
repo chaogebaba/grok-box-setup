@@ -70,6 +70,49 @@ describe("T11 validate_managed (D4 refusals, tests:2456-2483)", () => {
   test("known + unknown-but-well-formed keys allowed", () => {
     expect(validateManaged("[ssh]\npassword = x\n[update]\nnewkey = y\n").ok).toBe(true);
   });
+  // ---- A8 (5.12.1): [keepawake] -------------------------------------------
+  //
+  // The keep-awake experiment was ABANDONED, and the way to switch it off on
+  // every box at once is one line in /etc/grok-fleet/fleet.toml. D4 used to
+  // refuse that line, and a D4 refusal is rc 4 for EVERY box — so the line meant
+  // to disable one feature would have stopped config pushes fleet-wide.
+  //
+  // The mutant these kill: drop "keepawake" from ALLOWED_TABLES, or drop the
+  // KEEPAWAKE_KEYS check.
+  test("A8: the fleet-wide abandon line is ACCEPTED", () => {
+    const r = validateManaged("[keepawake]\ninterval_min = 0\n");
+    expect(r).toEqual({ ok: true, reasons: [] });
+  });
+
+  test("A8: a non-zero cadence is accepted too (the table is not a kill switch)", () => {
+    expect(validateManaged("[keepawake]\ninterval_min = 20\n").ok).toBe(true);
+  });
+
+  test("A8: any OTHER key under [keepawake] is REFUSED, not forward-compat", () => {
+    // `interval` parses, would log as "unknown but allowed", leave interval_min
+    // unset, and boxup would fall back to its 20-minute default — the feature
+    // stays on, at a model turn per fire, while the operator reads a clean push.
+    const r = validateManaged("[keepawake]\ninterval = 0\n");
+    expect(r.ok).toBe(false);
+    expect(r.reasons).toEqual([
+      "refuse: [keepawake].interval is not a boxup keep-awake key (only interval_min)",
+    ]);
+    expect(validateManaged("[keepawake]\nfoo = 1\n").ok).toBe(false);
+  });
+
+  test("A8: the closed key set is scoped to [keepawake] alone", () => {
+    // Every other table keeps the forward-compat rule.
+    expect(validateManaged("[update]\ninterval = 0\n").ok).toBe(true);
+    // ...and a key named interval_min elsewhere is not special either way.
+    expect(validateManaged("[update]\ninterval_min = 0\n").ok).toBe(true);
+  });
+
+  test("A8: keepawake.interval_min is a KNOWN key, so it logs no forward-compat noise", () => {
+    // Otherwise every config pass on the abandoned fleet would print
+    // `unknown-but-well-formed keys ... keepawake.interval_min` every tick.
+    expect(unknownManagedKeys("[keepawake]\ninterval_min = 0\n")).toEqual([]);
+  });
+
   test("unknownManagedKeys lists forward-compat keys (known excluded)", () => {
     const keys = unknownManagedKeys("[ssh]\npassword = x\n[update]\nnewkey = y\nrepo = m\n");
     expect(keys).toEqual(["update.newkey"]);
