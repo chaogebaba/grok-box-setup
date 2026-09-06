@@ -8,7 +8,10 @@
 //   CHECK   OK/FAIL via `boxup check` over the tunnel ONLY when tunnel up (m13);
 //           `-` when the tunnel is down (never probed — m13 killer)
 //   VERSION status_line_sha(boxup status) — the SHA, only when tunnel up
-//   AUTHKEY <box>.expires field 2, else `-`
+//   AUTHKEY <box>.expires field 2, else `-`; `stale` (r2/R2(a)) when the store
+//           says the key was minted BEFORE the box's current binding — see
+//           keystale.ts for why the column must not print a date the engine
+//           would refuse
 // rc 0 always (main:3437).
 
 import type { Runner } from "../runner.ts";
@@ -20,6 +23,8 @@ import { parseDevices } from "../tailscale.ts";
 import { splitVersion } from "../status.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../remote.ts";
 import { mapLimit } from "../maplimit.ts";
+import { keyStale, STALE_AUTHKEY } from "../keystale.ts";
+import { openReadHandle } from "../store/membership.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
@@ -45,7 +50,8 @@ export interface FleetStatusRow {
   api: "online" | "offline" | "?";
   tunnel: "up" | "down";
   check: "OK" | "FAIL" | "-";
-  authkey: string; // date or "-"
+  /** r2: a date, `stale`, or `-`. */
+  authkey: string;
   version: string; // sha, or "-"
 }
 
@@ -62,6 +68,42 @@ export interface FleetStatusDeps {
   boxes?: string[];
   /** read <box>.expires field 2 (tests). */
   readExpires?: (box: string) => string | undefined;
+  /**
+   * r2/R2(a): does the store say this box's key predates its current binding?
+   * Injected for tests; the production default opens a READ-ONLY store handle
+   * once per invocation. Absent AND no store ⇒ never stale, which is the
+   * pre-r2 rendering.
+   */
+  keyStale?: (box: string) => boolean;
+}
+
+/**
+ * r2/R2(a): the production staleness reader — ONE read-only store handle for
+ * the whole table, closed before the rows are formatted. A handle per row would
+ * open eleven databases to answer eleven booleans.
+ *
+ * Any failure (no store, a pre-5.8.0 file, an unreadable database) yields "not
+ * stale" for every box, so the table renders exactly as it did before r2 rather
+ * than failing. This surface is read-only and must not be the thing that breaks
+ * when the store is unavailable.
+ */
+export function storeKeyStale(env: Env, boxes: string[]): (box: string) => boolean {
+  const stale = new Set<string>();
+  try {
+    const h = openReadHandle(env);
+    try {
+      // `h.state` IS a ReconcileStateApi, which carries both timestamp
+      // accessors; `h.store` being undefined means there is no store to ask.
+      if (h.store !== undefined) {
+        for (const b of boxes) if (keyStale(h.state, b)) stale.add(b);
+      }
+    } finally {
+      h.close();
+    }
+  } catch {
+    /* read-only surface: no store ⇒ no staleness claim */
+  }
+  return (box: string) => stale.has(box);
 }
 
 function pad(s: string, w: number): string {
@@ -108,6 +150,8 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
   const body = await deps.devices.body();
   const devMap = body !== undefined ? parseDevices(body, boxes) : undefined;
   const readExp = deps.readExpires ?? ((b: string) => fsReadExpiresField2(deps.env, b));
+  // r2/R2(a): resolved ONCE for the whole table, before the probes fan out.
+  const isStale = deps.keyStale ?? storeKeyStale(deps.env, boxes);
 
   // A5: probe up to PROBE_CONCURRENCY boxes at once. `mapLimit` writes results
   // by INDEX, so the rows come back in reconcile-target order (box-index order)
@@ -141,7 +185,10 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
       api,
       tunnel: up ? "up" : "down",
       check,
-      authkey: readExp(box) ?? "-",
+      // r2/R2(a): `stale` OUTRANKS the date. The recorded expiry of a key from
+      // a previous incarnation is a true fact about a key that is not on the
+      // box, and printing it is what made the 011 incident invisible.
+      authkey: isStale(box) ? STALE_AUTHKEY : (readExp(box) ?? "-"),
       version,
     };
   });

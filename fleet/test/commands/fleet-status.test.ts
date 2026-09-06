@@ -6,6 +6,7 @@ import { fleetStatusRows, formatFleetStatus, cmdFleetStatus } from "../../src/co
 import { testEnv } from "../helpers.ts";
 import { FakeRunner, isSs } from "../fake-runner.ts";
 import type { Runner, RunOpts, RunResult } from "../../src/runner.ts";
+import { keyStale } from "../../src/keystale.ts";
 
 const env = testEnv();
 
@@ -166,5 +167,89 @@ describe("A5 fleet-status probes concurrently", () => {
     // ssh pairs behind one ss probe, ~100 ms. The bound is loose on purpose —
     // this asserts the shape, not a stopwatch.
     expect(elapsed).toBeLessThan(200);
+  });
+});
+
+// ---- r2/R2(a): the AUTHKEY column must never print a date the engine refuses ---
+//
+// The r1 gate, on the production VPS:
+//
+//   grok-box-011   offline up      OK      2026-11-28   ed2834e
+//
+// The key behind that date was minted seven days before the box's binding, the
+// box had no secrets/ts-authkey at all, and mintWindowValid would refuse it the
+// moment it were asked. A column that reads as reassurance while the thing it
+// describes is dead is worse than a blank.
+//
+// Mutant: drop the `isStale(box) ?` branch in the row builder, or make
+// keyStale() return false unconditionally. Both put the date back and fail here.
+describe("A1/r2 — AUTHKEY prints `stale` for a key from a previous incarnation", () => {
+  const staleRows = (stale: string[]) =>
+    fleetStatusRows({
+      runner: runnerFor(),
+      env,
+      devices: { async body() { return DEVICES; } },
+      boxes: ["grok-box-3", "grok-box-5"],
+      readExpires: () => "2026-11-28",
+      keyStale: (b) => stale.includes(b),
+    });
+
+  test("a stale box shows `stale`, a healthy one still shows its date", async () => {
+    const rows = await staleRows(["grok-box-3"]);
+    expect(rows[0]!.authkey).toBe("stale");
+    expect(rows[1]!.authkey).toBe("2026-11-28");
+  });
+
+  test("`stale` outranks the recorded date, and reaches the rendered table", async () => {
+    const rows = await staleRows(["grok-box-3", "grok-box-5"]);
+    const out = formatFleetStatus(rows);
+    expect(out).not.toContain("2026-11-28");
+    expect(out.split("\n")[1]).toContain("stale");
+  });
+
+  test("no staleness reader ⇒ the pre-r2 rendering (a date), never a crash", async () => {
+    // The production reader fails open when there is no store: a read-only
+    // surface must not be the thing that breaks when the database is absent.
+    const rows = await fleetStatusRows({
+      runner: runnerFor(),
+      env,
+      devices: { async body() { return DEVICES; } },
+      boxes: ["grok-box-3"],
+      readExpires: () => "2026-11-28",
+    });
+    expect(rows[0]!.authkey).toBe("2026-11-28");
+  });
+
+  test("a box with no key at all is still `-`, not `stale`", async () => {
+    const rows = await fleetStatusRows({
+      runner: runnerFor(),
+      env,
+      devices: { async body() { return DEVICES; } },
+      boxes: ["grok-box-3"],
+      readExpires: () => undefined,
+      keyStale: () => false,
+    });
+    expect(rows[0]!.authkey).toBe("-");
+  });
+});
+
+// The column and the engine ask ONE function, so they cannot drift apart.
+describe("r2 — keyStale is the same predicate mintWindowValid uses", () => {
+  const times = (minted: number | undefined, bound: number | undefined) => ({
+    keyMintedAt: () => minted,
+    bindingAt: () => bound,
+  });
+
+  test("minted before the binding ⇒ stale", () => {
+    expect(keyStale(times(100, 200), "grok-box-3")).toBe(true);
+  });
+  test("minted at or after the binding ⇒ not stale", () => {
+    expect(keyStale(times(200, 200), "grok-box-3")).toBe(false);
+    expect(keyStale(times(300, 200), "grok-box-3")).toBe(false);
+  });
+  test("either instant unknown ⇒ NOT stale (a legacy-imported row must not light up)", () => {
+    expect(keyStale(times(undefined, 200), "grok-box-3")).toBe(false);
+    expect(keyStale(times(100, undefined), "grok-box-3")).toBe(false);
+    expect(keyStale(times(undefined, undefined), "grok-box-3")).toBe(false);
   });
 });

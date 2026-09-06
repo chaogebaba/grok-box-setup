@@ -7,7 +7,8 @@
 //  - tunnel up ⇒ `boxup check` (S2/G4): rc 0 gives status from one call; rc 1
 //    (unhealthy) triggers a SECOND `boxup status` ssh to fill VERSION/SHA (G4).
 //  - API: online/offline from the Tailscale devices endpoint; `?` when down.
-//  - AUTHKEY from `<box>.expires` field 2.
+//  - AUTHKEY from `<box>.expires` field 2, or `stale` (r2/R2(a)) when the store
+//    says the key was minted BEFORE the box's current binding. See keystale.ts.
 // inventory NEVER fails on target resolution (F7.2): unresolvable ⇒ TARGET/DRIFT
 // `?`, one warn, exit 0. `inventory.json` is RETIRED from 5.9.0 (state-store
 // D3/D7): the pass writes no file and renders from the store's `boxes` rows plus
@@ -24,6 +25,7 @@ import { CHECK_COMMAND, STATUS_COMMAND } from "./remote.ts";
 import { parseCheck, parseStatusLine, type BoxStatus } from "./status.ts";
 import { resolveTarget, type Target } from "./stage.ts";
 import { openReadHandle } from "./store/membership.ts";
+import { keyStale, STALE_AUTHKEY } from "./keystale.ts";
 import { readLatestMeta } from "./store/snapshots.ts";
 import { log } from "./log.ts";
 
@@ -54,6 +56,8 @@ export interface ProbeResult {
   status: BoxStatus | undefined;
   checkReason: string | undefined;
   expires: string | undefined;
+  /** r2/R2(a): the recorded key predates the box's current binding. */
+  keyStale?: boolean;
 }
 
 /** Probe a single box (tunnel → check → maybe status). */
@@ -144,6 +148,12 @@ export interface InventoryDeps {
    * default reads the store.
    */
   previousTs?: (env: Env) => string | null;
+  /**
+   * r2/R2(a): does the store say this box's key predates its current binding?
+   * Injected for tests; the production default reads the store once for the
+   * whole pass. Absent and storeless ⇒ never stale (the pre-r2 rendering).
+   */
+  keyStale?: (box: string) => boolean;
 }
 
 /**
@@ -221,9 +231,16 @@ export async function runInventory(boxes: string[], deps: InventoryDeps): Promis
 
   const apiMap = await api.probe(boxes);
 
+  // r2/R2(a): resolved ONCE for the whole pass, before the probes fan out.
+  const isStale = deps.keyStale ?? storeKeyStale(env, boxes);
+
   const rows = await mapLimit(boxes, env.FLEET_MAX_CONCURRENCY, async (box) => {
     const expires = await readExpires(env.FLEET_STATE, box);
-    return probeBox(runner, env, box, apiMap, expires);
+    const r = await probeBox(runner, env, box, apiMap, expires);
+    // Attached here rather than threaded through probeBox: staleness is a
+    // STORE fact and probeBox is the ssh prober, which has no business opening
+    // a database on any of its three return paths.
+    return { ...r, keyStale: isStale(box) };
   });
 
   const generatedAt = new Date().toISOString();
@@ -239,6 +256,7 @@ export async function runInventory(boxes: string[], deps: InventoryDeps): Promis
       boxTunnel: r.status?.boxTunnel ?? null,
       checkReason: r.checkReason ?? null,
       expires: r.expires ?? null,
+      keyStale: r.keyStale === true ? true : undefined,
       checkedAt: generatedAt,
       reason: r.tunnel === "down" ? "tunnel-down" : r.api === "?" ? "api-unavailable" : null,
     };
@@ -270,6 +288,30 @@ export function driftCell(row: ProbeResult, target: Target | null): string {
   if (target.version === "unknown") return "?";
   if (row.version === "?" || row.version === "-" || row.version === "unknown") return "?";
   return row.version === target.version ? "no" : "yes";
+}
+
+/**
+ * r2/R2(a): the production staleness reader — ONE read-only store handle for
+ * the whole pass. Any failure (no store yet, a pre-5.8.0 file, an unreadable
+ * database) yields "not stale" for every box, so `status` renders exactly as it
+ * did before r2 rather than failing: this is a read-only surface and must not be
+ * the thing that breaks when the store is unavailable (F7.2).
+ */
+export function storeKeyStale(env: Env, boxes: string[]): (box: string) => boolean {
+  const stale = new Set<string>();
+  try {
+    const h = openReadHandle(env);
+    try {
+      if (h.store !== undefined) {
+        for (const b of boxes) if (keyStale(h.state, b)) stale.add(b);
+      }
+    } finally {
+      h.close();
+    }
+  } catch {
+    /* no store ⇒ no staleness claim */
+  }
+  return (box: string) => stale.has(box);
 }
 
 /** Render the human table (F9: NAME API TUNNEL CHECK VERSION SHA TARGET DRIFT AUTHKEY). */
@@ -304,7 +346,8 @@ export function renderTable(res: InventoryResult): string {
         pad(r.sha, 10),
         pad(targetDisplay, 10),
         pad(drift, 6),
-        r.expires ?? "-",
+        // r2/R2(a): `stale` OUTRANKS the date — see keystale.ts.
+        r.keyStale === true ? STALE_AUTHKEY : (r.expires ?? "-"),
       ].join(" "),
     );
   }

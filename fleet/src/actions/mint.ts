@@ -27,6 +27,7 @@ import {
   BOX_AUTHKEY_EXPIRES,
   BOX_ROOT,
 } from "../reconcile/seed-remote.ts";
+import { keyStale } from "../keystale.ts";
 import { log } from "../log.ts";
 
 const SEED_TIMEOUT_MS = 20_000;
@@ -182,9 +183,12 @@ export function mintWindowValid(box: string, deps: { state: ReconcileStateApi; n
   if (deps.state.keyMetaId(idx, box) === undefined) return false;
   // A1(b): a key from BEFORE the current binding belongs to the previous
   // incarnation of this box. Not a valid window, whatever its expiry says.
-  const mintedAt = deps.state.keyMintedAt(box);
-  const boundAt = deps.state.bindingAt(box);
-  if (mintedAt !== undefined && boundAt !== undefined && mintedAt < boundAt) return false;
+  //
+  // r2/R2(a): the predicate lives in keystale.ts because the AUTHKEY column now
+  // asks the SAME question. The r1 gate found the column printing a date for a
+  // key this function would refuse; sharing one function is what makes that
+  // disagreement impossible rather than merely unlikely.
+  if (keyStale(deps.state, box)) return false;
   // daysUntil >= 7 (import here to avoid a cycle at module top)
   const t = /^\d{4}-\d{2}-\d{2}$/.test(d) ? Date.parse(`${d}T00:00:00Z`) : Date.parse(d);
   if (Number.isNaN(t)) return false;
