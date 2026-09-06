@@ -162,6 +162,22 @@ export interface ReconcileStateApi {
    * the box, whatever its expiry date says.
    */
   bindingAt(box: string): number | undefined;
+  /**
+   * 5.13.0 box-conditions D1a. Two facts persist across ticks (the tick is a
+   * fresh process every 5 minutes):
+   *
+   *   - the keep-awake failure STREAK — consecutive status-seen ticks with a
+   *     live keep-awake failure — which `condition:keepawake-failing` gates on
+   *     (raise at 3, reset on any status-seen tick that does not qualify);
+   *   - the highest `tickwedge` this brain has recorded, which
+   *     `condition:tick-wedged` compares against so it alerts on an INCREASE,
+   *     not on a non-zero level (the counter is sticky across ticks with no
+   *     reset in boxup, so a level rule would page forever for one old wedge).
+   */
+  bumpKeepawakeFail(box: string): number;
+  resetKeepawakeFail(box: string): void;
+  lastTickwedge(box: string): number;
+  setTickwedge(box: string, n: number): void;
   recordApiFailure(nowSec: number): { n: number; mins: number };
   resetApiFailure(): void;
   apiFails(): number;
@@ -241,6 +257,26 @@ export class ReconcileState implements ReconcileStateApi {
   }
   resetIncoherent(box: string): void {
     this.fs.remove(this.p(`${box}.incoherent`)); // reset = rm -f
+  }
+
+  // --- keepawake-fail streak + tickwedge high-water (5.13.0 D1a) ---
+  //
+  // `<box>.keepawake-fail` is byte-for-byte the shape of `.incoherent` above:
+  // `bumpCounter`/`fs.remove`, value = consecutive status-seen ticks with a
+  // live keep-awake failure. `<box>.tickwedge` is a bare integer (absent ⇒ 0),
+  // the highest tickwedge recorded. Neither marker has a bash counterpart, so
+  // the D2 byte-parity set is untouched, exactly like the alert-dedup files.
+  bumpKeepawakeFail(box: string): number {
+    return this.bumpCounter(`${box}.keepawake-fail`);
+  }
+  resetKeepawakeFail(box: string): void {
+    this.fs.remove(this.p(`${box}.keepawake-fail`)); // reset = rm -f
+  }
+  lastTickwedge(box: string): number {
+    return this.readCounter(`${box}.tickwedge`);
+  }
+  setTickwedge(box: string, n: number): void {
+    this.fs.write(this.p(`${box}.tickwedge`), `${n}\n`);
   }
 
   // --- asleep (main:3216-3243) — "<since> <last_alert>\n" ---
