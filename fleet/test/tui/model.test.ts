@@ -25,6 +25,7 @@ import {
   segText,
   tableLines,
 } from "../../src/tui/model.ts";
+import { tableWidth, showJobColumn } from "../../src/tui/model.ts";
 import type { SnapshotBox } from "../../src/history/schema.ts";
 import { MUTED, toneProps } from "../../src/tui/tone.ts";
 import { box, state, SIZE_80x24, SIZE_120x40 } from "./helpers.ts";
@@ -514,5 +515,38 @@ describe("the detail card uses the state's zone, and --utc keeps the raw ISO", (
       .map((l) => l.text)
       .join("\n");
     expect(noZone).toContain("asleep since Mar 20 09:46 UTC (2h ago)");
+  });
+});
+
+
+// --- jobs J12 (D1): the JOB column width rule -------------------------------
+describe("D1 — the JOB column width rule (66 <= tableWidth(110))", () => {
+  // The blueprint's core arithmetic: with JOB shown the widths through EXPIRY
+  // sum to 66 (glyph 2 + name 14 + who 12 + JOB 9 + ver 8 + drift 8 + config 8
+  // + expiry 5), and 66 = Math.floor(110 * 0.6) = tableWidth({cols:110}). 110 is
+  // therefore the first width whose table pane holds the whole row through
+  // EXPIRY — which is exactly why showJobColumn's floor is 110.
+  test("tableWidth({cols:110}) is 66 — the row-through-EXPIRY budget with JOB", () => {
+    expect(tableWidth({ cols: 110, rows: 40 })).toBe(66);
+  });
+
+  test("showJobColumn turns on at exactly 110, off at 109", () => {
+    expect(showJobColumn({ cols: 109, rows: 40 })).toBe(false);
+    expect(showJobColumn({ cols: 110, rows: 40 })).toBe(true);
+  });
+
+  test("at 110 the header carries WHO, JOB, VER … EXP in order, none clipped", () => {
+    const head = tableLines(state({ boxes: [box("grok-box-1")] }), { cols: 110, rows: 40 })[0]!.text;
+    const iWho = head.indexOf("WHO");
+    const iJob = head.indexOf("JOB");
+    const iVer = head.indexOf("VER");
+    const iExp = head.indexOf("EXP");
+    // all present …
+    expect(iWho).toBeGreaterThanOrEqual(0);
+    expect(iJob).toBeGreaterThan(iWho);
+    expect(iVer).toBeGreaterThan(iJob);
+    // … and EXP still fits (the width rule's whole point) within tableWidth(110)
+    expect(iExp).toBeGreaterThan(iVer);
+    expect(iExp + "EXP".length).toBeLessThanOrEqual(tableWidth({ cols: 110, rows: 40 }));
   });
 });

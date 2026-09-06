@@ -1,7 +1,7 @@
 // T7 — config precedence (D5, S5, S6) and TOML strictness.
 
 import { test, expect, describe } from "bun:test";
-import { parseConfig, resolveRollout, configCanary, ConfigError } from "../src/config.ts";
+import { parseConfig, resolveRollout, configCanary, resolveJobRetentionDays, ConfigError } from "../src/config.ts";
 import { setLogSink } from "../src/log.ts";
 
 describe("T7 config precedence", () => {
@@ -109,5 +109,61 @@ describe("T7 config precedence", () => {
     const cfg = parseConfig("", "/x");
     expect(configCanary(cfg)).toBeUndefined();
     expect(resolveRollout(cfg, {}).canary).toBe("grok-box-008");
+  });
+});
+
+
+// --- jobs J12 (D3): [jobs] retain_days resolution --------------------------
+describe("D3 — [jobs] retain_days", () => {
+  test("absent ⇒ 30 (the default)", () => {
+    expect(resolveJobRetentionDays(parseConfig("", "/x"))).toBe(30);
+    // present file, no [jobs] table at all
+    expect(resolveJobRetentionDays(parseConfig(`[rollout]\ntarget = "main"\n`, "/x"))).toBe(30);
+  });
+
+  test("0 ⇒ 0 (pruning DISABLED — asNonNegInt accepts 0, asPosInt could not)", () => {
+    expect(resolveJobRetentionDays(parseConfig(`[jobs]\nretain_days = 0\n`, "/x"))).toBe(0);
+  });
+
+  test("7 ⇒ 7 (a plain positive integer)", () => {
+    expect(resolveJobRetentionDays(parseConfig(`[jobs]\nretain_days = 7\n`, "/x"))).toBe(7);
+  });
+
+  test('the digit-string "30" is ACCEPTED as 30', () => {
+    expect(resolveJobRetentionDays(parseConfig(`[jobs]\nretain_days = "30"\n`, "/x"))).toBe(30);
+  });
+
+  // MUTANT: retain_days = 0 prunes everything — pinned by the 0⇒0 case above.
+  // The house rule: an INVALID value FALLS BACK to 30 with NO throw and NO log.
+  test("invalid values fall back to 30 with no throw: -1, \"-1\", \"abc\", 1.5, true", () => {
+    const logs: string[] = [];
+    const prev = setLogSink((l) => logs.push(l));
+    try {
+      expect(resolveJobRetentionDays(parseConfig(`[jobs]\nretain_days = -1\n`, "/x"))).toBe(30);
+      expect(resolveJobRetentionDays(parseConfig(`[jobs]\nretain_days = "-1"\n`, "/x"))).toBe(30);
+      expect(resolveJobRetentionDays(parseConfig(`[jobs]\nretain_days = "abc"\n`, "/x"))).toBe(30);
+      expect(resolveJobRetentionDays(parseConfig(`[jobs]\nretain_days = 1.5\n`, "/x"))).toBe(30);
+      expect(resolveJobRetentionDays(parseConfig(`[jobs]\nretain_days = true\n`, "/x"))).toBe(30);
+      // the fallback is silent — no "retain_days" log line for the invalid values
+      expect(logs.some((l) => l.includes("retain_days"))).toBe(false);
+    } finally {
+      setLogSink(prev);
+    }
+  });
+
+  test("an unknown [jobs] key logs ONE info line and is NOT fatal", () => {
+    const logs: string[] = [];
+    const prev = setLogSink((l) => logs.push(l));
+    try {
+      const cfg = parseConfig(`[jobs]\nretain_days = 30\nbogus = "x"\n`, "/x");
+      expect(cfg.present).toBe(true);
+      expect(logs.filter((l) => l.includes("[jobs].bogus")).length).toBe(1);
+      // the KNOWN key does NOT log
+      expect(logs.some((l) => l.includes("[jobs].retain_days"))).toBe(false);
+      // and resolution still works
+      expect(resolveJobRetentionDays(cfg)).toBe(30);
+    } finally {
+      setLogSink(prev);
+    }
   });
 });

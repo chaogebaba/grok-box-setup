@@ -1375,7 +1375,7 @@ export function jobRows(jobs: Job[], nowMs: number): string[] {
     `${pad("PURPOSE", JOB_COLS.purpose)}`;
   const rank = (s: string): number => (s === "starting" || s === "running" ? 0 : 1);
   const sorted = [...jobs].sort(
-    (a, b) => rank(a.state) - rank(b.state) || tsDesc(a.created_at) - tsDesc(b.created_at),
+    (a, b) => rank(a.state) - rank(b.state) || tsDesc(b.created_at) - tsDesc(a.created_at),
   );
   const rows = [head];
   for (const j of sorted) {

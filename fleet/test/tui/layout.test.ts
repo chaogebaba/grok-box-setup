@@ -166,3 +166,49 @@ describe("the table's row budget", () => {
     expect(showDetail(s, { cols: 100, rows: 40 })).toBe(true);
   });
 });
+
+// --- jobs J12 (A20): JOB and COND are OMITTED (never clipped) by width -------
+describe("A20 — the painted header gains JOB and drops COND by width", () => {
+  const thirty = Array.from({ length: 30 }, (_, i) => box(`grok-box-${String(i + 1).padStart(3, "0")}`));
+  // The A26/A27 worked values, read straight off the PAINTED header the view
+  // region emits (tableViewLines[0]), which is the evidence the goldens capture:
+  //   99  ⇒ no JOB (below 110), COND SHOWN  (99−57 = 42 ≥ 8)
+  //   100 ⇒ no JOB, no COND     (60−57 = 3  < 8; Detail pane clips to 60)
+  //   110 ⇒ JOB shown, no COND  (66−66 = 0  < 8)
+  //   120 ⇒ JOB shown, no COND  (72−66 = 6  < 8)
+  //   123 ⇒ JOB shown, no COND  (73−66 = 7  < 8)  ← COND_MIN_VISIBLE boundary
+  //   124 ⇒ JOB shown, COND back (74−66 = 8 ≥ 8)  ← the pair that pins it = 8
+  //   137 ⇒ JOB shown, COND shown (82−66 = 16 ≥ 8)
+  const s = state({ boxes: thirty });
+  const head = (cols: number): string => tableViewLines(s, { cols, rows: 40 })[0]!.text;
+
+  test("100 columns: neither COND nor JOB (EXPIRY intact, proven separately)", () => {
+    expect(head(100)).not.toContain("JOB");
+    expect(head(100)).not.toContain("COND");
+  });
+
+  test("110 columns: JOB present, COND omitted", () => {
+    expect(head(110)).toContain("JOB");
+    expect(head(110)).not.toContain("COND");
+  });
+
+  test("120 and 123 columns: JOB present, COND still omitted", () => {
+    expect(head(120)).toContain("JOB");
+    expect(head(120)).not.toContain("COND");
+    expect(head(123)).toContain("JOB");
+    expect(head(123)).not.toContain("COND");
+  });
+
+  // MUTANT: COND_MIN_VISIBLE is 7 instead of 8 — the 123/124 pair must move.
+  test("124 columns: COND returns (the 123/124 pair pins COND_MIN_VISIBLE = 8)", () => {
+    expect(head(123)).not.toContain("COND");
+    expect(head(124)).toContain("COND");
+    expect(head(124)).toContain("JOB");
+  });
+
+  test("137 columns: both JOB and COND present", () => {
+    expect(head(137)).toContain("JOB");
+    expect(head(137)).toContain("COND");
+  });
+});
+

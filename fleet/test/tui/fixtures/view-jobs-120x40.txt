@@ -2,10 +2,10 @@ grokfleet 8 boxes  ● 5  ◆ 1  ✖ 1  ☾ 1 · free 5 · ▶ 3 jobs  apply off
 
 ── jobs ──  rows 1–5 of 5                                                                                               
 JOB_ID       BOX           KIND    STATE     RC   AGE    PURPOSE               
-SVCJOB000000 grok-box-002  service running   -    2d3h   keep-awake            
 JOBID0000000 grok-box-001  run     running   -    12m    gate-5.14.0           
-FAILJOB00000 grok-box-007  run     failed    1    3h00   a purpose long enoug… 
+SVCJOB000000 grok-box-002  service running   -    2d3h   keep-awake            
 DONEJOB00000 grok-box-004  run     done      0    2h00   smoke                 
+FAILJOB00000 grok-box-007  run     failed    1    3h00   a purpose long enoug… 
 
 ↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs                         
 P push  M rotate  R rename  T check  C reconcile                                                                        
