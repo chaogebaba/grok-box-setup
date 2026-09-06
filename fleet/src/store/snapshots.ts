@@ -99,10 +99,18 @@ export function writeSnapshot(store: Store, opts: WriteSnapshotOptions): void {
       );
 
     const insBox = store.db.query(
-      `INSERT INTO snapshot_boxes(tick,name,tunnel,"check",ver,drift,config,checkfail,asleep,expiry_days,observed)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO snapshot_boxes(tick,name,tunnel,"check",ver,drift,config,checkfail,asleep,expiry_days,observed,report)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
     );
     for (const b of line.boxes) {
+      // D3b: one JSON blob carries BOTH `report` and `conditions` (conditions is
+      // derivable, so it gets no column of its own). NULL when the box was not
+      // status-seen — the reader tolerates NULL, malformed JSON, and a v4 store
+      // with no `report` column at all.
+      const reportJson =
+        b.report === undefined && b.conditions === undefined
+          ? null
+          : JSON.stringify({ report: b.report, conditions: b.conditions });
       insBox.run(
         tick,
         b.name,
@@ -115,6 +123,7 @@ export function writeSnapshot(store: Store, opts: WriteSnapshotOptions): void {
         b.asleep ? 1 : 0,
         b.expiry_days,
         opts.observed.get(b.name) ?? "api_unknown",
+        reportJson,
       );
     }
 
@@ -151,15 +160,23 @@ interface BoxRow {
   asleep: number;
   expiry_days: number | null;
   observed: string;
+  /** D3b: the JSON blob `{report, conditions}`, or null/absent (v4 store). */
+  report: string | null;
 }
 
 /** Rebuild the 5.8.0 `SnapshotLine` for one parent row (`target_*` excluded). */
 function toSnapshotLine(store: Store, row: SnapshotRow): SnapshotLine {
+  // D3b: `report` is read ONLY on a v5+ store. Below v5 the column does not
+  // exist and selecting it throws `no such column`, and a v4 store is exactly
+  // what a read-only serve handle sees between installing 5.13.0 and the first
+  // write-mode tick (openReadHandle does not migrate). Gate the column out on
+  // userVersion() < 5, the same shape handleHistory/latestSnapshot already use.
+  const hasReport = store.userVersion() >= 5;
+  const cols = hasReport
+    ? `name, tunnel, "check" AS "check", ver, drift, config, checkfail, asleep, expiry_days, observed, report`
+    : `name, tunnel, "check" AS "check", ver, drift, config, checkfail, asleep, expiry_days, observed, NULL AS report`;
   const boxes = store.db
-    .query(
-      `SELECT name, tunnel, "check" AS "check", ver, drift, config, checkfail, asleep, expiry_days, observed
-       FROM snapshot_boxes WHERE tick = ? ORDER BY rowid`,
-    )
+    .query(`SELECT ${cols} FROM snapshot_boxes WHERE tick = ? ORDER BY rowid`)
     .all(row.tick) as BoxRow[];
 
   const line: SnapshotLine = {
@@ -167,8 +184,8 @@ function toSnapshotLine(store: Store, row: SnapshotRow): SnapshotLine {
     ts: isoSec(row.ts),
     apply: row.apply !== 0,
     canary: row.canary,
-    boxes: boxes.map(
-      (b): SnapshotBox => ({
+    boxes: boxes.map((b): SnapshotBox => {
+      const sb: SnapshotBox = {
         name: b.name,
         tunnel: b.tunnel as SnapshotBox["tunnel"],
         check: b.check as SnapshotBox["check"],
@@ -178,8 +195,21 @@ function toSnapshotLine(store: Store, row: SnapshotRow): SnapshotLine {
         checkfail: b.checkfail !== 0,
         asleep: b.asleep !== 0,
         expiry_days: b.expiry_days,
-      }),
-    ),
+      };
+      // D3b: parse the blob, TOLERATING NULL and malformed JSON — a bad blob
+      // reads back as absent, never throws. `conditions` derives from the blob,
+      // so it has no column of its own.
+      if (b.report !== null) {
+        try {
+          const parsed = JSON.parse(b.report) as { report?: SnapshotBox["report"]; conditions?: string[] };
+          if (parsed.report !== undefined) sb.report = parsed.report;
+          if (parsed.conditions !== undefined) sb.conditions = parsed.conditions;
+        } catch {
+          /* malformed blob ⇒ absent, the safe direction */
+        }
+      }
+      return sb;
+    }),
   };
 
   // D7: the `discover` block is OPTIONAL and ABSENT when the tick ran no

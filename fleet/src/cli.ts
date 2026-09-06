@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.12.1"; // 5.12.1: audit fixes — stale key after re-image, the API online column, tick log spam, release-check.
+const PKG_VERSION = "5.13.0"; // 5.13.0: box-reported conditions become brain alerts and a COND column.
 
 async function gitShaFromGit(): Promise<string> {
   try {
