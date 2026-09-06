@@ -123,12 +123,32 @@ tick watches for that.
 | `DISK_GUARD_TRUNCATE` | `/tmp/sand-host.log` | whitespace-separated allowlist of paths the guard may truncate. Nothing outside it is ever touched, and nothing is ever deleted. |
 | `BOXUP_DISK_TRUNCATE_MIN_BYTES` | `1073741824` (1 GiB) | only a file **larger** than this is truncated. A small log is not what fills a 100 GB overlay, and truncating it would only destroy evidence. |
 | `BOXUP_DISK_INTERVAL` | `60` | seconds between checks. The tick is 15s; four `df` calls a minute buy nothing. |
+| `BOXUP_SANDLOG_MAX_BYTES` | `4294967296` (4 GiB) | a **size** cap, independent of disk level: a file on `DISK_GUARD_TRUNCATE` larger than this is truncated on the guard's normal cadence whatever `df` says. `0`, empty, or any non-numeric value disables it. |
 
 A symlink named on the allowlist is refused outright, never followed, whatever
 its size — the refusal sits above the size floor precisely so nothing else can
 stand in for it.
 
-All five knobs survive `boxup`'s privilege escalation: a non-root `boxup once`
+**The size cap (5.6.1).** Reclaiming only at 90 % turned out to be too late.
+The sandbox host never rotates `/tmp/sand-host.log`, and a fleet audit found
+42.2 GB of it on 008 and 35.4 GB on 004 while root sat *below* the fail
+threshold — about 105 GB of a 126 GB overlay carrying nothing anyone would
+read, and on 2026-09-02 the same file took 006 to 100 % and broke a rollout.
+So `BOXUP_SANDLOG_MAX_BYTES` truncates by **size**, on the same 60 s cadence,
+at any disk level including `ok`. It reuses the one mutator and therefore every
+gate above it: allowlist, symlink refusal, regular-file check, floor, and the
+owner switch. Nothing gains new authority.
+
+This changes what `DISK_GUARD_TRUNCATE` means. It is now "truncated at 90 %
+pressure **and** unconditionally whenever above the cap" — putting a path on
+that list is a stronger statement than it was before 5.6.1. The cap applies to
+that list **only**. It never walks the built-in job-log list: job logs already
+carry their own 64 MiB per-job bound, and a second cap sixty-four times larger
+would only make it unclear which one applies. A cap truncation logs under its
+own prefix (`sandlog-cap: truncated <path> (<bytes> B, root <pct>%)`) so an
+operator can tell a routine reclaim from a disk emergency at a glance.
+
+All six knobs survive `boxup`'s privilege escalation: a non-root `boxup once`
 re-execs itself under `sudo`, and they are on the forwarded list, so
 `BOXUP_DISK_FAIL_PCT=1 boxup once` from an ordinary shell behaves as written.
 
