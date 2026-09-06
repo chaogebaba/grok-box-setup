@@ -2,11 +2,15 @@
 // down) + API '?' on failure (D14).
 
 import { describe, test, expect } from "bun:test";
-import { fleetStatusRows, formatFleetStatus, cmdFleetStatus } from "../../src/commands/fleet-status.ts";
+import { fleetStatusRows, formatFleetStatus, cmdFleetStatus, storeKeyStale } from "../../src/commands/fleet-status.ts";
 import { testEnv } from "../helpers.ts";
 import { FakeRunner, isSs } from "../fake-runner.ts";
 import type { Runner, RunOpts, RunResult } from "../../src/runner.ts";
-import { keyStale } from "../../src/keystale.ts";
+import { keyStale, STALE_AUTHKEY } from "../../src/keystale.ts";
+import { openStore, storePath } from "../../src/store/db.ts";
+import { StoreState } from "../../src/store/state.ts";
+import { suiteScratch, cleanup } from "../store/helpers.ts";
+import { afterAll } from "bun:test";
 
 const env = testEnv();
 
@@ -170,7 +174,7 @@ describe("A5 fleet-status probes concurrently", () => {
   });
 });
 
-// ---- r2/R2(a): the AUTHKEY column must never print a date the engine refuses ---
+// ---- r2/R2(a): the AUTHKEY column has THREE states, and they are distinct ----
 //
 // The r1 gate, on the production VPS:
 //
@@ -179,57 +183,103 @@ describe("A5 fleet-status probes concurrently", () => {
 // The key behind that date was minted seven days before the box's binding, the
 // box had no secrets/ts-authkey at all, and mintWindowValid would refuse it the
 // moment it were asked. A column that reads as reassurance while the thing it
-// describes is dead is worse than a blank.
+// describes is dead is worse than a blank one.
 //
-// Mutant: drop the `isStale(box) ?` branch in the row builder, or make
-// keyStale() return false unconditionally. Both put the date back and fail here.
-describe("A1/r2 — AUTHKEY prints `stale` for a key from a previous incarnation", () => {
-  const staleRows = (stale: string[]) =>
-    fleetStatusRows({
+// The column already printed `-` for an absent expiry, and the production reader
+// (`fsReadExpiresField2`) collapses EVERY failure to undefined — file missing,
+// file unreadable, field 2 unparsable — so `-` already carries three different
+// meanings. `stale` must therefore be distinguishable from `-` as well as from a
+// date, or it just joins the pile of things `-` might mean. These cases assert
+// the three states SEPARATELY, and assert the distinctness itself.
+//
+// Mutants: drop the `isStale(box) ?` branch in the row builder, or make
+// keyStale() return false unconditionally. Both put the date back.
+describe("A1/r2 — the AUTHKEY column's three states", () => {
+  /** date / stale / absent, in one call, so the three cannot be confused. */
+  function threeStateRows() {
+    return fleetStatusRows({
       runner: runnerFor(),
       env,
       devices: { async body() { return DEVICES; } },
-      boxes: ["grok-box-3", "grok-box-5"],
-      readExpires: () => "2026-11-28",
-      keyStale: (b) => stale.includes(b),
+      boxes: ["grok-box-3", "grok-box-5", "grok-box-2"],
+      // 3 has a date, 5 has a date the engine refuses, 2 has nothing recorded.
+      readExpires: (b) => (b === "grok-box-2" ? undefined : "2026-11-28"),
+      keyStale: (b) => b === "grok-box-5",
     });
+  }
 
-  test("a stale box shows `stale`, a healthy one still shows its date", async () => {
-    const rows = await staleRows(["grok-box-3"]);
-    expect(rows[0]!.authkey).toBe("stale");
-    expect(rows[1]!.authkey).toBe("2026-11-28");
+  test("all three states in ONE table, asserted separately", async () => {
+    const rows = await threeStateRows();
+    expect(rows.map((r) => r.authkey)).toEqual(["2026-11-28", "stale", "-"]);
   });
 
-  test("`stale` outranks the recorded date, and reaches the rendered table", async () => {
-    const rows = await staleRows(["grok-box-3", "grok-box-5"]);
-    const out = formatFleetStatus(rows);
-    expect(out).not.toContain("2026-11-28");
-    expect(out.split("\n")[1]).toContain("stale");
+  test("the three states are three DISTINCT strings", async () => {
+    const rows = await threeStateRows();
+    const [date, stale, none] = rows.map((r) => r.authkey);
+    expect(new Set([date, stale, none]).size).toBe(3);
+    // `stale` is neither the empty marker nor anything a date parser accepts —
+    // a reader scanning the column can tell the three apart without context.
+    expect(stale).toBe(STALE_AUTHKEY);
+    expect(stale).not.toBe("-");
+    expect(stale).not.toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(Number.isNaN(Date.parse(stale!))).toBe(true);
   });
 
-  test("no staleness reader ⇒ the pre-r2 rendering (a date), never a crash", async () => {
-    // The production reader fails open when there is no store: a read-only
-    // surface must not be the thing that breaks when the database is absent.
+  test("all three survive into the rendered table, one per row", async () => {
+    const lines = formatFleetStatus(await threeStateRows()).split("\n");
+    expect(lines[1]).toContain("2026-11-28");
+    expect(lines[2]).toContain("stale");
+    expect(lines[2]).not.toContain("2026-11-28");
+    // The absent row carries neither a date nor the stale marker.
+    expect(lines[3]).not.toContain("2026-11-28");
+    expect(lines[3]).not.toContain("stale");
+  });
+
+  test("a PROBE FAILURE reads `-`, never `stale`", async () => {
+    // `fsReadExpiresField2` catches everything and returns undefined, so an
+    // unreadable or unparsable `<box>.expires` is indistinguishable from an
+    // absent one at this seam — all three render `-`. What must never happen is
+    // a failed read being reported as `stale`: staleness is a claim about a key
+    // the store KNOWS about, and "I could not read the file" is not that claim.
     const rows = await fleetStatusRows({
       runner: runnerFor(),
       env,
       devices: { async body() { return DEVICES; } },
       boxes: ["grok-box-3"],
-      readExpires: () => "2026-11-28",
+      readExpires: () => undefined, // the reader's only failure signal
+      keyStale: () => false,
     });
-    expect(rows[0]!.authkey).toBe("2026-11-28");
+    expect(rows[0]!.authkey).toBe("-");
+    expect(rows[0]!.authkey).not.toBe(STALE_AUTHKEY);
   });
 
-  test("a box with no key at all is still `-`, not `stale`", async () => {
+  test("a STALE box with no recorded expiry still reads `stale`, not `-`", async () => {
+    // The two conditions coincide in exactly the case that matters: a re-imaged
+    // box whose export was already cleared. `stale` has to outrank the empty
+    // marker as well as the date, or the most informative state is the one that
+    // disappears.
     const rows = await fleetStatusRows({
       runner: runnerFor(),
       env,
       devices: { async body() { return DEVICES; } },
       boxes: ["grok-box-3"],
       readExpires: () => undefined,
-      keyStale: () => false,
+      keyStale: () => true,
     });
-    expect(rows[0]!.authkey).toBe("-");
+    expect(rows[0]!.authkey).toBe("stale");
+  });
+
+  test("no staleness reader ⇒ the pre-r2 rendering, never a crash", async () => {
+    // The production reader fails open when there is no store: a read-only
+    // surface must not be the thing that breaks when the database is absent.
+    const rows = await fleetStatusRows({
+      runner: runnerFor(),
+      env,
+      devices: { async body() { return DEVICES; } },
+      boxes: ["grok-box-3", "grok-box-2"],
+      readExpires: (b) => (b === "grok-box-2" ? undefined : "2026-11-28"),
+    });
+    expect(rows.map((r) => r.authkey)).toEqual(["2026-11-28", "-"]);
   });
 });
 
@@ -251,5 +301,78 @@ describe("r2 — keyStale is the same predicate mintWindowValid uses", () => {
     expect(keyStale(times(undefined, 200), "grok-box-3")).toBe(false);
     expect(keyStale(times(100, undefined), "grok-box-3")).toBe(false);
     expect(keyStale(times(undefined, undefined), "grok-box-3")).toBe(false);
+  });
+});
+
+// ---- r2: the PRODUCTION wiring, store row to boolean -------------------------
+//
+// Every rendering case above injects `keyStale`, which is right for testing the
+// column but leaves the seam that connects the two untested — and a seam that
+// silently answers "false for everything" would put the dates back with every
+// rendering test still green. This drives `storeKeyStale` against a REAL store.
+const WSCRATCH = suiteScratch("fleet-status-store");
+afterAll(() => WSCRATCH.clean());
+
+describe("r2 — storeKeyStale reads the real store", () => {
+  const DAY = 86_400;
+  const T = 1_780_000_000;
+
+  function seed(prefix: string, rows: Array<{ box: string; idx: number; minted: number; bound: number }>) {
+    const dir = WSCRATCH.dir(prefix);
+    const state = `${dir}/state`;
+    const store = openStore({ path: storePath(state), dir: state, now: () => T });
+    const st = new StoreState(store);
+    for (const r of rows) {
+      st.recordEnrolled(r.box, 20000 + r.idx, `AAAAKEY${r.idx}`);
+      st.recordKey(r.box, { keyId: `k${r.idx}`, expiresRaw: "2026-11-28T00:00:00Z", expiresDate: "2026-11-28" });
+      store.db.query("UPDATE boxes SET enrolled_at=? WHERE name=?").run(r.bound, r.box);
+      store.db
+        .query("UPDATE box_keys SET minted_at=? WHERE box_id=(SELECT box_id FROM boxes WHERE name=?)")
+        .run(r.minted, r.box);
+    }
+    store.close();
+    return { dir, state };
+  }
+
+  test("a key minted before the binding is stale; one minted after is not", () => {
+    const f = seed("mixed", [
+      { box: "grok-box-011", idx: 11, minted: T, bound: T + 7 * DAY }, // re-imaged
+      { box: "grok-box-008", idx: 8, minted: T + 7 * DAY, bound: T }, // healthy
+    ]);
+    try {
+      const isStale = storeKeyStale(testEnv({ FLEET_STATE: f.state }), ["grok-box-011", "grok-box-008"]);
+      expect(isStale("grok-box-011")).toBe(true);
+      expect(isStale("grok-box-008")).toBe(false);
+      // A box that was never asked about is not claimed either way.
+      expect(isStale("grok-box-099")).toBe(false);
+    } finally {
+      cleanup(f.dir);
+    }
+  });
+
+  test("no store at all ⇒ nothing is stale, and nothing throws", () => {
+    // The read-only surface must render rather than fail when the database is
+    // absent — the window before the first tick creates it (F7.2).
+    const isStale = storeKeyStale(testEnv({ FLEET_STATE: "/nonexistent/fleet-state" }), ["grok-box-011"]);
+    expect(isStale("grok-box-011")).toBe(false);
+  });
+
+  test("end to end: the store row alone turns the column to `stale`", async () => {
+    // No injected keyStale anywhere — the seam, the predicate and the renderer
+    // together, which is the combination production runs.
+    const f = seed("e2e", [{ box: "grok-box-011", idx: 11, minted: T, bound: T + 7 * DAY }]);
+    try {
+      const e = testEnv({ FLEET_STATE: f.state });
+      const rows = await fleetStatusRows({
+        runner: runnerFor(),
+        env: e,
+        devices: { async body() { return undefined; } },
+        boxes: ["grok-box-011"],
+        readExpires: () => "2026-11-28",
+      });
+      expect(rows[0]!.authkey).toBe("stale");
+    } finally {
+      cleanup(f.dir);
+    }
   });
 });

@@ -221,4 +221,39 @@ describe("A1/r2 — the status AUTHKEY column marks a stale key", () => {
     const res = await inv([]);
     expect(res.inventory.boxes["grok-box-008"]!.keyStale).toBeUndefined();
   });
+
+  test("the three states are distinct here too: date / stale / -", async () => {
+    // `status` renders the same three-valued column as `fleet-status`, and the
+    // empty marker already means "absent, unreadable or unparsable". `stale`
+    // must be tellable from all of that.
+    const mk = async (expires: string | undefined, stale: boolean) => {
+      const r = new FakeRunner(
+        sshResponder({
+          ssListens: [20008],
+          onCheck: () => ({ code: 0, stdout: "check=OK " + FULL_STATUS_LINE }),
+        }),
+      );
+      const res = await runInventory(["grok-box-008"], {
+        runner: r,
+        env: testEnv(),
+        rollout: testRollout(),
+        api: { async probe() { return undefined; } } as DevicesApi,
+        readExpires: async () => expires,
+        previousTs: () => null,
+        keyStale: () => stale,
+      });
+      // the AUTHKEY cell is the LAST column of the row line
+      return renderTable(res).split("\n")[2]!.trim().split(/\s+/).pop();
+    };
+
+    const date = await mk("2026-11-28", false);
+    const stale = await mk("2026-11-28", true);
+    const none = await mk(undefined, false);
+    expect([date, stale, none]).toEqual(["2026-11-28", "stale", "-"]);
+    expect(new Set([date, stale, none]).size).toBe(3);
+
+    // A probe failure reads `-`, never `stale`; a stale box with nothing
+    // recorded still reads `stale`.
+    expect(await mk(undefined, true)).toBe("stale");
+  });
 });
