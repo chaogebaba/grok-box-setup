@@ -65,6 +65,8 @@ interface Opts {
   statusLine?: string;
   /** the re-probe (STATUS_COMMAND) rc, for the unhealthy branch. default 0. */
   reprobeCode?: number;
+  /** override the re-probe's stdout (so rc≠0 can carry a REAL status line). */
+  reprobeStdout?: string;
   state?: ReconcileState;
   notes?: Array<[string, string]>;
   lines?: SnapshotLine[];
@@ -86,8 +88,13 @@ function tickDeps(o: Opts): { deps: ReconcileDeps; state: ReconcileState } {
       return result({ code: 1, stdout: "check=FAIL reason=disk" });
     }
     if (cmd === STATUS_COMMAND) {
-      // the unhealthy re-probe
-      return result({ code: o.reprobeCode ?? 0, stdout: (o.reprobeCode ?? 0) === 0 ? line : "" });
+      // The unhealthy re-probe. `reprobeStdout` lets a test send a NON-empty,
+      // syntactically valid status line together with a non-zero rc — the case
+      // that isolates the `st.code === 0` half of the D1b guard from the `v=`
+      // half. Default keeps the old shape (real line on rc 0, empty otherwise).
+      const stdout =
+        o.reprobeStdout !== undefined ? o.reprobeStdout : (o.reprobeCode ?? 0) === 0 ? line : "";
+      return result({ code: o.reprobeCode ?? 0, stdout });
     }
     return result({ code: 0, stdout: "cur=X want=X support=yes enabled=true" });
   });
@@ -158,6 +165,33 @@ describe("D1b — statusSeen: a box the brain could not READ raises/clears nothi
     expect("report" in b).toBe(false);
     expect("conditions" in b).toBe(false);
     // no condition alert fired, and no tickwedge record was written (no counter moved)
+    expect(notes.some(([, m]) => m.includes("condition:"))).toBe(false);
+    expect(state.lastTickwedge(BOX)).toBeNull();
+  });
+
+  test("rc≠0 re-probe with a VALID v= line is still NOT status-seen — isolates the st.code guard (blueprint M9)", async () => {
+    // The r1 gate's finding: the rc≠0 case above ALSO has empty stdout, so the
+    // `v=` half of the guard rejects it and the `st.code === 0` half is never
+    // isolated — the literal M9 mutant (drop only the rc check) survives. Here
+    // the re-probe returns rc 1 but a syntactically valid line carrying v= AND
+    // real condition tokens (disk=93%/fail, tickwedge=2). The `v=` guard PASSES,
+    // so ONLY `st.code === 0` can reject it. A build that keyed status-seen on
+    // `v=` alone would set `report` here, raise disk-fail, and record tickwedge.
+    const notes: Array<[string, string]> = [];
+    const lines: SnapshotLine[] = [];
+    const { deps, state } = tickDeps({
+      checkCode: 1,
+      reprobeCode: 1,
+      reprobeStdout: "v=5.3.0/abc1234 tunnel=up disk=93%/fail tickwedge=2",
+      notes,
+      lines,
+    });
+    await runReconcile(deps);
+    const b = boxRow(lines);
+    // rc≠0 ⇒ NOT status-seen despite the valid v= line: no report, no conditions.
+    expect("report" in b).toBe(false);
+    expect("conditions" in b).toBe(false);
+    // nothing raised or cleared, and the tickwedge counter did not move.
     expect(notes.some(([, m]) => m.includes("condition:"))).toBe(false);
     expect(state.lastTickwedge(BOX)).toBeNull();
   });
