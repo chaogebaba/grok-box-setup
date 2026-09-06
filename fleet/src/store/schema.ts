@@ -17,7 +17,7 @@
 // `enrol_stage`, `retired_at`) so v2 adds only tables — see D2/D3.
 
 /** The highest schema this binary knows how to create and operate. */
-export const KNOWN_SCHEMA = 4;
+export const KNOWN_SCHEMA = 5;
 
 /** Timestamps everywhere in the store are integer epoch SECONDS, UTC. */
 export const AUDIT_RETENTION_DAYS = 92;
@@ -325,11 +325,43 @@ const V4: string[] = [
   `CREATE INDEX IF NOT EXISTS jobs_poll_order ON jobs(last_poll_at)`,
 ];
 
+// --- v5 (grokfleet 5.13.0, box-conditions D1a) --------------------------------
+//
+// ADDITIVE ONLY: three ADD COLUMN, so `min_reader` STAYS 1 — an older brain
+// reading a v5 store ignores three columns it does not select. This is the
+// store's FIRST `ALTER TABLE` migration: V1's `snapshot_boxes` note above
+// records that v1 carries every column precisely "so no ALTER TABLE is needed
+// anywhere", and grep confirms none in V1-V4.
+//
+// The `IF NOT EXISTS` half of the migration rule at the top of this file CANNOT
+// be honoured here: SQLite has no `IF NOT EXISTS` for `ADD COLUMN`. That is
+// safe, and the reason is worth stating: SQLite DDL is transactional, so
+// `migrate()`'s single transaction (store/db.ts) rolls the columns back with
+// the `user_version` bump on any failure, and the forward-only `m.to <= from`
+// guard means a completed migration is never replayed. The idempotence
+// `IF NOT EXISTS` buys is redundant with the transaction, not lost.
+//
+//   - `box_counters.keepawake_fail`  — the D1a keep-awake failure streak;
+//   - `box_counters.tickwedge_seen`  — the D1a tickwedge high-water mark. A28:
+//                                       NULLABLE, DEFAULT NULL — NULL means
+//                                       "never recorded" so first sight is
+//                                       silent (a recorded 0 still pages a
+//                                       real 0→1 wedge);
+//   - `snapshot_boxes.report`        — the per-tick BoxReport blob (D3b), which
+//                                       also carries `conditions`. Read-gated on
+//                                       userVersion() >= 5 (store/snapshots.ts).
+const V5: string[] = [
+  `ALTER TABLE box_counters ADD COLUMN keepawake_fail INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE box_counters ADD COLUMN tickwedge_seen INTEGER`,
+  `ALTER TABLE snapshot_boxes ADD COLUMN report TEXT`,
+];
+
 export const MIGRATIONS: Migration[] = [
   { to: 1, minReader: 1, statements: V1 },
   { to: 2, minReader: 1, statements: V2 },
   { to: 3, minReader: 1, statements: V3 },
   { to: 4, minReader: 1, statements: V4 },
+  { to: 5, minReader: 1, statements: V5 },
 ];
 
 /** Every v1 table, in the order a full replay must DELETE them (children first). */

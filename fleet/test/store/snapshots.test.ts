@@ -103,6 +103,38 @@ const FIXTURES: Array<{ name: string; line: SnapshotLine }> = [
       discover: { candidates: 0, adopted: 0, repaired: 0, skipped: [] },
     },
   },
+  {
+    // 5.13.0 D3b: a status-seen box carries report + conditions; a
+    // not-status-seen box omits BOTH (absence, not null). The round-trip proves
+    // JSON.stringify is byte-identical either way.
+    name: "box-conditions: one box WITH report+conditions, one WITHOUT",
+    line: {
+      v: 1,
+      ts: "2026-09-01T12:25:00Z",
+      apply: true,
+      canary: null,
+      boxes: [
+        box("grok-box-004", {
+          check: "FAIL",
+          report: {
+            tickwedge: 2,
+            tunnelfail: 0,
+            disk: { pct: 93, level: "fail" },
+            keepawakeOn: false,
+            keepawakeRc: "refused",
+            keepawakeLast: "2026-09-01T11:00:00Z",
+            jumps: 0,
+            jobState: null,
+            refreshFailing: 0,
+            repairFailing: 0,
+          },
+          conditions: ["disk-fail"],
+        }),
+        // a not-status-seen box: report and conditions absent entirely.
+        box("grok-box-006", { tunnel: "down", check: "-", ver: "-", drift: "unknown", config: null, expiry_days: null }),
+      ],
+    },
+  },
 ];
 
 describe("(m) snapshot round-trip", () => {
@@ -300,6 +332,74 @@ describe("(k) v2 retention: 92 days of snapshots, children cascade", () => {
     // retention rule is the single DELETE and not a three-table sweep.
     expect((s.db.query("SELECT COUNT(*) AS n FROM snapshot_boxes").get() as { n: number }).n).toBe(2);
     expect((s.db.query("SELECT COUNT(*) AS n FROM snapshot_skipped").get() as { n: number }).n).toBe(2);
+    s.close();
+  });
+});
+
+
+describe("D3b — the report/conditions blob round-trips and degrades safely", () => {
+  const withReport = (name: string): SnapshotBox =>
+    box(name, {
+      report: {
+        tickwedge: 0,
+        tunnelfail: 7,
+        disk: { pct: 82, level: "warn" },
+        keepawakeOn: true,
+        keepawakeRc: "ok",
+        keepawakeLast: "2026-09-01T11:00:00Z",
+        jumps: 1,
+        jobState: "running",
+        refreshFailing: 0,
+        repairFailing: 0,
+      },
+      conditions: ["disk-warn"],
+    });
+
+  test("a box WITH report+conditions survives write → read", () => {
+    const s = memStore();
+    const line: SnapshotLine = { v: 1, ts: "2026-09-01T12:00:00Z", apply: true, canary: null, boxes: [withReport("grok-box-008")] };
+    writeSnapshot(s, { tick: 1, line, observed: new Map() });
+    const back = readLatestSnapshot(s)!;
+    expect(back.boxes[0]!.report).toEqual(line.boxes[0]!.report);
+    expect(back.boxes[0]!.conditions).toEqual(["disk-warn"]);
+    s.close();
+  });
+
+  test("a box WITHOUT them round-trips as absent (no null keys)", () => {
+    const s = memStore();
+    const line: SnapshotLine = { v: 1, ts: "2026-09-01T12:00:00Z", apply: true, canary: null, boxes: [box("grok-box-008")] };
+    writeSnapshot(s, { tick: 1, line, observed: new Map() });
+    const back = readLatestSnapshot(s)!;
+    expect("report" in back.boxes[0]!).toBe(false);
+    expect("conditions" in back.boxes[0]!).toBe(false);
+    s.close();
+  });
+
+  test("a MALFORMED JSON blob reads back as absent, never throws", () => {
+    const s = memStore();
+    const line: SnapshotLine = { v: 1, ts: "2026-09-01T12:00:00Z", apply: true, canary: null, boxes: [withReport("grok-box-008")] };
+    writeSnapshot(s, { tick: 1, line, observed: new Map() });
+    // Corrupt the stored blob.
+    s.db.query("UPDATE snapshot_boxes SET report = ? WHERE tick = 1").run("{not valid json");
+    const back = readLatestSnapshot(s)!;
+    expect("report" in back.boxes[0]!).toBe(false);
+    expect("conditions" in back.boxes[0]!).toBe(false);
+    s.close();
+  });
+
+  test("a v4 store (report column read-gated out) reads back absent rather than throwing", () => {
+    const s = memStore();
+    const line: SnapshotLine = { v: 1, ts: "2026-09-01T12:00:00Z", apply: true, canary: null, boxes: [withReport("grok-box-008")] };
+    writeSnapshot(s, { tick: 1, line, observed: new Map() });
+    // Simulate a store a read-only handle sees before the first write-mode tick
+    // migrates it: userVersion() < 5 gates the report column OUT of the SELECT.
+    s.db.run("PRAGMA user_version = 4");
+    const back = readLatestSnapshot(s)!;
+    expect(back.boxes).toHaveLength(1);
+    expect("report" in back.boxes[0]!).toBe(false);
+    expect("conditions" in back.boxes[0]!).toBe(false);
+    // and the rest of the line is intact
+    expect(back.boxes[0]!.name).toBe("grok-box-008");
     s.close();
   });
 });

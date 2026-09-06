@@ -1,8 +1,7 @@
 // fleet-status.ts — `grokfleet fleet-status` (D14), the brain status table.
 //
-// Ports cmd_fleet_status (main:3410-3437) VERBATIM in shape: ONE devices GET;
-// header `%-14s %-7s %-7s %-7s %-12s %-10s` NAME API TUNNEL CHECK AUTHKEY VERSION
-// (main:3414); rows in reconcile_target_boxes order. Per row:
+// Ports cmd_fleet_status (main:3410-3437) in shape: ONE devices GET; rows in
+// reconcile_target_boxes order. Per row:
 //   API     online/offline via the devices body; `?` when the API is unavailable
 //   TUNNEL  up/down via tunnelUp
 //   CHECK   OK/FAIL via `boxup check` over the tunnel ONLY when tunnel up (m13);
@@ -12,6 +11,16 @@
 //           says the key was minted BEFORE the box's current binding — see
 //           keystale.ts for why the column must not print a date the engine
 //           would refuse
+//   COND    5.13.0 box-conditions (D3d): comma-joined short condition names, or
+//           `-`. This command probes LIVE and holds no tick state, so its COND
+//           shows only the STATELESS conditions (disk-fail, disk-warn,
+//           repair-failing); the two stateful kinds are shown as
+//           `keepawake-failing?`/`tick-wedged?` when the raw token would qualify
+//           but the streak/delta cannot be evaluated here. It comes off the
+//           same probe 5.12.1's `mapLimit` already runs — a parse, no extra ssh.
+//
+// COND ends this table's byte-parity with bash's printf: the TS table is now a
+// SUPERSET of the bash one, and `grokfleet fleet-status` is the authority.
 // rc 0 always (main:3437).
 
 import type { Runner } from "../runner.ts";
@@ -20,7 +29,8 @@ import { tunnelUp, tunnelSsh } from "../tunnel.ts";
 import { knownHostsFile } from "../hostkey.ts";
 import { parseEnrolled } from "../boxes.ts";
 import { parseDevices } from "../tailscale.ts";
-import { splitVersion } from "../status.ts";
+import { splitVersion, parseStatusLine, toReport } from "../status.ts";
+import { statelessConditions } from "../reconcile/alerts.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../remote.ts";
 import { mapLimit } from "../maplimit.ts";
 import { storeKeyStale, STALE_AUTHKEY } from "../keystale.ts";
@@ -52,6 +62,8 @@ export interface FleetStatusRow {
   /** r2: a date, `stale`, or `-`. */
   authkey: string;
   version: string; // sha, or "-"
+  /** 5.13.0 D3d: comma-joined stateless short condition names, or `-`. */
+  cond: string;
 }
 
 /** A devices-body source: returns the raw body, or undefined when unavailable. */
@@ -81,12 +93,13 @@ function pad(s: string, w: number): string {
   return s.length >= w ? s : s + " ".repeat(w - s.length);
 }
 
-/** Header + row formatter (byte-identical to bash's printf). */
+/** Header + row formatter. COND (%-16s, F30) makes this a SUPERSET of bash's
+ *  printf table (the other six columns keep their bash widths). */
 export function formatFleetStatus(rows: FleetStatusRow[]): string {
   const fmt = (c: string[]): string =>
-    `${pad(c[0]!, 14)} ${pad(c[1]!, 7)} ${pad(c[2]!, 7)} ${pad(c[3]!, 7)} ${pad(c[4]!, 12)} ${pad(c[5]!, 10)}`;
-  const out: string[] = [fmt(["NAME", "API", "TUNNEL", "CHECK", "AUTHKEY", "VERSION"])];
-  for (const r of rows) out.push(fmt([r.box, r.api, r.tunnel, r.check, r.authkey, r.version]));
+    `${pad(c[0]!, 14)} ${pad(c[1]!, 7)} ${pad(c[2]!, 7)} ${pad(c[3]!, 7)} ${pad(c[4]!, 12)} ${pad(c[5]!, 10)} ${pad(c[6]!, 16)}`;
+  const out: string[] = [fmt(["NAME", "API", "TUNNEL", "CHECK", "AUTHKEY", "VERSION", "COND"])];
+  for (const r of rows) out.push(fmt([r.box, r.api, r.tunnel, r.check, r.authkey, r.version, r.cond]));
   return out.join("\n");
 }
 
@@ -136,6 +149,7 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
     const up = await tunnelUp(deps.runner, box);
     let check: FleetStatusRow["check"] = "-";
     let version = "-";
+    let cond = "-";
     if (up) {
       const chk = await tunnelSsh(deps.runner, box, deps.env.FLEET_BOX_KEY, CHECK_COMMAND, {
         timeoutMs: CHECK_TIMEOUT_MS,
@@ -149,6 +163,12 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
       const line = st.code === 0 ? st.stdout : "";
       const v = line.trim().split(/\s+/).find((t) => t.startsWith("v="));
       version = splitVersion(v?.slice(2)).sha;
+      // D3d: COND off the SAME probe (a parse of `line`, no extra ssh). An empty
+      // `line` (rc≠0) parses to a fully-defaulted report ⇒ no stateless
+      // condition ⇒ `-`, which is the "not read this tick" reading, same guard
+      // D1b's rc half applies. Stateless only; stateful kinds get a `?`.
+      const conds = line === "" ? [] : statelessConditions(toReport(parseStatusLine(line)));
+      cond = conds.length > 0 ? conds.join(",") : "-";
     }
 
     return {
@@ -161,6 +181,7 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
       // box, and printing it is what made the 011 incident invisible.
       authkey: isStale(box) ? STALE_AUTHKEY : (readExp(box) ?? "-"),
       version,
+      cond,
     };
   });
   return rows;

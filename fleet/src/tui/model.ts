@@ -383,7 +383,7 @@ export function headerText(state: TuiState, size: Size): string {
 // tolerable only because EXPIRY is the last data column and the `C` cell brings
 // its own two leading spaces. The header label is `EXP`, because
 // pad("EXPIRY", 5) would print `EXPIR`.
-const TABLE_HEADER_COLS = { glyph: 2, name: 14, who: 12, ver: 8, drift: 8, config: 8, expiry: 5 };
+const TABLE_HEADER_COLS = { glyph: 2, name: 14, who: 12, ver: 8, drift: 8, config: 8, expiry: 5, cond: 16 };
 
 /** WHO's holder budget: 12 = `⚑` 1 + space 1 + holder ≤ 9 + trailing gap 1. */
 const WHO_HOLDER = 9;
@@ -441,7 +441,7 @@ export function tableLines(state: TuiState, size: Size): TableLine[] {
     `${pad("", TABLE_HEADER_COLS.glyph)}${pad("NAME", TABLE_HEADER_COLS.name)}` +
     `${pad("WHO", TABLE_HEADER_COLS.who)}${pad("VER", TABLE_HEADER_COLS.ver)}` +
     `${pad("DRIFT", TABLE_HEADER_COLS.drift)}${pad("CONFIG", TABLE_HEADER_COLS.config)}` +
-    `${pad("EXP", TABLE_HEADER_COLS.expiry)}${showCanaryCol ? "  C" : ""}`;
+    `${pad("EXP", TABLE_HEADER_COLS.expiry)}${pad("COND", TABLE_HEADER_COLS.cond)}${showCanaryCol ? "  C" : ""}`;
   const headText = pad(head, size.cols);
   rows.push({ text: headText, tone: "main", bold: true, segments: [{ text: headText, tone: "main", bold: true }] });
 
@@ -464,6 +464,17 @@ export function tableLines(state: TuiState, size: Size): TableLine[] {
       { text: pad(dash(b.drift), TABLE_HEADER_COLS.drift), tone: t.drift },
       { text: pad(dash(b.config), TABLE_HEADER_COLS.config), tone: t.config },
       { text: pad(b.expiry_days === null ? "-" : `${b.expiry_days}d`, TABLE_HEADER_COLS.expiry), tone: t.expiry },
+      // D3e: COND carries the SAME string /v1/fleet carries — the short condition
+      // names, comma-joined, or `-`. A condition is DISPLAYED; it does not
+      // recolour the box (boxHealth/counts are unchanged), so the tone is muted
+      // when empty and plain otherwise.
+      {
+        text: pad(
+          b.conditions !== undefined && b.conditions.length > 0 ? b.conditions.join(",") : "-",
+          TABLE_HEADER_COLS.cond,
+        ),
+        tone: b.conditions !== undefined && b.conditions.length > 0 ? "warn" : "muted",
+      },
     ];
     if (showCanaryCol) segs.push({ text: isCanary ? `  ${GLYPH.canary}` : "   ", tone: "accent" });
     // Selection: a MAIN-tinted bar (`selected`), and in NO_COLOR mode a leading

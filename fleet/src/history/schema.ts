@@ -7,6 +7,8 @@
 // writer (history/write.ts) and the reader (history/read.ts, serve handlers)
 // agree on the contract. Lane B's render layer consumes exactly these fields.
 
+import type { BoxReport } from "../status.ts";
+
 /** A box's per-tick snapshot fields (TUI-D4 field contracts). */
 export interface SnapshotBox {
   name: string;
@@ -28,6 +30,15 @@ export interface SnapshotBox {
   asleep: boolean;
   /** days until the box's key expires, or null when unknown. */
   expiry_days: number | null;
+  /**
+   * 5.13.0 box-conditions (D3b). BOTH OPTIONAL and absent when the box was not
+   * status-seen (tunnel down, or an unhealthy re-probe with rc≠0 / no `v=`) —
+   * `SnapshotLine.v` stays 1, exactly as `SnapshotDiscover` is tolerated absent
+   * with no bump. `report` is the typed box report; `conditions` is the short
+   * name of every condition kind active this tick, in `CONDITION_KINDS` order.
+   */
+  report?: BoxReport;
+  conditions?: string[];
 }
 
 /**

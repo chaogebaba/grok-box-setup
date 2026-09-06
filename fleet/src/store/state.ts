@@ -45,7 +45,14 @@ export interface BoxRow {
   updated_at: number;
 }
 
-const COUNTER_COLUMNS = ["checkfail", "seedfail", "cfgfail", "incoherent"] as const;
+const COUNTER_COLUMNS = [
+  "checkfail",
+  "seedfail",
+  "cfgfail",
+  "incoherent",
+  "keepawake_fail",
+  "tickwedge_seen",
+] as const;
 type CounterColumn = (typeof COUNTER_COLUMNS)[number];
 
 /** The three membership phases (D4). */
@@ -285,6 +292,7 @@ export class StoreState implements ReconcileStateApi {
         this.store.db
           .query(
             `UPDATE box_counters SET checkfail=0, seedfail=0, cfgfail=0, incoherent=0,
+                                     keepawake_fail=0, tickwedge_seen=NULL,
                                      repair_pending_runs=0, repair_pending_tick=NULL,
                                      hostkey_mismatch=0, asleep_since=NULL, asleep_last_alert=NULL
              WHERE box_id=?`,
@@ -619,6 +627,34 @@ export class StoreState implements ReconcileStateApi {
   }
   resetIncoherent(box: string): void {
     this.setCounter(box, "incoherent", 0);
+  }
+
+  // keepawake-fail streak + tickwedge high-water (5.13.0 D1a). Same column
+  // idiom as the counters above: the file class resets `keepawake-fail` with
+  // `rm -f` (reads 0) and stores `tickwedge` as a bare int (absent ⇒ 0); the
+  // store reads 0 from a fresh row, so the two implementations are observably
+  // identical. `resetKeepawakeFail` writes 0 (the `rm -f` observable) and
+  // `setTickwedge` writes the value.
+  bumpKeepawakeFail(box: string): number {
+    return this.bump(box, "keepawake_fail");
+  }
+  resetKeepawakeFail(box: string): void {
+    this.setCounter(box, "keepawake_fail", 0);
+  }
+  lastTickwedge(box: string): number | null {
+    // A28: NULL column ⇒ null (never recorded, first sight is silent). Distinct
+    // from a recorded 0, which a real 0→1 wedge pages against. `readCounter`
+    // collapses NULL to 0, so read the column directly.
+    const id = this.boxId(box);
+    if (id === undefined) return null;
+    const r = this.store.db.query("SELECT tickwedge_seen AS v FROM box_counters WHERE box_id = ?").get(id) as
+      | { v?: number | null }
+      | null;
+    if (r === null || r === undefined || r.v === null || r.v === undefined) return null;
+    return r.v;
+  }
+  setTickwedge(box: string, n: number): void {
+    this.setCounter(box, "tickwedge_seen", n);
   }
 
   // asleep — "<since> <last_alert>"; 5.7.1 reset is `rm -f`, i.e. ABSENT, which

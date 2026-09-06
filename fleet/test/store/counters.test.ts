@@ -66,6 +66,15 @@ describe("(c) counter semantics are identical in both implementations", () => {
       run: (s) => (s.resetIncoherent(BOX), s.bumpIncoherent(BOX)),
       want: 1,
     },
+    // keepawake-fail streak (5.13.0 D1a): bump/reset, `rm -f` reset reads 0.
+    { name: "keepawake-fail starts at 0-bump ⇒ 1", run: (s) => s.bumpKeepawakeFail(BOX), want: 1 },
+    { name: "keepawake-fail bump ⇒ 2", run: (s) => s.bumpKeepawakeFail(BOX), want: 2 },
+    { name: "keepawake-fail reset then bump restarts at 1", run: (s) => (s.resetKeepawakeFail(BOX), s.bumpKeepawakeFail(BOX)), want: 1 },
+    // tickwedge high-water (5.13.0 D1a / A28): NEVER-recorded ⇒ null (not 0), so
+    // first sight is silent; a recorded 0 is distinct.
+    { name: "tickwedge never recorded ⇒ null", run: (s) => s.lastTickwedge(BOX), want: null },
+    { name: "tickwedge record 0 ⇒ reads 0 (recorded, not null)", run: (s) => (s.setTickwedge(BOX, 0), s.lastTickwedge(BOX)), want: 0 },
+    { name: "tickwedge record 3 ⇒ reads 3", run: (s) => (s.setTickwedge(BOX, 3), s.lastTickwedge(BOX)), want: 3 },
     // asleep's reset is `rm -f` and ABSENT is distinguishable from zero: the 2h
     // first-alert gate keys off the marker's absence.
     { name: "asleep absent", run: (s) => s.readAsleep(BOX), want: undefined },

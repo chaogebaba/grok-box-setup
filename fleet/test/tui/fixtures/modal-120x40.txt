@@ -1,9 +1,9 @@
 grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0 · free 1  apply off  tick 10s   admin  link ● up                                  
 
-  NAME          WHO         VER     DRIFT   CONFIG  EXP                                                                   ╭─ grok-box-001 ─────────────────────────────╮
-> grok-box-001  -           5.3.0   no      in-sync 40d                   │tunnel up · check OK · ver 5.3.0            │
-◆ grok-box-002  -           5.6.0   yes     in-sync 40d                   │drift no · config in-sync · expiry 40d      │
-✖ grok-box-003  -           5.3.0   no      in-sync 3d                    │checkfail no · asleep no · canary none      │
+  NAME          WHO         VER     DRIFT   CONFIG  EXP  COND                                                             ╭─ grok-box-001 ─────────────────────────────╮
+> grok-box-001  -           5.3.0   no      in-sync 40d  -                 │tunnel up · check OK · ver 5.3.0            │
+◆ grok-box-002  -           5.6.0   yes     in-sync 40d  -                 │drift no · config in-sync · expiry 40d      │
+✖ grok-box-003  -           5.3.0   no      in-sync 3d   -                 │checkfail no · asleep no · canary none      │
                                                                           │checkfail# — · expires —                    │
                                                                           │phase — · observed —                        │
                                                                           │free                                        │

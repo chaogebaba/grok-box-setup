@@ -52,8 +52,11 @@ function mkJob(
 describe("J4 — the schema", () => {
   test("v4 exists, is additive, and min_reader is still 1", () => {
     const s = memStore();
-    expect(KNOWN_SCHEMA).toBe(4);
-    expect(s.userVersion()).toBe(4);
+    // KNOWN_SCHEMA moved 4 → 5 in 5.13.0 (box-conditions migration v5); jobs
+    // (v4) is still additive and min_reader is still 1. A fresh store now
+    // migrates to 5.
+    expect(KNOWN_SCHEMA).toBe(5);
+    expect(s.userVersion()).toBe(5);
     expect(s.meta("min_reader")).toBe("1");
     expect(jobsAvailable(s)).toBe(true);
     s.close();
