@@ -48,9 +48,31 @@
 #   (b4) check_reason emits the once/hour `check: WARN disk NN%` line at warn
 #        and does NOT fail the check
 #   (b5) the owner switch is structurally present (runuser then su)
-#   (b7) require_root forwards the five documented disk knobs across its sudo
+#   (b7) require_root forwards the six documented disk knobs across its sudo
 #        re-exec, so `BOXUP_DISK_FAIL_PCT=1 boxup once` from a normal shell is
 #        not silently discarded
+#
+# boxup 5.6.1 adds a SIZE cap (BOXUP_SANDLOG_MAX_BYTES) that truncates the
+# OVERRIDABLE allowlist at any disk level, not only at fail. The (c) block below
+# covers it. Scale note: the whole suite works in MiB, so the cap seam is 4 MiB,
+# the over-cap fixture 5 MiB and the under-cap fixture 3 MiB. The under-cap
+# fixture is deliberately LARGER than the 1 MiB BOXUP_DISK_TRUNCATE_MIN_BYTES in
+# force: with a 0.5 MiB fixture, a mutant that passes the hardcoded 1 GiB floor
+# instead of the cap would leave it intact for the wrong reason and survive.
+#
+#   (c1) over-cap fixture at `ok` => truncated, `sandlog-cap:` line present
+#   (c2) under-cap fixture at `ok` => untouched  [mutant: hardcoded 1 GiB floor]
+#   (c3) cap=0 => over-cap fixture untouched at `ok`, still truncated at `fail`
+#   (c4) a job log over the cap is NOT capped: the cap walks the OVERRIDABLE
+#        list alone, with the built-in list and JOBS_DIR really armed
+#   (c5) a symlink on the allowlist is refused by the CAP path too
+#   (c6) the 60s rate limit covers the cap: one truncation, not two
+#   (c7) six knobs survive require_root (see b7)
+#   (c8) `4G` and empty DISABLE the cap — they never fall open to the 1 GiB floor
+#   (c9) after a cap truncation the state records the POST-truncation percent
+#  (c10) the 4 GiB default literal is present in boxup   [F1-tripwire style]
+#  (c11) under-cap at `ok`: rc 0, state written, NOTHING on stderr — the only
+#        assertion that catches an aborted tick from an uninitialised `capped`
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -108,6 +130,14 @@ PATH="\$BIN:\$PATH"
 # --- stubs around the extracted code --------------------------------------
 log(){ printf '%s\n' "\$*" >> "\$LOGLINES"; }
 have(){ command -v "\$1" >/dev/null 2>&1; }
+# disk_truncate_one bumps the job-log truncation counters through this hook
+# (boxup, \`case "\$f" in "\$JOBS_DIR"/*/log)\`). The harness does NOT extract it —
+# only six disk functions are eval'd below — and until 5.6.1 that was harmless
+# because JOBS_DIR pointed at nothing so the case never matched. (c4) arms
+# JOBS_DIR for real, so the hook becomes reachable: this stub RECORDS its calls
+# so "the counters did not move" is an assertion rather than a hope.
+JOBCALLS="\$WORK/jobcalls"; : > "\$JOBCALLS"
+jobs_record_truncation(){ printf '%s %s\n' "\$1" "\$2" >> "\$JOBCALLS"; }
 
 # --- extract the REAL functions -------------------------------------------
 extract_fn_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
@@ -125,11 +155,13 @@ BOXUP_DISK_INTERVAL=60
 # grokfleet-jobs J6 gave the guard a BUILT-IN second allowlist and a job-log
 # counter hook. Neither is this suite's concern, so both are pointed away from
 # anything it creates: an empty built-in list and a JOBS_DIR with no records
-# means the `case` inside disk_truncate_one never matches and every assertion
+# means the \`case\` inside disk_truncate_one never matches and every assertion
 # below is about the same code paths it was written for.
 # tests/test-boxup-jobs.sh (cases 10, 10e, 10f, 11b) owns the job-log behaviour.
 DISK_GUARD_BUILTIN_TRUNCATE=""
 JOBS_DIR="\$WORK/nojobs"
+# 5.6.1: the SIZE cap seam. 4 MiB here plays the part 4 GiB plays on a box.
+BOXUP_SANDLOG_MAX_BYTES=\$((4 * MIB))
 DISK_STATE="\$RUN_DIR/disk"
 DISK_STAMP="\$RUN_DIR/last-disk-guard"
 DISK_WARN_STAMP="\$RUN_DIR/last-disk-warn"
@@ -146,9 +178,28 @@ mk "\$OTHER" \$((2 * MIB))
 mk "\$SMALL" \$MIB
 mk "\$TARGET" \$((2 * MIB))
 ln -s "\$TARGET" "\$LINK"
+# --- 5.6.1 size-cap fixtures, against a 4 MiB cap seam ---------------------
+OVER="\$WORK/over-cap.log"                     # 5 MiB, ABOVE the cap
+UNDER="\$WORK/under-cap.log"                   # 3 MiB, below the cap but ABOVE
+                                               # the 1 MiB floor (see the header)
+CAPTARGET="\$WORK/cap-symlink-target.log"      # 5 MiB, reached only via a link
+CAPLINK="\$WORK/cap-link.log"                  # symlink -> CAPTARGET
+JOBS_REAL="\$WORK/jobs"; mkdir -p "\$JOBS_REAL/x"
+JOBLOG="\$JOBS_REAL/x/log"                     # 5 MiB, ABOVE the cap
+mk "\$OVER" \$((5 * MIB))
+mk "\$UNDER" \$((3 * MIB))
+mk "\$CAPTARGET" \$((5 * MIB))
+ln -s "\$CAPTARGET" "\$CAPLINK"
+mk "\$JOBLOG" \$((5 * MIB))
 
 sz(){ stat -c %s "\$1" 2>/dev/null || echo -1; }
 
+# stderr is captured to a FILE and reported as a field. run_case invokes the
+# inner script with no redirection, so anything the extracted code writes to
+# stderr would otherwise escape to the suite's own stderr where no assertion can
+# see it — and (c11) is precisely an assertion that stderr stayed empty.
+ERRLOG="\$WORK/stderr"; : > "\$ERRLOG"
+{
 case "$scenario" in
   guard)
     DISK_GUARD_TRUNCATE="\$BIG"
@@ -186,14 +237,82 @@ case "$scenario" in
     DISK_GUARD_TRUNCATE="\$BIG"
     disk_truncate_one "\$OTHER" 93; grc=\$?
     ;;
+
+  # --- 5.6.1 size cap ------------------------------------------------------
+  cap-over)
+    DISK_GUARD_TRUNCATE="\$OVER"
+    disk_guard; grc=\$?
+    ;;
+  cap-under)
+    DISK_GUARD_TRUNCATE="\$UNDER"
+    disk_guard; grc=\$?
+    ;;
+  cap-off)
+    # 0 DISABLES the cap. The df sequence decides whether the pressure path
+    # then picks the same file up.
+    BOXUP_SANDLOG_MAX_BYTES=0
+    DISK_GUARD_TRUNCATE="\$OVER"
+    disk_guard; grc=\$?
+    ;;
+  cap-4g)
+    # A human-friendly "4G" is NOT a number. It must DISABLE the cap, never
+    # reach disk_truncate_one as a floor: that callee fails a non-numeric floor
+    # OPEN to BOXUP_DISK_TRUNCATE_MIN_BYTES, which would truncate the live
+    # platform log every 60 s at ok.
+    BOXUP_SANDLOG_MAX_BYTES=4G
+    DISK_GUARD_TRUNCATE="\$OVER"
+    disk_guard; grc=\$?
+    ;;
+  cap-empty)
+    BOXUP_SANDLOG_MAX_BYTES=""
+    DISK_GUARD_TRUNCATE="\$OVER"
+    disk_guard; grc=\$?
+    ;;
+  cap-joblog)
+    # The cap must walk DISK_GUARD_TRUNCATE ALONE. The harness default points
+    # both job seams at nothing (DISK_GUARD_BUILTIN_TRUNCATE="", JOBS_DIR at an
+    # empty dir), which would make this scenario pass for the WRONG reason — a
+    # job log the guard could not name at all. So arm both for real: a genuine
+    # JOBS_DIR holding a 5 MiB log, and the built-in glob that names it. With
+    # that armed, disk_allowlisted MATCHES the job log, and the only thing
+    # keeping it intact is that the cap loop does not walk the built-in list.
+    # Do NOT restore the harness defaults here.
+    JOBS_DIR="\$JOBS_REAL"
+    DISK_GUARD_BUILTIN_TRUNCATE="\$JOBS_DIR/*/log"
+    DISK_GUARD_TRUNCATE="\$WORK/nothing.log"
+    disk_guard; grc=\$?
+    ;;
+  cap-symlink)
+    # The cap path goes through disk_truncate_one, so it inherits the symlink
+    # refusal — and this proves the refusal is what stops it. Both the cap and
+    # the floor are dropped to 4 bytes, BELOW the symlink's own pathname length
+    # (stat -c %s does not follow a link), so neither size gate can mask a
+    # missing \`-L\`: without it, \`-f\` follows the link and the 5 MiB target is
+    # zeroed. Same technique as (a6b).
+    BOXUP_SANDLOG_MAX_BYTES=4
+    BOXUP_DISK_TRUNCATE_MIN_BYTES=4
+    DISK_GUARD_TRUNCATE="\$CAPLINK"
+    disk_guard; grc=\$?
+    ;;
+  cap-twice)
+    # Two calls back to back: the rate limit must swallow the second, so the
+    # cap truncates ONCE and the state still holds the first call's re-read.
+    DISK_GUARD_TRUNCATE="\$OVER"
+    disk_guard; disk_guard; grc=\$?
+    ;;
 esac
+} 2>"\$ERRLOG"
 
 # --- report ----------------------------------------------------------------
 state=NONE; [ -f "\$DISK_STATE" ] && state="\$(cat "\$DISK_STATE")"
 stamp=no; [ -f "\$DISK_STAMP" ] && stamp=yes
-echo "rc=\${grc:-?} level=\$(disk_level "\$(disk_used_pct)") token=\$(disk_status_token) stamp=\$stamp"
+echo "rc=\${grc:-?} level=\$(disk_level "\$(disk_used_pct)") token=\$(disk_status_token) stamp=\$stamp errbytes=\$(wc -c < "\$ERRLOG" | tr -d ' ') jobcalls=\$(wc -l < "\$JOBCALLS" | tr -d ' ')"
 echo "state:\$state"
 echo "sizes:big=\$(sz "\$BIG") other=\$(sz "\$OTHER") small=\$(sz "\$SMALL") target=\$(sz "\$TARGET") link=\$([ -L "\$LINK" ] && echo symlink || echo GONE)"
+echo "sizes2:over=\$(sz "\$OVER") under=\$(sz "\$UNDER") joblog=\$(sz "\$JOBLOG") captarget=\$(sz "\$CAPTARGET") caplink=\$([ -L "\$CAPLINK" ] && echo symlink || echo GONE)"
+echo "errstart:"
+cat "\$ERRLOG"
+echo "errend:"
 echo "logstart:"
 cat "\$LOGLINES"
 echo "logend:"
@@ -206,6 +325,7 @@ INNER
 r1()   { printf '%s\n' "$1" | sed -n 1p; }
 field(){ printf '%s' "$1" | sed -n "s/.*\\b$2=\\([^ ]*\\).*/\\1/p"; }
 sizes(){ printf '%s\n' "$1" | sed -n 's/^sizes://p'; }
+sizes2(){ printf '%s\n' "$1" | sed -n 's/^sizes2://p'; }
 statel(){ printf '%s\n' "$1" | sed -n 's/^state://p'; }
 logs() { printf '%s\n' "$1" | sed -n '/^logstart:$/,/^logend:$/p'; }
 
@@ -353,6 +473,185 @@ if [ "$(field "$(r1 "$o")" level)" = unknown ] \
   pass "(a9) df broken => level unknown, token disk=unknown, no truncation, rc 0"
 else
   bad  "(a9) broken df not handled: [$(r1 "$o")] [$(sizes "$o")]"
+fi
+
+# ===========================================================================
+# (c) boxup 5.6.1 — the SIZE cap. Everything below runs at `ok` (40%) unless it
+# says otherwise, which is the whole point: the pressure path only reclaims at
+# 90%, and a 42 GB log on a 126 GB overlay never gets there before an outage.
+# The cap seam is 4 MiB, the over-cap fixture 5 MiB, the under-cap fixture
+# 3 MiB, and the floor in force is 1 MiB.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# (c1) over-cap fixture at `ok`: truncated to 0, and the log line carries the
+# `sandlog-cap:` prefix with the PRE-truncation size and percent. Dropping the
+# cap loop, or gating it on `level = fail`, dies here.
+# ---------------------------------------------------------------------------
+o="$(run_case '40
+40' cap-over)"
+lg="$(logs "$o")"
+if [ "$(field "$(r1 "$o")" level)" = ok ] \
+   && printf '%s\n' "$(sizes2 "$o")" | grep -q "^over=0 " \
+   && printf '%s\n' "$lg" | grep -q "sandlog-cap: truncated .*over-cap.log ($((5 * MIB)) B, root 40%)"; then
+  pass "(c1) over-cap file truncated at ok, 'sandlog-cap: truncated … (5242880 B, root 40%)'  [mutants: drop the loop; skip the cap at ok]"
+else
+  bad  "(c1) the cap did not fire at ok: [$(r1 "$o")] [$(sizes2 "$o")] log=[$lg]"
+fi
+
+# ---------------------------------------------------------------------------
+# (c2) under-cap fixture at `ok`: untouched, and NO sandlog-cap line. The
+# fixture is 3 MiB — larger than the 1 MiB floor — so a mutant that hands
+# disk_truncate_one the hardcoded BOXUP_DISK_TRUNCATE_MIN_BYTES instead of the
+# cap would truncate it and die here. (With a sub-floor fixture that mutant
+# survives; see the header note on the scale invariant.)
+# ---------------------------------------------------------------------------
+o="$(run_case '40
+40' cap-under)"
+if printf '%s\n' "$(sizes2 "$o")" | grep -q "under=$((3 * MIB))" \
+   && ! printf '%s\n' "$(logs "$o")" | grep -q 'sandlog-cap:'; then
+  pass "(c2) under-cap file left intact at ok, no sandlog-cap line  [mutant: hardcoded 1 GiB floor]"
+else
+  bad  "(c2) an under-cap file was truncated: [$(sizes2 "$o")] log=[$(logs "$o")]"
+fi
+
+# ---------------------------------------------------------------------------
+# (c3) cap=0 DISABLES it. The same over-cap fixture survives at `ok` — and is
+# still truncated at `fail`, because 5.6.1 changed nothing about the 90 %
+# pressure path.
+# ---------------------------------------------------------------------------
+o="$(run_case '40
+40' cap-off)"
+if printf '%s\n' "$(sizes2 "$o")" | grep -q "over=$((5 * MIB))" \
+   && ! printf '%s\n' "$(logs "$o")" | grep -q 'sandlog-cap:'; then
+  pass "(c3a) cap=0 at ok: the over-cap file is left alone"
+else
+  bad  "(c3a) cap=0 still truncated at ok: [$(sizes2 "$o")] log=[$(logs "$o")]"
+fi
+o="$(run_case '93
+40' cap-off)"
+if printf '%s\n' "$(sizes2 "$o")" | grep -q "^over=0 " \
+   && printf '%s\n' "$(logs "$o")" | grep -q "disk-guard: truncated .*over-cap.log ($((5 * MIB)) B, root 93%)"; then
+  pass "(c3b) cap=0 at fail: the 90% pressure path still reclaims, under its own disk-guard: prefix"
+else
+  bad  "(c3b) cap=0 broke the pressure path: [$(sizes2 "$o")] log=[$(logs "$o")]"
+fi
+
+# ---------------------------------------------------------------------------
+# (c4) THE NON-GOAL. A 5 MiB job log — over the cap, over the floor, and really
+# on the BUILT-IN allowlist with a real JOBS_DIR (see the scenario comment) —
+# is untouched at ok. Job logs are bounded by grokfleet-jobs J6 at 64 MiB;
+# a second cap sixty-four times larger walking the same list would only make it
+# unclear which bound applies. Two witnesses: the file's size, and the job
+# truncation counters, which disk_truncate_one bumps through
+# jobs_record_truncation and which must not have moved.
+# ---------------------------------------------------------------------------
+o="$(run_case '40
+40' cap-joblog)"
+if printf '%s\n' "$(sizes2 "$o")" | grep -q "joblog=$((5 * MIB))" \
+   && [ "$(field "$(r1 "$o")" jobcalls)" = 0 ] \
+   && ! printf '%s\n' "$(logs "$o")" | grep -q 'sandlog-cap:'; then
+  pass "(c4) a job log over the cap is NOT capped (size intact, zero jobs_record_truncation calls)  [mutant: walk the BUILT-IN list too]"
+else
+  bad  "(c4) the cap walked the built-in job-log list: [$(sizes2 "$o")] [$(r1 "$o")] log=[$(logs "$o")]"
+fi
+
+# ---------------------------------------------------------------------------
+# (c5) The cap path inherits the symlink refusal, and this proves the `-L` line
+# is what stops it: both the cap and the floor sit at 4 bytes, below the link's
+# own pathname length, so no size gate can mask a missing refusal.
+# ---------------------------------------------------------------------------
+o="$(run_case '40
+40' cap-symlink)"
+if printf '%s\n' "$(sizes2 "$o")" | grep -q "captarget=$((5 * MIB)) caplink=symlink" \
+   && ! printf '%s\n' "$(logs "$o")" | grep -q 'sandlog-cap:'; then
+  pass "(c5) an allowlisted SYMLINK is refused by the cap path, target intact"
+else
+  bad  "(c5) the cap followed a symlink: [$(sizes2 "$o")] log=[$(logs "$o")]"
+fi
+
+# ---------------------------------------------------------------------------
+# (c6) The rate limit covers the cap too: two back-to-back disk_guard calls
+# produce exactly ONE sandlog-cap line, and the state still holds the first
+# call's post-truncation re-read (41) rather than the third df value (10).
+# Without the limit the cap would stat and truncate four times a minute.
+# ---------------------------------------------------------------------------
+o="$(run_case '40
+41
+10' cap-twice)"
+n="$(printf '%s\n' "$(logs "$o")" | grep -c 'sandlog-cap: truncated')"
+if [ "$n" = 1 ] && printf '%s' "$(statel "$o")" | grep -Eq '^41% ok [0-9]+$'; then
+  pass "(c6) rate limit: the cap truncates ONCE per BOXUP_DISK_INTERVAL, not once per tick"
+else
+  bad  "(c6) the cap ran twice inside the window (n=$n): state=[$(statel "$o")] log=[$(logs "$o")]"
+fi
+
+# ---------------------------------------------------------------------------
+# (c8) A non-numeric or empty cap DISABLES it. This is the dangerous one: the
+# raw knob must never reach disk_truncate_one as the floor, because that callee
+# fails a bad floor OPEN to BOXUP_DISK_TRUNCATE_MIN_BYTES — so a mutant that
+# skips the sanitiser truncates the live 5 MiB platform log at `ok` on every
+# interval. rc must stay 0 and stderr must stay empty either way.
+# ---------------------------------------------------------------------------
+for sc in cap-4g cap-empty; do
+  o="$(run_case '40
+40' "$sc")"
+  if printf '%s\n' "$(sizes2 "$o")" | grep -q "over=$((5 * MIB))" \
+     && [ "$(field "$(r1 "$o")" rc)" = 0 ] \
+     && [ "$(field "$(r1 "$o")" errbytes)" = 0 ]; then
+    pass "(c8/$sc) a non-numeric cap DISABLES the cap — it never falls open to the 1 GiB floor  [mutant: pass the raw cap]"
+  else
+    bad  "(c8/$sc) bad cap value not handled: [$(r1 "$o")] [$(sizes2 "$o")] err=[$(printf '%s\n' "$o" | sed -n '/^errstart:$/,/^errend:$/p')]"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# (c9) After a CAP truncation the state must be re-read, exactly as the
+# pressure path already does: the df stub serves 40 first and 12 on the
+# re-read, and $DISK_STATE must hold 12. Recording the pre-truncation number
+# would make `boxup status` and `boxup check` describe a disk the guard had
+# already freed.
+# ---------------------------------------------------------------------------
+o="$(run_case '40
+12' cap-over)"
+if printf '%s' "$(statel "$o")" | grep -Eq '^12% ok [0-9]+$' \
+   && printf '%s\n' "$(sizes2 "$o")" | grep -q "^over=0 "; then
+  pass "(c9) the state records the POST-cap-truncation percent (12%, not 40%)  [mutant: omit the post-cap df re-read]"
+else
+  bad  "(c9) state is pre-truncation after a cap truncation: state=[$(statel "$o")] [$(sizes2 "$o")]"
+fi
+
+# ---------------------------------------------------------------------------
+# (c10) The default is 4 GiB, spelled as a literal in boxup. F1-tripwire style:
+# the unit suite drives the seam at 4 MiB, so nothing else in this file would
+# notice a default that quietly became 4 MiB, or 40 GiB, or disabled.
+# ---------------------------------------------------------------------------
+if grep -q 'BOXUP_SANDLOG_MAX_BYTES="\${BOXUP_SANDLOG_MAX_BYTES:-4294967296}"' "$BOXUP"; then
+  pass "(c10) boxup carries the literal default BOXUP_SANDLOG_MAX_BYTES:-4294967296 (4 GiB)"
+else
+  bad  "(c10) the 4 GiB default literal is missing or changed in $BOXUP"
+fi
+
+# ---------------------------------------------------------------------------
+# (c11) THE ABORTED-TICK WITNESS. Under-cap file, cap enabled, ok: disk_guard
+# returns 0, $DISK_STATE is written, and NOTHING reaches stderr.
+#
+# boxup runs under `set -u`. Removing the `capped=0` initialisation makes the
+# under-cap path — the common one, on every box, every minute — read an unset
+# variable: the tick subshell dies silently mid-guard, which is the exact
+# half-dead-tick shape 5.6.0 was written to bound. (c2)'s "file untouched"
+# is satisfied by that abort too, so it cannot see it; the rc, the state file
+# and the empty stderr can. run_case's inner script starts with `set -u`, so
+# this reproduces the box's behaviour and not a laxer one.
+# ---------------------------------------------------------------------------
+o="$(run_case '40
+40' cap-under)"
+if [ "$(field "$(r1 "$o")" rc)" = 0 ] \
+   && printf '%s' "$(statel "$o")" | grep -Eq '^40% ok [0-9]+$' \
+   && [ "$(field "$(r1 "$o")" errbytes)" = 0 ]; then
+  pass "(c11) under-cap at ok: rc 0, state written, stderr empty — the tick was not aborted  [mutant: remove capped=0]"
+else
+  bad  "(c11) the guard aborted or wrote to stderr on the under-cap path: [$(r1 "$o")] state=[$(statel "$o")] err=[$(printf '%s\n' "$o" | sed -n '/^errstart:$/,/^errend:$/p')]"
 fi
 
 # ===========================================================================
@@ -537,7 +836,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# (b7) The knobs survive the sudo re-exec. `boxup once` needs root, so a
+# (b7) The knobs survive the sudo re-exec. SIX of them since 5.6.1 — the size
+# cap joined the list, and a cap that silently reverts to 4 GiB under sudo is a
+# knob that does not exist. `boxup once` needs root, so a
 # non-root invocation re-execs itself under `sudo env …` with an EXPLICIT
 # variable list. Anything not on that list is silently dropped — the r1 gate
 # found that `BOXUP_DISK_FAIL_PCT=1 boxup once` from a normal shell therefore
@@ -561,6 +862,9 @@ BOXUP_DISK_FAIL_PCT=72
 BOXUP_DISK_TRUNCATE_MIN_BYTES=73
 BOXUP_DISK_INTERVAL=74
 DISK_GUARD_TRUNCATE=/tmp/canary-75.log
+# boxup 5.6.1's size cap. The extracted require_root runs under \`set -u\`, so
+# an unforwarded knob is not merely dropped, it aborts the re-exec.
+BOXUP_SANDLOG_MAX_BYTES=76
 # boxup 5.4.0 forwards the two keepawake gateway seams on the same list; the
 # extracted require_root runs under `set -u`, so they must exist here. Their own
 # forwarding assertion lives in tests/test-boxup-keepawake.sh (14).
@@ -580,13 +884,14 @@ argv="$(reexec_argv)"
 missing=""
 for kv in BOXUP_DISK_WARN_PCT=71 BOXUP_DISK_FAIL_PCT=72 \
           BOXUP_DISK_TRUNCATE_MIN_BYTES=73 BOXUP_DISK_INTERVAL=74 \
-          DISK_GUARD_TRUNCATE=/tmp/canary-75.log; do
+          DISK_GUARD_TRUNCATE=/tmp/canary-75.log \
+          BOXUP_SANDLOG_MAX_BYTES=76; do
   printf '%s\n' "$argv" | grep -qx "$kv" || missing="$missing $kv"
 done
 # the pre-existing forwards must not regress
 printf '%s\n' "$argv" | grep -q '^BOX_SETUP_ROOT=' || missing="$missing BOX_SETUP_ROOT"
 if [ -z "$missing" ]; then
-  pass "(b7) require_root forwards all five disk knobs (and BOX_SETUP_ROOT) across the sudo re-exec"
+  pass "(b7) require_root forwards all six disk knobs, cap included, (and BOX_SETUP_ROOT) across the sudo re-exec  [mutant: drop the knob from the forward list]"
 else
   bad  "(b7) knobs LOST at the sudo re-exec:$missing  — argv was: [$(printf '%s' "$argv" | tr '\n' ' ')]"
 fi

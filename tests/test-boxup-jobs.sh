@@ -1107,20 +1107,57 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# (10g) the same, on a shellcheck-clean tree: the suppression is present and
-# the built-in expansion is unquoted (quoting it leaves the glob literal and
-# every comparison fails SILENTLY)
+# (10g) the same, on a shellcheck-clean tree: every allowlist consumer expands
+# its list UNQUOTED (quoting it leaves the glob literal and every comparison
+# fails SILENTLY) and each carries the SC2086 suppression that says so.
+#
+# There are THREE consumers since boxup 5.6.1: the checker disk_allowlisted,
+# disk_guard's FAIL-level candidate loop, and disk_guard's SIZE-cap loop — the
+# last of which walks the overridable list ALONE (the 4 GiB cap must not reach
+# job logs, which have their own 64 MiB bound; that behaviour is owned by
+# tests/test-boxup-disk-guard.sh (c4)).
+#
+# Why the directives are asserted STRUCTURALLY rather than left to lint:
+# shellcheck 0.10 does NOT raise SC2086 for a `for` list — word splitting there
+# is the idiomatic use — so `shellcheck -S warning` (and even -S info) stays
+# clean with every one of these directives deleted. Measured on grok-box-011,
+# 2026-09-06. The directives are therefore documentation of a load-bearing
+# choice, and only an assertion like this one keeps them attached to the loops
+# they explain. Pinning each directive to the line ABOVE its loop is the point:
+# a bare grep for the string anywhere in the file passes while the loop it
+# belonged to has lost its comment.
 # ---------------------------------------------------------------------------
+# 0 iff the CONTIGUOUS comment block directly above the given literal `for`
+# line carries a SC2086 disable. It walks the whole block, not just one line,
+# because a shellcheck directive applies to the next COMMAND and both existing
+# consumers put explanatory prose between the directive and their loop.
+suppressed_above() {
+  local ln prev
+  ln="$(grep -nxF "$1" "$BOXUP" | head -1 | cut -d: -f1)"
+  [ -n "$ln" ] || return 1
+  while [ "$ln" -gt 1 ]; do
+    ln=$((ln - 1))
+    prev="$(sed -n "${ln}p" "$BOXUP")"
+    case "$prev" in
+      *'shellcheck disable=SC2086'*) return 0 ;;
+      [[:space:]]*'#'*|'#'*)         continue ;;
+      *)                             return 1 ;;
+    esac
+  done
+  return 1
+}
+teng_ok=1
+[ "$tenf_ok" = 1 ] || teng_ok=0
+grep -q 'for p in \$DISK_GUARD_BUILTIN_TRUNCATE' "$BOXUP" || teng_ok=0
+suppressed_above '    for f in $DISK_GUARD_TRUNCATE $DISK_GUARD_BUILTIN_TRUNCATE; do' || teng_ok=0
+suppressed_above '    for f in $DISK_GUARD_TRUNCATE; do' || teng_ok=0
 if ! command -v shellcheck >/dev/null 2>&1; then
   pass "(10g) SKIPPED (shellcheck not installed)"
 elif shellcheck -S warning "$BOXUP" >/dev/null 2>&1; then
-  if [ "$tenf_ok" = 1 ] && \
-     grep -q 'shellcheck disable=SC2086' "$BOXUP" && \
-     grep -q 'for f in \$DISK_GUARD_TRUNCATE \$DISK_GUARD_BUILTIN_TRUNCATE' "$BOXUP" && \
-     grep -q 'for p in \$DISK_GUARD_BUILTIN_TRUNCATE' "$BOXUP"; then
-    pass "(10g) the tree is shellcheck-clean at warning severity AND (10f) still passes — both allowlist consumers expand the built-in pattern UNQUOTED under the existing suppression"
+  if [ "$teng_ok" = 1 ]; then
+    pass "(10g) shellcheck-clean at warning severity, (10f) still passes, and all THREE allowlist consumers expand unquoted with SC2086 disabled in the comment block above  [mutant: drop the suppression from the 5.6.1 cap loop]"
   else
-    bad  "(10g) shellcheck-clean but the unquoted expansion is missing from one of the two consumers (or (10f) failed)"
+    bad  "(10g) an allowlist consumer lost its unquoted expansion or its SC2086 directive (or (10f) failed)"
   fi
 else
   bad  "(10g) shellcheck -S warning is NOT clean on boxup"
