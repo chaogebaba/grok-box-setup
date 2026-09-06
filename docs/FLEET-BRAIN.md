@@ -1792,10 +1792,15 @@ The fix has two independent halves, and both are needed:
 - A box's tunnel keypair is generated once, on the box, by boxup's first run.
   The only way it changes is a re-image — which also destroys the authkey. So
   `beginEnrol` now treats a pubkey that differs from the recorded one as proof
-  the box is new: it FORGETS the key (`forgetKey`, which drops the row and
-  removes `<box>.expires` and `keys/<idx>.json`) and re-dates `boxes.enrolled_at`
-  to now. This covers the manual `grokfleet enroll` and the zero-touch
-  adopt/repair path together, because both run `cmdEnrollResult`.
+  the box is new: `rebindIfNewKeypair` DELETES the `box_keys` row and re-dates
+  `boxes.enrolled_at` to now, both in ONE transaction, and then re-exports so
+  `<box>.expires` and `keys/<idx>.json` go with it. The delete is inline rather
+  than a call to `forgetKey` precisely so it commits together with the re-dating:
+  a row dropped without the new binding time, or a binding time without the drop,
+  is a half-applied re-image. `forgetKey` is the OPERATOR path instead — see
+  `grokfleet state forget-key` below. This covers the manual `grokfleet enroll`
+  and the zero-touch adopt/repair path together, because both run
+  `cmdEnrollResult`.
 - `boxes.enrolled_at` now means "when the CURRENT binding was established", not
   "first ever enrolled", and `mintWindowValid` requires the key's `minted_at` to
   be at or after it. An expiry date says when a key stops being valid; it says
@@ -1803,6 +1808,53 @@ The fix has two independent halves, and both are needed:
   either instant is unknown — a legacy-imported row has a NULL `enrolled_at` on
   purpose, and a whole imported fleet must not re-mint on the first tick after an
   upgrade.
+
+**A1 is PREVENTION, not remediation — and the r2 additions.** The r1 empirical
+gate established the boundary precisely, on the production VPS, and it is worth
+stating because it is easy to misread what A1 buys. The engine emits `mint` only
+for a box the tailnet reports GONE (`reconcile/decide.ts:51`, row a), so
+`mintWindowValid` is consulted only for an OFFLINE box. `grok-box-011` is online.
+No tick asks the guard, so no tick repairs it; what A1 guarantees is that the
+NEXT time a box with a stale key drops off the tailnet, the tick mints instead of
+skipping. The gate proved the decision flips on 011's real numbers — `minted
+1788072474 < bound 1788673516` ⇒ `mintWindowValid = false` on the branch, `true`
+with the clause removed.
+
+Two things follow from that, and 5.12.1 carries both:
+
+- **The AUTHKEY column prints `stale`, not a date.** `grokfleet fleet-status` and
+  `grokfleet status` both asked `<box>.expires` and printed whatever they found,
+  so 011 read `2026-11-28` for a key that was not on the box. The column now asks
+  the SAME predicate the engine does — `keyStale()` in `fleet/src/keystale.ts`,
+  which `mintWindowValid` also calls — so the table and the tick cannot disagree
+  about whether a key counts. A column that reports a date the engine would
+  refuse is worse than a blank one, because it reads as reassurance. The JSON
+  view keeps the recorded date and adds `keyStale: true` beside it. When the
+  store is unavailable both surfaces fall back to the pre-r2 rendering rather
+  than failing: this is a read-only path (F7.2).
+
+- **`grokfleet state forget-key <box> [--force]`** is the operator repair for a
+  box the tick cannot fix. A1's automatic forget needs a CHANGED pubkey; a box
+  re-enrolled before 5.12.1 shipped already has its new pubkey recorded, so the
+  signal is spent and only a human can clear the row. The command drops the
+  `box_keys` row and its audit entry in one transaction, re-exports so
+  `<box>.expires` goes too, and logs
+  `state: forgot key <id> for <box> (minted <iso> < bound <iso>)`. It REFUSES a
+  key that is not stale (rc 1) unless `--force`, and the refusal names both
+  instants so an operator can see what the verdict rests on. VPS-only with rc 6
+  elsewhere, inherited from the `state` command's existing guard. This is the one
+  caller of `forgetKey()` on both state implementations; if the command goes
+  away, so should the method.
+
+**A4's `release-check` is itself tested (r2).** The r1 gate planted three mutants
+in `fleet/scripts/release-check.sh` — always exit 0, stub the brain comparison to
+`if true`, gut the F1-tripwire loop — and all three SURVIVED the full suite,
+because nothing exercised the script's failure behaviour. A version gate that
+nothing gates is the regression it was written to prevent.
+`tests/test-release-check.sh` now copies the repo to a scratch directory, bumps
+each of the six literals ONE AT A TIME, and asserts rc 1 with the offending file
+named; two further cases bump a whole set together and assert it still passes,
+pinning the design decision that the brain and box sets version independently.
 
 **A2 — the API column read `offline` for every box, forever.** `tailscale.ts`
 keyed on `d.online`, a field the Tailscale v2 devices endpoint has never returned
