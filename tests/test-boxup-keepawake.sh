@@ -825,6 +825,12 @@ ROOT="\$W/box-setup"; SELF="\$W/boxup"
 BOXUP_DISK_WARN_PCT=80; BOXUP_DISK_FAIL_PCT=90
 BOXUP_DISK_TRUNCATE_MIN_BYTES=1; BOXUP_DISK_INTERVAL=60
 DISK_GUARD_TRUNCATE=/tmp/x.log
+# boxup 5.6.1's size cap rides the same forwarded list. The extracted
+# require_root runs under \`set -u\`, so every variable it names must exist here
+# or the re-exec aborts and this case fails on an EMPTY argv rather than on the
+# gateway seams it is actually about. The cap's own forwarding assertion lives
+# in tests/test-boxup-disk-guard.sh (b7).
+BOXUP_SANDLOG_MAX_BYTES=4294967296
 BOXUP_GATEWAY_URL=http://127.0.0.1:9999
 BOXUP_GATEWAY_JSON=/tmp/canary-gateway.json
 log(){ :; }
