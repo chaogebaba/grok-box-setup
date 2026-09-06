@@ -8,13 +8,14 @@ lint:
 	bash -n vps/install-vps.sh
 	bash -n fleet/scripts/release-build.sh
 	bash -n fleet/scripts/release-check.sh
+	bash -n tests/test-release-check.sh
 	bash -n fleet/scripts/run-tests.sh
 	bash -n fleet/scripts/release-publish.sh
 	bash -n tests/test-rename-allowlist.sh
 	bash -n tests/test-boxup-jobs.sh
 	bash -n tests/keepawake-readout.sh
 	bash -n tests/test-boxup-watchdog.sh
-	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-check.sh fleet/scripts/release-publish.sh fleet/scripts/run-tests.sh tests/keepawake-readout.sh || echo "shellcheck not installed; skipped"
+	@command -v shellcheck >/dev/null && shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-check.sh fleet/scripts/release-publish.sh fleet/scripts/run-tests.sh tests/keepawake-readout.sh tests/test-release-check.sh || echo "shellcheck not installed; skipped"
 
 # A4 (5.12.1): the version constants must agree BEFORE anything else runs. Six
 # copies of two numbers lived in five file formats and only two of them were
@@ -34,6 +35,7 @@ test: release-check
 	bash tests/test-boxup-jobs.sh
 	bash tests/test-install-boxup-symlink.sh
 	bash tests/test-makefile-targets.sh
+	bash tests/test-release-check.sh
 	bash tests/test-rename-allowlist.sh
 
 # --- grokfleet (bun+TS brain) ---------------------------------------------------
