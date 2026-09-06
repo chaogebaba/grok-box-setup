@@ -47,7 +47,7 @@ import {
   type JobState,
 } from "../jobs.ts";
 import { nodeJobLogs, pollJob, type JobTickDeps } from "../reconcile/job-tick.ts";
-import { chooseBox, type BoxFacts } from "./lease-eligibility.ts";
+import { chooseBox, isoSec, type BoxFacts } from "./lease-eligibility.ts";
 import { StoreState } from "../store/state.ts";
 import { tunnelSsh } from "../tunnel.ts";
 import { knownHostsFile } from "../hostkey.ts";
@@ -99,7 +99,8 @@ function boxJobField(j: JobRow): BoxJobField {
     state: j.state,
     holder: j.holder,
     purpose: j.purpose,
-    started_at: j.started_at === null ? null : new Date(j.started_at * 1000).toISOString(),
+    // A7 (5.12.1): SECOND precision, like every other timestamp on the wire.
+    started_at: j.started_at === null ? null : isoSec(j.started_at),
   };
 }
 
@@ -121,7 +122,13 @@ export function fleetJobMap(ctx: ServerContext): Map<string, BoxJobField> {
 
 /** The full row, as every JSON surface renders it. */
 function jobView(j: JobRow): Record<string, unknown> {
-  const iso = (t: number | null): string | null => (t === null ? null : new Date(t * 1000).toISOString());
+  // A7 (5.12.1): `.toISOString()` emits milliseconds — `2026-09-06T10:11:12.000Z`
+  // — while `expires_at`, `created_at` on the lease surfaces, the audit rows and
+  // every other timestamp in these same response bodies are second-precision
+  // (`...T10:11:12Z`). The store holds epoch SECONDS, so the `.000` was three
+  // digits of fabricated precision and a client parsing the two shapes with one
+  // format string had to special-case /v1/jobs. `isoSec` is the house helper.
+  const iso = (t: number | null): string | null => (t === null ? null : isoSec(t));
   return {
     job_id: j.job_id,
     box: j.box,
