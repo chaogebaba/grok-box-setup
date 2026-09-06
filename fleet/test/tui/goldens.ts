@@ -506,18 +506,18 @@ export const GOLDENS: Golden[] = [
   },
 
   // The B jobs view, frozen rows and empty. 5.14.1 D1: these two gain the
-  // cursor at row 0 and the sorted jobs behind it, and their fixtures must come
-  // back BYTE-IDENTICAL — at cursor 0 the window offset is still 0 and the
-  // `rows 1–5 of 5` indicator is unchanged, and the selection is colour and
-  // bold, which a fixture built from `l.text` cannot see. They are declared
-  // with colour ON for exactly that reason: under NO_COLOR the model prepends
-  // the `>` marker instead, and that path has its own fixture below.
+  // cursor at row 0 and the sorted jobs behind it. They keep the helpers
+  // default, NO_COLOR, which is the state the test suite actually renders — so
+  // the model's `>` marker lands on the first data row and BOTH fixtures move
+  // by exactly that one byte. Supervisor addendum A9 records the decision: a
+  // fixture shows what the TUI paints under the test default, and flipping
+  // these to colour to keep a census number would hide the marker behind
+  // chalk-level ordering between test files.
   ...([40, 20] as const).map((rows) => ({
     name: `view-jobs-120x${rows}`,
     size: SIZE(120, rows),
     state: state({
       boxes: JOBBED,
-      noColor: false,
       view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES, jobs: sortJobs(JOB_ROWS), cursor: 0 },
     }),
     exceptions: [] as GoldenException[],
@@ -541,7 +541,6 @@ export const GOLDENS: Golden[] = [
     size: SIZE(120, 20),
     state: state({
       boxes: JOBBED,
-      noColor: false,
       view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES, jobs: sortJobs(JOB_ROWS), cursor: 2 },
     }),
     exceptions: [],
@@ -565,7 +564,6 @@ export const GOLDENS: Golden[] = [
     size: SIZE(120, 12),
     state: state({
       boxes: JOBBED,
-      noColor: false,
       view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: MANY_JOB_LINES, jobs: sortJobs(MANY_JOBS), cursor: 19 },
     }),
     exceptions: [],
@@ -596,7 +594,6 @@ export const GOLDENS: Golden[] = [
     size: SIZE(120, 40),
     state: state({
       boxes: JOBBED,
-      noColor: false,
       view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES, jobs: sortJobs(JOB_ROWS), cursor: 0 },
       modal: { ...STOP_MODAL, typed: "JOBI" },
     }),
@@ -611,7 +608,6 @@ export const GOLDENS: Golden[] = [
     size: SIZE(120, 40),
     state: state({
       boxes: JOBBED,
-      noColor: false,
       view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES, jobs: sortJobs(JOB_ROWS), cursor: 0 },
       modal: { ...STOP_MODAL, typed: "WRONGX" },
       message: 'confirm mismatch (expected "JOBID0")',

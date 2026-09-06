@@ -6,7 +6,7 @@ MANYJOB15000 grok-box-008  run     done      0    16h00  batch 15
 MANYJOB16000 grok-box-001  run     done      0    17h00  batch 16              
 MANYJOB17000 grok-box-002  run     done      0    18h00  batch 17              
 MANYJOB18000 grok-box-003  run     done      0    19h00  batch 18              
-MANYJOB19000 grok-box-004  run     done      0    20h00  batch 19              
+>MANYJOB19000 grok-box-004  run     done      0    20h00  batch 19              
 
 ↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs                         
 P push  M rotate  R rename  T check  C reconcile                                                                        

@@ -125,8 +125,11 @@ describe("5.14.1 D1: the jobs view's cursor is a real selection bar", () => {
   // and the colour selection leaves the text alone — so this mounted assertion
   // is the ONLY thing that catches it. Same shape as the table's bar above.
   test("the cursor row carries the SELECTION background, never `inverse`", async () => {
+    // The golden itself is NO_COLOR, like every golden in this release (A9); the
+    // colour path is exercised by flipping the flag here, exactly as the table's
+    // selection assertion above does.
     const g = GOLDENS.find((x) => x.name === "view-jobs-cursor-120x20")!;
-    const frame = await frameOf(g.state, g.size);
+    const frame = await frameOf({ ...g.state, noColor: false }, g.size);
     expect(frame).toContain(bg(SELECTION_BG));
     expect(frame).not.toContain("\x1b[7m");
   });
