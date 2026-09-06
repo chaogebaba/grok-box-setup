@@ -780,6 +780,33 @@ describe("5.14.1 D2 — the joblog fetch", () => {
     big.m.unmount();
   });
 
+  // MUTANT 1: `sortJobs` is applied to the ROWS but the captured `jobs` are
+  // stored in the server's order, so the cursor's index picks a different job
+  // than the row under it and `Enter` opens the WRONG log.
+  test("the stored jobs are the SORTED ones, so the cursor's row and its job agree", async () => {
+    const opened: string[] = [];
+    const client = silentClient({
+      listJobs: async () => ({ ok: true as const, value: FOUR }),
+      getJob: async (id: string) => {
+        opened.push(id);
+        return { ok: true as const, value: job({ job_id: id, log_bytes: 4 }) };
+      },
+      jobLog: async (_id: string, offset: number) => ({ ok: true as const, value: { text: "x\n", next: offset + 2, truncated: false } }),
+    });
+    const m = mount(state({ boxes: [box("grok-box-001")] }), { client });
+    await settle(40);
+    await m.press("B");
+    await settle(40);
+    // cursor 0 is the FIRST SORTED row — the newest `starting` job — not the
+    // first row the server happened to return (`DONEJOB…`).
+    expect(m.lastFrame()).toContain("STARTJOB0000");
+    await m.press("\r");
+    await settle(40);
+    expect(opened).toEqual(["STARTJOB000000000000C"]);
+    expect(m.lastFrame()).toContain("── job STARTJOB0000 ──");
+    m.unmount();
+  });
+
   test("the joblog frame shows the job title and the log body", async () => {
     const r = await openLog(10_000, "first line\nsecond line\n");
     expect(r.m.lastFrame()).toContain("── job JOBID0000000 ──");
