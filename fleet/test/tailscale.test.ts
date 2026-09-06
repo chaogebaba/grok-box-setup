@@ -54,6 +54,35 @@ describe("parseDevices (recorded fixture)", () => {
     expect(m.get("grok-box-011")?.lastSeen).toBe("2026-08-30T00:39:00Z");
   });
 
+  // A2 (5.12.1) — the liveness field.
+  //
+  // These are the mutant guards for the fix. The fixture no longer contains the
+  // string "online" at all, so a parser that goes back to `d.online === true`
+  // reports every box offline and both of these fail.
+  test("A2: liveness comes from connectedToControl", () => {
+    const m = parseDevices(FIXTURE, BOXES);
+    expect(m.get("grok-box-008")?.online).toBe(true);
+    expect(m.get("grok-box-009")?.online).toBe(false);
+    expect(m.get("grok-box-011")?.online).toBe(true);
+  });
+
+  test("A2: the fixture carries no fabricated `online` field", () => {
+    // The endpoint has never returned one (tailscale/tailscale#7004). If this
+    // fails someone re-fabricated it and the parser can pass vacuously again.
+    expect(FIXTURE).not.toContain('"online"');
+    expect(FIXTURE).toContain('"connectedToControl"');
+  });
+
+  test("A2: a connected device with NO lastSeen is still online (tailscale#17504)", () => {
+    const m = parseDevices(FIXTURE, ["grok-box-012"]);
+    expect(m.get("grok-box-012")).toEqual({ online: true, lastSeen: null });
+  });
+
+  test("A2: `online: true` is still honoured if the API ever grows the field", () => {
+    const body = JSON.stringify({ devices: [{ hostname: "grok-box-099", online: true }] });
+    expect(parseDevices(body, ["grok-box-099"])?.get("grok-box-099")?.online).toBe(true);
+  });
+
   test("a box absent from the fixture is left out of the map", () => {
     const m = parseDevices(FIXTURE, ["grok-box-099"]);
     expect(m.has("grok-box-099")).toBe(false);
