@@ -25,6 +25,9 @@
 // which keeps a legacy-imported fleet out of both the re-mint path and the
 // `stale` column.
 
+import type { Env } from "./env.ts";
+import { openReadHandle } from "./store/membership.ts";
+
 /** The two store reads this predicate needs — a subset of ReconcileStateApi. */
 export interface KeyTimes {
   keyMintedAt(box: string): number | undefined;
@@ -40,4 +43,48 @@ export function keyStale(state: KeyTimes, box: string): boolean {
   const boundAt = state.bindingAt(box);
   if (mintedAt === undefined || boundAt === undefined) return false;
   return mintedAt < boundAt;
+}
+
+/**
+ * The production staleness reader: ONE read-only store handle for a whole
+ * table, closed before anything is rendered. A handle per row would open eleven
+ * databases to answer eleven booleans.
+ *
+ * r4: this lived in `fleet-status.ts` and again, verbatim, in `inventory.ts`.
+ * Two copies of a fail-open catch is two places to get the failure semantics
+ * wrong, so it is one function here beside the predicate it wraps.
+ *
+ * FAIL-OPEN, and the catch is load-bearing — but not for the reason it looks
+ * like. `openStore` wraps every open-time failure (a directory where the file
+ * should be, a non-database file, unwritable pragmas) in `ConfigError`, and
+ * `openReadHandle` swallows exactly that class and hands back a file-backed
+ * handle with `store === undefined`. So an unopenable file never reaches here.
+ *
+ * What DOES reach here is a store that opens cleanly, reports a schema version
+ * this binary knows, and then throws on the first query — `no such table:
+ * box_keys` from a truncated file, an interrupted `state restore`, or a
+ * hand-made database. That throw happens inside the per-box loop, one query at
+ * a time, and without this catch it would propagate out of `grokfleet status`
+ * and `grokfleet fleet-status` and take the whole table down. These are the
+ * read-only surfaces an operator reaches for WHEN something is wrong; they must
+ * render what they can (F7.2), so a store that cannot answer means "no
+ * staleness claim", not "no output".
+ */
+export function storeKeyStale(env: Env, boxes: string[]): (box: string) => boolean {
+  const stale = new Set<string>();
+  try {
+    const h = openReadHandle(env);
+    try {
+      // `h.state` IS a ReconcileStateApi, which carries both timestamp
+      // accessors; `h.store` being undefined means there is no store to ask.
+      if (h.store !== undefined) {
+        for (const b of boxes) if (keyStale(h.state, b)) stale.add(b);
+      }
+    } finally {
+      h.close();
+    }
+  } catch {
+    /* a store that cannot answer makes no staleness claim */
+  }
+  return (box: string) => stale.has(box);
 }

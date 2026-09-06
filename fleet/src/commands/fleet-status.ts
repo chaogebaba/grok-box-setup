@@ -23,8 +23,7 @@ import { parseDevices } from "../tailscale.ts";
 import { splitVersion } from "../status.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../remote.ts";
 import { mapLimit } from "../maplimit.ts";
-import { keyStale, STALE_AUTHKEY } from "../keystale.ts";
-import { openReadHandle } from "../store/membership.ts";
+import { storeKeyStale, STALE_AUTHKEY } from "../keystale.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
@@ -77,34 +76,6 @@ export interface FleetStatusDeps {
   keyStale?: (box: string) => boolean;
 }
 
-/**
- * r2/R2(a): the production staleness reader — ONE read-only store handle for
- * the whole table, closed before the rows are formatted. A handle per row would
- * open eleven databases to answer eleven booleans.
- *
- * Any failure (no store, a pre-5.8.0 file, an unreadable database) yields "not
- * stale" for every box, so the table renders exactly as it did before r2 rather
- * than failing. This surface is read-only and must not be the thing that breaks
- * when the store is unavailable.
- */
-export function storeKeyStale(env: Env, boxes: string[]): (box: string) => boolean {
-  const stale = new Set<string>();
-  try {
-    const h = openReadHandle(env);
-    try {
-      // `h.state` IS a ReconcileStateApi, which carries both timestamp
-      // accessors; `h.store` being undefined means there is no store to ask.
-      if (h.store !== undefined) {
-        for (const b of boxes) if (keyStale(h.state, b)) stale.add(b);
-      }
-    } finally {
-      h.close();
-    }
-  } catch {
-    /* read-only surface: no store ⇒ no staleness claim */
-  }
-  return (box: string) => stale.has(box);
-}
 
 function pad(s: string, w: number): string {
   return s.length >= w ? s : s + " ".repeat(w - s.length);

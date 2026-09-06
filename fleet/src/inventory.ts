@@ -25,7 +25,7 @@ import { CHECK_COMMAND, STATUS_COMMAND } from "./remote.ts";
 import { parseCheck, parseStatusLine, type BoxStatus } from "./status.ts";
 import { resolveTarget, type Target } from "./stage.ts";
 import { openReadHandle } from "./store/membership.ts";
-import { keyStale, STALE_AUTHKEY } from "./keystale.ts";
+import { storeKeyStale, STALE_AUTHKEY } from "./keystale.ts";
 import { readLatestMeta } from "./store/snapshots.ts";
 import { log } from "./log.ts";
 
@@ -290,29 +290,6 @@ export function driftCell(row: ProbeResult, target: Target | null): string {
   return row.version === target.version ? "no" : "yes";
 }
 
-/**
- * r2/R2(a): the production staleness reader — ONE read-only store handle for
- * the whole pass. Any failure (no store yet, a pre-5.8.0 file, an unreadable
- * database) yields "not stale" for every box, so `status` renders exactly as it
- * did before r2 rather than failing: this is a read-only surface and must not be
- * the thing that breaks when the store is unavailable (F7.2).
- */
-export function storeKeyStale(env: Env, boxes: string[]): (box: string) => boolean {
-  const stale = new Set<string>();
-  try {
-    const h = openReadHandle(env);
-    try {
-      if (h.store !== undefined) {
-        for (const b of boxes) if (keyStale(h.state, b)) stale.add(b);
-      }
-    } finally {
-      h.close();
-    }
-  } catch {
-    /* no store ⇒ no staleness claim */
-  }
-  return (box: string) => stale.has(box);
-}
 
 /** Render the human table (F9: NAME API TUNNEL CHECK VERSION SHA TARGET DRIFT AUTHKEY). */
 export function renderTable(res: InventoryResult): string {
