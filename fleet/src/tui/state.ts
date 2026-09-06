@@ -14,8 +14,9 @@ import { filteredBoxes, viewContent, viewRowsAvailable, viewportWindow, type Siz
 
 export const POLL_INTERVAL_MS = 5000; // TUI-D7
 
-/** The full-frame views: D2/D3/D4, plus O5's fleet-wide leases list. */
-export type ViewKind = "diff" | "journal" | "history" | "leases";
+/** The full-frame views: D2/D3/D4, O5's fleet-wide leases list, and jobs J12's
+ *  fleet-wide read-only jobs list. */
+export type ViewKind = "diff" | "journal" | "history" | "leases" | "jobs";
 
 /**
  * An OPEN full-frame view. Everything here is a COPY captured at open (D6): the
@@ -313,6 +314,15 @@ export function handleKey(state: TuiState, key: string, size: Size = DEFAULT_SIZ
       return {
         state: { ...state, message: undefined, view: { kind: "leases", box: "", offset: 0, loading: true } },
         effect: { type: "load-view", kind: "leases", box: "" },
+      };
+    }
+    case "B": {
+      // jobs J12: fleet-wide, read-only, scroll-only, box `""` — the L pattern.
+      // Uppercase, like D/J/H/L; lowercase `b` is inert (falls through). `J`
+      // stays journal. No cursor, no Enter, no `s` in 5.14.0.
+      return {
+        state: { ...state, message: undefined, view: { kind: "jobs", box: "", offset: 0, loading: true } },
+        effect: { type: "load-view", kind: "jobs", box: "" },
       };
     }
     case "j":

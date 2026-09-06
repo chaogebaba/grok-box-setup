@@ -36,5 +36,5 @@ grokfleet 3 boxes  ● 1  ◆ 1  ✖ 1  ☾ 0 · free 1  apply off  tick 10s   a
 --- diff line 52 for the config push
 --- diff line 53 for the config push
 
-↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases                                 
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs                         
 P push  M rotate  R rename  T check  C reconcile                                                                        

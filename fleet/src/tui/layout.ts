@@ -31,8 +31,10 @@ import {
 
 // The column geometry moved to `model.ts` when `detailLines` started framing its
 // card to the pane width; re-exported here because layout.ts has always been
-// where the components import it from.
-export { DETAIL_GAP, tableWidth, detailWidth } from "./model.ts";
+// where the components import it from. jobs J12: `showJobColumn`/`showCondColumn`
+// live in `model.ts` (layout.ts imports model.ts, so putting them there would
+// form a cycle) and are re-exported here beside the width helpers.
+export { DETAIL_GAP, tableWidth, detailWidth, showJobColumn, showCondColumn } from "./model.ts";
 
 /** The table's own column-header row (`NAME TUNNEL CHECK …`). It is a fixed
  *  cost of the table region, not a box row, so the window arithmetic below

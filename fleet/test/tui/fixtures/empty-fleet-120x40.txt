@@ -1,7 +1,7 @@
 grokfleet 0 boxes  ● 0  ◆ 0  ✖ 0  ☾ 0 · free 0  apply off  tick 10s   admin  link ● up                                  
 
-  NAME          WHO         VER     DRIFT   CONFIG  EXP  COND
+  NAME          WHO         JOB      VER     DRIFT   CONFIG  EXP
 (no boxes)
 
-↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases                                 
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs                         
 P push  M rotate  R rename  T check  C reconcile                                                                        

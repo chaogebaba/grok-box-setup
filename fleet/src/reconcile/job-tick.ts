@@ -19,7 +19,7 @@
 // NO TRANSACTION SPANS AN SSH (state-store D5). Each poll is one UPDATE issued
 // after its ssh has already returned.
 
-import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import type { Runner } from "../runner.ts";
 import type { Store } from "../store/db.ts";
 import type { StoreState } from "../store/state.ts";
@@ -35,18 +35,19 @@ import {
   isTerminal,
   parseJobStatus,
   stateFromBox,
+  type JobLogSink,
   type JobState,
 } from "../jobs.ts";
 import { dueJobs, loseJob, updateJob, type JobRow } from "../store/jobs.ts";
 import { releaseLease } from "../store/leases.ts";
 import { tunnelSsh } from "../tunnel.ts";
 
-/** The VPS-side log mirror, behind a seam so tests stay in memory. */
-export interface JobLogSink {
-  append(jobId: string, text: string): void;
-  size(jobId: string): number;
-  read(jobId: string, offset: number, limit: number): string;
-}
+// jobs J12 (A23): `JobLogSink` MOVED to `fleet/src/jobs.ts` (the layer-neutral
+// module the store already imports) so `store/jobs.ts` can call `remove` for
+// retention without importing this reconcile-layer module and forming a cycle.
+// Re-exported here so `serve/job-handlers.ts` and every other existing import
+// site keep working unchanged.
+export type { JobLogSink } from "../jobs.ts";
 
 /** `$FLEET_STATE/jobs/<job_id>.log`. Every failure is swallowed: a log mirror
  *  that cannot be written must never take down a reconcile tick. */
@@ -74,6 +75,14 @@ export function nodeJobLogs(fleetState: string): JobLogSink {
         return readFileSync(path(id), "utf8").slice(offset, offset + limit);
       } catch {
         return "";
+      }
+    },
+    remove(id) {
+      try {
+        unlinkSync(path(id));
+      } catch {
+        /* swallowed — a log file that cannot be removed (already gone, or a
+         * permission error) must never take down a reconcile tick (D3). */
       }
     },
   };

@@ -14,7 +14,7 @@
 // concatenation of `segments`, which the model tests pin.
 
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
-import type { BoxLease, FleetBox, Lease } from "./api-client.ts";
+import type { BoxJob, BoxLease, FleetBox, Job, Lease } from "./api-client.ts";
 import type { TuiState } from "./state.ts";
 import type { Tone } from "./tone.ts";
 
@@ -87,6 +87,9 @@ export const GLYPH = {
   canary: "★",
   /** lease-api L5: this box is IN USE — a lease row with `released_at IS NULL`. */
   leased: "⚑",
+  /** jobs J12: a box is running a job. The glyph the table comment below has
+   *  reserved for `▶ <job>` since 5.11.1; the header counter uses it too. */
+  job: "▶",
 } as const;
 
 /** Any of the health/lease glyphs above. */
@@ -215,6 +218,22 @@ export function leasedCount(boxes: FleetBox[]): number {
 }
 
 /**
+ * jobs J12: how many boxes have an ACTIVE job — one whose state is `starting`
+ * or `running`. A terminal job's `job` field is not attached by the serve layer
+ * (`fleetJobMap` reads `activeJobs`), but the count keys on the STATE anyway so
+ * it can never print a box that is merely between jobs. This is the header
+ * counter's `n`, and it is ZERO-SUPPRESSED like `leased`.
+ */
+export function jobCount(boxes: FleetBox[]): number {
+  let n = 0;
+  for (const b of boxes) {
+    const j = b.job;
+    if (j !== null && j !== undefined && (j.state === "starting" || j.state === "running")) n++;
+  }
+  return n;
+}
+
+/**
  * occupancy O3: can I TAKE this box right now — the panel's one `free`
  * predicate, called by the WHO cell, the header count, the `f` filter and the
  * detail card so the four can never disagree. Awake and healthy (`●`) and
@@ -304,6 +323,7 @@ export function messageTone(text: string): Tone {
 export function headerSegments(state: TuiState, size: Size): Seg[] {
   const c = counts(state.boxes);
   const leased = leasedCount(state.boxes);
+  const jobs = jobCount(state.boxes);
   const free = freeCount(state, state.boxes);
   const stale = state.tickAgeS !== null && state.tickAgeS >= STALE_SECONDS;
   const applyText =
@@ -338,6 +358,16 @@ export function headerSegments(state: TuiState, size: Size): Seg[] {
       ? ([
           { text: " · ", tone: "muted" as Tone },
           { text: size.cols >= 120 ? `${GLYPH.leased} ${leased} leased` : `${GLYPH.leased} ${leased}`, tone: "accent" as Tone },
+        ] as Seg[])
+      : []),
+    // jobs J12: the jobs counter, after the free/leased counts. ZERO-SUPPRESSED
+    // like `leased` (V3) — nothing renders when n is 0. The same width-gated
+    // long/short pair: `▶ 2 jobs` at ≥120 columns, `▶ 2` below, so the bar still
+    // ends in `link ● up` at 100 columns with `leased` also present.
+    ...(jobs > 0
+      ? ([
+          { text: " · ", tone: "muted" as Tone },
+          { text: size.cols >= 120 ? `${GLYPH.job} ${jobs} jobs` : `${GLYPH.job} ${jobs}`, tone: "accent" as Tone },
         ] as Seg[])
       : []),
     { text: "  ", tone: "plain" },
@@ -376,14 +406,89 @@ export function headerText(state: TuiState, size: Size): string {
 // one state the glyph does not distinguish is a `◆` box whose tunnel is down;
 // the card shows it, the row does not, and that is accepted.
 //
+// jobs J12: the row gains a JOB column after WHO — `<kind> <age>` for the box's
+// open job, `-` when there is none. It is 9 wide (`job` below), and it is
+// OMITTED, never clipped, below 110 columns: the widths through EXPIRY are 57
+// today and `tableWidth({cols:100})` is 60, so a 9-wide JOB cell takes the row
+// to 66 and `layout.ts` would clip EXPIRY away once the Detail pane shows. 66 is
+// `Math.floor(110 * 0.6)` — the first width that holds the whole row through
+// EXPIRY. `showJobColumn` gates it, `condStart`/`showCondColumn` follow. (The
+// old note here — "widths through EXPIRY must sum to at most tableWidth(100)=60"
+// — is superseded: with JOB shown the row runs to 66 and needs 110 columns; COND
+// was already clipped to a 3-char stub at 100 before this change, which is the
+// defect the COND-omission rule below turns honest.)
+//
 // EVERY cell is budgeted at its longest REAL value plus one column of gap:
 // DRIFT 8 holds `unknown` (7) + 1 and CONFIG 8 holds `in-sync` (7) + 1. EXPIRY's
 // domain is `-` or `<integer>d` from `expiry_days`, and the integer can be
 // negative for an expired key: `-365d` is 5 and fills the cell with NO gap,
 // tolerable only because EXPIRY is the last data column and the `C` cell brings
 // its own two leading spaces. The header label is `EXP`, because
-// pad("EXPIRY", 5) would print `EXPIR`.
-const TABLE_HEADER_COLS = { glyph: 2, name: 14, who: 12, ver: 8, drift: 8, config: 8, expiry: 5, cond: 16 };
+// pad("EXPIRY", 5) would print `EXPIR`. JOB 9 holds `svc 2d3h` / `run 1h05` (8)
+// + 1 (D1: the ONE place the JOB width is written; `condStart` reads it here).
+const TABLE_HEADER_COLS = { glyph: 2, name: 14, who: 12, job: 9, ver: 8, drift: 8, config: 8, expiry: 5, cond: 16 };
+
+/** jobs J12: the JOB column is OMITTED (not clipped) below this width. 110 is
+ *  the first width whose `tableWidth` (66) holds the row through EXPIRY. */
+export const JOB_COL_MIN_COLS = 110;
+
+/** jobs J12: half the 16-wide COND cell — enough for one short condition name
+ *  plus its comma. Below this many surviving columns COND is OMITTED from the
+ *  header and every row, exactly as JOB is below 110; the detail card's
+ *  condition line carries the full string for the operator to read. */
+export const COND_MIN_VISIBLE = 8;
+
+/** jobs J12: does the fleet table show the JOB column at this width? Lives in
+ *  `model.ts` (not `layout.ts`, which imports it and would form a cycle) beside
+ *  `TABLE_HEADER_COLS`; `layout.ts` re-exports it beside `tableWidth`. */
+export function showJobColumn(size: Size): boolean {
+  return size.cols >= JOB_COL_MIN_COLS;
+}
+
+/**
+ * jobs J12 (A26): the COLUMN half of `showDetail` (layout.ts) and deliberately
+ * NOT its row-budget half, which `model.ts` cannot see without importing
+ * `layout.ts` and forming a cycle. Below 100 columns the whole width is the
+ * paint width (the Detail pane is off); at 100+ it is the table pane. The
+ * consequence — COND may be omitted at a height-dropped 100+ frame although the
+ * full width was there — is accepted (design r3, BL1): it keeps the column
+ * decision inside `tableLines`, which is what makes the goldens real evidence.
+ */
+export function paintWidth(size: Size): number {
+  return size.cols >= 100 ? tableWidth(size) : size.cols;
+}
+
+/** jobs J12 (A27): the column at which COND starts — the sum of every cell
+ *  before it, INCLUDING JOB only when it is shown. 66 with JOB, 57 without, and
+ *  it follows any future column-width change on its own rather than a literal. */
+function condStart(size: Size): number {
+  const c = TABLE_HEADER_COLS;
+  return c.glyph + c.name + c.who + (showJobColumn(size) ? c.job : 0) + c.ver + c.drift + c.config + c.expiry;
+}
+
+/** jobs J12: does the fleet table show the COND column at this width? COND is
+ *  OMITTED, never reduced to an unreadable stub, when fewer than
+ *  `COND_MIN_VISIBLE` of its columns survive. Between 124 and 136 columns COND
+ *  IS present and CLIPPED (8-15 visible columns) — the pre-existing behaviour
+ *  this release does not change; it is omitted only below 8. */
+export function showCondColumn(size: Size): boolean {
+  return paintWidth(size) - condStart(size) >= COND_MIN_VISIBLE;
+}
+
+/**
+ * jobs J12: the JOB cell text — `<kind> <age>` for the box's open job, `-` when
+ * there is none. `kind` is `run`/`svc`; `age` is the ONE relative grammar
+ * (`age(nowMs, started_at)`), so `run 12m`, `run 1h05`, `svc 2d3h`. A `starting`
+ * job has a null `started_at` (job-handlers.ts) and renders `run ?` / `svc ?`.
+ * A value longer than the cell (`svc 100d5h`) is cut to 8 then padded, the exact
+ * treatment `leaseRows` gives WHO/PURPOSE.
+ */
+export function jobCell(job: BoxJob | null | undefined, nowMs: number): string {
+  if (job === null || job === undefined) return "-";
+  const kind = job.kind === "service" ? "svc" : "run";
+  const when = job.started_at === null || job.started_at === undefined ? "?" : age(nowMs, job.started_at);
+  return `${kind} ${when}`;
+}
 
 /** WHO's holder budget: 12 = `⚑` 1 + space 1 + holder ≤ 9 + trailing gap 1. */
 const WHO_HOLDER = 9;
@@ -437,11 +542,13 @@ export function filteredBoxes(state: TuiState): FleetBox[] {
 export function tableLines(state: TuiState, size: Size): TableLine[] {
   const rows: TableLine[] = [];
   const showCanaryCol = state.canary !== null; // C glyph only when snapshot canary non-null
+  const showJob = showJobColumn(size); // jobs J12: JOB omitted below 110 cols
+  const showCond = showCondColumn(size); // jobs J12: COND omitted below 8 surviving cols
   const head =
     `${pad("", TABLE_HEADER_COLS.glyph)}${pad("NAME", TABLE_HEADER_COLS.name)}` +
-    `${pad("WHO", TABLE_HEADER_COLS.who)}${pad("VER", TABLE_HEADER_COLS.ver)}` +
+    `${pad("WHO", TABLE_HEADER_COLS.who)}${showJob ? pad("JOB", TABLE_HEADER_COLS.job) : ""}${pad("VER", TABLE_HEADER_COLS.ver)}` +
     `${pad("DRIFT", TABLE_HEADER_COLS.drift)}${pad("CONFIG", TABLE_HEADER_COLS.config)}` +
-    `${pad("EXP", TABLE_HEADER_COLS.expiry)}${pad("COND", TABLE_HEADER_COLS.cond)}${showCanaryCol ? "  C" : ""}`;
+    `${pad("EXP", TABLE_HEADER_COLS.expiry)}${showCond ? pad("COND", TABLE_HEADER_COLS.cond) : ""}${showCanaryCol ? "  C" : ""}`;
   const headText = pad(head, size.cols);
   rows.push({ text: headText, tone: "main", bold: true, segments: [{ text: headText, tone: "main", bold: true }] });
 
@@ -460,22 +567,33 @@ export function tableLines(state: TuiState, size: Size): TableLine[] {
       { text: `${health.glyph} `, tone: health.tone },
       { text: pad(b.name, TABLE_HEADER_COLS.name), tone: health.tone, bold: selected },
       whoSegment(b),
+    ];
+    // jobs J12: the JOB cell, only when the column is shown. `<kind> <age>` in
+    // ACCENT (like the WHO flag), MUTED when there is no open job.
+    if (showJob) {
+      const job = b.job;
+      const hasJob = job !== null && job !== undefined;
+      segs.push({ text: pad(cut(jobCell(job, state.nowMs), TABLE_HEADER_COLS.job), TABLE_HEADER_COLS.job), tone: hasJob ? "accent" : "muted" });
+    }
+    segs.push(
       { text: pad(dash(b.ver), TABLE_HEADER_COLS.ver), tone: t.ver },
       { text: pad(dash(b.drift), TABLE_HEADER_COLS.drift), tone: t.drift },
       { text: pad(dash(b.config), TABLE_HEADER_COLS.config), tone: t.config },
       { text: pad(b.expiry_days === null ? "-" : `${b.expiry_days}d`, TABLE_HEADER_COLS.expiry), tone: t.expiry },
-      // D3e: COND carries the SAME string /v1/fleet carries — the short condition
-      // names, comma-joined, or `-`. A condition is DISPLAYED; it does not
-      // recolour the box (boxHealth/counts are unchanged), so the tone is muted
-      // when empty and plain otherwise.
-      {
+    );
+    // D3e: COND carries the SAME string /v1/fleet carries — the short condition
+    // names, comma-joined, or `-`. A condition is DISPLAYED; it does not
+    // recolour the box (boxHealth/counts are unchanged), so the tone is muted
+    // when empty and plain otherwise. jobs J12: omitted below 8 surviving cols.
+    if (showCond) {
+      segs.push({
         text: pad(
           b.conditions !== undefined && b.conditions.length > 0 ? b.conditions.join(",") : "-",
           TABLE_HEADER_COLS.cond,
         ),
         tone: b.conditions !== undefined && b.conditions.length > 0 ? "warn" : "muted",
-      },
-    ];
+      });
+    }
     if (showCanaryCol) segs.push({ text: isCanary ? `  ${GLYPH.canary}` : "   ", tone: "accent" });
     // Selection: a MAIN-tinted bar (`selected`), and in NO_COLOR mode a leading
     // '>' so a colourless frame still encodes which row is selected.
@@ -1004,8 +1122,14 @@ export function statusLine(state: TuiState, opts: { view?: boolean } = {}): Seg[
 // EXACTLY 120 characters, so these +18 make it two lines at 120 columns and one
 // line only at ≥ 138 — which costs every 120-wide admin frame one table row and
 // collapses the `fleet30-admin-120x12` windows onto the readonly ones.
+//
+// jobs J12: `B jobs` joins VIEW_KEYS. The nav line grows from 87 to 95 visible
+// columns; the combined one-line form (nav │ actions) is 138 columns today and
+// 146 with `B jobs`, both above 120, so the footer STAYS two lines at 100 and at
+// 120 and no row budget moves — every existing fixture changes by exactly this
+// one legend line.
 const NAV_KEYS: [string, string][] = [["↑↓", "select"], ["/", "filter"], ["f", "free"], ["r", "refresh"], ["q", "quit"]];
-const VIEW_KEYS: [string, string][] = [["D", "diff"], ["J", "journal"], ["H", "history"], ["L", "leases"]];
+const VIEW_KEYS: [string, string][] = [["D", "diff"], ["J", "journal"], ["H", "history"], ["L", "leases"], ["B", "jobs"]];
 const ACTION_KEYS: [string, string][] = [
   ["P", "push"],
   ["M", "rotate"],
@@ -1146,7 +1270,8 @@ export function viewLines(state: TuiState, size: Size): ToneLine[] {
   const rows: ToneLine[] = [];
   // O5: the leases view is FLEET-WIDE, so its `box` is `""` and the title says
   // just `── leases ──` rather than the double space `${kind} ${box}` gives.
-  const title = v.kind === "leases" ? "── leases ──" : `── ${v.kind} ${v.box} ──`;
+  // jobs J12: the jobs view is fleet-wide too and gets the same treatment.
+  const title = v.kind === "leases" || v.kind === "jobs" ? `── ${v.kind} ──` : `── ${v.kind} ${v.box} ──`;
   rows.push({
     text: pad(stripToWidth(`${title}  ${indicator}`, size.cols), size.cols),
     tone: "main",
@@ -1215,6 +1340,64 @@ export function leaseRows(leases: Lease[], nowMs: number): string[] {
 
 /** O5: an empty leases list is an ANSWER, not an empty screen. */
 export const NO_OPEN_LEASES = "no open leases";
+
+// --- the jobs view's rows (jobs J12) -----------------------------------------
+/** jobs J12: fixed widths totalling 79 — the SAME budget as `LEASE_COLS`, so
+ *  both views clip identically at every width. Each width is its longest real
+ *  value + one column of gap (the O1 rule): `id` 12 chars of a 22-char base64url
+ *  id + 1; `box` 14 as `LEASE_COLS.box`; `kind` holds `service` (7) + 1; `state`
+ *  holds `crashloop` (9) + 1; `rc` holds `143` (3) + gap; `age` holds `100d5h`
+ *  (6) + 1; `purpose` 22 as `LEASE_COLS.purpose`. Every text cell that would
+ *  fill its column is cut to width−2 + `…` through the shared `cut` helper. */
+const JOB_COLS = { id: 13, box: 14, kind: 8, state: 10, rc: 5, age: 7, purpose: 22 };
+
+/** jobs J12: an empty jobs list is an ANSWER, not an empty screen. */
+export const NO_JOBS = "no jobs";
+
+/** jobs J12: `listJobs` caps at 200 rows; when exactly 200 come back this MUTED
+ *  line is appended so `rows a–b of N` is never read as the fleet total. */
+export const JOBS_CAP_NOTE = "(newest 200 shown)";
+
+/**
+ * jobs J12: the jobs view's content rows — the header line, then one row per
+ * job, sorted starting|running FIRST and then by `created_at` desc. Formatted
+ * ONCE when the response lands and frozen into `ViewState.lines`, exactly as the
+ * leases view's rows are; nothing in 5.14.0 acts on a row, so no `Job[]` is
+ * retained. `JOB_ID` shows the first 12 chars; `RC` is `-` when null; `AGE` is
+ * `age(nowMs, started_at ?? created_at)` (the list DOES have `created_at`, so
+ * `?` is never needed). When exactly 200 rows come back the cap note is
+ * appended.
+ */
+export function jobRows(jobs: Job[], nowMs: number): string[] {
+  const head =
+    `${pad("JOB_ID", JOB_COLS.id)}${pad("BOX", JOB_COLS.box)}${pad("KIND", JOB_COLS.kind)}` +
+    `${pad("STATE", JOB_COLS.state)}${pad("RC", JOB_COLS.rc)}${pad("AGE", JOB_COLS.age)}` +
+    `${pad("PURPOSE", JOB_COLS.purpose)}`;
+  const rank = (s: string): number => (s === "starting" || s === "running" ? 0 : 1);
+  const sorted = [...jobs].sort(
+    (a, b) => rank(a.state) - rank(b.state) || tsDesc(b.created_at) - tsDesc(a.created_at),
+  );
+  const rows = [head];
+  for (const j of sorted) {
+    const rc = j.rc === null ? "-" : String(j.rc);
+    rows.push(
+      `${pad(j.job_id.slice(0, 12), JOB_COLS.id)}${pad(cut(j.box, JOB_COLS.box), JOB_COLS.box)}` +
+        `${pad(cut(j.kind, JOB_COLS.kind), JOB_COLS.kind)}${pad(cut(j.state, JOB_COLS.state), JOB_COLS.state)}` +
+        `${pad(rc, JOB_COLS.rc)}${pad(age(nowMs, j.started_at ?? j.created_at), JOB_COLS.age)}` +
+        `${pad(cut(j.purpose, JOB_COLS.purpose), JOB_COLS.purpose)}`,
+    );
+  }
+  if (jobs.length === 200) rows.push(JOBS_CAP_NOTE);
+  return rows;
+}
+
+/** A parsed ms for the DESC sort, or −∞ so an unparseable/absent value sorts
+ *  last within its rank. */
+function tsDesc(iso: string | null | undefined): number {
+  if (iso === null || iso === undefined || iso === "") return Number.NEGATIVE_INFINITY;
+  const ms = tsMillis(iso);
+  return ms === undefined ? Number.NEGATIVE_INFINITY : ms;
+}
 
 // --- modal -------------------------------------------------------------------
 export function modalLines(state: TuiState): ToneLine[] {

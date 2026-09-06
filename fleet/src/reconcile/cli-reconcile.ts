@@ -9,7 +9,7 @@
 
 import type { Env } from "../env.ts";
 import type { ParsedConfig, RolloutConfig } from "../config.ts";
-import { resolveRollout, configCanary, resolveLeaseLimits } from "../config.ts";
+import { resolveRollout, configCanary, resolveLeaseLimits, resolveJobRetentionDays } from "../config.ts";
 import { BunRunner } from "../runner.ts";
 import { reexecArgv } from "../upgrade.ts";
 import { spawnReexec, type Spawner } from "../reexec.ts";
@@ -174,6 +174,10 @@ export async function assembleTickDeps(
   const notify = (level: "info" | "warn", msg: string) =>
     notifyFn(level, msg, { telegramEnvPath: env.FLEET_TELEGRAM_ENV, source: fsTelegramSource, poster: fetchPoster });
 
+  // jobs J12 (D3): ONE sink instance, shared by the job tick (mirror writes)
+  // and the retention prune (mirror deletes), so both point at the same files.
+  const jobLogSink = nodeJobLogs(env.FLEET_STATE);
+
   const upgradeDeps: UpgradeDeps = {
     runner,
     env,
@@ -219,10 +223,16 @@ export async function assembleTickDeps(
           runner,
           boxKey: env.FLEET_BOX_KEY,
           knownHosts: knownHostsFile(env),
-          logs: nodeJobLogs(env.FLEET_STATE),
+          logs: jobLogSink,
           notify,
         })
       : undefined,
+    // jobs J12 (D3): the retention pass prunes terminal rows AND their mirrored
+    // log files. The SAME sink instance the job tick uses is handed to the
+    // prune (run.ts), and the window comes from `[jobs] retain_days` (default
+    // 30, 0 disables).
+    jobLogs: jobLogSink,
+    jobRetentionDays: resolveJobRetentionDays(cfg),
     // TUI-D4 + state-store D3: the production tick writes ONE snapshot into the
     // three `snapshots` tables, in ONE transaction. `history/*.jsonl` is no
     // longer written — a 5.8.0 binary rolled back onto this file resumes

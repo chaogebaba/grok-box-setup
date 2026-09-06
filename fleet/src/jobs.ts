@@ -64,6 +64,26 @@ export const JOB_SSH_TIMEOUT_MS = 20_000;
 /** boxup 5.5.0 is the first version with the runner (J3). */
 export const JOB_RUNNER_MIN_BOXUP = "5.5.0";
 
+/**
+ * The VPS-side log mirror, behind a seam so tests stay in memory (J6). It lives
+ * HERE, in the layer-neutral `jobs.ts` module, rather than in the reconcile
+ * layer: `store/jobs.ts` needs `remove` for retention (D3) and it already
+ * imports this module, whereas importing `reconcile/job-tick.ts` from the store
+ * would invert the layering and form a cycle. `reconcile/job-tick.ts` re-exports
+ * the interface so every existing import site keeps working unchanged, and
+ * `nodeJobLogs` (the node-fs implementation) stays in the reconcile layer where
+ * it belongs.
+ */
+export interface JobLogSink {
+  append(jobId: string, text: string): void;
+  size(jobId: string): number;
+  read(jobId: string, offset: number, limit: number): string;
+  /** jobs J12 (D3): delete a pruned job's mirrored log file. Swallow-everything
+   *  like its siblings — a file that cannot be removed must never take down a
+   *  reconcile tick. */
+  remove(jobId: string): void;
+}
+
 /** The parsed `boxup job status <id>` line. Absent fields are `undefined`. */
 export interface BoxJobStatus {
   /** the box's own vocabulary, verbatim — e.g. `running`, `lost:image-swap`. */

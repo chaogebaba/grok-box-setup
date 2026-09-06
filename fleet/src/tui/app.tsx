@@ -23,7 +23,9 @@ import {
   detailLines,
   discoverSegments,
   footerSegmentLines,
+  jobRows,
   leaseRows,
+  NO_JOBS,
   NO_OPEN_LEASES,
   statusLine,
   modalLines,
@@ -169,6 +171,21 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
               box: "",
               payload: r.ok
                 ? { lines: r.value.length === 0 ? [NO_OPEN_LEASES] : leaseRows(r.value, d.now()) }
+                : { error: viewError(r, effect.kind) },
+            });
+            break;
+          }
+          if (effect.kind === "jobs") {
+            // jobs J12: on-demand `GET /v1/jobs` with no filter; the rows are
+            // rendered ONCE here and frozen into the view, sorted and capped by
+            // `jobRows`. Read-only — nothing acts on a row in 5.14.0.
+            const r = await d.client.listJobs();
+            dispatch({
+              type: "view-result",
+              kind: effect.kind,
+              box: "",
+              payload: r.ok
+                ? { lines: r.value.length === 0 ? [NO_JOBS] : jobRows(r.value, d.now()) }
                 : { error: viewError(r, effect.kind) },
             });
             break;

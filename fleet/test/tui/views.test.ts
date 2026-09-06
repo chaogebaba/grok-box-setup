@@ -28,7 +28,9 @@ import type { BoxDetail } from "../../src/tui/api-client.ts";
 import { box, state, SIZE_120x40 } from "./helpers.ts";
 
 const SIZE_100x24 = { cols: 100, rows: 24 };
-const SIZE_140x40 = { cols: 140, rows: 40 };
+// jobs J12 (D2): `B jobs` grew the admin one-line footer from 138 to 146 cols,
+// so the ONE-LINE width is now 146, not 140 (140 now takes two lines).
+const SIZE_146x40 = { cols: 146, rows: 40 };
 /** Wide enough for the widest single row: the folded
  *  `asleep since · last · backoff` triple (occupancy O6), which is ~130
  *  columns of card and so needs a pane wider than 300 columns leaves. */
@@ -186,21 +188,22 @@ describe("D5 footer re-layout", () => {
   test("SNAPSHOT at 100 cols: two lines, navigation+views then actions", () => {
     const f = renderFooter(state({ scope: "admin" }), SIZE_100x24);
     expect(f.length).toBe(2);
-    expect(f[0]!.trimEnd()).toBe("↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases");
+    expect(f[0]!.trimEnd()).toBe("↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs");
     expect(f[1]!.trimEnd()).toBe("P push  M rotate  R rename  T check  C reconcile");
   });
-  // occupancy O7: `f free` and `L leases` make the one line 138 characters, so
-  // 140 is still wide enough for it — 120 no longer is.
-  test("SNAPSHOT at 140 cols: one line carrying every key", () => {
-    const f = renderFooter(state({ scope: "admin" }), SIZE_140x40);
+  // occupancy O7: `f free` and `L leases` made the one line 138 characters;
+  // jobs J12 (D2) `B jobs` takes it to 146, so 146 is the width that still fits
+  // it on one line — 120 and 140 no longer do.
+  test("SNAPSHOT at 146 cols: one line carrying every key", () => {
+    const f = renderFooter(state({ scope: "admin" }), SIZE_146x40);
     expect(f.length).toBe(1);
     expect(f[0]!.trimEnd()).toBe(
-      "↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases │ P push  M rotate  R rename  T check  C reconcile",
+      "↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs │ P push  M rotate  R rename  T check  C reconcile",
     );
   });
   test("no key falls off at >= 100 cols, at any width and either scope", () => {
-    const keys = ["↑↓", "/ filter", "f free", "r refresh", "q quit", "D diff", "J journal", "H history", "L leases", "P push", "M rotate", "R rename", "T check", "C reconcile"];
-    for (const cols of [100, 110, 119, 120, 121, 130, 140, 200]) {
+    const keys = ["↑↓", "/ filter", "f free", "r refresh", "q quit", "D diff", "J journal", "H history", "L leases", "B jobs", "P push", "M rotate", "R rename", "T check", "C reconcile"];
+    for (const cols of [100, 110, 119, 120, 121, 130, 140, 146, 200]) {
       for (const scope of ["admin", "readonly"] as const) {
         const joined = renderFooter(state({ scope }), { cols, rows: 40 }).join("\n");
         for (const k of keys) expect(joined).toContain(k);
@@ -235,8 +238,8 @@ describe("D5b viewport", () => {
     // a banner adds one more row above.
     const banner: TuiState = { ...base, link: { up: false, sinceMs: 0 }, nowMs: 1000 };
     expect(viewChromeRows(banner, SIZE_100x24)).toBe(7);
-    // 140 cols ⇒ ONE footer line.
-    expect(viewChromeRows(base, SIZE_140x40)).toBe(5);
+    // 146 cols ⇒ ONE footer line (the `B jobs` one-line threshold, D2).
+    expect(viewChromeRows(base, SIZE_146x40)).toBe(5);
   });
 
   test("SNAPSHOT at 24 rows × 100 cols: the window fits and the FOOTER IS LAST", async () => {

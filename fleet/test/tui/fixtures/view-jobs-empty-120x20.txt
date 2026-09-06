@@ -1,0 +1,7 @@
+grokfleet 8 boxes  ● 5  ◆ 1  ✖ 1  ☾ 1 · free 5 · ▶ 3 jobs  apply off  tick 10s   admin  link ● up                       
+
+── jobs ──  rows 1–1 of 1                                                                                               
+no jobs
+
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs                         
+P push  M rotate  R rename  T check  C reconcile                                                                        

@@ -60,6 +60,23 @@ function asPosInt(v: unknown, fallback: number): number {
   return fallback;
 }
 
+/**
+ * jobs J12 (D3): identical to `asPosInt` but accepts 0 — a NON-NEGATIVE integer.
+ * `asPosInt` cannot express "0 disables", which is exactly what `retain_days=0`
+ * means, so retention needs its own resolver. It keeps `asPosInt`'s digit-string
+ * branch, so `"30"` is accepted as 30. Anything else — a negative number,
+ * `"-1"`, `"abc"`, `true`, `1.5` — falls back, the house rule (a typo must not
+ * silently change retention).
+ */
+function asNonNegInt(v: unknown, fallback: number): number {
+  if (typeof v === "number" && Number.isInteger(v) && v >= 0) return v;
+  if (typeof v === "string" && /^[0-9]+$/.test(v)) {
+    const n = Number.parseInt(v, 10);
+    if (n >= 0) return n;
+  }
+  return fallback;
+}
+
 function asBool(v: unknown, fallback: boolean): boolean {
   if (typeof v === "boolean") return v;
   if (typeof v === "string") {
@@ -87,11 +104,17 @@ const KNOWN_ROLLOUT_KEYS = new Set([
  */
 const KNOWN_LEASE_KEYS = new Set(["ephemeral_max_life_s", "expired_grace_s", "lost_grace_s"]);
 
+/** jobs J12 (D3): the `[jobs]` knobs. `retain_days` is the only one; an unknown
+ *  `[jobs]` key is LOGGED, never fatal — exactly like `[leases]`/`[rollout]`. */
+const KNOWN_JOB_KEYS = new Set(["retain_days"]);
+
 export interface ParsedConfig {
   fleetBrain: Table;
   rollout: Table;
   /** the `[leases]` table (empty when absent). */
   leases: Table;
+  /** jobs J12: the `[jobs]` table (empty when absent). */
+  jobs: Table;
   /** The raw parsed object (empty when the file is absent). */
   raw: Table;
   /** True when the config file existed and parsed. */
@@ -106,7 +129,7 @@ export interface ParsedConfig {
  */
 export function parseConfig(text: string | undefined, path: string): ParsedConfig {
   if (text === undefined) {
-    return { fleetBrain: {}, rollout: {}, leases: {}, raw: {}, present: false };
+    return { fleetBrain: {}, rollout: {}, leases: {}, jobs: {}, raw: {}, present: false };
   }
   let raw: Table;
   try {
@@ -118,6 +141,7 @@ export function parseConfig(text: string | undefined, path: string): ParsedConfi
   const fleetBrain = asTable(raw["fleet-brain"]);
   const rollout = asTable(raw["rollout"]);
   const leases = asTable(raw["leases"]);
+  const jobs = asTable(raw["jobs"]);
   // Unknown keys in [rollout] → one info line, never fatal (D5).
   for (const k of Object.keys(rollout)) {
     if (!KNOWN_ROLLOUT_KEYS.has(k)) {
@@ -130,7 +154,13 @@ export function parseConfig(text: string | undefined, path: string): ParsedConfi
       log(`config: unknown key [leases].${k} ignored`);
     }
   }
-  return { fleetBrain, rollout, leases, raw, present: true };
+  // jobs J12: the same rule for [jobs].
+  for (const k of Object.keys(jobs)) {
+    if (!KNOWN_JOB_KEYS.has(k)) {
+      log(`config: unknown key [jobs].${k} ignored`);
+    }
+  }
+  return { fleetBrain, rollout, leases, jobs, raw, present: true };
 }
 
 export interface RolloutEnv {
@@ -179,4 +209,13 @@ export function resolveLeaseLimits(cfg: ParsedConfig): LeaseLimits {
     expiredGraceS: asPosInt(cfg.leases["expired_grace_s"], DEFAULT_LEASE_LIMITS.expiredGraceS),
     lostGraceS: asPosInt(cfg.leases["lost_grace_s"], DEFAULT_LEASE_LIMITS.lostGraceS),
   };
+}
+
+/** jobs J12 (D3): the terminal-job retention window, in DAYS. Default 30; `0`
+ *  DISABLES pruning entirely. There is no "reject": an invalid value FALLS BACK
+ *  to 30 with no error and no log line (the house rule) — `-1`, `"-1"`, `"abc"`,
+ *  `true` and `1.5` all yield 30, while `"30"` is accepted as 30. Mirrors
+ *  `resolveLeaseLimits`. */
+export function resolveJobRetentionDays(cfg: ParsedConfig): number {
+  return asNonNegInt(cfg.jobs["retain_days"], 30);
 }

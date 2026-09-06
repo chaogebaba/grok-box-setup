@@ -16,5 +16,5 @@ Apr 30 12:11:00 box grok-agent[1]: line 11
 Apr 30 12:12:00 box grok-agent[1]: line 12
 Apr 30 12:13:00 box grok-agent[1]: line 13
 
-↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases                                 
+↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs                         
 P push  M rotate  R rename  T check  C reconcile                                                                        
