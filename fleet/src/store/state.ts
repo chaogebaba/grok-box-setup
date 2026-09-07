@@ -292,7 +292,7 @@ export class StoreState implements ReconcileStateApi {
         this.store.db
           .query(
             `UPDATE box_counters SET checkfail=0, seedfail=0, cfgfail=0, incoherent=0,
-                                     keepawake_fail=0, tickwedge_seen=NULL,
+                                     keepawake_fail=0, tickwedge_seen=NULL, driftpair=NULL,
                                      repair_pending_runs=0, repair_pending_tick=NULL,
                                      hostkey_mismatch=0, asleep_since=NULL, asleep_last_alert=NULL
              WHERE box_id=?`,
@@ -655,6 +655,30 @@ export class StoreState implements ReconcileStateApi {
   }
   setTickwedge(box: string, n: number): void {
     this.setCounter(box, "tickwedge_seen", n);
+  }
+
+  // driftpair (5.14.3 D5-noise) — a TEXT column, not a counter, so it has its
+  // own accessors rather than riding COUNTER_COLUMNS. NULL column ⇒ null (never
+  // recorded, first sight emits and records), the same first-sight rule as
+  // `tickwedge_seen`. A box with no `box_counters` row at all also reads null.
+  driftPair(box: string): string | null {
+    const id = this.boxId(box);
+    if (id === undefined) return null;
+    const r = this.store.db.query("SELECT driftpair AS v FROM box_counters WHERE box_id = ?").get(id) as
+      | { v?: string | null }
+      | null;
+    if (r === null || r === undefined || r.v === null || r.v === undefined || r.v === "") return null;
+    return r.v;
+  }
+  setDriftPair(box: string, pair: string): boolean {
+    // A name with no `boxes` row cannot get a counter row (the FK), so the write
+    // is dropped and read-back returns null ⇒ false ⇒ the D5 line fires again.
+    // A committed write is confirmed by re-reading it — the same fail-open,
+    // read-back contract the file implementation documents.
+    const id = this.counterRow(box, true);
+    if (id === undefined) return false;
+    this.store.db.query("UPDATE box_counters SET driftpair = ? WHERE box_id = ?").run(pair, id);
+    return this.driftPair(box) === pair;
   }
 
   // asleep — "<since> <last_alert>"; 5.7.1 reset is `rm -f`, i.e. ABSENT, which

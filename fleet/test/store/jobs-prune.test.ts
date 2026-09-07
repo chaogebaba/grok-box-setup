@@ -237,7 +237,7 @@ describe("D3 — pruneJobs", () => {
     }).not.toThrow();
     expect(n).toBe(0);
     // restore so the row is still readable for the assertion
-    s.db.run("PRAGMA user_version = 5");
+    s.db.run("PRAGMA user_version = 6");
     expect(jobById(s, doomed)).not.toBeUndefined();
     s.close();
   });

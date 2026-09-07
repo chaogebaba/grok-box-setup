@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.14.2"; // 5.14.2: fleet-status COND stops printing a stale `tick-wedged?` — it consults the store's tickwedge_seen the same read-only, fail-open way AUTHKEY consults staleness.
+const PKG_VERSION = "5.14.3"; // 5.14.3: reconcile journal noise — the D5 "content drift ignored" line logs once per (box, checkSha, targetSha) transition (persisted in the state store, falls back to every-tick when the store cannot record it), and the dynamic `config: canary policy=dynamic` line is folded into the pass-start line.
 
 async function gitShaFromGit(): Promise<string> {
   try {

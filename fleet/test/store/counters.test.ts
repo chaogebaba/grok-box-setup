@@ -75,6 +75,12 @@ describe("(c) counter semantics are identical in both implementations", () => {
     { name: "tickwedge never recorded ⇒ null", run: (s) => s.lastTickwedge(BOX), want: null },
     { name: "tickwedge record 0 ⇒ reads 0 (recorded, not null)", run: (s) => (s.setTickwedge(BOX, 0), s.lastTickwedge(BOX)), want: 0 },
     { name: "tickwedge record 3 ⇒ reads 3", run: (s) => (s.setTickwedge(BOX, 3), s.lastTickwedge(BOX)), want: 3 },
+    // driftpair (5.14.3 D5-noise / A): NEVER-recorded ⇒ null (first sight emits);
+    // a recorded pair reads back verbatim; setDriftPair confirms via read-back.
+    { name: "driftpair never recorded ⇒ null", run: (s) => s.driftPair(BOX), want: null },
+    { name: "driftpair set confirms via read-back ⇒ true", run: (s) => s.setDriftPair(BOX, "aaa|bbb"), want: true },
+    { name: "driftpair reads back the recorded pair", run: (s) => s.driftPair(BOX), want: "aaa|bbb" },
+    { name: "driftpair overwrite with a new pair", run: (s) => (s.setDriftPair(BOX, "ccc|ddd"), s.driftPair(BOX)), want: "ccc|ddd" },
     // asleep's reset is `rm -f` and ABSENT is distinguishable from zero: the 2h
     // first-alert gate keys off the marker's absence.
     { name: "asleep absent", run: (s) => s.readAsleep(BOX), want: undefined },
