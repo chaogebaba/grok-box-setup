@@ -137,7 +137,11 @@ read, and on 2026-09-02 the same file took 006 to 100 % and broke a rollout.
 So `BOXUP_SANDLOG_MAX_BYTES` truncates by **size**, on the same 60 s cadence,
 at any disk level including `ok`. It reuses the one mutator and therefore every
 gate above it: allowlist, symlink refusal, regular-file check, floor, and the
-owner switch. Nothing gains new authority.
+owner switch. Nothing gains new authority. Because the cap runs before the
+pressure path re-reads the disk level, a tick that started at ≥ 90 % but was
+brought back under it by the cap alone does not enter that tick's pressure
+reclaim of the built-in job-log list; there is no longer an emergency, and the
+next tick re-evaluates in `BOXUP_DISK_INTERVAL`.
 
 This changes what `DISK_GUARD_TRUNCATE` means. It is now "truncated at 90 %
 pressure **and** unconditionally whenever above the cap" — putting a path on
@@ -327,8 +331,9 @@ discovers every `grok-box-NNN` peer; it never touches other machines.
 
 `rollout` requires a target: one or more explicit `grok-box-NNN`, or `--all` for
 the whole fleet. A bare `grokfleet rollout` is a usage error (it will not guess).
-`--all` deploys to a canary first (default `grok-box-005`, override with
-`--canary <box>`), verifies it with `boxup check`, and only then rolls the rest
+`--all` deploys to a canary first (default `grok-box-008`, overridden by
+`--canary <box>` or by config `[rollout].canary` / `[fleet-brain].canary_box`),
+verifies it with `boxup check`, and only then rolls the rest
 at 2-concurrency. The first box that fails verification trips an **abort**: no
 new boxes are dispatched (in-flight ones finish and report), the command exits
 nonzero, and a summary lists each box's result and `v=<version>/<sha>`. There is

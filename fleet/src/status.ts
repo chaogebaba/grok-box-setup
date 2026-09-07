@@ -96,12 +96,13 @@ export function parseCheck(code: number | null, output: string): CheckResult {
 // `BoxStatus`: making `report` required would touch every `BoxStatus`
 // construction site and every test that builds one, for no gain (D1).
 //
-// Token domains are boxup 5.6.1's (audit §4): `disk=` is
+// Token domains are boxup 5.6.2's (audit §4): `disk=` is
 // `unknown | N% | N%/warn | N%/fail`; the `keepawake_rc` domain is exactly the
 // eight values `keepawake_status_tokens()` can print — `ok inert refused skip
 // unreachable parked-ok parked-blocked` plus the literal `-` — and `-`/absence
 // ⇒ null (`off` and `error` are NOT values of this token). `keepawake_last=` is
 // ISO8601Z, and the literal `never`, an unparseable value, or absence ⇒ null.
+// boxup 5.6.2's tunnelspawns= lands in tokens and is not yet consumed.
 
 /** The disk level boxup reports, or `unknown` when the token is absent/garbage. */
 export type DiskLevel = "ok" | "warn" | "fail" | "unknown";

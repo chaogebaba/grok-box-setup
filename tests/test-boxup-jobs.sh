@@ -78,8 +78,9 @@
 #   (10f) with DISK_GUARD_TRUNCATE overridden to a list WITHOUT the job entry,
 #         the 64 MiB bound still fires AND the pressure path still SELECTS and
 #         reclaims a job log                          [mutants j38, j39, j40]
-#   (10g) the tree is shellcheck-clean and (10f) still passes — i.e. the
-#         suppression is present and the built-in expansion is unquoted
+#   (10g) shellcheck-clean at warning severity; the two truncation loops carry
+#         SC2086 disabled in the comment block above; disk_allowlisted's
+#         built-in expansion present  [mutant: drop the cap-loop suppression]
 #   (11)  terminal records are pruned by AGE and by COUNT           [mutant j25]
 #   (11b) under disk pressure disk_guard TRUNCATES a job log (the size after is
 #         the assertion, not allowlist membership)
@@ -1155,7 +1156,7 @@ if ! command -v shellcheck >/dev/null 2>&1; then
   pass "(10g) SKIPPED (shellcheck not installed)"
 elif shellcheck -S warning "$BOXUP" >/dev/null 2>&1; then
   if [ "$teng_ok" = 1 ]; then
-    pass "(10g) shellcheck-clean at warning severity, (10f) still passes, and all THREE allowlist consumers expand unquoted with SC2086 disabled in the comment block above  [mutant: drop the suppression from the 5.6.1 cap loop]"
+    pass "(10g) shellcheck-clean at warning severity, (10f) still passes, the two truncation LOOPS (fail-branch candidates, 5.6.1 cap) carry SC2086 disabled in the comment block above, and \`disk_allowlisted\`'s built-in expansion is present  [mutant: drop the suppression from the 5.6.1 cap loop]"
   else
     bad  "(10g) an allowlist consumer lost its unquoted expansion or its SC2086 directive (or (10f) failed)"
   fi

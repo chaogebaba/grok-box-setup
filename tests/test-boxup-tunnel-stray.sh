@@ -21,6 +21,12 @@
 #       and right key but wrong port => NOT candidates; spawn path runs; decoys live
 #   (d) zero candidates            => spawn path exactly as before (fails++, backoff stamp)
 #   (e) status line carries tunnelfail=N
+#   (g)  spawn path bumps $RUN_DIR/tunnelspawns by exactly 1
+#   (g2) adopt path leaves it alone (fail.tunnel reset only)
+#   (g3) live-pid path leaves it alone
+#   (g4) backoff return leaves it alone (never spawned, never counted)
+#   (g5) a garbage counter file sanitises to 0, then a spawn writes 1
+#   (e2) the status line carries tunnelspawns=N and carries it LAST
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -42,11 +48,16 @@ bad()  { printf 'FAIL: %s\n' "$1"; fail=1; }
 #      one live process whose argv carries `-R 127.0.0.1:<port>:localhost:22`
 #      and `-i <key>`, spawned in the listed order (so the LAST one is newest).
 # $2 = initial fail.tunnel contents ("" => file absent)
-# $3 = initial tunnel.pid contents  ("" => file absent)
+# $3 = initial tunnel.pid contents  ("" => file absent); also accepts @<label>,
+#      resolved after the fixtures spawn to that label's pid.
+# $4 = initspawns: initial $RUN_DIR/tunnelspawns contents ("" => file absent;
+#      any other value written verbatim, so "12x" is expressible)
+# $5 = initlast: initial last-tunnel ("" => absent; the literal `now` writes
+#      `date +%s` inside the inner script; any other value written verbatim)
 # ---------------------------------------------------------------------------
 PORT=20005
 run_supervise() {
-  local procs="$1" initfail="$2" initpid="$3" inner
+  local procs="$1" initfail="$2" initpid="$3" initspawns="${4:-}" initlast="${5:-}" inner
   inner="$(mktemp)"
   cat > "$inner" <<INNER
 set -u
@@ -60,6 +71,8 @@ TUNNEL_LOG="\$WORK/tunnel.log"
 EVENTS="\$WORK/events"; : > "\$EVENTS"
 LOGLINES="\$WORK/log"; : > "\$LOGLINES"
 [ -n "$initfail" ] && echo "$initfail" > "\$RUN_DIR/fail.tunnel"
+[ -n "$initspawns" ] && echo "$initspawns" > "\$RUN_DIR/tunnelspawns"
+case "$initlast" in "") : ;; now) date +%s > "\$RUN_DIR/last-tunnel" ;; *) echo "$initlast" > "\$RUN_DIR/last-tunnel" ;; esac
 
 # --- spawn the candidate / decoy processes --------------------------------
 # Real processes: the argv tokens below land in /proc/<pid>/cmdline exactly as
@@ -86,7 +99,7 @@ PROCS
 for p in \$pids; do
   command kill -0 "\$p" 2>/dev/null || { echo "SPAWNFAIL:\$p"; exit 9; }
 done
-[ -n "$initpid" ] && echo "$initpid" > "\$TUNNEL_PID"
+case "$initpid" in "") : ;; @*) echo "\$PID_${initpid#@}" > "\$TUNNEL_PID" ;; *) echo "$initpid" > "\$TUNNEL_PID" ;; esac
 
 # --- stubs -----------------------------------------------------------------
 fleet_configured(){ return 0; }
@@ -109,7 +122,7 @@ kill(){
 
 extract_fn_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
 for fn in tunnel_candidates tunnel_starttime tunnel_newest tunnel_pid \\
-          tunnel_backoff_window tunnel_fail_count supervise_tunnel; do
+          tunnel_backoff_window tunnel_fail_count tunnel_spawn_count supervise_tunnel; do
   eval "\$(extract_fn_from "\$BOXUP" "\$fn")"
 done
 
@@ -121,13 +134,15 @@ rc=\$?
 # SHELL prints that, not the command), so guard with -f instead.
 pidfile=""; [ -f "\$TUNNEL_PID" ] && pidfile="\$(tr -d '[:space:]' < "\$TUNNEL_PID")"
 failn=NONE; [ -f "\$RUN_DIR/fail.tunnel" ] && failn="\$(tr -d '[:space:]' < "\$RUN_DIR/fail.tunnel")"
+spawnsn=NONE; [ -f "\$RUN_DIR/tunnelspawns" ] && spawnsn="\$(tr -d '[:space:]' < "\$RUN_DIR/tunnelspawns")"
 spawned=no; grep -q '^SPAWN\$' "\$EVENTS" && spawned=yes
 adopted=no; grep -q 'adopted stray' "\$LOGLINES" && adopted=yes
+backoff=no; grep -q 'backing off' "\$LOGLINES" && backoff=yes
 stamp=no; [ -f "\$RUN_DIR/last-tunnel" ] && stamp=yes
 termed=""; while IFS= read -r l; do case "\$l" in TERM:*|KILL:*) termed="\$termed \${l#*:}" ;; esac; done < "\$EVENTS"
 alive=""
 for p in \$pids; do command kill -0 "\$p" 2>/dev/null && alive="\$alive \$p"; done
-echo "rc=\$rc pidfile=\$pidfile fail=\$failn spawned=\$spawned adopted=\$adopted stamp=\$stamp"
+echo "rc=\$rc pidfile=\$pidfile fail=\$failn spawned=\$spawned adopted=\$adopted stamp=\$stamp spawns=\$spawnsn backoff=\$backoff"
 echo "labels:\$labels"
 echo "signalled:\$termed"
 echo "alive:\$alive"
@@ -249,12 +264,98 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# (g) D1 — the spawn path bumps $RUN_DIR/tunnelspawns by exactly 1. First:
+# zero candidates, no counter file => spawns=1 and spawned=yes (m1: deleting
+# the bump leaves spawns=NONE). Then: zero candidates with initspawns=1 =>
+# spawns=2 — the bump READS the existing value and adds one rather than writing
+# a constant (kills a constant-writing bump without needing a shared RUN_DIR).
+# ---------------------------------------------------------------------------
+outg="$(run_supervise '' 2 '' '' '')"
+spawnok "$outg" || exit 1
+g1="$(printf '%s\n' "$outg" | sed -n 1p)"
+if [ "$(field "$g1" spawned)" = yes ] && [ "$(field "$g1" spawns)" = 1 ]; then
+  pass "(g) spawn path writes tunnelspawns=1 from an absent counter file"
+else
+  bad "(g) spawn did not bump tunnelspawns to 1 (want spawned=yes spawns=1): [$g1]"
+fi
+outg1="$(run_supervise '' 2 '' 1 '')"
+spawnok "$outg1" || exit 1
+g1b="$(printf '%s\n' "$outg1" | sed -n 1p)"
+if [ "$(field "$g1b" spawned)" = yes ] && [ "$(field "$g1b" spawns)" = 2 ]; then
+  pass "(g) spawn path reads the existing counter (1) and bumps to 2"
+else
+  bad "(g) spawn did not bump 1->2 (want spawned=yes spawns=2): [$g1b]"
+fi
+
+# ---------------------------------------------------------------------------
+# (g2) the adopt path leaves the counter alone (fail.tunnel reset only). A
+# lone stray with initspawns=5 => spawns=5, fail=0, spawned=no, adopted=yes.
+# Kills m2 (bump moved into the adopt path => 6) and m3 (adopt writes 0 => 0).
+# ---------------------------------------------------------------------------
+outg2="$(run_supervise 'stray|20005|real' 4 '' 5 '')"
+spawnok "$outg2" || exit 1
+g2="$(printf '%s\n' "$outg2" | sed -n 1p)"
+if [ "$(field "$g2" spawns)" = 5 ] && [ "$(field "$g2" fail)" = 0 ] \
+   && [ "$(field "$g2" spawned)" = no ] && [ "$(field "$g2" adopted)" = yes ]; then
+  pass "(g2) adopt path leaves tunnelspawns untouched (5), resets fail.tunnel only"
+else
+  bad "(g2) adopt path disturbed the counter (want spawns=5 fail=0 spawned=no adopted=yes): [$g2]"
+fi
+
+# ---------------------------------------------------------------------------
+# (g3) the live-pid path leaves the counter alone. `wrongport` carries our key
+# on another port: not a tunnel_candidates match (PORT=20005), but tunnel_pid
+# accepts its `-R 127.0.0.1:` argv, so the pidfile pointed at it lands on the
+# live-pid branch (boxup:1220-1223). initspawns=5 => spawns=5, no spawn, no adopt.
+# ---------------------------------------------------------------------------
+outg3="$(run_supervise 'wrongport|20009|real' 0 '@wrongport' 5 '')"
+spawnok "$outg3" || exit 1
+g3="$(printf '%s\n' "$outg3" | sed -n 1p)"
+if [ "$(field "$g3" spawns)" = 5 ] && [ "$(field "$g3" spawned)" = no ] \
+   && [ "$(field "$g3" adopted)" = no ]; then
+  pass "(g3) live-pid path leaves tunnelspawns untouched (5), no spawn"
+else
+  bad "(g3) live-pid path disturbed the counter (want spawns=5 spawned=no adopted=no): [$g3]"
+fi
+
+# ---------------------------------------------------------------------------
+# (g4) the backoff return leaves the counter alone (never spawned, never
+# counted). Zero candidates, fail.tunnel=4 (window 60s) and last-tunnel stamped
+# NOW => spawned=no, fail=4 (unchanged), spawns=5 (unchanged), backoff=yes.
+# First case to reach boxup:1232-1235; makes m4 killable (bump above the
+# backoff check would count => 6) and pins the backoff branch by name.
+# ---------------------------------------------------------------------------
+outg4="$(run_supervise '' 4 '' 5 now)"
+spawnok "$outg4" || exit 1
+g4="$(printf '%s\n' "$outg4" | sed -n 1p)"
+if [ "$(field "$g4" spawned)" = no ] && [ "$(field "$g4" fail)" = 4 ] \
+   && [ "$(field "$g4" spawns)" = 5 ] && [ "$(field "$g4" backoff)" = yes ]; then
+  pass "(g4) backoff return: no spawn, tunnelspawns unchanged (5), backoff branch taken"
+else
+  bad "(g4) backoff path wrong (want spawned=no fail=4 spawns=5 backoff=yes): [$g4]"
+fi
+
+# ---------------------------------------------------------------------------
+# (g5) the sanitiser: a garbage counter file (12x) reads as 0, then a spawn
+# writes 1. Kills m5 (sanitiser dropped => `$(( 12x + 1 ))` is a bash
+# arithmetic error, so spawns is not 1).
+# ---------------------------------------------------------------------------
+outg5="$(run_supervise '' 2 '' 12x '')"
+spawnok "$outg5" || exit 1
+g5="$(printf '%s\n' "$outg5" | sed -n 1p)"
+if [ "$(field "$g5" spawned)" = yes ] && [ "$(field "$g5" spawns)" = 1 ]; then
+  pass "(g5) a garbage counter file sanitises to 0, then a spawn writes 1"
+else
+  bad "(g5) garbage counter not sanitised (want spawned=yes spawns=1): [$g5]"
+fi
+
+# ---------------------------------------------------------------------------
 # (e) D3 — the status line carries `tunnelfail=N` next to `tunnel=`. Drives the
 # REAL print_status with the REAL tunnel_state / tunnel_pid / tunnel_fail_count
 # extracted from boxup; only the unrelated helpers are stubbed.
 # ---------------------------------------------------------------------------
 status_line() {
-  local inner; inner="$(mktemp)"
+  local inner spawns="${2:-}"; inner="$(mktemp)"
   cat > "$inner" <<INNER
 set -u
 BOXUP="$BOXUP"
@@ -264,6 +365,7 @@ TUNNEL_PID="\$RUN_DIR/tunnel.pid"
 WORKER_PID="\$RUN_DIR/worker.pid"
 BOXUP_VERSION=test
 echo "$1" > "\$RUN_DIR/fail.tunnel"
+[ -n "$spawns" ] && echo "$spawns" > "\$RUN_DIR/tunnelspawns"
 fleet_configured(){ return 0; }
 read_ts_fields(){ backend=Running; online=yes; exitn=yes; ts_tags=tag:grok-box; ts_keyexpiry=""; auth=""; }
 read_box_name(){ echo grok-box-005; }
@@ -273,7 +375,7 @@ repair_fail_count(){ echo 0; }
 authkey_expiry_state(){ echo ok; }
 pgrep(){ return 1; }
 extract_fn_from(){ awk -v fn="\$2" '\$0 ~ "^"fn"\\\\(\\\\) \\\\{"{i=1} i{print} i&&/^\}\$/{exit}' "\$1"; }
-for fn in tunnel_pid tunnel_state tunnel_fail_count print_status; do
+for fn in tunnel_pid tunnel_state tunnel_fail_count tunnel_spawn_count print_status; do
   eval "\$(extract_fn_from "\$BOXUP" "\$fn")"
 done
 print_status
@@ -290,6 +392,25 @@ sl0="$(status_line 0)"
 case "$sl0" in
   *"tunnel=down tunnelfail=0"*) pass "(e) a healthy counter still prints tunnelfail=0 (field always present)" ;;
   *) bad "(e) tunnelfail=0 not printed: [$sl0]" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# (e2) D1 — the status line carries `tunnelspawns=N` and carries it LAST.
+#   - status_line 0 ""  => an ABSENT counter file still prints tunnelspawns=0
+#     (the token is never conditional — kills m6);
+#   - status_line 0 7   => the line ENDS with ` tunnelspawns=7`, end-anchored so
+#     a token merely inserted beside tunnelfail= (which still CONTAINS the
+#     substring) is rejected — kills m7.
+# ---------------------------------------------------------------------------
+sl2a="$(status_line 0 "")"
+case "$sl2a" in
+  *" tunnelspawns=0"*) pass "(e2) absent counter file still prints tunnelspawns=0 (token unconditional)" ;;
+  *) bad "(e2) tunnelspawns=0 not printed for absent file: [$sl2a]" ;;
+esac
+sl2b="$(status_line 0 7)"
+case "$sl2b" in
+  *" tunnelspawns=7") pass "(e2) status line ends with tunnelspawns=7 (appended LAST)" ;;
+  *) bad "(e2) tunnelspawns=7 not the LAST token: [$sl2b]" ;;
 esac
 
 # ---------------------------------------------------------------------------

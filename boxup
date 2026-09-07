@@ -32,7 +32,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.6.1
+BOXUP_VERSION=5.6.2
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -1162,6 +1162,12 @@ tunnel_fail_count() {
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
   echo "$n"
 }
+tunnel_spawn_count() {
+  local n=0
+  [ -f "$RUN_DIR/tunnelspawns" ] && n=$(tr -d '[:space:]' < "$RUN_DIR/tunnelspawns" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
 
 # supervise_tunnel: the per-tick supervisor. Unconfigured => silent no-op. A
 # stray tunnel (one with our exact argv that is NOT the pidfile pid) is ADOPTED
@@ -1239,6 +1245,7 @@ supervise_tunnel() {
 
   echo "$now" > "$RUN_DIR/last-tunnel" 2>/dev/null || true
   echo $((fails + 1)) > "$RUN_DIR/fail.tunnel" 2>/dev/null || true
+  echo $(( $(tunnel_spawn_count) + 1 )) > "$RUN_DIR/tunnelspawns" 2>/dev/null || true
 
   touch "$TUNNEL_LOG" 2>/dev/null || true
   if [ "$(wc -c < "$TUNNEL_LOG" 2>/dev/null || echo 0)" -gt 10485760 ]; then : > "$TUNNEL_LOG"; fi
@@ -2288,6 +2295,11 @@ disk_guard() {
     level=$(disk_level "$pct")
   fi
 
+  # D4 (5.6.2): because `pct`/`level` are re-read here, a tick that STARTED at
+  # ≥ 90 % and was brought under it by the cap alone does not enter the `fail`
+  # branch below, so the built-in job-log list is not reclaimed on that tick.
+  # Deliberate: there is no longer an emergency, and the next tick re-evaluates
+  # in `BOXUP_DISK_INTERVAL`.
   if [ "$level" = fail ]; then
     # shellcheck disable=SC2086  # word splitting is the point (space-separated list)
     # BOTH lists (J6, r10-B1): disk_allowlisted is the checker, this is the
@@ -3823,6 +3835,11 @@ print_status() {
   # already parses this line moves, and grokfleet's status.ts tokenizes on `k=v`
   # and drops unknown keys.
   printf ' %s' "$(jobs_status_tokens)"
+  # boxup 5.6.2: tunnelspawns= appended LAST, for the same reason disk=, the
+  # keepawake four and the jobs two were appended after what came before them —
+  # nothing that already parses this line moves, and grokfleet's status.ts
+  # tokenizes on `k=v` and drops unknown keys.
+  printf ' tunnelspawns=%s' "$(tunnel_spawn_count)"
   printf '\n'
 }
 
