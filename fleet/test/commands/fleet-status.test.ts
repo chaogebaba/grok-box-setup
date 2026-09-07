@@ -6,7 +6,7 @@ import { fleetStatusRows, formatFleetStatus, cmdFleetStatus } from "../../src/co
 import { testEnv } from "../helpers.ts";
 import { FakeRunner, isSs } from "../fake-runner.ts";
 import type { Runner, RunOpts, RunResult } from "../../src/runner.ts";
-import { keyStale, storeKeyStale, STALE_AUTHKEY } from "../../src/keystale.ts";
+import { keyStale, storeKeyStale, STALE_AUTHKEY, storeTickwedgeSeen } from "../../src/keystale.ts";
 import { openStore, storePath } from "../../src/store/db.ts";
 import { StoreState } from "../../src/store/state.ts";
 import { suiteScratch, cleanup } from "../store/helpers.ts";
@@ -486,6 +486,193 @@ describe("r2 — storeKeyStale reads the real store", () => {
         readExpires: () => "2026-11-28",
       });
       expect(rows[0]!.authkey).toBe("stale");
+    } finally {
+      cleanup(f.dir);
+    }
+  });
+});
+
+
+// ---- 5.14.2: the COND column stops printing a stale latched `tick-wedged?` ---
+//
+// The incident: `$RUN_DIR/tickwedge` is never reset by boxup, so grok-box-007
+// has carried `tickwedge=1` since one genuine wedge on 2026-09-04. The
+// reconciler's stateful delta (alerts.ts §3) correctly treats it as seen-and-
+// stale, but the COND column read the RAW token and printed `tick-wedged?`
+// forever — a live-looking warning about a healthy box. fleet-status now
+// consults the store's recorded high-water (`tickwedge_seen`) the same read-
+// only, fail-open way AUTHKEY consults staleness, and applies §3's rule.
+//
+// Cases mirror the brief: (a) seen=1,raw=1 ⇒ no entry; (b) seen=1,raw=2 ⇒
+// `tick-wedged`; (c) seen=null ⇒ `tick-wedged?`; (d) no store ⇒ `tick-wedged?`;
+// (e) the store throws ⇒ `tick-wedged?` AND the table still renders.
+
+/** A runner whose up box (grok-box-3) reports `tickwedge=N` in its status line. */
+function runnerWithWedge(n: number): FakeRunner {
+  return new FakeRunner((argv) => {
+    if (isSs(argv)) return { code: 0, stdout: "LISTEN 0 0 127.0.0.1:20003 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" };
+    const cmd = argv[argv.length - 1] ?? "";
+    if (cmd.includes("boxup check")) return { code: 0 };
+    if (cmd.includes("boxup status")) return { code: 0, stdout: `name=grok-box-3 v=5.3.0/abc1234 tunnel=up tickwedge=${n}\n` };
+    return { code: 0 };
+  });
+}
+
+describe("5.14.2 — COND tick-wedged consults tickwedge_seen (injected reader)", () => {
+  async function condFor(raw: number, seen: number | null | undefined, injectReader = true): Promise<string> {
+    const rows = await fleetStatusRows({
+      runner: runnerWithWedge(raw),
+      env,
+      devices: { async body() { return DEVICES; } },
+      boxes: ["grok-box-3"],
+      readExpires: () => undefined,
+      // when injectReader is false we DON'T pass tickwedgeSeen: exercises the
+      // production default against `env` (which has no store) ⇒ undefined ⇒ `?`.
+      ...(injectReader ? { tickwedgeSeen: () => seen } : {}),
+    });
+    return rows[0]!.cond;
+  }
+
+  test("(a) seen=1, raw=1 ⇒ COND has NO tick-wedged entry (seen-and-stale)", async () => {
+    const cond = await condFor(1, 1);
+    expect(cond).not.toContain("tick-wedged");
+    expect(cond).not.toContain("tick-wedged?");
+    // A clean line but for the stale counter ⇒ nothing else ⇒ `-`.
+    expect(cond).toBe("-");
+  });
+
+  test("(b) seen=1, raw=2 ⇒ `tick-wedged` (a real increase, no `?`)", async () => {
+    const cond = await condFor(2, 1);
+    expect(cond).toContain("tick-wedged");
+    expect(cond).not.toContain("tick-wedged?");
+  });
+
+  test("(c) seen=null (never recorded) ⇒ `tick-wedged?` (fail-open)", async () => {
+    const cond = await condFor(1, null);
+    expect(cond).toContain("tick-wedged?");
+    expect(cond).not.toBe("tick-wedged"); // must keep the `?`
+  });
+
+  test("(d) no store (production default, empty env) ⇒ `tick-wedged?`", async () => {
+    const cond = await condFor(1, undefined, /* injectReader */ false);
+    expect(cond).toContain("tick-wedged?");
+  });
+});
+
+const WEDGE_SCRATCH = suiteScratch("fleet-status-tickwedge");
+afterAll(() => WEDGE_SCRATCH.clean());
+
+describe("5.14.2 — storeTickwedgeSeen reads the real store (the seam)", () => {
+  function seedWedge(prefix: string, rows: Array<{ box: string; idx: number; seen?: number }>): { dir: string; state: string } {
+    const dir = WEDGE_SCRATCH.dir(prefix);
+    const state = `${dir}/state`;
+    const store = openStore({ path: storePath(state), dir: state });
+    const st = new StoreState(store);
+    for (const r of rows) {
+      st.recordEnrolled(r.box, 20000 + r.idx, `AAAAKEY${r.idx}`);
+      if (r.seen !== undefined) st.setTickwedge(r.box, r.seen); // absent ⇒ null (never recorded)
+    }
+    store.close();
+    return { dir, state };
+  }
+
+  test("a recorded high-water reads back as a number; an enrolled box never recorded reads null", () => {
+    const f = seedWedge("mixed", [
+      { box: "grok-box-007", idx: 7, seen: 1 }, // the incident box: recorded 1
+      { box: "grok-box-008", idx: 8 }, // enrolled, tickwedge never recorded
+    ]);
+    try {
+      const seen = storeTickwedgeSeen(testEnv({ FLEET_STATE: f.state }), ["grok-box-007", "grok-box-008", "grok-box-099"]);
+      expect(seen("grok-box-007")).toBe(1);
+      expect(seen("grok-box-008")).toBe(null);
+      // A box the store has never heard of: also null (boxId undefined).
+      expect(seen("grok-box-099")).toBe(null);
+    } finally {
+      cleanup(f.dir);
+    }
+  });
+
+  test("no store at all ⇒ undefined (fail-open ⇒ `?`), nothing throws", () => {
+    const seen = storeTickwedgeSeen(testEnv({ FLEET_STATE: "/nonexistent/fleet-state" }), ["grok-box-007"]);
+    expect(seen("grok-box-007")).toBeUndefined();
+  });
+
+  // (e) — a store that opens but throws on the query: fail-open to undefined,
+  // and the whole table still renders rc 0. Same corrupt-store construction as
+  // the AUTHKEY N4 case: schema v4, no box_counters table ⇒ lastTickwedge's
+  // SELECT throws `no such table: box_counters`.
+  function corruptCountersStore(prefix: string): { dir: string; state: string } {
+    const dir = WEDGE_SCRATCH.dir(prefix);
+    const state = `${dir}/state`;
+    mkdirSync(state, { recursive: true });
+    const db = new Database(`${state}/fleet.db`, { create: true });
+    db.run("PRAGMA user_version = 4");
+    db.run("CREATE TABLE boxes(box_id INTEGER PRIMARY KEY, name TEXT, idx INTEGER, port INTEGER, enrolled_at INTEGER)");
+    db.run("INSERT INTO boxes VALUES(1,'grok-box-007',7,20007,200)");
+    // deliberately NO box_counters table ⇒ the tickwedge SELECT throws.
+    db.close();
+    return { dir, state };
+  }
+
+  test("(e) a store that throws on the query ⇒ undefined, and the premise holds", () => {
+    const f = corruptCountersStore("throw-probe");
+    try {
+      const e = testEnv({ FLEET_STATE: f.state });
+      // Premise: the read really throws (so the catch below is load-bearing).
+      const h = openReadHandle(e);
+      expect(h.store).toBeDefined();
+      expect(() => h.state.lastTickwedge("grok-box-007")).toThrow();
+      h.close();
+      // storeTickwedgeSeen absorbs it: undefined for every box ⇒ fail-open `?`.
+      const seen = storeTickwedgeSeen(e, ["grok-box-007"]);
+      expect(seen("grok-box-007")).toBeUndefined();
+    } finally {
+      cleanup(f.dir);
+    }
+  });
+
+  test("(e) the table still renders `tick-wedged?` and rc 0 when the store throws", async () => {
+    const f = corruptCountersStore("throw-render");
+    try {
+      const e = testEnv({ FLEET_STATE: f.state });
+      // Production default reader (no injected tickwedgeSeen) against the
+      // throwing store. raw=1 from the status line, undefined seen ⇒ `?`.
+      const rows = await fleetStatusRows({
+        runner: runnerWithWedge(1),
+        env: e,
+        devices: { async body() { return DEVICES; } },
+        boxes: ["grok-box-3"],
+        readExpires: () => undefined,
+      });
+      expect(rows[0]!.cond).toContain("tick-wedged?");
+
+      let out = "";
+      const rc = await cmdFleetStatus(
+        { runner: runnerWithWedge(1), env: e, devices: { async body() { return DEVICES; } }, boxes: ["grok-box-3"], readExpires: () => undefined },
+        (x) => (out += x),
+      );
+      expect(rc).toBe(0);
+      expect(out).toContain("NAME");
+      expect(out).toContain("tick-wedged?");
+    } finally {
+      cleanup(f.dir);
+    }
+  });
+
+  // end-to-end: the store row alone (no injected reader) turns 007's stale
+  // counter into a blank COND — the whole point of the change.
+  test("end to end: seen=1 + raw=1 renders COND `-`, no injected reader", async () => {
+    const f = seedWedge("e2e", [{ box: "grok-box-3", idx: 3, seen: 1 }]);
+    try {
+      const e = testEnv({ FLEET_STATE: f.state });
+      const rows = await fleetStatusRows({
+        runner: runnerWithWedge(1),
+        env: e,
+        devices: { async body() { return DEVICES; } },
+        boxes: ["grok-box-3"],
+        readExpires: () => undefined,
+      });
+      expect(rows[0]!.cond).toBe("-");
     } finally {
       cleanup(f.dir);
     }

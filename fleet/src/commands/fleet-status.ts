@@ -13,11 +13,18 @@
 //           would refuse
 //   COND    5.13.0 box-conditions (D3d): comma-joined short condition names, or
 //           `-`. This command probes LIVE and holds no tick state, so its COND
-//           shows only the STATELESS conditions (disk-fail, disk-warn,
-//           repair-failing); the two stateful kinds are shown as
-//           `keepawake-failing?`/`tick-wedged?` when the raw token would qualify
-//           but the streak/delta cannot be evaluated here. It comes off the
-//           same probe 5.12.1's `mapLimit` already runs — a parse, no extra ssh.
+//           shows the STATELESS conditions (disk-fail, disk-warn,
+//           repair-failing) directly. Of the two STATEFUL kinds, `tick-wedged`
+//           is now settled here by consulting the store's `tickwedge_seen` the
+//           same read-only, fail-open way AUTHKEY consults staleness
+//           (keystale.ts): `raw > seen` prints `tick-wedged` (a real increase),
+//           `raw <= seen` prints nothing (seen-and-stale, e.g. 007's latched
+//           `tickwedge=1`), and no store / never-recorded / unreadable keeps the
+//           fail-open `tick-wedged?`. `keepawake-failing` still cannot be
+//           evaluated live (its streak needs state) and is shown as
+//           `keepawake-failing?`. It comes off the same probe 5.12.1's
+//           `mapLimit` already runs — a parse plus one read-only store handle,
+//           no extra ssh. This command NEVER writes to the store.
 //
 // COND ends this table's byte-parity with bash's printf: the TS table is now a
 // SUPERSET of the bash one, and `grokfleet fleet-status` is the authority.
@@ -33,7 +40,7 @@ import { splitVersion, parseStatusLine, toReport } from "../status.ts";
 import { statelessConditions } from "../reconcile/alerts.ts";
 import { CHECK_COMMAND, STATUS_COMMAND } from "../remote.ts";
 import { mapLimit } from "../maplimit.ts";
-import { storeKeyStale, STALE_AUTHKEY } from "../keystale.ts";
+import { storeKeyStale, STALE_AUTHKEY, storeTickwedgeSeen } from "../keystale.ts";
 
 const CHECK_TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 20_000;
@@ -86,6 +93,15 @@ export interface FleetStatusDeps {
    * pre-r2 rendering.
    */
   keyStale?: (box: string) => boolean;
+  /**
+   * The tickwedge display rule's one datum: the highest tickwedge the store has
+   * RECORDED for this box (number), `null` when never recorded, `undefined`
+   * when there is no store / it is unreadable. Injected for tests; the
+   * production default opens the SAME read-only handle idiom as `keyStale`,
+   * once per invocation. Absent AND no store ⇒ `undefined` ⇒ the pre-change
+   * `tick-wedged?` rendering. fleet-status never writes.
+   */
+  tickwedgeSeen?: (box: string) => number | null | undefined;
 }
 
 
@@ -136,6 +152,9 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
   const readExp = deps.readExpires ?? ((b: string) => fsReadExpiresField2(deps.env, b));
   // r2/R2(a): resolved ONCE for the whole table, before the probes fan out.
   const isStale = deps.keyStale ?? storeKeyStale(deps.env, boxes);
+  // tickwedge display rule: the recorded high-water per box, resolved ONCE the
+  // same read-only, fail-open way. `undefined` (no store) ⇒ fail-open `?`.
+  const seenWedge = deps.tickwedgeSeen ?? storeTickwedgeSeen(deps.env, boxes);
 
   // A5: probe up to PROBE_CONCURRENCY boxes at once. `mapLimit` writes results
   // by INDEX, so the rows come back in reconcile-target order (box-index order)
@@ -166,8 +185,10 @@ export async function fleetStatusRows(deps: FleetStatusDeps): Promise<FleetStatu
       // D3d: COND off the SAME probe (a parse of `line`, no extra ssh). An empty
       // `line` (rc≠0) parses to a fully-defaulted report ⇒ no stateless
       // condition ⇒ `-`, which is the "not read this tick" reading, same guard
-      // D1b's rc half applies. Stateless only; stateful kinds get a `?`.
-      const conds = line === "" ? [] : statelessConditions(toReport(parseStatusLine(line)));
+      // D1b's rc half applies. Stateless kinds directly; `tick-wedged` settled
+      // against the store's recorded high-water (undefined ⇒ fail-open `?`);
+      // `keepawake-failing` still gets a `?`.
+      const conds = line === "" ? [] : statelessConditions(toReport(parseStatusLine(line)), seenWedge(box));
       cond = conds.length > 0 ? conds.join(",") : "-";
     }
 
