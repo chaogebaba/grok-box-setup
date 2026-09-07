@@ -1,7 +1,9 @@
 // config-pass.ts — reconcile_config_pass port (main:2345-2453) + F1/F2 canary policy.
 //
 // managed_files_present ⇒ silent no-op (feature off). Canary FIRST (F1: verbatim
-// pass-start line + a SEPARATE `config: canary policy=<fixed|dynamic>` line),
+// pass-start line; 5.14.3 D5-noise F3-fold folds the dynamic-policy note INTO
+// that line as `(canary=<box>, policy=dynamic)` — there is no longer a separate
+// `config: canary policy=` line, and fixed policy stays byte-identical to bash),
 // then the rest in reconcile_target_boxes order, SERIALLY. Guard: tunnel up AND
 // checkfail count <= 3. Canary routing: tunnel-down / checkfail>3 ⇒ log+skip+
 // fall-through; push rc 0 ⇒ reset cfgfail + ok; rc 6 ⇒ skip canary + fall-
