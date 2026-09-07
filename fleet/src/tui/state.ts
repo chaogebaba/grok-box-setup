@@ -210,6 +210,9 @@ export function applyViewResult(
     offset: 0,
   };
   if (kind === "jobs") {
+    if (payload.error !== undefined) {
+      return { ...state, view: { ...view, offset: v.offset, jobs: undefined, cursor: undefined } };
+    }
     // 5.14.1 D1: the jobs view keeps the OPERATOR'S ROW across a reload — the
     // `r` refetch and the one `s` triggers both land here. `offset` is left
     // alone because the jobs window is derived from the cursor at paint time.
@@ -455,8 +458,10 @@ function handleViewKey(state: TuiState, key: string, size: Size): { state: TuiSt
     const live = jobs !== undefined && jobs.length > 0 && v.cursor !== undefined;
     if (down || up) {
       // inert while loading, on an error and on an empty list — all of which
-      // are ONE content line with no row under the cursor.
-      if (!live) return { state, effect: { type: "none" } };
+      // are ONE content line with no row under the cursor. `r` preserves the
+      // cursor+jobs across the in-flight reload (D1), so `!live` alone would
+      // miss it; `v.loading` makes j/k/arrows inert during that reload too.
+      if (v.loading || !live) return { state, effect: { type: "none" } };
       const cursor = Math.min(Math.max(v.cursor! + (down ? 1 : -1), 0), jobs!.length - 1);
       return { state: { ...state, view: { ...v, cursor } }, effect: { type: "none" } };
     }

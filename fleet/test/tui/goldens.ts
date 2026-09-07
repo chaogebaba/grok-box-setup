@@ -533,9 +533,9 @@ export const GOLDENS: Golden[] = [
   },
 
   // --- 5.14.1: the cursor, the joblog and the stop modal ---------------------
-  // The cursor on row 2 (`DONEJOB0000000000000A`) with colour ON: the fixture
-  // shows the window and the indicator; the SELECTION itself is pinned by the
-  // mounted colour assertion in visual.test.ts.
+  // The cursor on row 2 (`DONEJOB0000000000000A`) under NO_COLOR (the helpers
+  // default, per A9): the fixture shows the window and the `>` indicator; the
+  // colour SELECTION itself is pinned by the mounted assertion in visual.test.ts.
   {
     name: "view-jobs-cursor-120x20",
     size: SIZE(120, 20),

@@ -485,6 +485,19 @@ describe("5.14.1 D1 — the cursor's lifecycle", () => {
     expect(handleKey(empty, "j", SIZE_120x40).state.view?.cursor).toBeUndefined();
   });
 
+  // MUTANT 23 (BLOCKER 2): `r` on a POPULATED view preserves cursor+jobs (D1),
+  // so `!live` is FALSE mid-reload; only `v.loading` keeps j/k/arrows inert.
+  // Pressing `r` on the real reload shape and then j/k/↓/↑ must NOT move.
+  test("j/k/arrows are INERT during an actual reload (r preserves cursor+jobs)", () => {
+    const reloading = handleKey(openJobs({ cursor: 1 }), "r", SIZE_120x40).state;
+    expect(reloading.view?.loading).toBe(true);
+    expect(reloading.view?.cursor).toBe(1); // cursor preserved across r
+    expect(reloading.view?.jobs).toBeDefined(); // jobs preserved across r
+    for (const key of ["j", "k", "\x1b[B", "\x1b[A"]) {
+      expect(handleKey(reloading, key, SIZE_120x40).state.view?.cursor).toBe(1);
+    }
+  });
+
   // MUTANT 5: `applyViewResult` resets the cursor to 0 after a reload.
   test("a reload PRESERVES the cursor, and clamps it when the list shrank", () => {
     const s = openJobs({ cursor: 3 });
@@ -493,6 +506,32 @@ describe("5.14.1 D1 — the cursor's lifecycle", () => {
     const shrunk = sortJobs(FOUR).slice(0, 2);
     const fewer = applyViewResult(s, "jobs", "", { lines: jobRows(shrunk, NOW), jobs: shrunk }, SIZE_120x40);
     expect(fewer.view?.cursor).toBe(1);
+  });
+
+  // MUTANT 22 (BLOCKER 1): a FAILED reload must clear jobs+cursor (D1: error ⇒
+  // cursor undefined ⇒ j/k, Enter and admin `s` inert), keeping only offset.
+  // Otherwise the stale invisible row is still navigable and stoppable.
+  test("a FAILED reload clears jobs+cursor, making j / Enter / admin `s` inert", () => {
+    const populated = openJobs({ cursor: 1 }, { scope: "admin" });
+    const reloading = handleKey(populated, "r", SIZE_120x40).state;
+    const errored = applyViewResult(reloading, "jobs", "", { error: "link error" }, SIZE_120x40);
+    // the view keeps offset but drops the stale row entirely.
+    expect(errored.view?.error).toBe("link error");
+    expect(errored.view?.jobs).toBeUndefined();
+    expect(errored.view?.cursor).toBeUndefined();
+    expect(errored.view?.offset).toBe(0);
+    // j is inert: cursor stays undefined, effect none.
+    const jResult = handleKey(errored, "j", SIZE_120x40);
+    expect(jResult.state.view?.cursor).toBeUndefined();
+    expect(jResult.effect).toEqual({ type: "none" });
+    // Enter is inert: no joblog opened, no load-view effect.
+    const enterResult = handleKey(errored, "\r", SIZE_120x40);
+    expect(enterResult.state.view?.kind).toBe("jobs");
+    expect(enterResult.effect).toEqual({ type: "none" });
+    // admin `s` is inert: no stop-job modal, no effect.
+    const stopResult = handleKey(errored, "s", SIZE_120x40);
+    expect(stopResult.state.modal).toBeUndefined();
+    expect(stopResult.effect).toEqual({ type: "none" });
   });
 });
 
