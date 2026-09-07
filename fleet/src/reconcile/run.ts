@@ -636,8 +636,16 @@ async function reconcileOne(
     checkVersion !== "unknown" && checkVersion !== "-" && checkVersion !== "?" && checkVersion !== "";
   if (tunnel === "up" && targetVersionKnown && boxVersionKnown) {
     drift = checkVersion === deps.targetVersion ? "no" : "yes";
-    // D5: ONE debug line per box per tick when the versions agree but the
-    // stamped shas do not — the case that used to force a pointless rollout.
+    // D5: ONE debug line when the versions agree but the stamped shas do not —
+    // the case that used to force a pointless rollout. 5.14.3 (D5-noise): emit
+    // it ONCE per (box, checkSha, targetSha) transition — the first tick a given
+    // pair is observed for the box — then stay silent until either sha changes
+    // (a rollout, a new main commit, a box re-image). The pair is persisted in
+    // the state store beside the other per-box markers so the memory survives
+    // the fresh process every tick. If the store cannot record the pair,
+    // `driftPair` reads null next tick and the line fires again — the deliberate
+    // fall-back to today's log-every-tick behaviour, never a silent suppression.
+    // The snapshot's drift/version fields below are UNCHANGED.
     if (
       drift === "no" &&
       deps.targetSha !== undefined &&
@@ -646,9 +654,13 @@ async function reconcileOne(
       checkSha !== "?" &&
       checkSha !== deps.targetSha
     ) {
-      log(
-        `drift: ${box} same VERSION ${checkVersion}, sha ${checkSha}≠${deps.targetSha} — content drift ignored (D5)`,
-      );
+      const pair = `${checkSha}|${deps.targetSha}`;
+      if (deps.state.driftPair(box) !== pair) {
+        log(
+          `drift: ${box} same VERSION ${checkVersion}, sha ${checkSha}≠${deps.targetSha} — content drift ignored (D5)`,
+        );
+        deps.state.setDriftPair(box, pair);
+      }
     }
   }
 

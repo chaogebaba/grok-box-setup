@@ -390,9 +390,16 @@ describe("T11 config pass canary routing (F1/F2)", () => {
     // bash emits the pass-start line but NEVER a `config: canary policy=` line.
     expect(lines.some((l) => l.includes("config: pass start (dry-run)"))).toBe(true);
     expect(lines.some((l) => l.includes("config: canary policy="))).toBe(false);
+    // 5.14.3 F3-fold: FIXED mode is byte-identical to bash — the pass-start line
+    // carries NO `policy=` suffix (the fold is dynamic-only). A mutant that
+    // appended the suffix in fixed mode would break bash parity here.
+    const fixedStart = lines.find((l) => l.includes("config: pass start (dry-run)"));
+    expect(fixedStart).toContain("config: pass start (dry-run) — canary-first over tunnels (canary=grok-box-002)");
+    expect(fixedStart!.endsWith("(canary=grok-box-002)")).toBe(true);
+    expect(fixedStart).not.toContain("policy=");
   });
 
-  test("F3: dynamic policy KEEPS the 'config: canary policy=dynamic' line (grokfleet-only mode)", async () => {
+  test("F3: dynamic policy FOLDS policy=dynamic into the pass-start line, NO separate canary line", async () => {
     const { fs } = memState();
     const lines = await withLogs(async () => {
       await configPass({
@@ -407,7 +414,18 @@ describe("T11 config pass canary routing (F1/F2)", () => {
         apply: false,
       });
     });
-    expect(lines.some((l) => l.includes("config: canary policy=dynamic"))).toBe(true);
+    // 5.14.3 F3-fold: exactly ONE pass-start line, and it carries policy=dynamic
+    // inside the canary group. The standalone `config: canary policy=` line is
+    // gone (M7 keeps it ⇒ this assertion fails).
+    const starts = lines.filter((l) => l.includes("config: pass start (dry-run)"));
+    expect(starts.length).toBe(1);
+    expect(starts[0]).toContain("policy=dynamic");
+    expect(starts[0]).toContain("(canary=grok-box-004, policy=dynamic)");
+    // NO separate `config: canary policy=` line anywhere (M6 drops policy=dynamic
+    // from the fold; M7 re-adds the separate line — both caught here + above).
+    expect(lines.some((l) => l.includes("config: canary policy="))).toBe(false);
+    // exactly one line mentions policy=dynamic at all (the folded pass-start)
+    expect(lines.filter((l) => l.includes("policy=dynamic")).length).toBe(1);
   });
 
   test("no reachable box ⇒ no canary, one skip, non-canary loop still runs", async () => {

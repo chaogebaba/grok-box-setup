@@ -511,17 +511,19 @@ describe("L2/L3 — the lease field on /v1/fleet and /v1/boxes/:name", () => {
     // migrating the file forward behind a GET.
     //
     // To be a GENUINE v2 file we must strip every LATER addition, not just the
-    // v3 `leases` table: v4 added `jobs`, and v5 (5.13.0) ADDED COLUMNS to
-    // `box_counters`/`snapshot_boxes`. Migration replay is CREATE TABLE IF NOT
-    // EXISTS (idempotent) but ADD COLUMN is NOT — a v5 column left in place makes
-    // the 4→5 ALTER fail "duplicate column". A real v2 store never had them, so
-    // drop them here before rewinding user_version.
+    // v3 `leases` table: v4 added `jobs`, v5 (5.13.0) ADDED COLUMNS to
+    // `box_counters`/`snapshot_boxes`, and v6 (5.14.3) added `box_counters.
+    // driftpair`. Migration replay is CREATE TABLE IF NOT EXISTS (idempotent)
+    // but ADD COLUMN is NOT — a later column left in place makes its own ALTER
+    // fail "duplicate column". A real v2 store never had them, so drop them here
+    // before rewinding user_version.
     const dir = seedFleet("v2-store");
     const store = openStore({ path: storePath(dir), dir });
     store.db.run("DROP TABLE leases");
     store.db.run("DROP TABLE IF EXISTS jobs");
     store.db.run("ALTER TABLE box_counters DROP COLUMN keepawake_fail");
     store.db.run("ALTER TABLE box_counters DROP COLUMN tickwedge_seen");
+    store.db.run("ALTER TABLE box_counters DROP COLUMN driftpair");
     store.db.run("ALTER TABLE snapshot_boxes DROP COLUMN report");
     store.db.run("PRAGMA user_version = 2");
     store.close();

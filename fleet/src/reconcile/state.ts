@@ -185,6 +185,35 @@ export interface ReconcileStateApi {
    */
   lastTickwedge(box: string): number | null;
   setTickwedge(box: string, n: number): void;
+  /**
+   * 5.14.3 D5-noise: the last (checkSha, targetSha) drift pair OBSERVED for this
+   * box, as the string `"<checkSha>|<targetSha>"`, or `null` when none has been
+   * recorded — first sight, a legacy-imported row, or a store that could not
+   * read one. The D5 "content drift ignored" line is emitted only on the tick
+   * that first observes a given pair for a box; `setDriftPair` records the pair
+   * so the next tick stays silent until either sha changes for that box.
+   *
+   * `null` is deliberately fail-OPEN, exactly like `lastTickwedge`'s A28 rule
+   * and the alert-dedup layer: a reader that cannot find its state lets the line
+   * through, never suppresses it without a record. That is what turns a store
+   * that cannot persist the marker back into today's log-every-tick behaviour.
+   */
+  driftPair(box: string): string | null;
+  /**
+   * Record the drift pair for `box`. Returns `true` only when the write is
+   * CONFIRMED by a read-back — a write that did not land (an unwritable/absent
+   * store) returns `false`, and because the next tick then reads `null` the D5
+   * line fires again. The read-back is what makes the fall-back to every-tick
+   * logging self-correcting rather than a silent gap.
+   *
+   * NEVER THROWS (r2 gate BLOCKER). A mid-tick backing-store write failure —
+   * SQLITE_BUSY after the busy_timeout, FULL, IOERR, or an injected StateFs that
+   * throws — is caught and reported as `false` ("not confirmed"), because a
+   * throw here would escape into runReconcile and kill the whole reconcile tick.
+   * The old, pre-5.14.3 code merely logged the D5 line unconditionally; the
+   * marker must never be able to do worse than that.
+   */
+  setDriftPair(box: string, pair: string): boolean;
   recordApiFailure(nowSec: number): { n: number; mins: number };
   resetApiFailure(): void;
   apiFails(): number;
@@ -291,6 +320,39 @@ export class ReconcileState implements ReconcileStateApi {
   }
   setTickwedge(box: string, n: number): void {
     this.fs.write(this.p(`${box}.tickwedge`), `${n}\n`);
+  }
+
+  // --- driftpair (5.14.3 D5-noise) -----------------------------------------
+  //
+  // `<box>.driftpair` is a single line, `"<checkSha>|<targetSha>"`, with NO bash
+  // counterpart — like `.tickwedge` and the alert-dedup files it is namespaced
+  // outside the D2 byte-parity set, so a bash reader simply ignores it. Absent
+  // ⇒ null (never recorded), which the D5 emit rule treats as "log this tick and
+  // record", mirroring `lastTickwedge`'s A28 first-sight semantics.
+  driftPair(box: string): string | null {
+    const raw = this.fs.read(this.p(`${box}.driftpair`));
+    if (raw === undefined) return null;
+    const v = raw.trim();
+    return v === "" ? null : v;
+  }
+  setDriftPair(box: string, pair: string): boolean {
+    // `write` swallows its errors (bash parity, StateFs contract), so the ONLY
+    // signal that the marker landed is a read-back — the same fail-open rule the
+    // interface documents: an unwritable store cannot confirm, returns false,
+    // and the next tick re-reads null and re-emits (log every tick).
+    //
+    // r2 (gate BLOCKER): the production `nodeStateFs.write`/`read` already
+    // swallow their errors, but the interface promises setDriftPair NEVER throws
+    // and returns false when unconfirmed. A custom/injected `StateFs` whose
+    // write or read throws must not escape into runReconcile and kill the tick,
+    // so the whole write+read-back is guarded. A caught error is "not confirmed"
+    // ⇒ false ⇒ the D5 line logs again next tick.
+    try {
+      this.fs.write(this.p(`${box}.driftpair`), `${pair}\n`);
+      return this.driftPair(box) === pair;
+    } catch {
+      return false;
+    }
   }
 
   // --- asleep (main:3216-3243) — "<since> <last_alert>\n" ---

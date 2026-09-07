@@ -17,7 +17,7 @@
 // `enrol_stage`, `retired_at`) so v2 adds only tables — see D2/D3.
 
 /** The highest schema this binary knows how to create and operate. */
-export const KNOWN_SCHEMA = 5;
+export const KNOWN_SCHEMA = 6;
 
 /** Timestamps everywhere in the store are integer epoch SECONDS, UTC. */
 export const AUDIT_RETENTION_DAYS = 92;
@@ -356,12 +356,32 @@ const V5: string[] = [
   `ALTER TABLE snapshot_boxes ADD COLUMN report TEXT`,
 ];
 
+// --- v6 (grokfleet 5.14.3, reconcile journal-noise D5-noise) ------------------
+//
+// ADDITIVE ONLY: one ADD COLUMN, so `min_reader` STAYS 1 — an older brain
+// reading a v6 store ignores the column it does not select, and a v6 file stays
+// operable by a schema-5 reader (D2). Same shape as V5's `tickwedge_seen`: an
+// `ADD COLUMN` has no `IF NOT EXISTS`, which is safe because `migrate()` runs
+// each migration in ONE transaction and the forward-only `m.to <= from` guard
+// never replays a completed one.
+//
+//   - `box_counters.driftpair` — the last (checkSha, targetSha) drift pair
+//                                 OBSERVED for the box, stored as the string
+//                                 `"<checkSha>|<targetSha>"`. NULLABLE, DEFAULT
+//                                 NULL: NULL means "never recorded", so the D5
+//                                 "content drift ignored" line fires on first
+//                                 sight and legacy-imported rows (which never
+//                                 name this column) start NULL — i.e. emit —
+//                                 exactly like `tickwedge_seen`'s A28 rule.
+const V6: string[] = [`ALTER TABLE box_counters ADD COLUMN driftpair TEXT`];
+
 export const MIGRATIONS: Migration[] = [
   { to: 1, minReader: 1, statements: V1 },
   { to: 2, minReader: 1, statements: V2 },
   { to: 3, minReader: 1, statements: V3 },
   { to: 4, minReader: 1, statements: V4 },
   { to: 5, minReader: 1, statements: V5 },
+  { to: 6, minReader: 1, statements: V6 },
 ];
 
 /** Every v1 table, in the order a full replay must DELETE them (children first). */

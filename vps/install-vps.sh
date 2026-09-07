@@ -98,7 +98,7 @@ GROKFLEET_FETCH_ROOT_ENV="${GROKFLEET_FETCH_ROOT-}"
 
 # `make ts-release-build` rewrites EXACTLY these two lines (fleet/scripts/
 # release-build.sh); keep them at column 0 in `NAME=value` form.
-GROKFLEET_RELEASE=v5.14.2
+GROKFLEET_RELEASE=v5.14.3
 # Placeholder until the first `make ts-release-build` writes the real digest.
 # Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
 GROKFLEET_SHA256=0cb91c5f50306be5d8a5d0785870f74d3486d17a08dccac303b0403afddc026e

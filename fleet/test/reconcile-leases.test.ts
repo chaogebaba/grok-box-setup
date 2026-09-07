@@ -285,9 +285,12 @@ describe("L3 — the canary rules, one per engine (r1-B4/r2-B4)", () => {
     );
     lease(h.store, "grok-box-005");
     await runReconcile(h.deps);
-    expect(logs.some((l) => l.includes("config: pass start (apply) — canary-first over tunnels (canary=grok-box-008)"))).toBe(
-      true,
-    );
+    // 5.14.3 F3-fold: dynamic policy is folded into the pass-start line.
+    expect(
+      logs.some((l) =>
+        l.includes("config: pass start (apply) — canary-first over tunnels (canary=grok-box-008, policy=dynamic)"),
+      ),
+    ).toBe(true);
   });
 });
 

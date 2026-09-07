@@ -3,7 +3,9 @@
 
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { runReconcile, type ReconcileDeps } from "../src/reconcile/run.ts";
-import { ReconcileState, type StateFs } from "../src/reconcile/state.ts";
+import { ReconcileState, type StateFs, type ReconcileStateApi } from "../src/reconcile/state.ts";
+import { StoreState } from "../src/store/state.ts";
+import { openStore } from "../src/store/db.ts";
 import { RunContext, TailscaleKeys, type KeyTransport } from "../src/reconcile/tailscale-keys.ts";
 import { FakeRunner, result, isSs } from "./fake-runner.ts";
 import { testEnv, testRollout } from "./helpers.ts";
@@ -402,6 +404,174 @@ describe("D5 row-d drift compares VERSION, not the stamped repo sha", () => {
     await runReconcile(deps);
     expect(snapDrift(lines)).toBe("unknown");
     expect(logs.some((l) => l.includes("WOULD rollout"))).toBe(false);
+  });
+});
+
+// --- 5.14.3 D5-noise: the D5 line is once-per-(box,checkSha,targetSha) --------
+//
+// The "content drift ignored (D5)" line fired ~9× per tick, byte-identical tick
+// after tick, for the whole fleet after any grokfleet-only commit to main (the
+// 10 h audit: 1327 lines over 148 ticks). 5.14.3 emits it ONCE per (box,
+// checkSha, targetSha) transition — the first tick a pair is observed for a box
+// — and stays silent until a sha changes, persisting the pair in the state store
+// so the memory survives the fresh-process-every-tick systemd timer.
+describe("D5-noise: 'content drift ignored (D5)' logs once per (box,checkSha,targetSha) transition", () => {
+  const DRIFT = "content drift ignored (D5)";
+
+  /**
+   * Deps for ONE tick against a SHARED state, at a given box (check) sha and
+   * target sha. Sharing `state` is the whole point: the driftpair marker has to
+   * survive from one tick to the next, exactly as it does across the systemd
+   * timer's fresh processes.
+   */
+  function tickDeps(opts: {
+    state: ReconcileStateApi;
+    checkSha: string;
+    targetSha: string;
+    boxVersion?: string;
+    targetVersion?: string;
+  }): ReconcileDeps {
+    const boxVersion = opts.boxVersion ?? "5.3.1";
+    const targetVersion = opts.targetVersion ?? "5.3.1";
+    const devs = JSON.stringify({
+      devices: [
+        { hostname: "grok-box-005", online: true, lastSeen: "2999-01-01T00:00:00Z", tags: ["t"], keyExpiryDisabled: true },
+      ],
+    });
+    const { keys } = fakeKeys(() => ({ code: 200, body: devs }));
+    const runner = new FakeRunner((argv) => {
+      if (isSs(argv))
+        return result({ stdout: "LISTEN 0 128 127.0.0.1:20005 0.0.0.0:* users:((\"sshd\",pid=41,fd=7))\n" });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND)
+        return result({ code: 0, stdout: `check=OK v=${boxVersion}/${opts.checkSha} tunnel=up` });
+      return result({ code: 1 });
+    });
+    return baseDeps({
+      keys,
+      runner,
+      state: opts.state,
+      apply: true,
+      targetBoxes: ["grok-box-005"],
+      targetSha: opts.targetSha,
+      targetVersion,
+      rollout: testRollout({ auto: false }),
+    });
+  }
+
+  function driftLines(): string[] {
+    return logs.filter((l) => l.includes(DRIFT));
+  }
+
+  test("tick 1 emits; tick 2 (same pair) is silent — the audit's byte-identical repeat is gone", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    // Tick 1: box 005 runs 5.3.1 stamped f42c967, target sha moved to adfdc04.
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+    expect(driftLines().length).toBe(1);
+    expect(driftLines()[0]).toContain("grok-box-005 same VERSION 5.3.1, sha f42c967≠adfdc04");
+    // Tick 2: identical pair ⇒ SILENT. This is the fix.
+    logs = [];
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+    expect(driftLines().length).toBe(0);
+  });
+
+  test("tick 3: a NEW targetSha (a fresh main commit) emits again — M3 (compare only checkSha) kill", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+    logs = [];
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" })); // silent
+    expect(driftLines().length).toBe(0);
+    // targetSha changes (a new grokfleet-only commit to main) ⇒ emit again.
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "beef123" }));
+    expect(driftLines().length).toBe(1);
+    expect(driftLines()[0]).toContain("sha f42c967≠beef123");
+  });
+
+  test("a NEW checkSha (a box re-image / rollout) emits again — M4 (compare only targetSha) kill", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+    logs = [];
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" })); // silent
+    expect(driftLines().length).toBe(0);
+    // checkSha changes (the box now reports a different stamped sha) ⇒ emit.
+    await runReconcile(tickDeps({ state, checkSha: "cafe999", targetSha: "adfdc04" }));
+    expect(driftLines().length).toBe(1);
+    expect(driftLines()[0]).toContain("sha cafe999≠adfdc04");
+  });
+
+  test("store unavailable (writes do not land) ⇒ emitted EVERY tick — M5 kill (never suppress without a record)", async () => {
+    // A StateFs whose `write` is a no-op models an unwritable/absent store: the
+    // marker never persists, so `driftPair` reads null every tick and the line
+    // must fire every tick — today's behaviour, never a silent suppression.
+    const brokenFs: StateFs = {
+      read: () => undefined, // nothing was ever recorded
+      write: () => {}, // swallow — the write never lands
+      remove: () => {},
+      mkdirp: () => {},
+      chmod: () => {},
+      rename: () => {},
+      exists: () => false,
+      tmpname: (d, p) => `${d}/${p}x`,
+    };
+    const state = new ReconcileState("/s", brokenFs);
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+    expect(driftLines().length).toBe(1);
+    logs = [];
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+    expect(driftLines().length).toBe(1); // still fires — no record, no suppression
+  });
+
+  test("legacy-import path: marker ABSENT ⇒ first tick emits (fresh state is the same case)", async () => {
+    // A freshly imported row never recorded a driftpair (the legacy files had no
+    // such marker), so its column/file is absent ⇒ null ⇒ the first tick emits,
+    // exactly like a first-ever sight. `memState` with nothing pre-seeded IS the
+    // absent-marker state.
+    const { fs, store } = memState();
+    expect([...store.keys()].some((k) => k.includes("driftpair"))).toBe(false);
+    const state = new ReconcileState("/s", fs);
+    await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+    expect(driftLines().length).toBe(1);
+    // and it recorded the pair on the way, so a second identical tick is silent.
+    expect(store.get("/s/grok-box-005.driftpair")).toBe("f42c967|adfdc04\n");
+  });
+
+  test("r2 (gate BLOCKER): a store whose driftpair UPDATE ABORTS does not kill the tick — D5 line logs BOTH ticks", async () => {
+    // The reviewer's reproduction: a BEFORE UPDATE trigger that RAISE(ABORT)s is
+    // exactly what SQLITE_BUSY-after-timeout / FULL / IOERR does to the write.
+    // Before the fix, `setDriftPair`'s unguarded UPDATE threw straight out of
+    // runReconcile and killed the whole tick. Now it is caught and returns
+    // false, so the tick COMPLETES and the marker is never confirmed ⇒ the D5
+    // line logs every tick (the log-every-tick fall-back). Mutant M8 removes the
+    // try/catch and is killed by this test (the tick throws).
+    const store = openStore({ path: ":memory:", now: () => 1_000_000 });
+    store.db.run(
+      "INSERT INTO boxes(name,idx,port,phase,created_at,updated_at) VALUES('grok-box-005',5,20005,'enrolled',1000,1000)",
+    );
+    store.db.run("INSERT OR IGNORE INTO box_counters(box_id) VALUES((SELECT box_id FROM boxes WHERE name='grok-box-005'))");
+    store.db.run(
+      "CREATE TRIGGER driftpair_abort BEFORE UPDATE OF driftpair ON box_counters BEGIN SELECT RAISE(ABORT,'gate-injected'); END",
+    );
+    const state = new StoreState(store);
+
+    // Tick 1: the write aborts, is caught, and the tick still completes.
+    let r1: Awaited<ReturnType<typeof runReconcile>> | undefined;
+    await expect(
+      (async () => {
+        r1 = await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+      })(),
+    ).resolves.toBeUndefined();
+    expect(r1).toBeDefined();
+    expect(driftLines().length).toBe(1);
+    expect(state.driftPair("grok-box-005")).toBeNull(); // nothing was recorded
+
+    // Tick 2: identical pair, but the marker never landed ⇒ the line logs AGAIN.
+    logs = [];
+    const r2 = await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+    expect(r2).toBeDefined();
+    expect(driftLines().length).toBe(1);
+    store.close();
   });
 });
 

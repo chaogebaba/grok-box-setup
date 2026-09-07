@@ -1,7 +1,9 @@
 // config-pass.ts — reconcile_config_pass port (main:2345-2453) + F1/F2 canary policy.
 //
 // managed_files_present ⇒ silent no-op (feature off). Canary FIRST (F1: verbatim
-// pass-start line + a SEPARATE `config: canary policy=<fixed|dynamic>` line),
+// pass-start line; 5.14.3 D5-noise F3-fold folds the dynamic-policy note INTO
+// that line as `(canary=<box>, policy=dynamic)` — there is no longer a separate
+// `config: canary policy=` line, and fixed policy stays byte-identical to bash),
 // then the rest in reconcile_target_boxes order, SERIALLY. Guard: tunnel up AND
 // checkfail count <= 3. Canary routing: tunnel-down / checkfail>3 ⇒ log+skip+
 // fall-through; push rc 0 ⇒ reset cfgfail + ok; rc 6 ⇒ skip canary + fall-
@@ -137,14 +139,16 @@ export async function configPass(deps: ConfigPassDeps): Promise<ConfigPassResult
     return "drift";
   };
 
-  // Pass-start line — bash verbatim in BOTH policies (F1). `<canary>` is the
-  // resolved box, or "none" when dynamic found no reachable box.
-  log(`config: pass start (${mode}) — canary-first over tunnels (canary=${canary ?? "none"})`);
-  // F3 (r1 gate parity): bash emits NO `config: canary policy=` line. Suppress it
-  // in fixed-policy mode (the bash-equivalent mode where `[fleet-brain].canary_box`
-  // is set) for byte-identical logs. Keep it ONLY for dynamic-canary mode, which
-  // bash never had, so operators can still see the dynamic selection.
-  if (policy === "dynamic") log(`config: canary policy=${policy}`);
+  // Pass-start line — bash verbatim in FIXED policy (F1); `<canary>` is the
+  // resolved box, or "none" when dynamic found no reachable box. 5.14.3
+  // (D5-noise F3-fold): the standalone `config: canary policy=<policy>` line is
+  // GONE. For DYNAMIC policy (the grokfleet-only mode bash never had) the policy
+  // is folded into this line as `, policy=<policy>` inside the trailing group,
+  // so operators still see the dynamic selection in ONE line. FIXED policy emits
+  // the line byte-for-byte as bash does — no `policy=` suffix — which is what
+  // keeps the bash-parity test (managed.test.ts) green.
+  const policySuffix = policy === "dynamic" ? `, policy=${policy}` : "";
+  log(`config: pass start (${mode}) — canary-first over tunnels (canary=${canary ?? "none"}${policySuffix})`);
 
   const push = (box: string): Promise<{ rc: number; cur?: string; want?: string }> =>
     pushManaged(box, !deps.apply, pushDeps);

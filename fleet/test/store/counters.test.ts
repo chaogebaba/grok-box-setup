@@ -75,6 +75,12 @@ describe("(c) counter semantics are identical in both implementations", () => {
     { name: "tickwedge never recorded ⇒ null", run: (s) => s.lastTickwedge(BOX), want: null },
     { name: "tickwedge record 0 ⇒ reads 0 (recorded, not null)", run: (s) => (s.setTickwedge(BOX, 0), s.lastTickwedge(BOX)), want: 0 },
     { name: "tickwedge record 3 ⇒ reads 3", run: (s) => (s.setTickwedge(BOX, 3), s.lastTickwedge(BOX)), want: 3 },
+    // driftpair (5.14.3 D5-noise / A): NEVER-recorded ⇒ null (first sight emits);
+    // a recorded pair reads back verbatim; setDriftPair confirms via read-back.
+    { name: "driftpair never recorded ⇒ null", run: (s) => s.driftPair(BOX), want: null },
+    { name: "driftpair set confirms via read-back ⇒ true", run: (s) => s.setDriftPair(BOX, "aaa|bbb"), want: true },
+    { name: "driftpair reads back the recorded pair", run: (s) => s.driftPair(BOX), want: "aaa|bbb" },
+    { name: "driftpair overwrite with a new pair", run: (s) => (s.setDriftPair(BOX, "ccc|ddd"), s.driftPair(BOX)), want: "ccc|ddd" },
     // asleep's reset is `rm -f` and ABSENT is distinguishable from zero: the 2h
     // first-alert gate keys off the marker's absence.
     { name: "asleep absent", run: (s) => s.readAsleep(BOX), want: undefined },
@@ -233,4 +239,48 @@ describe("r2/R3 forgetKey removes the key on both implementations", () => {
       impl.close();
     });
   }
+});
+
+
+// ---- r2 (gate BLOCKER): setDriftPair never throws on a store write failure ---
+//
+// The r2 gate proved that an UNGUARDED `UPDATE box_counters SET driftpair` would
+// THROW out of runReconcile and kill the whole reconcile tick when sqlite fails
+// mid-write (SQLITE_BUSY after the busy_timeout, FULL, IOERR). The reviewer's
+// reproduction is a BEFORE UPDATE trigger that RAISE(ABORT)s, which is exactly
+// what any of those runtime failures does to the statement. The contract
+// (reconcile/state.ts) is: return false when unconfirmed, NEVER throw — a caught
+// error is "not confirmed", so the next tick re-reads null and re-emits the D5
+// line (the same log-every-tick fall-back as an unwritable store). Mutant M8
+// removes the try/catch and is killed here.
+describe("r2: setDriftPair swallows a store write failure — returns false, never throws (M8 kill)", () => {
+  const DBOX = "grok-box-003";
+  function storeWithAbortingDriftpair(): ReturnType<typeof memStore> {
+    const store = memStore();
+    store.db.run(
+      `INSERT INTO boxes(name,idx,port,phase,created_at,updated_at) VALUES('${DBOX}',3,20003,'enrolled',${T0},${T0})`,
+    );
+    // A counter row must already exist, else the UPDATE touches 0 rows and the
+    // BEFORE UPDATE trigger never fires — the failure we are testing is a write
+    // that REACHES the row and is aborted by the engine, not a no-op update.
+    store.db.query("INSERT OR IGNORE INTO box_counters(box_id) VALUES((SELECT box_id FROM boxes WHERE name=?))").run(DBOX);
+    store.db.run(
+      `CREATE TRIGGER driftpair_abort BEFORE UPDATE OF driftpair ON box_counters
+       BEGIN SELECT RAISE(ABORT,'gate-injected'); END`,
+    );
+    return store;
+  }
+
+  test("the aborting UPDATE ⇒ setDriftPair returns false, does not throw, driftPair stays null", () => {
+    const store = storeWithAbortingDriftpair();
+    const st = new StoreState(store);
+    let result: boolean | undefined;
+    expect(() => {
+      result = st.setDriftPair(DBOX, "aaa|bbb");
+    }).not.toThrow();
+    expect(result).toBe(false);
+    // nothing was recorded — the abort rolled the statement back
+    expect(st.driftPair(DBOX)).toBeNull();
+    store.close();
+  });
 });

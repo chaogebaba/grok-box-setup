@@ -69,10 +69,10 @@ function acquire(store: Store, box: string, over: Partial<{ kind: "ephemeral" | 
 describe("L1 — the schema", () => {
   test("the schema is additive and min_reader is still 1", () => {
     const s = memStore();
-    // KNOWN_SCHEMA moved 4 → 5 in 5.13.0 (box-conditions migration v5); leases
-    // (v3) stay additive and min_reader is still 1.
-    expect(KNOWN_SCHEMA).toBe(5);
-    expect(s.userVersion()).toBe(5);
+    // KNOWN_SCHEMA moved 5 → 6 in 5.14.3 (reconcile journal-noise migration v6);
+    // leases (v3) stay additive and min_reader is still 1.
+    expect(KNOWN_SCHEMA).toBe(6);
+    expect(s.userVersion()).toBe(6);
     expect(s.meta("min_reader")).toBe("1");
     expect(leasesAvailable(s)).toBe(true);
     s.close();
