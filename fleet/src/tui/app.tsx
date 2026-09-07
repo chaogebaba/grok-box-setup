@@ -25,13 +25,16 @@ import {
   footerSegmentLines,
   jobRows,
   leaseRows,
+  sortJobs,
   NO_JOBS,
+  NO_JOB_LOG,
   NO_OPEN_LEASES,
   statusLine,
   modalLines,
   viewLines,
   type Size,
 } from "./model.ts";
+import { JOB_LOG_TAIL_BYTES } from "../jobs.ts";
 import { DETAIL_GAP, detailWidth, rowRegionRows, showDetail, tableViewLines, tableWidth } from "./layout.ts";
 import {
   applyFleet,
@@ -48,7 +51,7 @@ import {
   type TuiState,
   type ViewKind,
 } from "./state.ts";
-import type { ApiClient, BoxDetail, FleetView } from "./api-client.ts";
+import type { ApiClient, BoxDetail, FleetView, Job } from "./api-client.ts";
 import type { SnapshotLine } from "../history/schema.ts";
 import type { ActionSpec } from "./actions.ts";
 
@@ -77,7 +80,15 @@ export type Action =
   | { type: "fleet"; view: FleetView; now: number }
   | { type: "link-down"; now: number; message?: string }
   | { type: "detail"; box: string; facts?: BoxDetail; history?: SnapshotLine[] }
-  | { type: "view-result"; kind: ViewKind; box: string; payload: { lines?: string[]; history?: SnapshotLine[]; error?: string } }
+  | {
+      type: "view-result";
+      kind: ViewKind;
+      box: string;
+      payload: { lines?: string[]; history?: SnapshotLine[]; jobs?: Job[]; error?: string };
+      /** 5.14.1 D2: the joblog anchors on the LAST screenful, so the reducer
+       *  needs the terminal size the result landed at. */
+      size: Size;
+    }
   | { type: "action-done"; message: string }
   | { type: "drain"; n: number };
 
@@ -100,7 +111,7 @@ export function reduce(w: Wrapper, action: Action): Wrapper {
       return { ...w, tui, seq: w.seq + 1 };
     }
     case "view-result":
-      return { ...w, tui: applyViewResult(w.tui, action.kind, action.box, action.payload), seq: w.seq + 1 };
+      return { ...w, tui: applyViewResult(w.tui, action.kind, action.box, action.payload, action.size), seq: w.seq + 1 };
     case "action-done":
       return { ...w, tui: { ...w.tui, message: action.message }, seq: w.seq + 1 };
     case "drain":
@@ -131,6 +142,28 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
     if (r.ok) dispatch({ type: "fleet", view: r.value, now: d.now() });
     else if (r.kind === "unauthorized" || r.kind === "forbidden") dispatch({ type: "link-down", now: d.now(), message: r.message });
     else dispatch({ type: "link-down", now: d.now() });
+  }, []);
+
+  // 5.14.1 D3: ONE definition of the jobs list fetch, called by the `load-view`
+  // arm and again by `stop-job` after a stop lands. `stop-job` deliberately does
+  // NOT call `poll()`: that refreshes the fleet table the operator is not
+  // looking at and leaves the open list stale.
+  const loadJobsView = useCallback(async (): Promise<void> => {
+    const d = depsRef.current;
+    // jobs J12: on-demand `GET /v1/jobs` with no filter; the rows are rendered
+    // ONCE here and frozen into the view, sorted and capped by `jobRows`.
+    // 5.14.1 D1: the SAME ordering is stored as `jobs`, through `sortJobs`, so
+    // row `i` and `jobs[i]` are the same job by construction.
+    const r = await d.client.listJobs();
+    dispatch({
+      type: "view-result",
+      kind: "jobs",
+      box: "",
+      size: sizeRef.current,
+      payload: r.ok
+        ? { lines: r.value.length === 0 ? [NO_JOBS] : jobRows(r.value, d.now()), jobs: sortJobs(r.value) }
+        : { error: viewError(r, "jobs") },
+    });
   }, []);
 
   const runEffect = useCallback(
@@ -169,6 +202,7 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
               type: "view-result",
               kind: effect.kind,
               box: "",
+              size: sizeRef.current,
               payload: r.ok
                 ? { lines: r.value.length === 0 ? [NO_OPEN_LEASES] : leaseRows(r.value, d.now()) }
                 : { error: viewError(r, effect.kind) },
@@ -176,17 +210,45 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
             break;
           }
           if (effect.kind === "jobs") {
-            // jobs J12: on-demand `GET /v1/jobs` with no filter; the rows are
-            // rendered ONCE here and frozen into the view, sorted and capped by
-            // `jobRows`. Read-only — nothing acts on a row in 5.14.0.
-            const r = await d.client.listJobs();
+            await loadJobsView();
+            break;
+          }
+          if (effect.kind === "joblog") {
+            // 5.14.1 D2: `box` is the JOB ID here. One extra cheap `getJob`
+            // first, for the CURRENT `log_bytes`, so `r` in the joblog tails the
+            // current end of the log rather than a size captured when the list
+            // was last fetched.
+            const jobId = effect.box;
+            const j = await d.client.getJob(jobId);
+            if (!j.ok) {
+              dispatch({ type: "view-result", kind: effect.kind, box: jobId, size: sizeRef.current, payload: { error: viewError(j, effect.kind) } });
+              break;
+            }
+            const total = j.value.log_bytes;
+            const offset = Math.max(0, total - JOB_LOG_TAIL_BYTES);
+            const lg = await d.client.jobLog(jobId, offset, JOB_LOG_TAIL_BYTES);
+            if (!lg.ok) {
+              dispatch({ type: "view-result", kind: effect.kind, box: jobId, size: sizeRef.current, payload: { error: viewError(lg, effect.kind) } });
+              break;
+            }
+            const body = lg.value.text.split("\n");
+            // ONE trailing empty line dropped: a log that ends in a newline is
+            // not a log with a blank last line.
+            if (body.length > 0 && body[body.length - 1] === "") body.pop();
+            // One header line, never both — the brain's own truncation is the
+            // more important fact, so it wins when the header says so.
+            const head = lg.value.truncated
+              ? `(log truncated on the brain; showing the last 64 KiB of ${total} bytes)`
+              : offset > 0
+                ? `(showing the last 64 KiB of ${total} bytes)`
+                : undefined;
+            const lines = head === undefined ? body : [head, ...body];
             dispatch({
               type: "view-result",
               kind: effect.kind,
-              box: "",
-              payload: r.ok
-                ? { lines: r.value.length === 0 ? [NO_JOBS] : jobRows(r.value, d.now()) }
-                : { error: viewError(r, effect.kind) },
+              box: jobId,
+              size: sizeRef.current,
+              payload: { lines: lines.length === 0 ? [NO_JOB_LOG] : lines },
             });
             break;
           }
@@ -198,6 +260,7 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
               type: "view-result",
               kind: effect.kind,
               box: effect.box,
+              size: sizeRef.current,
               payload: h.ok ? { history: h.value } : { error: viewError(h) },
             });
             break;
@@ -207,6 +270,7 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
             type: "view-result",
             kind: effect.kind,
             box: effect.box,
+            size: sizeRef.current,
             payload: r.ok ? { lines: r.value.log } : { error: viewError(r, effect.kind) },
           });
           break;
@@ -217,11 +281,24 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
           await poll(); // immediate refresh after an action (TUI-D7)
           break;
         }
+        case "stop-job": {
+          const short = effect.jobId.slice(0, 12);
+          const r = await d.client.stopJob(effect.jobId);
+          // `stopped` even when the server's idempotent path answered with an
+          // already-terminal row: the row's STATE is what the reloaded list
+          // shows, and it is the honest reading of what happened.
+          dispatch({ type: "action-done", message: r.ok ? `stopped ${short}` : `stop ${short} failed: ${r.message}` });
+          // Re-fetch the LIST the operator is looking at, not the fleet table.
+          // D1's cursor-preserving `applyViewResult` keeps the row under the
+          // cursor.
+          if (stateRef.current.view?.kind === "jobs") await loadJobsView();
+          break;
+        }
         case "none":
           break;
       }
     },
-    [exit, poll],
+    [exit, poll, loadJobsView],
   );
   const runEffectRef = useRef(runEffect);
   runEffectRef.current = runEffect;
@@ -297,6 +374,12 @@ export default function App({ initial, deps }: { initial: TuiState; deps: AppDep
       {viewOpen ? (
         <>
           <View lines={viewLines(state, size)} noColor={noColor} />
+          {state.modal !== undefined ? (
+            <>
+              <Box flexShrink={0} height={1} />
+              <Modal lines={modalLines(state)} noColor={noColor} />
+            </>
+          ) : null}
           {viewStatus !== null ? (
             <>
               <Box flexShrink={0} height={1} />

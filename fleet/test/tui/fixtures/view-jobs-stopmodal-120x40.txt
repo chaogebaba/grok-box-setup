@@ -7,5 +7,9 @@ SVCJOB000000 grok-box-002  service running   -    2d3h   keep-awake
 DONEJOB00000 grok-box-004  run     done      0    2h00   smoke                 
 FAILJOB00000 grok-box-007  run     failed    1    3h00   a purpose long enoug… 
 
+┌─ stop job JOBID0000000 ─┐
+type the first 6 characters of the job id to confirm: JOBI_
+(expect "JOBID0")   Enter=confirm  Esc=cancel
+
 ↑↓ select  / filter  f free  r refresh  q quit │ D diff  J journal  H history  L leases  B jobs                         
 P push  M rotate  R rename  T check  C reconcile                                                                        

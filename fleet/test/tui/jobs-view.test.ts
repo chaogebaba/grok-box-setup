@@ -13,16 +13,20 @@ import {
   GLYPH,
   JOB_COL_MIN_COLS,
   NO_JOBS,
+  NO_JOB_LOG,
   headerText,
   jobCell,
   jobCount,
   jobRows,
+  modalLines,
   showCondColumn,
   showJobColumn,
+  sortJobs,
   tableLines,
   viewLines,
+  viewRowsAvailable,
 } from "../../src/tui/model.ts";
-import { handleKey } from "../../src/tui/state.ts";
+import { applyViewResult, handleKey, type ViewState } from "../../src/tui/state.ts";
 import { makeApiClient, type BoxJob, type FetchLike, type FleetBox, type Job } from "../../src/tui/api-client.ts";
 import { mount, settle, silentClient } from "./ink-harness.ts";
 import { box, state, SIZE_120x40 } from "./helpers.ts";
@@ -382,6 +386,611 @@ describe("D2 — the jobs fetch", () => {
     await m.press("B");
     await settle(40);
     expect(m.lastFrame()).toContain("link error");
+    m.unmount();
+  });
+});
+
+// =============================================================================
+// 5.14.1 — the jobs view becomes actionable: a cursor, `Enter`, `s`.
+// =============================================================================
+
+/** Four jobs whose SORTED order is deterministic and not their input order:
+ *  two live (starting newest, then running) ahead of two terminal ones. */
+const FOUR: Job[] = [
+  job({ job_id: "DONEJOB0000000000000A", box: "grok-box-004", state: "done", rc: 0, created_at: "2026-04-30T22:00:00Z" }),
+  job({ job_id: "RUNJOB00000000000000B", box: "grok-box-001", state: "running", created_at: "2026-04-30T23:48:00Z" }),
+  job({ job_id: "FAILJOB0000000000000D", box: "grok-box-007", state: "failed", rc: 1, created_at: "2026-04-30T21:00:00Z" }),
+  job({ job_id: "STARTJOB000000000000C", box: "grok-box-002", state: "starting", created_at: "2026-04-30T23:59:00Z" }),
+];
+
+/** The jobs view as it stands once a result has landed. */
+function jobsView(over: Partial<ViewState> = {}): ViewState {
+  const jobs = sortJobs(FOUR);
+  return { kind: "jobs", box: "", offset: 0, loading: false, lines: jobRows(FOUR, NOW), jobs, cursor: 0, ...over };
+}
+
+const openJobs = (over: Partial<ViewState> = {}, s: Partial<Parameters<typeof state>[0]> = {}) =>
+  state({ boxes: [box("grok-box-001")], view: jobsView(over), ...s });
+
+describe("5.14.1 D1 — sortJobs is the ONE ordering", () => {
+  // MUTANT 1: `sortJobs` sorts but the captured `jobs` are stored unsorted, so
+  // `Enter` opens the wrong job. The two must agree row for row.
+  test("sortJobs order equals jobRows order, id column for id column", () => {
+    const rowIds = jobRows(FOUR, NOW).slice(1).map((r) => r.slice(0, 12).trim());
+    const sortedIds = sortJobs(FOUR).map((j) => j.job_id.slice(0, 12));
+    expect(rowIds).toEqual(sortedIds);
+    expect(sortedIds).toEqual(["STARTJOB0000", "RUNJOB000000", "DONEJOB00000", "FAILJOB00000"]);
+  });
+
+  test("sortJobs does not mutate its input", () => {
+    const input = [...FOUR];
+    sortJobs(input);
+    expect(input.map((j) => j.job_id)).toEqual(FOUR.map((j) => j.job_id));
+  });
+});
+
+describe("5.14.1 D1 — the cursor's lifecycle", () => {
+  test("`B` opens the view with NO cursor and no jobs (both arrive with the result)", () => {
+    const { state: next } = handleKey(state({ boxes: [box("a")] }), "B");
+    expect(next.view).toEqual({ kind: "jobs", box: "", offset: 0, loading: true });
+    expect(next.view?.cursor).toBeUndefined();
+    expect(next.view?.jobs).toBeUndefined();
+  });
+
+  test("the result sets cursor 0 and stores the SORTED jobs", () => {
+    const opening = handleKey(state({ boxes: [box("a")] }), "B").state;
+    const next = applyViewResult(opening, "jobs", "", { lines: jobRows(FOUR, NOW), jobs: sortJobs(FOUR) }, SIZE_120x40);
+    expect(next.view?.cursor).toBe(0);
+    expect(next.view?.jobs?.map((j) => j.job_id.slice(0, 8))).toEqual(["STARTJOB", "RUNJOB00", "DONEJOB0", "FAILJOB0"]);
+    expect(next.view?.loading).toBe(false);
+  });
+
+  test("an EMPTY list leaves the cursor undefined", () => {
+    const opening = handleKey(state({ boxes: [box("a")] }), "B").state;
+    const next = applyViewResult(opening, "jobs", "", { lines: [NO_JOBS], jobs: [] }, SIZE_120x40);
+    expect(next.view?.cursor).toBeUndefined();
+  });
+
+  // MUTANT 2: j/k move `offset` instead of `cursor`.
+  test("j/k move the CURSOR and never the offset", () => {
+    const s = openJobs();
+    const down = handleKey(s, "j", SIZE_120x40).state;
+    expect(down.view?.cursor).toBe(1);
+    expect(down.view?.offset).toBe(0);
+    const down2 = handleKey(down, "\x1b[B", SIZE_120x40).state;
+    expect(down2.view?.cursor).toBe(2);
+    expect(handleKey(down2, "k", SIZE_120x40).state.view?.cursor).toBe(1);
+    expect(handleKey(down2, "\x1b[A", SIZE_120x40).state.view?.cursor).toBe(1);
+    expect(down2.view?.offset).toBe(0);
+  });
+
+  // MUTANT 3: the cursor can reach the header line (clamp lower bound −1).
+  test("k at the top clamps to 0 — the cursor can never reach the header line", () => {
+    const s = openJobs({ cursor: 0 });
+    expect(handleKey(s, "k", SIZE_120x40).state.view?.cursor).toBe(0);
+    expect(handleKey(handleKey(s, "k", SIZE_120x40).state, "k", SIZE_120x40).state.view?.cursor).toBe(0);
+  });
+
+  test("j at the bottom clamps to the last row", () => {
+    const s = openJobs({ cursor: 3 });
+    expect(handleKey(s, "j", SIZE_120x40).state.view?.cursor).toBe(3);
+  });
+
+  test("j/k are INERT while loading, on an error and on an empty list", () => {
+    const loading = openJobs({ loading: true, jobs: undefined, cursor: undefined });
+    expect(handleKey(loading, "j", SIZE_120x40).state.view?.cursor).toBeUndefined();
+    const errored = openJobs({ jobs: undefined, cursor: undefined, error: "link error" });
+    expect(handleKey(errored, "j", SIZE_120x40).state.view?.cursor).toBeUndefined();
+    const empty = openJobs({ jobs: [], cursor: undefined, lines: [NO_JOBS] });
+    expect(handleKey(empty, "j", SIZE_120x40).state.view?.cursor).toBeUndefined();
+  });
+
+  // MUTANT 23 (BLOCKER 2): `r` on a POPULATED view preserves cursor+jobs (D1),
+  // so `!live` is FALSE mid-reload; only `v.loading` keeps j/k/arrows inert.
+  // Pressing `r` on the real reload shape and then j/k/↓/↑ must NOT move.
+  test("j/k/arrows are INERT during an actual reload (r preserves cursor+jobs)", () => {
+    const reloading = handleKey(openJobs({ cursor: 1 }), "r", SIZE_120x40).state;
+    expect(reloading.view?.loading).toBe(true);
+    expect(reloading.view?.cursor).toBe(1); // cursor preserved across r
+    expect(reloading.view?.jobs).toBeDefined(); // jobs preserved across r
+    for (const key of ["j", "k", "\x1b[B", "\x1b[A"]) {
+      expect(handleKey(reloading, key, SIZE_120x40).state.view?.cursor).toBe(1);
+    }
+  });
+
+  // MUTANT 5: `applyViewResult` resets the cursor to 0 after a reload.
+  test("a reload PRESERVES the cursor, and clamps it when the list shrank", () => {
+    const s = openJobs({ cursor: 3 });
+    const same = applyViewResult(s, "jobs", "", { lines: jobRows(FOUR, NOW), jobs: sortJobs(FOUR) }, SIZE_120x40);
+    expect(same.view?.cursor).toBe(3);
+    const shrunk = sortJobs(FOUR).slice(0, 2);
+    const fewer = applyViewResult(s, "jobs", "", { lines: jobRows(shrunk, NOW), jobs: shrunk }, SIZE_120x40);
+    expect(fewer.view?.cursor).toBe(1);
+  });
+
+  // MUTANT 22 (BLOCKER 1): a FAILED reload must clear jobs+cursor (D1: error ⇒
+  // cursor undefined ⇒ j/k, Enter and admin `s` inert), keeping only offset.
+  // Otherwise the stale invisible row is still navigable and stoppable.
+  test("a FAILED reload clears jobs+cursor, making j / Enter / admin `s` inert", () => {
+    const populated = openJobs({ cursor: 1 }, { scope: "admin" });
+    const reloading = handleKey(populated, "r", SIZE_120x40).state;
+    const errored = applyViewResult(reloading, "jobs", "", { error: "link error" }, SIZE_120x40);
+    // the view keeps offset but drops the stale row entirely.
+    expect(errored.view?.error).toBe("link error");
+    expect(errored.view?.jobs).toBeUndefined();
+    expect(errored.view?.cursor).toBeUndefined();
+    expect(errored.view?.offset).toBe(0);
+    // j is inert: cursor stays undefined, effect none.
+    const jResult = handleKey(errored, "j", SIZE_120x40);
+    expect(jResult.state.view?.cursor).toBeUndefined();
+    expect(jResult.effect).toEqual({ type: "none" });
+    // Enter is inert: no joblog opened, no load-view effect.
+    const enterResult = handleKey(errored, "\r", SIZE_120x40);
+    expect(enterResult.state.view?.kind).toBe("jobs");
+    expect(enterResult.effect).toEqual({ type: "none" });
+    // admin `s` is inert: no stop-job modal, no effect.
+    const stopResult = handleKey(errored, "s", SIZE_120x40);
+    expect(stopResult.state.modal).toBeUndefined();
+    expect(stopResult.effect).toEqual({ type: "none" });
+  });
+});
+
+describe("5.14.1 D1 — the painted window follows the cursor", () => {
+  test("line 0 (the column header) is NEVER selected", () => {
+    const painted = viewLines(openJobs({ cursor: 0 }), SIZE_120x40);
+    expect(painted[0]!.selected).toBeUndefined(); // the title
+    expect(painted[1]!.selected).toBeUndefined(); // the column header
+    expect(painted[2]!.selected).toBe(true); // jobs[0]
+  });
+
+  // MUTANT 4: the window does not follow the cursor (offset stays 0), so a
+  // cursor past the bottom of the window is painted nowhere at all.
+  test("cursor 30 of 40 rows at 12 available rows ⇒ the selected line is the LAST painted one", () => {
+    const many = Array.from({ length: 40 }, (_, i) =>
+      job({ job_id: `J${String(i).padStart(4, "0")}00000000000000`, state: "done", created_at: `2026-04-30T${String(23 - (i % 24)).padStart(2, "0")}:00:00Z` }),
+    );
+    const sorted = sortJobs(many);
+    const size = { cols: 120, rows: 18 };
+    const s = state({
+      boxes: [box("grok-box-001")],
+      view: { kind: "jobs", box: "", offset: 0, loading: false, lines: jobRows(many, NOW), jobs: sorted, cursor: 30 },
+    });
+    expect(viewRowsAvailable(s, size)).toBe(12);
+    const painted = viewLines(s, size);
+    const content = painted.slice(1); // drop the title
+    expect(content).toHaveLength(12);
+    expect(content[content.length - 1]!.selected).toBe(true);
+    // helpers.state is NO_COLOR, so the selected row carries the `>` marker.
+    expect(content[content.length - 1]!.text).toStartWith(`>${sorted[30]!.job_id.slice(0, 12)}`);
+    // and nothing above it is selected.
+    expect(content.slice(0, -1).some((l) => l.selected === true)).toBe(false);
+  });
+
+  test("under NO_COLOR the selected row is PREPENDED with `>`, never overwritten", () => {
+    const s = openJobs({ cursor: 1 }); // helpers.state is NO_COLOR
+    const painted = viewLines(s, SIZE_120x40);
+    const sel = painted.find((l) => l.selected === true)!;
+    expect(sel.text).toStartWith(">RUNJOB000000");
+    expect(sel.text.length).toBeLessThanOrEqual(SIZE_120x40.cols);
+  });
+
+  test("with colour ON the row carries no marker; the selection is a flag", () => {
+    const s = openJobs({ cursor: 1 }, { noColor: false });
+    const sel = viewLines(s, SIZE_120x40).find((l) => l.selected === true)!;
+    expect(sel.text).toStartWith("RUNJOB000000");
+    expect(sel.bold).toBe(true);
+  });
+
+  test("loading / error / empty have no cursor and paint the plain window", () => {
+    for (const over of [{ loading: true, jobs: undefined, cursor: undefined }, { jobs: undefined, cursor: undefined, error: "link error" }, { jobs: [], cursor: undefined, lines: [NO_JOBS] }]) {
+      const painted = viewLines(openJobs(over as Partial<ViewState>), SIZE_120x40);
+      expect(painted.some((l) => l.selected === true)).toBe(false);
+      expect(painted.length).toBeGreaterThan(1);
+    }
+  });
+});
+
+describe("5.14.1 D2 — `Enter` opens the joblog", () => {
+  test("Enter with a cursor opens `joblog` on the job id, with a COPY of the list as parent", () => {
+    const s = openJobs({ cursor: 2 });
+    const { state: next, effect } = handleKey(s, "\r", SIZE_120x40);
+    expect(next.view?.kind).toBe("joblog");
+    expect(next.view?.box).toBe("DONEJOB0000000000000A");
+    expect(effect).toEqual({ type: "load-view", kind: "joblog", box: "DONEJOB0000000000000A" });
+    // MUTANT 6: `parent` is a REFERENCE to the live view, not a copy.
+    expect(next.view?.parent).toEqual(s.view!);
+    expect(next.view?.parent).not.toBe(s.view!);
+  });
+
+  test("`\\n` opens it too", () => {
+    expect(handleKey(openJobs({ cursor: 1 }), "\n", SIZE_120x40).state.view?.kind).toBe("joblog");
+  });
+
+  test("Enter is INERT without a cursor (empty list, error)", () => {
+    for (const over of [{ jobs: [], cursor: undefined, lines: [NO_JOBS] }, { jobs: undefined, cursor: undefined, error: "link error" }]) {
+      const { state: next, effect } = handleKey(openJobs(over as Partial<ViewState>), "\r", SIZE_120x40);
+      expect(next.view?.kind).toBe("jobs");
+      expect(effect).toEqual({ type: "none" });
+    }
+  });
+
+  // MUTANT 19: the `v.loading` guard is dropped, so a mid-reload Enter captures
+  // a `loading: true` parent, the in-flight result is swallowed by the kind
+  // guard, and `Esc` returns to a list stuck on `(loading…)`.
+  test("Enter is INERT while the list is reloading, even though the cursor is still set", () => {
+    const reloading = openJobs({ loading: true, cursor: 2 });
+    expect(reloading.view?.cursor).toBe(2); // the cursor survives `r` — that is D1
+    const { state: next, effect } = handleKey(reloading, "\r", SIZE_120x40);
+    expect(next.view?.kind).toBe("jobs");
+    expect(effect).toEqual({ type: "none" });
+    // … and the reload's result then lands normally and clears `loading`.
+    const landed = applyViewResult(next, "jobs", "", { lines: jobRows(FOUR, NOW), jobs: sortJobs(FOUR) }, SIZE_120x40);
+    expect(landed.view?.loading).toBe(false);
+    expect(landed.view?.cursor).toBe(2);
+  });
+
+  // MUTANT 7: `Esc` in the joblog sets `view: undefined` and drops the list.
+  test("`Esc`/`q` in the joblog restores the parent list, cursor and jobs intact, with NO effect", () => {
+    const opened = handleKey(openJobs({ cursor: 2 }), "\r", SIZE_120x40).state;
+    for (const key of ["\x1b", "q"]) {
+      const { state: back, effect } = handleKey(opened, key, SIZE_120x40);
+      expect(back.view?.kind).toBe("jobs");
+      expect(back.view?.cursor).toBe(2);
+      expect(back.view?.jobs).toHaveLength(4);
+      expect(effect).toEqual({ type: "none" });
+    }
+  });
+
+  test("`Esc` in the LIST still returns to the table", () => {
+    expect(handleKey(openJobs(), "\x1b", SIZE_120x40).state.view).toBeUndefined();
+  });
+
+  test("the joblog title names the job's first 12 characters", () => {
+    const s = state({ view: { kind: "joblog", box: "DONEJOB0000000000000A", offset: 0, loading: false, lines: ["x"] } });
+    expect(viewLines(s, SIZE_120x40)[0]!.text).toStartWith("── job DONEJOB00000 ──  rows 1–1 of 1");
+  });
+
+  // MUTANT 10: the joblog opens at offset 0 instead of bottom-anchored.
+  test("`applyViewResult` for joblog BOTTOM-ANCHORS the offset", () => {
+    const opened = handleKey(openJobs({ cursor: 2 }), "\r", SIZE_120x40).state;
+    const lines = Array.from({ length: 100 }, (_, i) => `log line ${i}`);
+    const size = { cols: 120, rows: 18 };
+    const landed = applyViewResult(opened, "joblog", "DONEJOB0000000000000A", { lines }, size);
+    const rows = viewRowsAvailable(landed, size);
+    expect(landed.view?.offset).toBe(100 - rows);
+    expect(viewLines(landed, size).at(-1)!.text).toStartWith("log line 99");
+  });
+
+  test("a short log stays at offset 0, and an empty one is `(empty log)`", () => {
+    const opened = handleKey(openJobs({ cursor: 2 }), "\r", SIZE_120x40).state;
+    const short = applyViewResult(opened, "joblog", "DONEJOB0000000000000A", { lines: ["one", "two"] }, SIZE_120x40);
+    expect(short.view?.offset).toBe(0);
+    const empty = applyViewResult(opened, "joblog", "DONEJOB0000000000000A", { lines: [NO_JOB_LOG] }, SIZE_120x40);
+    expect(viewLines(empty, SIZE_120x40)[1]!.text).toStartWith(NO_JOB_LOG);
+  });
+
+  test("the joblog is scroll-only: j/k move the offset, and it has no cursor", () => {
+    const opened = handleKey(openJobs({ cursor: 2 }), "\r", SIZE_120x40).state;
+    const lines = Array.from({ length: 100 }, (_, i) => `log line ${i}`);
+    const landed = applyViewResult(opened, "joblog", "DONEJOB0000000000000A", { lines }, SIZE_120x40);
+    const up = handleKey(landed, "k", SIZE_120x40).state;
+    expect(up.view?.offset).toBe(landed.view!.offset - 1);
+    expect(up.view?.cursor).toBeUndefined();
+  });
+});
+
+describe("5.14.1 D3 — `s` stops the selected job", () => {
+  // MUTANT 11: `s` under readonly opens the modal.
+  test("readonly ⇒ the admin sentence and NO modal", () => {
+    const s = openJobs({ cursor: 1 }, { scope: "readonly" });
+    const { state: next, effect } = handleKey(s, "s", SIZE_120x40);
+    expect(next.message).toBe("admin token required for that action");
+    expect(next.modal).toBeUndefined();
+    expect(effect).toEqual({ type: "none" });
+  });
+
+  // MUTANT 12: `s` on a terminal row opens the modal.
+  test("a TERMINAL row ⇒ `job already finished` and no modal", () => {
+    for (const cursor of [2, 3]) {
+      const { state: next } = handleKey(openJobs({ cursor }), "s", SIZE_120x40);
+      expect(next.message).toBe("job already finished");
+      expect(next.modal).toBeUndefined();
+    }
+  });
+
+  // MUTANT 13: `expect` is the box name or the full id.
+  test("a running row opens a `stop-job` modal expecting the id's FIRST 6 characters", () => {
+    const { state: next } = handleKey(openJobs({ cursor: 1 }), "s", SIZE_120x40);
+    expect(next.modal).toEqual({
+      kind: "stop-job",
+      jobId: "RUNJOB00000000000000B",
+      actionLabel: "stop job",
+      box: "",
+      typed: "",
+      field: "confirm",
+      expect: "RUNJOB",
+    });
+  });
+
+  test("a `starting` row opens the modal too", () => {
+    expect(handleKey(openJobs({ cursor: 0 }), "s", SIZE_120x40).state.modal?.kind).toBe("stop-job");
+  });
+
+  test("no cursor ⇒ `s` is inert under admin", () => {
+    const { state: next, effect } = handleKey(openJobs({ jobs: [], cursor: undefined, lines: [NO_JOBS] }), "s", SIZE_120x40);
+    expect(next.modal).toBeUndefined();
+    expect(next.message).toBeUndefined();
+    expect(effect).toEqual({ type: "none" });
+  });
+
+  test("a MISMATCHED confirm keeps the modal open and sets the message", () => {
+    const withModal = handleKey(openJobs({ cursor: 1 }), "s", SIZE_120x40).state;
+    let typed = withModal;
+    for (const ch of "WRONGX") typed = handleKey(typed, ch, SIZE_120x40).state;
+    const { state: next, effect } = handleKey(typed, "\r", SIZE_120x40);
+    expect(next.modal).toBeDefined();
+    expect(next.message).toBe('confirm mismatch (expected "RUNJOB")');
+    expect(effect).toEqual({ type: "none" });
+  });
+
+  // MUTANT 14: the Enter arm falls through to `specKeyFromLabel`, which has no
+  // entry for "stop job" — `actionForKey("")!` is undefined and it throws.
+  test("a MATCHING confirm emits `stop-job` with the job id and closes the modal", () => {
+    const withModal = handleKey(openJobs({ cursor: 1 }), "s", SIZE_120x40).state;
+    let typed = withModal;
+    for (const ch of "RUNJOB") typed = handleKey(typed, ch, SIZE_120x40).state;
+    const { state: next, effect } = handleKey(typed, "\r", SIZE_120x40);
+    expect(next.modal).toBeUndefined();
+    expect(next.message).toBe("stopping RUNJOB000000…");
+    expect(effect).toEqual({ type: "stop-job", jobId: "RUNJOB00000000000000B" });
+  });
+
+  test("`Esc` cancels the modal and leaves the view untouched", () => {
+    const withModal = handleKey(openJobs({ cursor: 1 }), "s", SIZE_120x40).state;
+    const { state: next, effect } = handleKey(withModal, "\x1b", SIZE_120x40);
+    expect(next.modal).toBeUndefined();
+    expect(next.message).toBe("cancelled");
+    expect(next.view?.kind).toBe("jobs");
+    expect(next.view?.cursor).toBe(1);
+    expect(effect).toEqual({ type: "none" });
+  });
+
+  test("Tab is inert for the single-field stop modal", () => {
+    const withModal = handleKey(openJobs({ cursor: 1 }), "s", SIZE_120x40).state;
+    expect(handleKey(withModal, "\t", SIZE_120x40).state.modal).toEqual(withModal.modal!);
+  });
+
+  test("the stop modal's lines name the JOB, not a box", () => {
+    const withModal = handleKey(openJobs({ cursor: 1 }), "s", SIZE_120x40).state;
+    const text = modalLines(withModal).map((l) => l.text);
+    expect(text[0]).toBe("┌─ stop job RUNJOB000000 ─┐");
+    expect(text[1]).toBe("type the first 6 characters of the job id to confirm: _");
+    expect(text[2]).toBe('(expect "RUNJOB")   Enter=confirm  Esc=cancel');
+  });
+});
+
+// --- 5.14.1 D2/D3: the effect runner (mounted) -------------------------------
+describe("5.14.1 D2 — the joblog fetch", () => {
+  /** A client that records the call ORDER and the arguments of each. */
+  function recordingClient(logBytes: number, text = "a\nb\n") {
+    const calls: string[] = [];
+    const args: { offset?: number; limit?: number } = {};
+    return {
+      calls,
+      args,
+      client: silentClient({
+        listJobs: async () => ({ ok: true as const, value: [job({ job_id: "JOBID000000000000000A" })] }),
+        getJob: async () => {
+          calls.push("getJob");
+          return { ok: true as const, value: job({ job_id: "JOBID000000000000000A", log_bytes: logBytes }) };
+        },
+        jobLog: async (_id: string, offset: number, limit?: number) => {
+          calls.push("jobLog");
+          args.offset = offset;
+          args.limit = limit;
+          return { ok: true as const, value: { text, next: offset + text.length, truncated: false } };
+        },
+      }),
+    };
+  }
+
+  async function openLog(logBytes: number, text?: string) {
+    const r = recordingClient(logBytes, text);
+    const m = mount(state({ boxes: [box("grok-box-001")] }), { client: r.client });
+    await settle(40);
+    await m.press("B");
+    await settle(40);
+    await m.press("\r");
+    await settle(40);
+    return { ...r, m };
+  }
+
+  // MUTANT 8: `jobLog` is called with offset 0 (no tail).
+  test("getJob runs FIRST, then jobLog at `max(0, log_bytes − 65536)` with the 64 KiB limit", async () => {
+    const small = await openLog(10_000);
+    expect(small.calls).toEqual(["getJob", "jobLog"]);
+    expect(small.args.offset).toBe(0);
+    expect(small.args.limit).toBe(65_536);
+    small.m.unmount();
+
+    const big = await openLog(100_000);
+    expect(big.calls).toEqual(["getJob", "jobLog"]);
+    expect(big.args.offset).toBe(34_464);
+    big.m.unmount();
+  });
+
+  // MUTANT 1: `sortJobs` is applied to the ROWS but the captured `jobs` are
+  // stored in the server's order, so the cursor's index picks a different job
+  // than the row under it and `Enter` opens the WRONG log.
+  test("the stored jobs are the SORTED ones, so the cursor's row and its job agree", async () => {
+    const opened: string[] = [];
+    const client = silentClient({
+      listJobs: async () => ({ ok: true as const, value: FOUR }),
+      getJob: async (id: string) => {
+        opened.push(id);
+        return { ok: true as const, value: job({ job_id: id, log_bytes: 4 }) };
+      },
+      jobLog: async (_id: string, offset: number) => ({ ok: true as const, value: { text: "x\n", next: offset + 2, truncated: false } }),
+    });
+    const m = mount(state({ boxes: [box("grok-box-001")] }), { client });
+    await settle(40);
+    await m.press("B");
+    await settle(40);
+    // cursor 0 is the FIRST SORTED row — the newest `starting` job — not the
+    // first row the server happened to return (`DONEJOB…`).
+    expect(m.lastFrame()).toContain("STARTJOB0000");
+    await m.press("\r");
+    await settle(40);
+    expect(opened).toEqual(["STARTJOB000000000000C"]);
+    expect(m.lastFrame()).toContain("── job STARTJOB0000 ──");
+    m.unmount();
+  });
+
+  test("the joblog frame shows the job title and the log body", async () => {
+    const r = await openLog(10_000, "first line\nsecond line\n");
+    expect(r.m.lastFrame()).toContain("── job JOBID0000000 ──");
+    expect(r.m.lastFrame()).toContain("second line");
+    r.m.unmount();
+  });
+
+  test("a tailed log carries the `showing the last 64 KiB` header line", async () => {
+    const r = await openLog(100_000, "tail\n");
+    expect(r.m.lastFrame()).toContain("(showing the last 64 KiB of 100000 bytes)");
+    r.m.unmount();
+  });
+
+  test("an EMPTY log is the answer `(empty log)`", async () => {
+    const r = await openLog(0, "");
+    expect(r.m.lastFrame()).toContain(NO_JOB_LOG);
+    r.m.unmount();
+  });
+
+  test("a failed getJob renders the view's error line, never a throw", async () => {
+    const client = silentClient({
+      listJobs: async () => ({ ok: true as const, value: [job()] }),
+      getJob: async () => ({ ok: false as const, kind: "link_down" as const, message: "link down" }),
+    });
+    const m = mount(state({ boxes: [box("grok-box-001")] }), { client });
+    await settle(40);
+    await m.press("B");
+    await settle(40);
+    await m.press("\r");
+    await settle(40);
+    expect(m.lastFrame()).toContain("link error");
+    m.unmount();
+  });
+});
+
+describe("5.14.1 D3 — the `stop-job` effect runner", () => {
+  // MUTANT 15: the arm calls `poll()` instead of re-fetching the jobs view, so
+  // the fleet table the operator is NOT looking at is refreshed and the open
+  // list stays stale.
+  test("stopJob(id) → action-done → the jobs list re-fetched, and `poll` never called", async () => {
+    let fleetCalls = 0;
+    let listCalls = 0;
+    const stopped: string[] = [];
+    const client = silentClient({
+      fleet: async () => {
+        fleetCalls++;
+        return { ok: false as const, kind: "link_down" as const, message: "link down" };
+      },
+      listJobs: async () => {
+        listCalls++;
+        return { ok: true as const, value: [job({ job_id: "JOBID000000000000000A" })] };
+      },
+      stopJob: async (id: string) => {
+        stopped.push(id);
+        return { ok: true as const, value: job({ job_id: id, state: "stopped" }) };
+      },
+    });
+    const m = mount(state({ boxes: [box("grok-box-001")] }), { client });
+    await settle(40);
+    await m.press("B");
+    await settle(40);
+    expect(listCalls).toBe(1);
+    const fleetBefore = fleetCalls;
+
+    await m.press("s");
+    for (const ch of "JOBID0") await m.press(ch);
+    await m.press("\r");
+    await settle(60);
+
+    expect(stopped).toEqual(["JOBID000000000000000A"]);
+    expect(listCalls).toBe(2); // the LIST was re-fetched …
+    expect(fleetCalls).toBe(fleetBefore); // … and the fleet table was not.
+    expect(m.lastFrame()).toContain("stopped JOBID0000000");
+    m.unmount();
+  });
+
+  test("a failed stop reports the client's error text and still leaves the list open", async () => {
+    const client = silentClient({
+      fleet: async () => ({ ok: false as const, kind: "link_down" as const, message: "link down" }),
+      listJobs: async () => ({ ok: true as const, value: [job({ job_id: "JOBID000000000000000A" })] }),
+      stopJob: async () => ({ ok: false as const, kind: "error" as const, status: 409, message: "job already terminal" }),
+    });
+    const m = mount(state({ boxes: [box("grok-box-001")] }), { client });
+    await settle(40);
+    await m.press("B");
+    await settle(40);
+    await m.press("s");
+    for (const ch of "JOBID0") await m.press(ch);
+    await m.press("\r");
+    await settle(60);
+    expect(m.lastFrame()).toContain("job already terminal");
+    expect(m.lastFrame()).toContain("── jobs ──");
+    m.unmount();
+  });
+
+  // MUTANT 16: the modal is opened under the view but never PAINTED.
+  test("the stop modal is painted UNDER the open list, with the list still on screen", async () => {
+    const client = silentClient({
+      fleet: async () => ({ ok: false as const, kind: "link_down" as const, message: "link down" }),
+      listJobs: async () => ({ ok: true as const, value: [job({ job_id: "JOBID000000000000000A" })] }),
+    });
+    const m = mount(state({ boxes: [box("grok-box-001")] }), { client });
+    await settle(40);
+    await m.press("B");
+    await settle(40);
+    await m.press("s");
+    await settle(20);
+    const frame = m.lastFrame();
+    expect(frame).toContain("── jobs ──");
+    expect(frame).toContain("┌─ stop job JOBID0000000 ─┐");
+    expect(frame).toContain("type the first 6 characters of the job id to confirm:");
+    m.unmount();
+  });
+});
+
+describe("5.14.1 D2 — the joblog's ONE header line", () => {
+  async function openWith(logBytes: number, truncated: boolean) {
+    const client = silentClient({
+      listJobs: async () => ({ ok: true as const, value: [job({ job_id: "JOBID000000000000000A" })] }),
+      getJob: async () => ({ ok: true as const, value: job({ job_id: "JOBID000000000000000A", log_bytes: logBytes }) }),
+      jobLog: async (_id: string, offset: number) => ({ ok: true as const, value: { text: "body\n", next: offset + 5, truncated } }),
+    });
+    const m = mount(state({ boxes: [box("grok-box-001")] }), { client });
+    await settle(40);
+    await m.press("B");
+    await settle(40);
+    await m.press("\r");
+    await settle(40);
+    return m;
+  }
+
+  test("the brain's truncation wins, and NEVER both lines at once", async () => {
+    const m = await openWith(100_000, true);
+    const frame = m.lastFrame();
+    expect(frame).toContain("(log truncated on the brain; showing the last 64 KiB of 100000 bytes)");
+    expect(frame).not.toContain("(showing the last 64 KiB of 100000 bytes)\n(log truncated");
+    // exactly one header line on screen.
+    expect(frame.split("\n").filter((l) => l.includes("showing the last 64 KiB"))).toHaveLength(1);
+    m.unmount();
+  });
+
+  test("a whole log that was NOT truncated carries no header line at all", async () => {
+    const m = await openWith(5, false);
+    expect(m.lastFrame()).not.toContain("showing the last 64 KiB");
+    expect(m.lastFrame()).toContain("body");
     m.unmount();
   });
 });

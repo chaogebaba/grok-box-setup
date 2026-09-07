@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.14.0"; // 5.14.0: TUI jobs view (JOB column, header counter, read-only B list) + brain-side job retention.
+const PKG_VERSION = "5.14.1"; // 5.14.1: the TUI jobs view becomes actionable — a row cursor, `Enter` for the log tail, `s` to stop behind a typed confirm.
 
 async function gitShaFromGit(): Promise<string> {
   try {

@@ -55,6 +55,10 @@ export const JOB_DEFAULT_CAP_S = 2400;
 export const JOB_MAX_CAP_S = 86400;
 /** J5: at most this many log bytes per poll, matching the box's own per-call bound. */
 export const JOB_LOG_FETCH_MAX = 1024 * 1024;
+/** 5.14.1 D2: the window the TUI's joblog view tails — the LAST 64 KiB of a
+ *  job's log. Small enough that `Enter` on a long-running job is one cheap
+ *  request, large enough to hold the screenful anyone opens it for. */
+export const JOB_LOG_TAIL_BYTES = 64 * 1024;
 /** J6: the brain stops mirroring at the same bound the box truncates at. */
 export const JOB_LOG_MIRROR_MAX = 64 * 1024 * 1024;
 /** J5: the cumulative ssh budget one tick may spend polling jobs. */

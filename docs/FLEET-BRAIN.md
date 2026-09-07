@@ -1775,10 +1775,13 @@ column (`run 12m` / `svc 2d3h` / `-`), a zero-suppressed `▶ <n> jobs` header
 counter, and a read-only fleet-wide jobs list on the `B` key (`GET /v1/jobs`,
 scroll-only). The `job` field was already on `GET /v1/fleet` and
 `GET /v1/boxes/:name`, attached at serve time from ONE query per request like
-`lease`, so 5.14.0 was rendering only. Still OUTSTANDING for 5.14.1: `Enter`
-(log tail) and `s` (stop) on a row, which need a view cursor, a modal painted
-under a view, and a parent view. The `J` key stays journal; the jobs list is
-`B`.
+`lease`, so 5.14.0 was rendering only. The list became ACTIONABLE in 5.14.1: a
+row cursor (`j`/`k`, the first view with one), `Enter` for that job's log tail
+(the last 64 KiB, `r` re-tails it, `Esc`/`q` returns to the list with the row
+still selected), and `s` to stop the selected job behind a typed 6-character
+confirm. Readonly tokens can open the list and the logs but not stop — `s`
+answers `admin token required for that action`. The `J` key stays journal; the
+jobs list is `B`.
 
 Two 5.14.0 width rules the column forced, recorded because a later reader will
 re-derive them: the JOB column is 9 wide and is OMITTED (never clipped) below

@@ -14,7 +14,7 @@ import type { SnapshotBox, SnapshotLine } from "../../src/history/schema.ts";
 import type { BoxJob, BoxLease, FleetBox, Job, Lease } from "../../src/tui/api-client.ts";
 import type { TuiState } from "../../src/tui/state.ts";
 import type { Size } from "../../src/tui/model.ts";
-import { jobRows, leaseRows, NO_JOBS } from "../../src/tui/model.ts";
+import { jobRows, leaseRows, sortJobs, NO_JOBS, NO_JOB_LOG } from "../../src/tui/model.ts";
 import { box, state } from "./helpers.ts";
 
 /**
@@ -217,15 +217,54 @@ const job = (over: Partial<Job> = {}): Job => ({
   ...over,
 });
 
-const JOB_VIEW_LINES: string[] = jobRows(
-  [
-    job({ job_id: "DONEJOB0000000000000A", box: "grok-box-004", state: "done", rc: 0, purpose: "smoke", created_at: "2026-04-30T22:00:00Z", started_at: "2026-04-30T22:00:00Z", ended_at: "2026-04-30T22:05:00Z" }),
-    job(),
-    job({ job_id: "SVCJOB00000000000000B", box: "grok-box-002", kind: "service", state: "running", holder: "svc:brain", purpose: "keep-awake", created_at: "2026-04-28T21:00:10Z", started_at: "2026-04-28T21:00:10Z" }),
-    job({ job_id: "FAILJOB0000000000000C", box: "grok-box-007", state: "failed", rc: 1, purpose: "a purpose long enough to be cut", created_at: "2026-04-30T21:00:00Z", started_at: "2026-04-30T21:00:00Z", ended_at: "2026-04-30T21:03:00Z" }),
-  ],
-  NOW,
+/**
+ * 5.14.1 D1: the jobs the `B` view's goldens are built from, NAMED so the
+ * cursor goldens and the mounted colour test index into the same array
+ * `jobRows` rendered. After `sortJobs` the order is JOBID…A (running, newest),
+ * SVCJOB…B (running), DONEJOB…A, FAILJOB…C — so index 0 is a RUNNING job (the
+ * one `s` can stop) and index 2 is `DONEJOB0000000000000A` (terminal).
+ */
+export const JOB_ROWS: Job[] = [
+  job({ job_id: "DONEJOB0000000000000A", box: "grok-box-004", state: "done", rc: 0, purpose: "smoke", created_at: "2026-04-30T22:00:00Z", started_at: "2026-04-30T22:00:00Z", ended_at: "2026-04-30T22:05:00Z" }),
+  job(),
+  job({ job_id: "SVCJOB00000000000000B", box: "grok-box-002", kind: "service", state: "running", holder: "svc:brain", purpose: "keep-awake", created_at: "2026-04-28T21:00:10Z", started_at: "2026-04-28T21:00:10Z" }),
+  job({ job_id: "FAILJOB0000000000000C", box: "grok-box-007", state: "failed", rc: 1, purpose: "a purpose long enough to be cut", created_at: "2026-04-30T21:00:00Z", started_at: "2026-04-30T21:00:00Z", ended_at: "2026-04-30T21:03:00Z" }),
+];
+
+const JOB_VIEW_LINES: string[] = jobRows(JOB_ROWS, NOW);
+
+/** Twenty jobs — more than a 12-row terminal's jobs view can paint, so the
+ *  bottom-anchored cursor window has something to anchor against. */
+const MANY_JOBS: Job[] = Array.from({ length: 20 }, (_, i) =>
+  job({
+    job_id: `MANYJOB${String(i).padStart(2, "0")}000000000000`,
+    box: `grok-box-${String((i % 8) + 1).padStart(3, "0")}`,
+    state: "done",
+    rc: 0,
+    purpose: `batch ${i}`,
+    created_at: `2026-04-30T${String(23 - i).padStart(2, "0")}:00:00Z`,
+    started_at: `2026-04-30T${String(23 - i).padStart(2, "0")}:00:00Z`,
+    ended_at: `2026-04-30T${String(23 - i).padStart(2, "0")}:05:00Z`,
+  }),
 );
+const MANY_JOB_LINES: string[] = jobRows(MANY_JOBS, NOW);
+
+/** A 30-line log plus the tail header the runner prepends when it fetched a
+ *  WINDOW rather than the whole file. */
+const JOB_LOG_LINES: string[] = [
+  "(showing the last 64 KiB of 100000 bytes)",
+  ...Array.from({ length: 30 }, (_, i) => `2026-04-30T23:48:${String(i % 60).padStart(2, "0")}Z  worker: step ${i} of the gate run`),
+];
+
+/** The stop modal, on the RUNNING job at cursor 0. */
+const STOP_MODAL = {
+  kind: "stop-job" as const,
+  jobId: "JOBID000000000000000A",
+  actionLabel: "stop job",
+  box: "",
+  field: "confirm" as const,
+  expect: "JOBID0",
+};
 
 export const GOLDENS: Golden[] = [
   // --- the table frame -------------------------------------------------------
@@ -279,6 +318,7 @@ export const GOLDENS: Golden[] = [
       selected: 0,
       detail: { box: "grok-box-001", lines: HISTORY },
       modal: {
+        kind: "action" as const,
         actionLabel: "config-push",
         box: "grok-box-001",
         typed: "grok-box",
@@ -465,13 +505,20 @@ export const GOLDENS: Golden[] = [
     exceptions: ["detail-column"],
   },
 
-  // The B jobs view, frozen rows and empty.
+  // The B jobs view, frozen rows and empty. 5.14.1 D1: these two gain the
+  // cursor at row 0 and the sorted jobs behind it. They keep the helpers
+  // default, NO_COLOR, which is the state the test suite actually renders — so
+  // the model's `>` marker lands on the first data row and BOTH fixtures move
+  // by exactly that one byte. Supervisor addendum A9 records the decision: a
+  // fixture shows what the TUI paints under the test default, and flipping
+  // these to colour to keep a census number would hide the marker behind
+  // chalk-level ordering between test files.
   ...([40, 20] as const).map((rows) => ({
     name: `view-jobs-120x${rows}`,
     size: SIZE(120, rows),
     state: state({
       boxes: JOBBED,
-      view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES },
+      view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES, jobs: sortJobs(JOB_ROWS), cursor: 0 },
     }),
     exceptions: [] as GoldenException[],
   })),
@@ -481,6 +528,89 @@ export const GOLDENS: Golden[] = [
     state: state({
       boxes: JOBBED,
       view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: [NO_JOBS] },
+    }),
+    exceptions: [],
+  },
+
+  // --- 5.14.1: the cursor, the joblog and the stop modal ---------------------
+  // The cursor on row 2 (`DONEJOB0000000000000A`) under NO_COLOR (the helpers
+  // default, per A9): the fixture shows the window and the `>` indicator; the
+  // colour SELECTION itself is pinned by the mounted assertion in visual.test.ts.
+  {
+    name: "view-jobs-cursor-120x20",
+    size: SIZE(120, 20),
+    state: state({
+      boxes: JOBBED,
+      view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES, jobs: sortJobs(JOB_ROWS), cursor: 2 },
+    }),
+    exceptions: [],
+  },
+  // The SAME cursor under NO_COLOR: the `>` marker, PREPENDED and the row
+  // re-clipped, so the 12-character job id survives intact — unlike the table's
+  // marker, which overwrites column 0.
+  {
+    name: "view-jobs-cursor-nocolor-120x20",
+    size: SIZE(120, 20),
+    state: state({
+      boxes: JOBBED,
+      view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES, jobs: sortJobs(JOB_ROWS), cursor: 2 },
+    }),
+    exceptions: [],
+  },
+  // The cursor on the LAST row of a list longer than the window: the selected
+  // line is the last painted one and the indicator shows the tail.
+  {
+    name: "view-jobs-cursor-bottom-120x12",
+    size: SIZE(120, 12),
+    state: state({
+      boxes: JOBBED,
+      view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: MANY_JOB_LINES, jobs: sortJobs(MANY_JOBS), cursor: 19 },
+    }),
+    exceptions: [],
+  },
+  // The joblog: the title names the job, the content is bottom-anchored on the
+  // last screenful, and the tail header sits above it in the content.
+  {
+    name: "view-joblog-120x20",
+    size: SIZE(120, 20),
+    state: state({
+      boxes: JOBBED,
+      view: { kind: "joblog" as const, box: "JOBID000000000000000A", offset: 17, loading: false, lines: JOB_LOG_LINES },
+    }),
+    exceptions: [],
+  },
+  {
+    name: "view-joblog-empty-120x20",
+    size: SIZE(120, 20),
+    state: state({
+      boxes: JOBBED,
+      view: { kind: "joblog" as const, box: "JOBID000000000000000A", offset: 0, loading: false, lines: [NO_JOB_LOG] },
+    }),
+    exceptions: [],
+  },
+  // The stop modal painted UNDER the list, with the list still on screen.
+  {
+    name: "view-jobs-stopmodal-120x40",
+    size: SIZE(120, 40),
+    state: state({
+      boxes: JOBBED,
+      view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES, jobs: sortJobs(JOB_ROWS), cursor: 0 },
+      modal: { ...STOP_MODAL, typed: "JOBI" },
+    }),
+    exceptions: [],
+  },
+  // The same state with a WRONG confirm: the modal stays open AND the status
+  // line carries the mismatch, so both are painted at once. This is the fixture
+  // that pins the ADDITIVE chrome charge — an `else if` here would undercount
+  // by two rows and break the `lines.length <= size.rows` invariant.
+  {
+    name: "view-jobs-stopmodal-mismatch-120x40",
+    size: SIZE(120, 40),
+    state: state({
+      boxes: JOBBED,
+      view: { kind: "jobs" as const, box: "", offset: 0, loading: false, lines: JOB_VIEW_LINES, jobs: sortJobs(JOB_ROWS), cursor: 0 },
+      modal: { ...STOP_MODAL, typed: "WRONGX" },
+      message: 'confirm mismatch (expected "JOBID0")',
     }),
     exceptions: [],
   },
