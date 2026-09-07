@@ -68,7 +68,7 @@
 #   (c5) a symlink on the allowlist is refused by the CAP path too
 #   (c6) the 60s rate limit covers the cap: one truncation, not two
 #   (c7) six knobs survive require_root (see b7)
-#   (c8) `4G` and empty DISABLE the cap — they never fall open to the 1 GiB floor
+#   (c8) `4G`, empty, `0x10`, `--5` and `1.5` DISABLE the cap — they never fall open to the 1 GiB floor
 #   (c9) after a cap truncation the state records the POST-truncation percent
 #  (c10) the 4 GiB default literal is present in boxup   [F1-tripwire style]
 #  (c11) under-cap at `ok`: rc 0, state written, NOTHING on stderr — the only
@@ -265,6 +265,31 @@ case "$scenario" in
     ;;
   cap-empty)
     BOXUP_SANDLOG_MAX_BYTES=""
+    DISK_GUARD_TRUNCATE="\$OVER"
+    disk_guard; grc=\$?
+    ;;
+  cap-hex)
+    # D2: 0x10 is admitted by a class widened to [!0-9x] (mutant x2) but bash's
+    # test rejects it as an integer, so [ 0x10 -gt 0 ] writes to stderr — errbytes
+    # is non-zero and the assertion fires. Under the unmutated [!0-9] class it
+    # sanitises to 0 and errbytes stays 0.
+    BOXUP_SANDLOG_MAX_BYTES=0x10
+    DISK_GUARD_TRUNCATE="\$OVER"
+    disk_guard; grc=\$?
+    ;;
+  cap-neg)
+    # D2: --5 is admitted by [!0-9-] (mutant x2b) but [ --5 -gt 0 ] is an
+    # integer-expected error on stderr (rc 2), not a quiet false. -1 is the trap
+    # (legal integer, quiet false), so --5 is the only value that kills through
+    # the stderr route.
+    BOXUP_SANDLOG_MAX_BYTES=--5
+    DISK_GUARD_TRUNCATE="\$OVER"
+    disk_guard; grc=\$?
+    ;;
+  cap-float)
+    # D2: 1.5 is admitted by [!0-9.] (mutant x2c) but [ 1.5 -gt 0 ] is an
+    # integer-expected error on stderr.
+    BOXUP_SANDLOG_MAX_BYTES=1.5
     DISK_GUARD_TRUNCATE="\$OVER"
     disk_guard; grc=\$?
     ;;
@@ -593,7 +618,7 @@ fi
 # skips the sanitiser truncates the live 5 MiB platform log at `ok` on every
 # interval. rc must stay 0 and stderr must stay empty either way.
 # ---------------------------------------------------------------------------
-for sc in cap-4g cap-empty; do
+for sc in cap-4g cap-empty cap-hex cap-neg cap-float; do
   o="$(run_case '40
 40' "$sc")"
   if printf '%s\n' "$(sizes2 "$o")" | grep -q "over=$((5 * MIB))" \
