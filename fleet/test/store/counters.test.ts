@@ -284,3 +284,39 @@ describe("r2: setDriftPair swallows a store write failure — returns false, nev
     store.close();
   });
 });
+
+
+// ---- N1 (gate SHOULD): the FILE-backed setDriftPair guard has a killing test --
+//
+// r2 hardened both setDriftPair implementations against a throwing backing store,
+// but only the sqlite guard had a test — an "unguard" mutant on the FILE impl
+// (fleet/src/reconcile/state.ts) escaped 86/0. This is that test: a StateFs whose
+// `write` THROWS models a filesystem that fails mid-write (ENOSPC, EIO, EROFS —
+// nodeStateFs swallows those, but a custom/injected fs need not). The interface
+// contract is return false when unconfirmed, NEVER throw; removing the try/catch
+// makes this test throw, so it kills the unguard mutant.
+describe("N1: file-backed setDriftPair swallows a throwing StateFs write — false, never throws (unguard kill)", () => {
+  function throwingWriteFs(): StateFs {
+    return {
+      read: () => undefined,
+      write: () => {
+        throw new Error("n1-injected: write failed (ENOSPC)");
+      },
+      remove: () => {},
+      mkdirp: () => {},
+      chmod: () => {},
+      rename: () => {},
+      exists: () => false,
+      tmpname: (d, p) => `${d}/${p}x`,
+    };
+  }
+
+  test("a throwing fs.write ⇒ setDriftPair returns false and does not throw", () => {
+    const st = new ReconcileState("/state", throwingWriteFs());
+    let result: boolean | undefined;
+    expect(() => {
+      result = st.setDriftPair("grok-box-003", "aaa|bbb");
+    }).not.toThrow();
+    expect(result).toBe(false);
+  });
+});
