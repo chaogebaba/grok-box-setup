@@ -283,13 +283,36 @@ export async function alertBoxConditions(box: string, report: BoxReport, deps: A
  * stateful kinds (`keepawake-failing`, `tick-wedged`) cannot be evaluated
  * without the streak/delta, so they are shown with a trailing `?` when the raw
  * token would qualify. Returns short names in `CONDITION_KINDS` order (D3d).
+ *
+ * `tickwedge` is the ONE stateful kind this function can settle when given the
+ * one datum the reconciler's delta rule (§3 above, alerts.ts:205-235) uses: the
+ * highest tickwedge this brain has RECORDED for the box. Pass it via the
+ * optional `tickwedgeSeen` — read from the store the same fail-open way the
+ * AUTHKEY column reads staleness (keystale.ts). The rule mirrors §3 exactly:
+ *   - a number, `report.tickwedge > seen`  → `tick-wedged` (no `?`: a real
+ *     increase the next reconcile tick will page on);
+ *   - a number, `report.tickwedge <= seen` → nothing (§3's clear branch: a
+ *     latched-but-seen counter like grok-box-007's `tickwedge=1` is stale, not
+ *     a live warning);
+ *   - `null` (store says never recorded) or `undefined` (no store / unreadable
+ *     / not supplied) → today's `tick-wedged?`, the unchanged fail-open reading.
+ * The function stays PURE: it opens no store; the caller supplies `seen`.
  */
-export function statelessConditions(report: BoxReport): string[] {
+export function statelessConditions(report: BoxReport, tickwedgeSeen?: number | null): string[] {
   const out: string[] = [];
   if (report.disk.level === "fail") out.push("disk-fail");
   if (report.disk.level === "warn") out.push("disk-warn");
-  // tick-wedged: raw non-zero counter would qualify, but the delta needs state.
-  if (report.tickwedge > 0) out.push("tick-wedged?");
+  // tick-wedged: raw non-zero counter would qualify, but the delta needs the
+  // recorded high-water. With it we settle the delta exactly as §3 does; without
+  // it (null = never recorded, undefined = no store) we fall open to `?`.
+  if (report.tickwedge > 0) {
+    if (typeof tickwedgeSeen === "number") {
+      if (report.tickwedge > tickwedgeSeen) out.push("tick-wedged");
+      // report.tickwedge <= seen ⇒ seen-and-stale ⇒ print nothing (§3 clear).
+    } else {
+      out.push("tick-wedged?");
+    }
+  }
   // keepawake-failing: the raw token would qualify, but the streak needs state.
   if (
     report.keepawakeOn &&

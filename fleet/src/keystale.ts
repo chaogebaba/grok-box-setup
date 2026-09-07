@@ -88,3 +88,49 @@ export function storeKeyStale(env: Env, boxes: string[]): (box: string) => boole
   }
   return (box: string) => stale.has(box);
 }
+
+/** The one store read the tickwedge display rule needs — a subset of
+ *  ReconcileStateApi. `null` is the store's own "never recorded" answer. */
+export interface TickwedgeSeen {
+  lastTickwedge(box: string): number | null;
+}
+
+/**
+ * The tickwedge sibling of `storeKeyStale`, for the COND column of
+ * `grokfleet fleet-status`. It answers, per box, "what is the highest tickwedge
+ * this brain has RECORDED?" — the datum `statelessConditions` needs to tell a
+ * real increase (page-worthy) from a latched-but-seen counter (grok-box-007's
+ * `tickwedge=1`, stale since 2026-09-04). Without it the column prints a stale
+ * `tick-wedged?` forever, because boxup never resets `$RUN_DIR/tickwedge`.
+ *
+ * Same shape as `storeKeyStale`, for the same reasons: ONE read-only handle for
+ * the whole table, closed before anything renders; injectable for tests; and
+ * FAIL-OPEN. The three outcomes the caller distinguishes:
+ *   - a number  → the recorded high-water (drives the `> seen` / `<= seen` rule);
+ *   - `null`    → the store opened and answered "never recorded" for this box
+ *                 (first sight — the reconciler records silently, so the column
+ *                 keeps the `?`);
+ *   - `undefined` → NO store, or a store that opened and then threw on the query
+ *                 (the load-bearing catch, exactly as keystale.ts:60-75 explains
+ *                 — a read-only surface must render what it can, F7.2). The
+ *                 caller treats this identically to `null`: today's `?`.
+ * fleet-status NEVER writes to the store; this only reads.
+ */
+export function storeTickwedgeSeen(env: Env, boxes: string[]): (box: string) => number | null | undefined {
+  const seen = new Map<string, number | null>();
+  try {
+    const h = openReadHandle(env);
+    try {
+      if (h.store !== undefined) {
+        for (const b of boxes) seen.set(b, h.state.lastTickwedge(b));
+      }
+    } finally {
+      h.close();
+    }
+  } catch {
+    /* a store that cannot answer makes no tickwedge claim: undefined ⇒ `?` */
+  }
+  // A box present in the map carries the store's answer (number or null); a box
+  // absent (no store, or the query threw before it was reached) is `undefined`.
+  return (box: string) => seen.get(box);
+}

@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.14.1"; // 5.14.1: the TUI jobs view becomes actionable — a row cursor, `Enter` for the log tail, `s` to stop behind a typed confirm.
+const PKG_VERSION = "5.14.2"; // 5.14.2: fleet-status COND stops printing a stale `tick-wedged?` — it consults the store's tickwedge_seen the same read-only, fail-open way AUTHKEY consults staleness.
 
 async function gitShaFromGit(): Promise<string> {
   try {

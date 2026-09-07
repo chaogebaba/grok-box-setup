@@ -468,6 +468,35 @@ describe("statelessConditions — fleet-status subset", () => {
     expect(statelessConditions(rpt())).toEqual([]);
   });
 
+  // tickwedge display rule (5.14.2): given the store's recorded high-water,
+  // fleet-status settles tick-wedged instead of always printing a stale `?`.
+  // These mirror the reconciler's delta branch (alerts.ts §3) exactly.
+  test("tickwedge_seen settles tick-wedged: >seen pages, <=seen is silent", () => {
+    // (a) seen=1, raw=1 → seen-and-stale → NO tick-wedged entry at all.
+    expect(statelessConditions(rpt({ tickwedge: 1 }), 1)).not.toContain("tick-wedged");
+    expect(statelessConditions(rpt({ tickwedge: 1 }), 1)).not.toContain("tick-wedged?");
+    expect(statelessConditions(rpt({ tickwedge: 1 }), 1)).toEqual([]);
+    // (b) seen=1, raw=2 → a real increase → `tick-wedged` (no `?`), never `?`.
+    expect(statelessConditions(rpt({ tickwedge: 2 }), 1)).toContain("tick-wedged");
+    expect(statelessConditions(rpt({ tickwedge: 2 }), 1)).not.toContain("tick-wedged?");
+    // raw < seen (a reboot lowered the counter) is also <= seen ⇒ silent.
+    expect(statelessConditions(rpt({ tickwedge: 1 }), 5)).toEqual([]);
+    // a recorded seen=0 with raw=1 is a real 0→1 wedge ⇒ pages.
+    expect(statelessConditions(rpt({ tickwedge: 1 }), 0)).toContain("tick-wedged");
+  });
+
+  test("tickwedge_seen null or undefined ⇒ the unchanged fail-open `tick-wedged?`", () => {
+    // (c) seen=null (store says never recorded) → `tick-wedged?`.
+    expect(statelessConditions(rpt({ tickwedge: 1 }), null)).toContain("tick-wedged?");
+    expect(statelessConditions(rpt({ tickwedge: 1 }), null)).not.toContain("tick-wedged");
+    // (d) seen omitted / undefined (no store) → `tick-wedged?` (pre-5.14.2).
+    expect(statelessConditions(rpt({ tickwedge: 1 }), undefined)).toContain("tick-wedged?");
+    expect(statelessConditions(rpt({ tickwedge: 1 }))).toContain("tick-wedged?");
+    // raw==0 never emits either form regardless of seen.
+    expect(statelessConditions(rpt({ tickwedge: 0 }), 3)).toEqual([]);
+    expect(statelessConditions(rpt({ tickwedge: 0 }), null)).toEqual([]);
+  });
+
   test("shortCondition strips the condition: prefix and CONDITION_KINDS is in the fixed order", () => {
     expect(shortCondition("condition:disk-fail")).toBe("disk-fail");
     expect(CONDITION_KINDS.map(shortCondition)).toEqual([
