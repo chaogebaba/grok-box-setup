@@ -675,10 +675,24 @@ export class StoreState implements ReconcileStateApi {
     // is dropped and read-back returns null ⇒ false ⇒ the D5 line fires again.
     // A committed write is confirmed by re-reading it — the same fail-open,
     // read-back contract the file implementation documents.
-    const id = this.counterRow(box, true);
-    if (id === undefined) return false;
-    this.store.db.query("UPDATE box_counters SET driftpair = ? WHERE box_id = ?").run(pair, id);
-    return this.driftPair(box) === pair;
+    //
+    // r2 (gate BLOCKER): the whole thing is wrapped so a mid-tick sqlite write
+    // failure (SQLITE_BUSY after busy_timeout, FULL, IOERR — bun:sqlite THROWS
+    // on any of these) can NEVER escape into runReconcile and kill the tick.
+    // `ReconcileStateApi.setDriftPair` is contracted to return false when the
+    // write is not confirmed and to never throw; a caught error is exactly "not
+    // confirmed", so the next tick re-reads null and re-emits the D5 line — the
+    // same log-every-tick fall-back as an unwritable store. The `counterRow`
+    // INSERT is inside the try for the same reason: it is also a write.
+    try {
+      const id = this.counterRow(box, true);
+      if (id === undefined) return false;
+      this.store.db.query("UPDATE box_counters SET driftpair = ? WHERE box_id = ?").run(pair, id);
+      return this.driftPair(box) === pair;
+    } catch (e) {
+      log(`state store: ${box} driftpair write not confirmed (${e instanceof Error ? e.message : String(e)}) — D5 line will log again next tick`);
+      return false;
+    }
   }
 
   // asleep — "<since> <last_alert>"; 5.7.1 reset is `rm -f`, i.e. ABSENT, which

@@ -3,7 +3,9 @@
 
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { runReconcile, type ReconcileDeps } from "../src/reconcile/run.ts";
-import { ReconcileState, type StateFs } from "../src/reconcile/state.ts";
+import { ReconcileState, type StateFs, type ReconcileStateApi } from "../src/reconcile/state.ts";
+import { StoreState } from "../src/store/state.ts";
+import { openStore } from "../src/store/db.ts";
 import { RunContext, TailscaleKeys, type KeyTransport } from "../src/reconcile/tailscale-keys.ts";
 import { FakeRunner, result, isSs } from "./fake-runner.ts";
 import { testEnv, testRollout } from "./helpers.ts";
@@ -423,7 +425,7 @@ describe("D5-noise: 'content drift ignored (D5)' logs once per (box,checkSha,tar
    * timer's fresh processes.
    */
   function tickDeps(opts: {
-    state: ReconcileState;
+    state: ReconcileStateApi;
     checkSha: string;
     targetSha: string;
     boxVersion?: string;
@@ -533,6 +535,43 @@ describe("D5-noise: 'content drift ignored (D5)' logs once per (box,checkSha,tar
     expect(driftLines().length).toBe(1);
     // and it recorded the pair on the way, so a second identical tick is silent.
     expect(store.get("/s/grok-box-005.driftpair")).toBe("f42c967|adfdc04\n");
+  });
+
+  test("r2 (gate BLOCKER): a store whose driftpair UPDATE ABORTS does not kill the tick — D5 line logs BOTH ticks", async () => {
+    // The reviewer's reproduction: a BEFORE UPDATE trigger that RAISE(ABORT)s is
+    // exactly what SQLITE_BUSY-after-timeout / FULL / IOERR does to the write.
+    // Before the fix, `setDriftPair`'s unguarded UPDATE threw straight out of
+    // runReconcile and killed the whole tick. Now it is caught and returns
+    // false, so the tick COMPLETES and the marker is never confirmed ⇒ the D5
+    // line logs every tick (the log-every-tick fall-back). Mutant M8 removes the
+    // try/catch and is killed by this test (the tick throws).
+    const store = openStore({ path: ":memory:", now: () => 1_000_000 });
+    store.db.run(
+      "INSERT INTO boxes(name,idx,port,phase,created_at,updated_at) VALUES('grok-box-005',5,20005,'enrolled',1000,1000)",
+    );
+    store.db.run("INSERT OR IGNORE INTO box_counters(box_id) VALUES((SELECT box_id FROM boxes WHERE name='grok-box-005'))");
+    store.db.run(
+      "CREATE TRIGGER driftpair_abort BEFORE UPDATE OF driftpair ON box_counters BEGIN SELECT RAISE(ABORT,'gate-injected'); END",
+    );
+    const state = new StoreState(store);
+
+    // Tick 1: the write aborts, is caught, and the tick still completes.
+    let r1: Awaited<ReturnType<typeof runReconcile>> | undefined;
+    await expect(
+      (async () => {
+        r1 = await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+      })(),
+    ).resolves.toBeUndefined();
+    expect(r1).toBeDefined();
+    expect(driftLines().length).toBe(1);
+    expect(state.driftPair("grok-box-005")).toBeNull(); // nothing was recorded
+
+    // Tick 2: identical pair, but the marker never landed ⇒ the line logs AGAIN.
+    logs = [];
+    const r2 = await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
+    expect(r2).toBeDefined();
+    expect(driftLines().length).toBe(1);
+    store.close();
   });
 });
 

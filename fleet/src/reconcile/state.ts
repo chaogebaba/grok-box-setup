@@ -205,6 +205,13 @@ export interface ReconcileStateApi {
    * store) returns `false`, and because the next tick then reads `null` the D5
    * line fires again. The read-back is what makes the fall-back to every-tick
    * logging self-correcting rather than a silent gap.
+   *
+   * NEVER THROWS (r2 gate BLOCKER). A mid-tick backing-store write failure —
+   * SQLITE_BUSY after the busy_timeout, FULL, IOERR, or an injected StateFs that
+   * throws — is caught and reported as `false` ("not confirmed"), because a
+   * throw here would escape into runReconcile and kill the whole reconcile tick.
+   * The old, pre-5.14.3 code merely logged the D5 line unconditionally; the
+   * marker must never be able to do worse than that.
    */
   setDriftPair(box: string, pair: string): boolean;
   recordApiFailure(nowSec: number): { n: number; mins: number };
@@ -333,8 +340,19 @@ export class ReconcileState implements ReconcileStateApi {
     // signal that the marker landed is a read-back — the same fail-open rule the
     // interface documents: an unwritable store cannot confirm, returns false,
     // and the next tick re-reads null and re-emits (log every tick).
-    this.fs.write(this.p(`${box}.driftpair`), `${pair}\n`);
-    return this.driftPair(box) === pair;
+    //
+    // r2 (gate BLOCKER): the production `nodeStateFs.write`/`read` already
+    // swallow their errors, but the interface promises setDriftPair NEVER throws
+    // and returns false when unconfirmed. A custom/injected `StateFs` whose
+    // write or read throws must not escape into runReconcile and kill the tick,
+    // so the whole write+read-back is guarded. A caught error is "not confirmed"
+    // ⇒ false ⇒ the D5 line logs again next tick.
+    try {
+      this.fs.write(this.p(`${box}.driftpair`), `${pair}\n`);
+      return this.driftPair(box) === pair;
+    } catch {
+      return false;
+    }
   }
 
   // --- asleep (main:3216-3243) — "<since> <last_alert>\n" ---

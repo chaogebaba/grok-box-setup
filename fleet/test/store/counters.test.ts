@@ -240,3 +240,47 @@ describe("r2/R3 forgetKey removes the key on both implementations", () => {
     });
   }
 });
+
+
+// ---- r2 (gate BLOCKER): setDriftPair never throws on a store write failure ---
+//
+// The r2 gate proved that an UNGUARDED `UPDATE box_counters SET driftpair` would
+// THROW out of runReconcile and kill the whole reconcile tick when sqlite fails
+// mid-write (SQLITE_BUSY after the busy_timeout, FULL, IOERR). The reviewer's
+// reproduction is a BEFORE UPDATE trigger that RAISE(ABORT)s, which is exactly
+// what any of those runtime failures does to the statement. The contract
+// (reconcile/state.ts) is: return false when unconfirmed, NEVER throw — a caught
+// error is "not confirmed", so the next tick re-reads null and re-emits the D5
+// line (the same log-every-tick fall-back as an unwritable store). Mutant M8
+// removes the try/catch and is killed here.
+describe("r2: setDriftPair swallows a store write failure — returns false, never throws (M8 kill)", () => {
+  const DBOX = "grok-box-003";
+  function storeWithAbortingDriftpair(): ReturnType<typeof memStore> {
+    const store = memStore();
+    store.db.run(
+      `INSERT INTO boxes(name,idx,port,phase,created_at,updated_at) VALUES('${DBOX}',3,20003,'enrolled',${T0},${T0})`,
+    );
+    // A counter row must already exist, else the UPDATE touches 0 rows and the
+    // BEFORE UPDATE trigger never fires — the failure we are testing is a write
+    // that REACHES the row and is aborted by the engine, not a no-op update.
+    store.db.query("INSERT OR IGNORE INTO box_counters(box_id) VALUES((SELECT box_id FROM boxes WHERE name=?))").run(DBOX);
+    store.db.run(
+      `CREATE TRIGGER driftpair_abort BEFORE UPDATE OF driftpair ON box_counters
+       BEGIN SELECT RAISE(ABORT,'gate-injected'); END`,
+    );
+    return store;
+  }
+
+  test("the aborting UPDATE ⇒ setDriftPair returns false, does not throw, driftPair stays null", () => {
+    const store = storeWithAbortingDriftpair();
+    const st = new StoreState(store);
+    let result: boolean | undefined;
+    expect(() => {
+      result = st.setDriftPair(DBOX, "aaa|bbb");
+    }).not.toThrow();
+    expect(result).toBe(false);
+    // nothing was recorded — the abort rolled the statement back
+    expect(st.driftPair(DBOX)).toBeNull();
+    store.close();
+  });
+});
