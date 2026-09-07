@@ -101,7 +101,7 @@ GROKFLEET_FETCH_ROOT_ENV="${GROKFLEET_FETCH_ROOT-}"
 GROKFLEET_RELEASE=v5.14.3
 # Placeholder until the first `make ts-release-build` writes the real digest.
 # Until then the fetch 404s or mismatches — which, by D2, mutates nothing.
-GROKFLEET_SHA256=0cb91c5f50306be5d8a5d0785870f74d3486d17a08dccac303b0403afddc026e
+GROKFLEET_SHA256=531a015e1e02ab580af3be1be097ff55403e7b6f64f9c99e3ae9932301c7b22b
 
 # D10 — the fetch ORIGIN is a seam so the security-critical paths (good fetch,
 # corrupt body, 404, a 200 whose body is an HTML error page) can be tested
