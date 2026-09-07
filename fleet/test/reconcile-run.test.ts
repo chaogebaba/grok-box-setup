@@ -473,7 +473,7 @@ describe("D5-noise: 'content drift ignored (D5)' logs once per (box,checkSha,tar
     expect(driftLines().length).toBe(0);
   });
 
-  test("tick 3: a NEW targetSha (a fresh main commit) emits again — M4 (compare only targetSha kill guard)", async () => {
+  test("tick 3: a NEW targetSha (a fresh main commit) emits again — M3 (compare only checkSha) kill", async () => {
     const { fs } = memState();
     const state = new ReconcileState("/s", fs);
     await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
@@ -486,7 +486,7 @@ describe("D5-noise: 'content drift ignored (D5)' logs once per (box,checkSha,tar
     expect(driftLines()[0]).toContain("sha f42c967≠beef123");
   });
 
-  test("a NEW checkSha (a box re-image / rollout) emits again — M3 (compare only checkSha kill guard)", async () => {
+  test("a NEW checkSha (a box re-image / rollout) emits again — M4 (compare only targetSha) kill", async () => {
     const { fs } = memState();
     const state = new ReconcileState("/s", fs);
     await runReconcile(tickDeps({ state, checkSha: "f42c967", targetSha: "adfdc04" }));
