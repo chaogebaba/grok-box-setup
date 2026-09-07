@@ -145,6 +145,10 @@ tunnel-spawn failure count behind the respawn backoff ladder
 (0s→0s→15s→30s→60s→120s→300s cap), so `tunnel=down tunnelfail=4` means the
 box is parked for 60s before it retries. A healthy box reads
 `tunnel=up tunnelfail=0`. `check` never fails on `tunnelfail` alone.
+`tunnelspawns=N` is the number of reverse-tunnel spawn attempts since boot,
+monotonic and never reset by adoption; a climbing count alongside `tunnel=up`
+is a flapping tunnel that `tunnelfail` cannot show. `boxup check` never fails
+on it.
 
 ## D. Something is wrong
 
