@@ -85,7 +85,12 @@ describe("the crash barrier", () => {
   // `exit` so this test drives `onFatal` on the real `process` event emitter
   // (the ordering guarantee under test) without ever touching the real
   // `process.exit`, and `detach()` cancels the fallback timer it armed.
-  test("an uncaught exception unmounts Ink BEFORE the process is allowed to exit", () => {
+  // r2 gate SHOULD: `toBeGreaterThanOrEqual(1)` passes whether the write
+  // callback's own `clearTimeout` actually cancelled the 200ms fallback or
+  // not, so a mutant that deletes that `clearTimeout` (the fallback then
+  // fires a SECOND exit at 200ms) was never caught. Waiting past 200ms and
+  // asserting an EXACT count closes that.
+  test("an uncaught exception unmounts Ink BEFORE the process is allowed to exit, and exits exactly once", async () => {
     let unmounts = 0;
     let exits = 0;
     const writes: Array<string> = [];
@@ -113,8 +118,43 @@ describe("the crash barrier", () => {
       // the teardown bytes were written before the empty write whose callback exits.
       expect(writes[0]).toContain("\x1b[?1049l");
       expect(writes[writes.length - 1]).toBe("");
-      expect(exits).toBeGreaterThanOrEqual(1);
+      expect(exits).toBe(1);
       expect(cap.lines.join("\n")).toContain("boom");
+      // the write callback fired synchronously and cleared the fallback: waiting
+      // past its 200ms does not produce a second exit.
+      await new Promise((r) => setTimeout(r, 260));
+      expect(exits).toBe(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  // r2 gate SHOULD: nothing exercised the `catch` arm, so a mutant that made
+  // it call the real `process.exit` instead of the injected `exit` survived.
+  test("a stdout that throws on write exits through the injected exit, synchronously, exactly once", async () => {
+    let unmounts = 0;
+    const exits: number[] = [];
+    const stdout = {
+      isTTY: true,
+      write: (): boolean => {
+        throw new Error("EPIPE");
+      },
+    } as unknown as NodeJS.WriteStream;
+    const cap = capture();
+    try {
+      const detach = installCrashBarrier(
+        () => void unmounts++,
+        { stdin: {} as NodeJS.ReadStream, stdout, stderr: {} as NodeJS.WriteStream },
+        { exit: (code) => void exits.push(code) },
+      );
+      detachers.push(detach);
+      process.emit("uncaughtException", new Error("boom"));
+      expect(unmounts).toBe(1);
+      // the catch arm ran synchronously — the process (this test) is still
+      // alive to make this assertion, and it went through the injected exit.
+      expect(exits).toEqual([1]);
+      await new Promise((r) => setTimeout(r, 260));
+      expect(exits).toEqual([1]); // the catch arm also disarms the fallback: no second exit
     } finally {
       cap.restore();
     }
@@ -172,6 +212,32 @@ describe("the crash barrier", () => {
       detach();
       await new Promise((r) => setTimeout(r, 260));
       expect(exits).toEqual([]); // detach() cleared the armed fallback: it never fires
+    } finally {
+      cap.restore();
+    }
+  });
+
+  // r2 gate SHOULD: `onFatal` used to overwrite `fallback` on every call, so
+  // only the MOST RECENT timer was reachable by `detach()` — a fatal event
+  // before the one that gets detached would leave its own 200ms timer
+  // orphaned. Two fatal events (an uncaughtException a real crash could well
+  // be followed by an unhandledRejection mid-unmount), then an immediate
+  // detach(), must leave nothing armed at all.
+  test("two fatal events before detach() do not orphan a timer", async () => {
+    const exits: number[] = [];
+    const stdout = { isTTY: true, write: (): boolean => true } as unknown as NodeJS.WriteStream; // callback never called
+    const cap = capture();
+    try {
+      const detach = installCrashBarrier(
+        () => {},
+        { stdin: {} as NodeJS.ReadStream, stdout, stderr: {} as NodeJS.WriteStream },
+        { exit: (code) => void exits.push(code) },
+      );
+      process.emit("uncaughtException", new Error("first"));
+      process.emit("unhandledRejection", new Error("second"), Promise.resolve());
+      detach();
+      await new Promise((r) => setTimeout(r, 260));
+      expect(exits).toEqual([]); // neither the first nor the second fallback survives detach()
     } finally {
       cap.restore();
     }

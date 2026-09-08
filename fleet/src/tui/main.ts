@@ -97,10 +97,15 @@ export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
  * knob: it lets a test drive `onFatal` on the real `process` event emitter
  * (as the crash-barrier test must, to prove the write-before-exit ordering)
  * without a real `process.exit` call escaping the test. The 200 ms fallback
- * timer is stored and `clearTimeout`'d by the returned detacher — the barrier
- * is only meant to fire once per install, so once `detach()` has run (a test's
- * `afterEach`, or a real second render's own barrier is installed) no exit
- * this instance armed may go off later against a process that has moved on.
+ * timer is armed BEFORE the write is attempted — not after — so that when a
+ * stream's callback fires synchronously (every stub in this suite, and most
+ * real TTYs) the callback's own `clearTimeout` actually cancels a timer that
+ * exists, rather than an `undefined` assigned a line later. It is stored and
+ * `clearTimeout`'d by the returned detacher too, and `onFatal` itself clears
+ * whatever fallback is still pending before arming a new one, so a second
+ * fatal event ahead of teardown (an `uncaughtException` followed by an
+ * `unhandledRejection` mid-unmount, say) cannot orphan the first timer past
+ * `detach()` — only the most recently armed handle used to be reachable.
  */
 export function installCrashBarrier(
   unmount: () => void,
@@ -116,15 +121,17 @@ export function installCrashBarrier(
       /* best-effort */
     }
     log(e instanceof Error ? (e.stack ?? e.message) : String(e));
+    clearTimeout(fallback); // a still-pending timer from an earlier fatal event must not survive this one
+    fallback = setTimeout(() => exit(1), 200).unref();
     try {
       io.stdout.write("", () => {
         clearTimeout(fallback); // the callback ran: the fallback is no longer needed
         exit(1);
       });
     } catch {
+      clearTimeout(fallback); // write() itself threw: no callback is ever coming either
       exit(1);
     }
-    fallback = setTimeout(() => exit(1), 200).unref();
   };
   process.on("uncaughtException", onFatal);
   process.on("unhandledRejection", onFatal);
