@@ -92,8 +92,12 @@ describe("L1 — the schema", () => {
     s.close();
   });
 
-  test("a lease id is 22 base64url characters", () => {
-    for (let i = 0; i < 50; i++) expect(newLeaseId()).toMatch(/^[A-Za-z0-9_-]{22}$/);
+  test("a lease id is 22 base64url characters and never starts with '-' (issue #15c)", () => {
+    for (let i = 0; i < 2000; i++) {
+      const id = newLeaseId();
+      expect(id).toMatch(/^[A-Za-z0-9_-]{22}$/);
+      expect(id.startsWith("-")).toBe(false);
+    }
   });
 
   test("a `service` lease has expires_at NULL; an ephemeral one gets the TTL", () => {

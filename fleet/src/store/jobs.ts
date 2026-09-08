@@ -57,9 +57,16 @@ export interface JobRow {
   lost_reason: string | null;
 }
 
-/** J4: the same 22-char base64url as a lease id — and it can start with `-`. */
+/** J4: the same 22-char base64url as a lease id. Re-rolled while the first
+ *  character is `-` so a freshly minted id is never CLI-hostile (issue #15c)
+ *  — an OLD id already in the store can still start with `-`, and every
+ *  reader of an id must keep accepting that shape. */
 export function newJobId(): string {
-  return randomBytes(16).toString("base64url");
+  let id: string;
+  do {
+    id = randomBytes(16).toString("base64url");
+  } while (id.startsWith("-"));
+  return id;
 }
 
 /** Does this store carry the `jobs` table (schema v4)? */

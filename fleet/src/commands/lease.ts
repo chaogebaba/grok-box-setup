@@ -65,6 +65,8 @@ export const LEASE_HELP = [
   "  show <id> [--json]",
   "  run [--purpose <p>] [--ttl 2h] [--box NNN] [--via tailnet|tunnel] [--json] -- <cmd...>",
   "",
+  "ids may start with `-`; `--` before the id works too.",
+  "",
   "`run` acquires, runs the command on the leased box, and releases in a finally",
   "(including on SIGINT/SIGTERM). Its rc is the REMOTE command's rc when a command",
   "ran, and 255 when nothing ran at all. Key on the --json envelope's lease_id,",
@@ -121,7 +123,7 @@ export interface AcquireFlags {
 export type FlagParse = { flags: AcquireFlags } | { err: string } | { help: true };
 
 /** One parser for every subcommand; unknown flags are a usage error (U4). */
-export function parseLeaseFlags(args: string[], opts: { commandTail: boolean }): FlagParse {
+export function parseLeaseFlags(args: string[], _opts: { commandTail: boolean }): FlagParse {
   const flags: AcquireFlags = { purpose: "", kind: "ephemeral", require: {}, json: false };
   const tail: string[] = [];
   let afterDashDash = false;
@@ -132,7 +134,9 @@ export function parseLeaseFlags(args: string[], opts: { commandTail: boolean }):
       continue;
     }
     if (a === "--") {
-      if (!opts.commandTail) return { err: "-- is only meaningful for `lease run`" };
+      // `lease run` treats everything after `--` as the remote command; every
+      // other subcommand treats it as "everything left is positional" so a
+      // `-`-prefixed id (issue #15a) never has to fight the flag parser.
       afterDashDash = true;
       continue;
     }
@@ -212,8 +216,14 @@ export function parseLeaseFlags(args: string[], opts: { commandTail: boolean }):
         continue;
       }
       default:
-        if (a.startsWith("-")) return { err: `unknown flag ${a}` };
-        tail.push(a);
+        // A lease/job id is 22 base64url characters (store/leases.ts
+        // newLeaseId) and no real flag has that shape, so a `-`-prefixed id
+        // (issue #15b) is accepted positionally even without a `--`.
+        if (/^-[A-Za-z0-9_-]{21}$/.test(a) || !a.startsWith("-")) {
+          tail.push(a);
+          continue;
+        }
+        return { err: `unknown flag ${a}` };
     }
   }
   if (tail.length > 0) flags.command = tail.join(" ");

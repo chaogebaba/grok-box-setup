@@ -93,7 +93,8 @@ describe("J8 — parsing", () => {
     if (!p.ok) expect(p.message).toContain("no deadline");
   });
 
-  test("an id that starts with '-' needs '--' first (J open item)", () => {
+  test("an id that starts with '-' works bare or behind '--' (issue #15)", () => {
+    expect(idArg(["-Ab3xyz"])).toBe("-Ab3xyz");
     expect(idArg(["--", "-Ab3xyz"])).toBe("-Ab3xyz");
     expect(idArg(["J1"])).toBe("J1");
   });
