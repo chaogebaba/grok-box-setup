@@ -225,6 +225,29 @@ describe("L4 — flag parsing", () => {
       expect(p.flags.command).toBe(DASH_ID);
     }
   });
+
+  // S1: the shape match is exactly 22 characters (1 `-` + 21 base64url), not
+  // "22 or nearby" — a dash token one character short or one character long
+  // must still be an unknown flag, never accepted positionally.
+  const DASH_ID_21 = "-Pj88Kc5ELYqqJNvjcXp2"; // 21 chars total: one short
+  const DASH_ID_23 = "-Pj88Kc5ELYqqJNvjcXp2gA"; // 23 chars total: one long
+
+  test("a 22-char dash token is accepted; 21- and 23-char ones are not (15b: exact shape)", () => {
+    expect(DASH_ID_21.length).toBe(21);
+    expect(DASH_ID.length).toBe(22);
+    expect(DASH_ID_23.length).toBe(23);
+
+    const ok = parseLeaseFlags([DASH_ID], { commandTail: false });
+    expect("flags" in ok).toBe(true);
+    if ("flags" in ok) expect(ok.flags.command).toBe(DASH_ID);
+
+    expect(parseLeaseFlags([DASH_ID_21], { commandTail: false })).toEqual({
+      err: `unknown flag ${DASH_ID_21}`,
+    });
+    expect(parseLeaseFlags([DASH_ID_23], { commandTail: false })).toEqual({
+      err: `unknown flag ${DASH_ID_23}`,
+    });
+  });
 });
 
 describe("L4 — acquire", () => {

@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.14.4"; // 5.14.4: reconcile journal noise — the `identity: ok=N flagged=N` and `stage: target …` lines log once per transition (persisted through the existing meta(key,value) table via logMemo/setLogMemo, no schema migration; fall back to every-tick when the store cannot record it), same pattern as the 5.14.3 D5 line.
+const PKG_VERSION = "5.14.5"; // 5.14.5: lease CLI accepts `-`-prefixed lease/job ids and `--` on every subcommand; new ids never start with `-` (issue #15)
 
 async function gitShaFromGit(): Promise<string> {
   try {
