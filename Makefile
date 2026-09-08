@@ -54,9 +54,10 @@ GROKFLEET_REMOTE ?= /opt/grok-fleet/grokfleet
 ts-deps:
 	cd fleet && bun install --frozen-lockfile
 
-# One bun process per test FILE — see fleet/scripts/run-tests.sh for why a
-# single-process `bun test` dies silently part-way through on every machine but
-# the laptop this was written on, and why per-file is better diagnostics anyway.
+# Single bun process, `--isolate` per file — see fleet/scripts/run-tests.sh for
+# the issue #16 history (a plain single-process `bun test` used to die silently
+# part-way through on every machine but the laptop this was written on) and why
+# `--isolate` fixes it at the source instead of paying for a bun process per file.
 ts-test: ts-deps
 	bash fleet/scripts/run-tests.sh
 
