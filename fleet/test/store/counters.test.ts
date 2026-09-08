@@ -320,3 +320,72 @@ describe("N1: file-backed setDriftPair swallows a throwing StateFs write — fal
     expect(result).toBe(false);
   });
 });
+
+
+// ---- 5.14.4: logMemo/setLogMemo — meta-backed, never-throw (M5/M6 kill) ------
+//
+// The once-per-transition memo for the identity + stage journal lines lives in
+// the EXISTING meta(key,value) table (sqlite) / a <key>.memo file (file impl) —
+// NO schema migration. Same never-throw contract as setDriftPair (the 5.14.3 B1
+// lesson): a backing-store write failure is caught and reported as false, so the
+// tick completes and the line re-emits next tick.
+describe("5.14.4 logMemo/setLogMemo on both implementations", () => {
+  test("round-trips: null first, set confirms true, reads back, overwrite (both impls)", () => {
+    for (const impl of bothImplementations()) {
+      const s = impl.state;
+      expect(s.logMemo("log.identity")).toBeNull();
+      expect(s.setLogMemo("log.identity", "1|0")).toBe(true);
+      expect(s.logMemo("log.identity")).toBe("1|0");
+      expect(s.setLogMemo("log.identity", "2|1")).toBe(true);
+      expect(s.logMemo("log.identity")).toBe("2|1");
+      // a second key is independent
+      expect(s.logMemo("log.stage")).toBeNull();
+      expect(s.setLogMemo("log.stage", "abc123|5.3.1")).toBe(true);
+      expect(s.logMemo("log.stage")).toBe("abc123|5.3.1");
+      impl.close();
+    }
+  });
+
+  test("M4 kill: sqlite setLogMemo write failure ⇒ returns false, never throws, memo stays null", () => {
+    const store = memStore();
+    // A BEFORE INSERT/UPDATE trigger on meta that RAISE(ABORT)s — exactly what
+    // SQLITE_BUSY-after-timeout / FULL / IOERR does to the write. Guard against
+    // the pre-existing min_reader/schema_created_at rows already in meta by
+    // scoping the trigger to the log.* keys the memo uses.
+    store.db.run(
+      "CREATE TRIGGER logmemo_abort BEFORE INSERT ON meta WHEN NEW.key LIKE 'log.%' BEGIN SELECT RAISE(ABORT,'gate-injected'); END",
+    );
+    store.db.run(
+      "CREATE TRIGGER logmemo_abort_u BEFORE UPDATE ON meta WHEN NEW.key LIKE 'log.%' BEGIN SELECT RAISE(ABORT,'gate-injected'); END",
+    );
+    const st = new StoreState(store);
+    let result: boolean | undefined;
+    expect(() => {
+      result = st.setLogMemo("log.identity", "1|0");
+    }).not.toThrow();
+    expect(result).toBe(false);
+    expect(st.logMemo("log.identity")).toBeNull(); // nothing recorded
+    store.close();
+  });
+
+  test("M5 kill: file-backed setLogMemo swallows a throwing StateFs write ⇒ false, no throw", () => {
+    const throwingFs: StateFs = {
+      read: () => undefined,
+      write: () => {
+        throw new Error("logmemo: injected write failed (ENOSPC)");
+      },
+      remove: () => {},
+      mkdirp: () => {},
+      chmod: () => {},
+      rename: () => {},
+      exists: () => false,
+      tmpname: (d, p) => `${d}/${p}x`,
+    };
+    const st = new ReconcileState("/state", throwingFs);
+    let result: boolean | undefined;
+    expect(() => {
+      result = st.setLogMemo("log.identity", "1|0");
+    }).not.toThrow();
+    expect(result).toBe(false);
+  });
+});

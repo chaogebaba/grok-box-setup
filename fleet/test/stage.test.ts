@@ -115,3 +115,80 @@ describe("D1 resolveTarget prefers the remote-tracking ref", () => {
     expect(r.joined().some((c) => c === `git -C ${SRC} show ${REMOTE_SHA}:VERSION`)).toBe(true);
   });
 });
+
+
+// --- 5.14.4: the `stage: target …` line is once-per-(sha|version) transition ---
+//
+// It fired every tick before; now resolveTarget takes an optional state and logs
+// only when `${sha}|${version}` differs from the memo (log.stage), writing the
+// memo COUPLED to the emit — a useRemote=false tick is silent and never writes
+// (mirrors driftPair). A store that cannot record ⇒ log every tick.
+import type { ReconcileStateApi } from "../src/reconcile/state.ts";
+
+/** An in-memory logMemo/setLogMemo pair; the rest of the API is never called. */
+function memoState(opts: { failWrite?: boolean } = {}): {
+  state: ReconcileStateApi;
+  map: Map<string, string>;
+} {
+  const map = new Map<string, string>();
+  const state = {
+    logMemo: (k: string): string | null => map.get(k) ?? null,
+    setLogMemo: (k: string, v: string): boolean => {
+      if (opts.failWrite) return false; // did not land ⇒ not confirmed
+      map.set(k, v);
+      return true;
+    },
+  } as unknown as ReconcileStateApi;
+  return { state, map };
+}
+
+function stageLines(ls: string[]): string[] {
+  return ls.filter((l) => l.includes("stage: target"));
+}
+
+describe("5.14.4 stage: target logs once per (sha|version) transition", () => {
+  test("two ticks, same sha/version ⇒ line once; then a NEW sha ⇒ line again", async () => {
+    const { state } = memoState();
+    // tick 1 — first sight ⇒ emit + record.
+    await resolveTarget(runnerFor({ remoteExists: true }), SRC, REF, state);
+    expect(stageLines(logs)).toHaveLength(1);
+    // tick 2 — identical (sha REMOTE_SHA, v5.3.1) ⇒ SILENT.
+    logs = [];
+    await resolveTarget(runnerFor({ remoteExists: true }), SRC, REF, state);
+    expect(stageLines(logs)).toHaveLength(0);
+    // tick 3 — version changes ⇒ emit again (M2 kill: remove the stage memo compare).
+    logs = [];
+    await resolveTarget(runnerFor({ remoteExists: true, version: "5.3.2" }), SRC, REF, state);
+    expect(stageLines(logs)).toHaveLength(1);
+    expect(logs.some((l) => l.includes("(v5.3.2)"))).toBe(true);
+  });
+
+  test("a silent tick (useRemote=false) writes NOTHING, so the next emitting tick still fires (M6 kill: write on silent tick)", async () => {
+    const { state, map } = memoState();
+    // useRemote=false ⇒ the bare-ref path ⇒ NO stage line ⇒ NO memo write.
+    await resolveTarget(runnerFor({ remoteExists: false }), SRC, REF, state);
+    expect(stageLines(logs)).toHaveLength(0);
+    expect(map.has("log.stage")).toBe(false); // the silent tick recorded nothing
+    // now a useRemote tick MUST emit (first real sight), not be suppressed by a
+    // memo a silent tick should never have written.
+    logs = [];
+    await resolveTarget(runnerFor({ remoteExists: true }), SRC, REF, state);
+    expect(stageLines(logs)).toHaveLength(1);
+  });
+
+  test("no state ⇒ every tick logs (unchanged behaviour for non-tick callers)", async () => {
+    await resolveTarget(runnerFor({ remoteExists: true }), SRC, REF);
+    logs = [];
+    await resolveTarget(runnerFor({ remoteExists: true }), SRC, REF);
+    expect(stageLines(logs)).toHaveLength(1);
+  });
+
+  test("setLogMemo returns false (write not confirmed) ⇒ line logs EVERY tick (fall-back)", async () => {
+    const { state } = memoState({ failWrite: true });
+    await resolveTarget(runnerFor({ remoteExists: true }), SRC, REF, state);
+    expect(stageLines(logs)).toHaveLength(1);
+    logs = [];
+    await resolveTarget(runnerFor({ remoteExists: true }), SRC, REF, state);
+    expect(stageLines(logs)).toHaveLength(1); // no record ⇒ re-emits
+  });
+});

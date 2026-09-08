@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.14.3"; // 5.14.3: reconcile journal noise — the D5 "content drift ignored" line logs once per (box, checkSha, targetSha) transition (persisted in the state store, falls back to every-tick when the store cannot record it), and the dynamic `config: canary policy=dynamic` line is folded into the pass-start line.
+const PKG_VERSION = "5.14.4"; // 5.14.4: reconcile journal noise — the `identity: ok=N flagged=N` and `stage: target …` lines log once per transition (persisted through the existing meta(key,value) table via logMemo/setLogMemo, no schema migration; fall back to every-tick when the store cannot record it), same pattern as the 5.14.3 D5 line.
 
 async function gitShaFromGit(): Promise<string> {
   try {

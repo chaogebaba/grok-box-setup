@@ -695,6 +695,30 @@ export class StoreState implements ReconcileStateApi {
     }
   }
 
+  // logMemo (5.14.4) — once-per-transition memo for non-per-box journal lines,
+  // stored in the EXISTING meta(key,value) table (schema.ts V1) — NO migration.
+  // Absent/blank ⇒ null (first sight). setLogMemo confirms with a read-back and
+  // NEVER throws (the B1 lesson): a sqlite write failure (BUSY/FULL/IOERR — or a
+  // BEFORE INSERT/UPDATE trigger RAISE(ABORT) in the test) is caught and reported
+  // as false, so the tick completes and the line re-emits next tick.
+  logMemo(key: string): string | null {
+    try {
+      const v = this.store.meta(key);
+      return v === undefined || v === "" ? null : v;
+    } catch {
+      return null;
+    }
+  }
+  setLogMemo(key: string, value: string): boolean {
+    try {
+      this.store.setMeta(key, value);
+      return this.logMemo(key) === value;
+    } catch (e) {
+      log(`state store: log memo '${key}' write not confirmed (${e instanceof Error ? e.message : String(e)}) — the line will log again next tick`);
+      return false;
+    }
+  }
+
   // asleep — "<since> <last_alert>"; 5.7.1 reset is `rm -f`, i.e. ABSENT, which
   // is distinguishable from zero here (both columns NULL) and must stay so: the
   // 2h first-alert gate keys off the marker's absence.

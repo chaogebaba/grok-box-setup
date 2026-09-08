@@ -3,6 +3,7 @@
 
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { runReconcile, type ReconcileDeps } from "../src/reconcile/run.ts";
+import { identityPass } from "../src/reconcile/identity.ts";
 import { ReconcileState, type StateFs, type ReconcileStateApi } from "../src/reconcile/state.ts";
 import { StoreState } from "../src/store/state.ts";
 import { openStore } from "../src/store/db.ts";
@@ -261,6 +262,85 @@ describe("T15 identity pass log-only + empty-devs enrolled loop (G2)", () => {
     const deps = baseDeps({ keys, targetBoxes: ["grok-box-002"] });
     await runReconcile(deps);
     expect(logs.some((l) => l.includes("identity: ok="))).toBe(true);
+  });
+});
+
+// --- 5.14.4: identity summary line is once-per-(ok|flagged) transition --------
+//
+// identityPass takes an optional state; the `identity: ok=N flagged=N` summary
+// logs only when the tuple differs from the memo (log.identity), writing the
+// memo COUPLED to the emit — an empty-devs (read-only) tick is silent and never
+// writes (mirrors driftPair). A store that cannot record ⇒ log every tick.
+describe("5.14.4 identity: ok=N flagged=N logs once per (ok|flagged) transition", () => {
+  function memoState(opts: { failWrite?: boolean } = {}): { state: ReconcileStateApi; map: Map<string, string> } {
+    const map = new Map<string, string>();
+    const state = {
+      logMemo: (k: string): string | null => map.get(k) ?? null,
+      setLogMemo: (k: string, v: string): boolean => {
+        if (opts.failWrite) return false;
+        map.set(k, v);
+        return true;
+      },
+    } as unknown as ReconcileStateApi;
+    return { state, map };
+  }
+  // devices JSON yielding ok=1 flagged=0 (tagged + keyExpiryDisabled).
+  const okDevs = JSON.stringify({ devices: [{ hostname: "grok-box-002", tags: ["tag:box"], keyExpiryDisabled: true }] });
+  // ok=1 flagged=1 (add an untagged device).
+  const flaggedDevs = JSON.stringify({
+    devices: [
+      { hostname: "grok-box-002", tags: ["tag:box"], keyExpiryDisabled: true },
+      { hostname: "grok-box-004", tags: [] },
+    ],
+  });
+  const idLines = () => logs.filter((l) => l.includes("identity: ok="));
+
+  test("two ticks same tuple ⇒ line once; tuple change ⇒ line again (M1 kill: remove identity memo compare)", () => {
+    const { state } = memoState();
+    identityPass({ devs: okDevs, targetBoxes: ["grok-box-002"], state });
+    expect(idLines()).toHaveLength(1);
+    expect(idLines()[0]).toContain("identity: ok=1 flagged=0");
+    logs = [];
+    identityPass({ devs: okDevs, targetBoxes: ["grok-box-002"], state }); // same tuple ⇒ silent
+    expect(idLines()).toHaveLength(0);
+    logs = [];
+    identityPass({ devs: flaggedDevs, targetBoxes: ["grok-box-002", "grok-box-004"], state }); // ok=1 flagged=1 ⇒ emit
+    expect(idLines()).toHaveLength(1);
+    expect(idLines()[0]).toContain("identity: ok=1 flagged=1");
+  });
+
+  test("first sight always emits (M3 kill: remove first-sight emit)", () => {
+    const { state, map } = memoState();
+    expect(map.has("log.identity")).toBe(false);
+    identityPass({ devs: okDevs, targetBoxes: ["grok-box-002"], state });
+    expect(idLines()).toHaveLength(1);
+    expect(map.get("log.identity")).toBe("1|0"); // recorded on the way
+  });
+
+  test("a silent tick (empty devs) writes NOTHING, so the next non-empty tick still emits (M6 kill: write on silent tick)", () => {
+    const { state, map } = memoState();
+    identityPass({ devs: "", targetBoxes: ["grok-box-002"], state }); // read-only ⇒ silent
+    expect(idLines()).toHaveLength(0);
+    expect(map.has("log.identity")).toBe(false); // the silent tick recorded nothing
+    logs = [];
+    identityPass({ devs: okDevs, targetBoxes: ["grok-box-002"], state }); // MUST emit
+    expect(idLines()).toHaveLength(1);
+  });
+
+  test("setLogMemo false (write not confirmed) ⇒ logs EVERY tick (fall-back)", () => {
+    const { state } = memoState({ failWrite: true });
+    identityPass({ devs: okDevs, targetBoxes: ["grok-box-002"], state });
+    expect(idLines()).toHaveLength(1);
+    logs = [];
+    identityPass({ devs: okDevs, targetBoxes: ["grok-box-002"], state });
+    expect(idLines()).toHaveLength(1); // no record ⇒ re-emits
+  });
+
+  test("no state ⇒ every tick logs (unchanged for non-tick callers)", () => {
+    identityPass({ devs: okDevs, targetBoxes: ["grok-box-002"] });
+    logs = [];
+    identityPass({ devs: okDevs, targetBoxes: ["grok-box-002"] });
+    expect(idLines()).toHaveLength(1);
   });
 });
 
