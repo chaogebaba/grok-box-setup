@@ -92,8 +92,28 @@ export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
  * alone does not wait on stream callbacks). The unref'd 200 ms timer is the
  * fallback for a destroyed or errored stdout whose callback never fires, so a
  * crash can never hang the process instead of ending it.
+ *
+ * `exit` (default `process.exit`) is an injection seam, not a production
+ * knob: it lets a test drive `onFatal` on the real `process` event emitter
+ * (as the crash-barrier test must, to prove the write-before-exit ordering)
+ * without a real `process.exit` call escaping the test. The 200 ms fallback
+ * timer is armed BEFORE the write is attempted — not after — so that when a
+ * stream's callback fires synchronously (every stub in this suite, and most
+ * real TTYs) the callback's own `clearTimeout` actually cancels a timer that
+ * exists, rather than an `undefined` assigned a line later. It is stored and
+ * `clearTimeout`'d by the returned detacher too, and `onFatal` itself clears
+ * whatever fallback is still pending before arming a new one, so a second
+ * fatal event ahead of teardown (an `uncaughtException` followed by an
+ * `unhandledRejection` mid-unmount, say) cannot orphan the first timer past
+ * `detach()` — only the most recently armed handle used to be reachable.
  */
-export function installCrashBarrier(unmount: () => void, io: RenderIo): () => void {
+export function installCrashBarrier(
+  unmount: () => void,
+  io: RenderIo,
+  opts: { exit?: (code: number) => void } = {},
+): () => void {
+  const exit = opts.exit ?? process.exit.bind(process);
+  let fallback: ReturnType<typeof setTimeout> | undefined;
   const onFatal = (e: unknown): void => {
     try {
       unmount(); // idempotent
@@ -101,18 +121,24 @@ export function installCrashBarrier(unmount: () => void, io: RenderIo): () => vo
       /* best-effort */
     }
     log(e instanceof Error ? (e.stack ?? e.message) : String(e));
+    clearTimeout(fallback); // a still-pending timer from an earlier fatal event must not survive this one
+    fallback = setTimeout(() => exit(1), 200).unref();
     try {
-      io.stdout.write("", () => process.exit(1));
+      io.stdout.write("", () => {
+        clearTimeout(fallback); // the callback ran: the fallback is no longer needed
+        exit(1);
+      });
     } catch {
-      process.exit(1);
+      clearTimeout(fallback); // write() itself threw: no callback is ever coming either
+      exit(1);
     }
-    setTimeout(() => process.exit(1), 200).unref();
   };
   process.on("uncaughtException", onFatal);
   process.on("unhandledRejection", onFatal);
   return () => {
     process.off("uncaughtException", onFatal);
     process.off("unhandledRejection", onFatal);
+    clearTimeout(fallback);
   };
 }
 

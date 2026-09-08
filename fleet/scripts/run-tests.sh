@@ -1,24 +1,33 @@
 #!/bin/bash
 # run-tests.sh — the bun suite, ONE FILE PER PROCESS.
 #
-# Why not plain `bun test`: a single-process run of this suite dies SILENTLY
-# part-way through on every machine except the laptop it was developed on. It
-# prints no `(fail)` line and no error — the process simply stops after N files
-# and exits non-zero. Observed on grok-box-010 (rc 1 after 54 of 99 files, at
-# test/store/rename.test.ts) and on ubuntu-latest in GitHub Actions (rc 2, at
-# test/tui/visual.test.ts). It reproduces identically on `main` at the commit
-# before this script existed, so it is not caused by any change here. It is
-# cumulative (the files that die pass when run as a pair) and deterministic per
-# environment, which points at a resource the runner does not release between
-# files rather than at a test.
+# HISTORY (issue #16), root-caused: a plain single-process `bun test` used to
+# die SILENTLY part-way through the suite (no `(fail)` line, no error, just a
+# non-zero rc after N files) on every environment except the laptop it was
+# developed on. The real cause was `installCrashBarrier`'s fallback timer in
+# `src/tui/main.ts` (`setTimeout(() => process.exit(1), 200).unref()`):
+# `test/tui/main.test.ts`'s crash-barrier test fired that handler on the REAL
+# process, stubbed `process.exit` only for its own body, and restored the real
+# `process.exit` in its `finally` — but never cancelled the 200ms fallback
+# timer the handler had already armed. ~200ms later, wherever the run happened
+# to be, that timer called the real `process.exit(1)` on the whole bun test
+# process: rc 1, zero output (the timer prints nothing), and "cumulative"/
+# "environment-dependent" because the death always landed ~200ms of wall time
+# after that one test, which is a different file on every machine (file 54 on
+# grok-box-010, `visual.test.ts` on CI, file 56 or 89 depending on box).
+# Fixed at the source (`src/tui/main.ts`): the barrier's exit function is now
+# injectable, and `detach()` clears the armed fallback timer, so the crash-
+# barrier test can drive `onFatal` without arming a real process exit. Plain
+# single-process `bun test` is green as of that fix.
 #
-# The laptop that completes the suite in one process runs bun 1.4.1-canary.1;
-# the machines that do not run bun 1.4.1 release. That is the likeliest
-# difference, but it has not been confirmed upstream.
-#
-# Running each file in its own process sidesteps it AND is strictly better
-# diagnostics: a crash in one file no longer takes the remaining 45 with it, so
-# the report below is always complete. Cost is ~99 bun startups (~40 s).
+# This script (one bun process per test file) is KEPT ANYWAY, not because the
+# above bug needs it: it is strictly better crash-isolation diagnostics for
+# anything else that calls `process.exit` from inside a test (a `--isolate`
+# single-process run was tried during r1 of this issue and lost that property —
+# a hard exit in one file truncates the whole run and drops every later file's
+# result, uncredited as a crash). A crash in one file here still cannot take
+# the rest of the suite down with it, and the report below is always complete.
+# Cost is ~99 bun startups (~40s) versus ~20s for a single `bun test` process.
 #
 # Usage: bash fleet/scripts/run-tests.sh [extra bun test args...]
 # Exit 0 = every file passed; 1 = at least one file failed or crashed.

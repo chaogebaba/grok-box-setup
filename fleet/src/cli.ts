@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.14.5"; // 5.14.5: lease CLI accepts `-`-prefixed lease/job ids and `--` on every subcommand; new ids never start with `-` (issue #15)
+const PKG_VERSION = "5.14.6"; // 5.14.6: TUI crash barrier — injectable exit and a cancellable fallback timer; the crash-barrier test no longer kills a single-process `bun test` (issue #16)
 
 async function gitShaFromGit(): Promise<string> {
   try {
