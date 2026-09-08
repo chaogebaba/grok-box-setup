@@ -446,7 +446,7 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
   }
 
   // --- identity pass (log-only) ---
-  identityPass({ devs, targetBoxes: deps.targetBoxes });
+  identityPass({ devs, targetBoxes: deps.targetBoxes, state: deps.state });
 
   // lease-api L3: mid-run box loss, from THIS tick's `observed` labels. It runs
   // after the loop (the labels are only complete now) and before the snapshot

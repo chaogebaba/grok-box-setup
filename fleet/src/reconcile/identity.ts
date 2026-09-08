@@ -12,6 +12,7 @@
 // -1 ONLY when the remainder is still a valid grok-box-N (never maul grok-box-1).
 
 import { log } from "../log.ts";
+import type { ReconcileStateApi } from "./state.ts";
 
 /** identity base(): grok-box-N as-is, grok-box-N-1 folded, else "". */
 export function identityBase(h: string): string {
@@ -33,6 +34,12 @@ export interface IdentityDeps {
   devs: string;
   /** enrolled/target box names in reconcile order. */
   targetBoxes: string[];
+  /**
+   * 5.14.4: the tick's state, for the once-per-transition memo on the summary
+   * line. Optional so non-tick callers/tests that do not care about de-noising
+   * keep the every-tick behaviour (a missing state ⇒ log every time).
+   */
+  state?: ReconcileStateApi;
 }
 
 export function identityPass(deps: IdentityDeps): void {
@@ -80,6 +87,16 @@ export function identityPass(deps: IdentityDeps): void {
     legacySeen.add(eb);
   }
 
-  // Summary reflects the DEVICE analysis; silent on a read-only run.
-  if (deps.devs.trim() !== "") log(`identity: ok=${ok} flagged=${flagged}`);
+  // Summary reflects the DEVICE analysis; silent on a read-only run. 5.14.4:
+  // emit only when the tuple changed (or first sight / no state), then record —
+  // the memo write is COUPLED to the emit (a silent empty-devs tick never gets
+  // here, so never writes), mirroring driftPair. A store that cannot record
+  // reads the old value next tick and the line re-emits (log-every-tick).
+  if (deps.devs.trim() !== "") {
+    const tuple = `${ok}|${flagged}`;
+    if (deps.state === undefined || deps.state.logMemo("log.identity") !== tuple) {
+      log(`identity: ok=${ok} flagged=${flagged}`);
+      deps.state?.setLogMemo("log.identity", tuple);
+    }
+  }
 }

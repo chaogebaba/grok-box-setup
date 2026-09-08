@@ -11,6 +11,7 @@
 import type { Runner } from "./runner.ts";
 import { log } from "./log.ts";
 import { ConfigError } from "./config.ts";
+import type { ReconcileStateApi } from "./reconcile/state.ts";
 
 const FETCH_TIMEOUT_MS = 30_000;
 const GIT_TIMEOUT_MS = 30_000;
@@ -91,7 +92,12 @@ export async function assertGitSrc(runner: Runner, src: string): Promise<void> {
  * actually seen, rather than falling back to a stale local branch or failing the
  * tick outright.
  */
-export async function resolveTarget(runner: Runner, src: string, ref: string): Promise<Target> {
+export async function resolveTarget(
+  runner: Runner,
+  src: string,
+  ref: string,
+  state?: ReconcileStateApi,
+): Promise<Target> {
   await assertGitSrc(runner, src);
   // Best-effort fetch — offline is not fatal.
   const fetched = await runner.run(["git", "-C", src, "fetch", "--quiet", "origin"], {
@@ -121,9 +127,17 @@ export async function resolveTarget(runner: Runner, src: string, ref: string): P
   });
   const version = sv.code === 0 ? sv.stdout.trim() : "unknown";
   // One line per tick, and only when the remote ref was the one used, so the
-  // journal says which of the two refs the target came from.
+  // journal says which of the two refs the target came from. 5.14.4: emit only
+  // when `${sha}|${version}` changed (or first sight / no state), then record —
+  // the memo write is COUPLED to the emit (a useRemote=false tick is silent and
+  // never writes), mirroring driftPair. A store that cannot record reads the old
+  // value next tick and the line re-emits (log-every-tick fall-back).
   if (useRemote) {
-    log(`stage: target ${ref} → origin/${ref} ${sha} (v${version})`);
+    const memo = `${sha}|${version}`;
+    if (state === undefined || state.logMemo("log.stage") !== memo) {
+      log(`stage: target ${ref} → origin/${ref} ${sha} (v${version})`);
+      state?.setLogMemo("log.stage", memo);
+    }
   }
   return { ref, sha, version };
 }

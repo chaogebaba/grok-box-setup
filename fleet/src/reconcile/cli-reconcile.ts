@@ -162,7 +162,7 @@ export async function assembleTickDeps(
   let targetSha: string | undefined;
   let targetVersion: string | undefined;
   try {
-    const t = await resolveTarget(runner, rollout.src, rollout.target);
+    const t = await resolveTarget(runner, rollout.src, rollout.target, state);
     targetSha = t.sha;
     targetVersion = t.version;
   } catch (e) {

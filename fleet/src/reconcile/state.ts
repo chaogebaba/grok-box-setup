@@ -214,6 +214,27 @@ export interface ReconcileStateApi {
    * marker must never be able to do worse than that.
    */
   setDriftPair(box: string, pair: string): boolean;
+  /**
+   * 5.14.4: a generic once-per-transition log memo, keyed by a caller-chosen
+   * string, for journal lines that are NOT per-box (identity summary, stage
+   * target). Returns the last recorded value for `key`, or `null` when none was
+   * recorded — first sight, or a store that could not read one. Same fail-OPEN
+   * contract as `driftPair`: a reader that cannot find its state lets the line
+   * through. Persisted through the existing `meta(key,value)` table (sqlite) or
+   * a `<key>` file (file impl) — NO schema migration. Keys: `log.identity`,
+   * `log.stage`.
+   */
+  logMemo(key: string): string | null;
+  /**
+   * Record the memo value for `key`. Returns `true` only when the write is
+   * CONFIRMED by a read-back; a write that did not land returns `false`, and the
+   * next tick reads the old/absent value and re-emits. NEVER THROWS (the 5.14.3
+   * B1 lesson): a backing-store write failure is caught and reported as `false`,
+   * because a throw would escape into runReconcile and kill the tick. Callers
+   * couple the write to the emit exactly as `setDriftPair` does — a silent tick
+   * writes nothing.
+   */
+  setLogMemo(key: string, value: string): boolean;
   recordApiFailure(nowSec: number): { n: number; mins: number };
   resetApiFailure(): void;
   apiFails(): number;
@@ -350,6 +371,28 @@ export class ReconcileState implements ReconcileStateApi {
     try {
       this.fs.write(this.p(`${box}.driftpair`), `${pair}\n`);
       return this.driftPair(box) === pair;
+    } catch {
+      return false;
+    }
+  }
+
+  // --- logMemo (5.14.4) — once-per-transition memo for non-per-box lines ------
+  //
+  // Stored as `<key>.memo` (e.g. `log.identity.memo`), a single trimmed line.
+  // NO bash counterpart and outside the D2 byte-parity set, like `.driftpair`.
+  // Absent/blank ⇒ null (first sight). `setLogMemo` confirms with a read-back
+  // and NEVER throws — a throwing StateFs (the file B1 lesson) is caught and
+  // reported as false, so the next tick re-reads the old value and re-emits.
+  logMemo(key: string): string | null {
+    const raw = this.fs.read(this.p(`${key}.memo`));
+    if (raw === undefined) return null;
+    const v = raw.trim();
+    return v === "" ? null : v;
+  }
+  setLogMemo(key: string, value: string): boolean {
+    try {
+      this.fs.write(this.p(`${key}.memo`), `${value}\n`);
+      return this.logMemo(key) === value;
     } catch {
       return false;
     }
