@@ -62,8 +62,12 @@ describe("J4 — the schema", () => {
     s.close();
   });
 
-  test("a job id is 22 base64url characters", () => {
-    for (let i = 0; i < 50; i++) expect(newJobId()).toMatch(/^[A-Za-z0-9_-]{22}$/);
+  test("a job id is 22 base64url characters and never starts with '-' (issue #15c)", () => {
+    for (let i = 0; i < 2000; i++) {
+      const id = newJobId();
+      expect(id).toMatch(/^[A-Za-z0-9_-]{22}$/);
+      expect(id.startsWith("-")).toBe(false);
+    }
   });
 
   test("the state CHECK refuses a state outside the eight", () => {

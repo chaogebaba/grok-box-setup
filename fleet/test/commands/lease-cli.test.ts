@@ -194,11 +194,36 @@ describe("L4 — flag parsing", () => {
     });
   });
 
-  test("an unknown flag is a usage error; `--` is only for `run`", () => {
+  test("an unknown flag is a usage error", () => {
     expect(parseLeaseFlags(["--nope"], { commandTail: false })).toEqual({ err: "unknown flag --nope" });
-    expect(parseLeaseFlags(["--", "x"], { commandTail: false })).toEqual({
-      err: "-- is only meaningful for `lease run`",
-    });
+    expect(parseLeaseFlags(["-x"], { commandTail: false })).toEqual({ err: "unknown flag -x" });
+    expect(parseLeaseFlags(["--bogus"], { commandTail: false })).toEqual({ err: "unknown flag --bogus" });
+  });
+
+  // issue #15: a lease id can start with `-` (1/64 mint chance for OLD ids;
+  // newLeaseId/newJobId re-roll those away going forward, but the CLI must
+  // keep accepting one that already exists in the store).
+  const DASH_ID = "-Pj88Kc5ELYqqJNvjcXp2g";
+
+  test("a `-`-prefixed id is positional on its own (15b: shape match)", () => {
+    const p = parseLeaseFlags([DASH_ID], { commandTail: false });
+    expect("flags" in p).toBe(true);
+    if ("flags" in p) expect(p.flags.command).toBe(DASH_ID);
+  });
+
+  test("`--` before a `-`-prefixed id works on every subcommand, not just `run` (15a)", () => {
+    const p = parseLeaseFlags(["--", DASH_ID], { commandTail: false });
+    expect("flags" in p).toBe(true);
+    if ("flags" in p) expect(p.flags.command).toBe(DASH_ID);
+  });
+
+  test("`--json` before `--`-then-id still parses both", () => {
+    const p = parseLeaseFlags(["--json", "--", DASH_ID], { commandTail: false });
+    expect("flags" in p).toBe(true);
+    if ("flags" in p) {
+      expect(p.flags.json).toBe(true);
+      expect(p.flags.command).toBe(DASH_ID);
+    }
   });
 });
 
@@ -439,6 +464,30 @@ describe("L4 — renew / release / ls / show", () => {
     for (const sub of ["renew", "release", "show"]) {
       expect(await cmdLease([sub], h.deps)).toBe(RC.USAGE);
     }
+  });
+
+  // issue #15: a `-`-prefixed lease id (1/64 mint chance for OLD ids) reaches
+  // the API client VERBATIM, both bare and behind `--`.
+  const DASH_ID = "-Pj88Kc5ELYqqJNvjcXp2g";
+
+  test("renew/release/show accept a `-`-prefixed id bare", async () => {
+    const h = harness();
+    expect(await cmdLease(["renew", DASH_ID], h.deps)).toBe(RC.OK);
+    expect(h.calls).toContain(`renew ${DASH_ID}`);
+    expect(await cmdLease(["release", DASH_ID], h.deps)).toBe(RC.OK);
+    expect(h.calls).toContain(`release ${DASH_ID}`);
+    expect(await cmdLease(["show", DASH_ID], h.deps)).toBe(RC.OK);
+    expect(h.calls).toContain(`get ${DASH_ID}`);
+  });
+
+  test("renew/release/show accept a `-`-prefixed id behind `--`", async () => {
+    const h = harness();
+    expect(await cmdLease(["renew", "--", DASH_ID], h.deps)).toBe(RC.OK);
+    expect(h.calls).toContain(`renew ${DASH_ID}`);
+    expect(await cmdLease(["release", "--", DASH_ID], h.deps)).toBe(RC.OK);
+    expect(h.calls).toContain(`release ${DASH_ID}`);
+    expect(await cmdLease(["show", "--", DASH_ID], h.deps)).toBe(RC.OK);
+    expect(h.calls).toContain(`get ${DASH_ID}`);
   });
 
   test("an unknown subcommand is rc 2 with one stderr line", async () => {
