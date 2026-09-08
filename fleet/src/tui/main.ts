@@ -92,8 +92,23 @@ export async function cmdTui(rest: string[], deps: TuiDeps): Promise<number> {
  * alone does not wait on stream callbacks). The unref'd 200 ms timer is the
  * fallback for a destroyed or errored stdout whose callback never fires, so a
  * crash can never hang the process instead of ending it.
+ *
+ * `exit` (default `process.exit`) is an injection seam, not a production
+ * knob: it lets a test drive `onFatal` on the real `process` event emitter
+ * (as the crash-barrier test must, to prove the write-before-exit ordering)
+ * without a real `process.exit` call escaping the test. The 200 ms fallback
+ * timer is stored and `clearTimeout`'d by the returned detacher — the barrier
+ * is only meant to fire once per install, so once `detach()` has run (a test's
+ * `afterEach`, or a real second render's own barrier is installed) no exit
+ * this instance armed may go off later against a process that has moved on.
  */
-export function installCrashBarrier(unmount: () => void, io: RenderIo): () => void {
+export function installCrashBarrier(
+  unmount: () => void,
+  io: RenderIo,
+  opts: { exit?: (code: number) => void } = {},
+): () => void {
+  const exit = opts.exit ?? process.exit.bind(process);
+  let fallback: ReturnType<typeof setTimeout> | undefined;
   const onFatal = (e: unknown): void => {
     try {
       unmount(); // idempotent
@@ -102,17 +117,21 @@ export function installCrashBarrier(unmount: () => void, io: RenderIo): () => vo
     }
     log(e instanceof Error ? (e.stack ?? e.message) : String(e));
     try {
-      io.stdout.write("", () => process.exit(1));
+      io.stdout.write("", () => {
+        clearTimeout(fallback); // the callback ran: the fallback is no longer needed
+        exit(1);
+      });
     } catch {
-      process.exit(1);
+      exit(1);
     }
-    setTimeout(() => process.exit(1), 200).unref();
+    fallback = setTimeout(() => exit(1), 200).unref();
   };
   process.on("uncaughtException", onFatal);
   process.on("unhandledRejection", onFatal);
   return () => {
     process.off("uncaughtException", onFatal);
     process.off("unhandledRejection", onFatal);
+    clearTimeout(fallback);
   };
 }
 

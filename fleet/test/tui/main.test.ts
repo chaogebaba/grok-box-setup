@@ -75,6 +75,16 @@ describe("the crash barrier", () => {
     for (const d of detachers.splice(0)) d();
   });
 
+  // Issue #16: this test used to monkeypatch the REAL `process.exit` for its
+  // own body only, then restore it in `finally` — but `onFatal` had already
+  // armed an unref'd 200ms fallback `setTimeout(() => process.exit(1), 200)`,
+  // which nothing here ever cancelled. ~200ms later, against the REAL
+  // (restored) `process.exit`, that timer fired and killed the whole `bun
+  // test` process silently: no `(fail)` line, no error, whatever file the run
+  // happened to be on next. `installCrashBarrier` now takes an injectable
+  // `exit` so this test drives `onFatal` on the real `process` event emitter
+  // (the ordering guarantee under test) without ever touching the real
+  // `process.exit`, and `detach()` cancels the fallback timer it armed.
   test("an uncaught exception unmounts Ink BEFORE the process is allowed to exit", () => {
     let unmounts = 0;
     let exits = 0;
@@ -87,18 +97,16 @@ describe("the crash barrier", () => {
         return true;
       },
     } as unknown as NodeJS.WriteStream;
-    const realExit = process.exit;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (process as any).exit = (): never => {
-      exits++;
-      return undefined as never;
-    };
     const cap = capture();
     try {
-      const detach = installCrashBarrier(() => {
-        unmounts++;
-        stdout.write("\x1b[?1049l\x1b[?25h");
-      }, { stdin: {} as NodeJS.ReadStream, stdout, stderr: {} as NodeJS.WriteStream });
+      const detach = installCrashBarrier(
+        () => {
+          unmounts++;
+          stdout.write("\x1b[?1049l\x1b[?25h");
+        },
+        { stdin: {} as NodeJS.ReadStream, stdout, stderr: {} as NodeJS.WriteStream },
+        { exit: () => void exits++ },
+      );
       detachers.push(detach);
       process.emit("uncaughtException", new Error("boom"));
       expect(unmounts).toBe(1);
@@ -109,8 +117,6 @@ describe("the crash barrier", () => {
       expect(cap.lines.join("\n")).toContain("boom");
     } finally {
       cap.restore();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (process as any).exit = realExit;
     }
   });
 
@@ -120,6 +126,55 @@ describe("the crash barrier", () => {
     expect(process.listenerCount("uncaughtException")).toBe(before + 1);
     detach();
     expect(process.listenerCount("uncaughtException")).toBe(before);
+  });
+
+  // A destroyed/errored stdout whose write callback never fires is exactly
+  // what the 200ms fallback timer is for (see the doc comment on
+  // `installCrashBarrier`). This drives that path directly and proves the
+  // fallback goes through the INJECTED exit, never the real `process.exit` —
+  // if the timer site called `process.exit` directly instead of `exit`, this
+  // test would kill the whole `bun test` process instead of asserting cleanly.
+  test("a stuck stdout falls back to the 200ms timer, through the injected exit", async () => {
+    let unmounts = 0;
+    const exits: number[] = [];
+    const stdout = { isTTY: true, write: (): boolean => true } as unknown as NodeJS.WriteStream; // callback never called
+    const cap = capture();
+    try {
+      const detach = installCrashBarrier(
+        () => void unmounts++,
+        { stdin: {} as NodeJS.ReadStream, stdout, stderr: {} as NodeJS.WriteStream },
+        { exit: (code) => void exits.push(code) },
+      );
+      detachers.push(detach);
+      process.emit("uncaughtException", new Error("stuck stdout"));
+      expect(unmounts).toBe(1);
+      expect(exits).toEqual([]); // nothing has exited yet — the write callback never ran
+      await new Promise((r) => setTimeout(r, 260));
+      expect(exits).toEqual([1]); // the fallback timer fired, through the injected exit
+    } finally {
+      cap.restore();
+    }
+  });
+
+  // The r1 bug in one line: the fallback timer this handler arms MUST be
+  // cancellable, or nothing detach() does can stop a later real process exit.
+  test("detach() disarms the fallback timer before it fires", async () => {
+    const exits: number[] = [];
+    const stdout = { isTTY: true, write: (): boolean => true } as unknown as NodeJS.WriteStream; // callback never called
+    const cap = capture();
+    try {
+      const detach = installCrashBarrier(
+        () => {},
+        { stdin: {} as NodeJS.ReadStream, stdout, stderr: {} as NodeJS.WriteStream },
+        { exit: (code) => void exits.push(code) },
+      );
+      process.emit("uncaughtException", new Error("stuck stdout"));
+      detach();
+      await new Promise((r) => setTimeout(r, 260));
+      expect(exits).toEqual([]); // detach() cleared the armed fallback: it never fires
+    } finally {
+      cap.restore();
+    }
   });
 });
 
