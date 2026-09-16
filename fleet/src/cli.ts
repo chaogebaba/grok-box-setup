@@ -56,7 +56,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.14.7"; // 5.14.7: TUI `r` refresh retires its own "refreshing…" note on both poll outcomes, success and failure (tui-refresh-hang)
+const PKG_VERSION = "5.14.8"; // 5.14.8: brain log/alert hygiene — reconcile's rc-N line no longer doubles, the asleep digest formats a duration not a raw epoch, the API logs one line per non-2xx/slow request, and released leases are pruned after 30d (VPS audit r3, F3/F5/F6/F7)
 
 async function gitShaFromGit(): Promise<string> {
   try {
