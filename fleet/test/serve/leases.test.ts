@@ -18,6 +18,7 @@ import {
 } from "../../src/serve/lease-eligibility.ts";
 import { expireDue, listLeases, markLost, type LeaseRow } from "../../src/store/leases.ts";
 import type { SnapshotBox } from "../../src/history/schema.ts";
+import type { BoxReport } from "../../src/status.ts";
 import type { Observed } from "../../src/reconcile/observe.ts";
 
 const SCRATCH = suiteScratch("serve-leases");
@@ -26,6 +27,23 @@ afterAll(() => SCRATCH.clean());
 const NOW = 1_780_000_000;
 const ADMIN = "ADMINSECRET";
 const READ = "READSECRET";
+
+/** A minimal all-clear BoxReport with only jobState/job set (S3 test seeding). */
+function minimalReport(jobState: string, job: string | null): BoxReport {
+  return {
+    tickwedge: 0,
+    tunnelfail: 0,
+    disk: { pct: 5, level: "ok" },
+    keepawakeOn: false,
+    keepawakeRc: null,
+    keepawakeLast: null,
+    jumps: 0,
+    jobState,
+    job,
+    refreshFailing: 0,
+    repairFailing: 0,
+  };
+}
 
 function snapBox(name: string, over: Partial<SnapshotBox> = {}): SnapshotBox {
   return {
@@ -49,7 +67,15 @@ function snapBox(name: string, over: Partial<SnapshotBox> = {}): SnapshotBox {
 function seedFleet(
   prefix: string,
   opts: {
-    boxes?: Array<{ name: string; phase?: string; observed?: Observed; ver?: string; drift?: string }>;
+    boxes?: Array<{
+      name: string;
+      phase?: string;
+      observed?: Observed;
+      ver?: string;
+      drift?: string;
+      jobState?: string;
+      job?: string;
+    }>;
     snapshotTs?: number;
     tick?: number;
   } = {},
@@ -77,7 +103,13 @@ function seedFleet(
         ts: new Date((opts.snapshotTs ?? NOW) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
         apply: true,
         canary: null,
-        boxes: boxes.map((b) => snapBox(b.name, { ver: b.ver ?? "5.3.0", drift: (b.drift ?? "no") as "no" })),
+        boxes: boxes.map((b) =>
+          snapBox(b.name, {
+            ver: b.ver ?? "5.3.0",
+            drift: (b.drift ?? "no") as "no",
+            ...(b.jobState === undefined ? {} : { report: minimalReport(b.jobState, b.job ?? null) }),
+          }),
+        ),
       },
       observed,
     });
@@ -196,6 +228,48 @@ describe("L2 — eligibility and the r3-n5 reason precedence", () => {
     );
   });
 
+  // S3 (memo B3): a held job slot refuses job placement and an opted-in
+  // `require.job_runner` acquire, but never a plain acquire by default.
+  describe("S3 — job slot eligibility", () => {
+    test("plain acquire on a held slot is NOT refused", () => {
+      const b = facts({ jobState: "running", job: "abc123" });
+      expect(ineligibleReason(b, elig())).toBeUndefined();
+      expect(ineligibleReason(b, elig({ require: {} }))).toBeUndefined();
+    });
+
+    test("acquire with require.job_runner=true IS refused with the id", () => {
+      const b = facts({ jobState: "running", job: "abc123" });
+      expect(ineligibleReason(b, elig({ require: { job_runner: true } }))).toBe("job slot held by abc123");
+    });
+
+    test("job placement (requireJobRunner) is refused the same way", () => {
+      const b = facts({ ver: "5.5.2", jobState: "running", job: "abc123" });
+      expect(ineligibleReason(b, elig({ requireJobRunner: true }))).toBe("job slot held by abc123");
+    });
+
+    test("id unknown ⇒ 'job slot held' with no id", () => {
+      const b = facts({ jobState: "running" });
+      expect(ineligibleReason(b, elig({ require: { job_runner: true } }))).toBe("job slot held");
+    });
+
+    test("missing report (no jobState) ⇒ no fire, even with require.job_runner", () => {
+      const b = facts({ jobState: undefined, job: undefined });
+      expect(ineligibleReason(b, elig({ require: { job_runner: true } }))).toBeUndefined();
+    });
+
+    test("a non-running jobState (terminal/lost) does not fire", () => {
+      const b = facts({ jobState: "done", job: "abc123" });
+      expect(ineligibleReason(b, elig({ require: { job_runner: true } }))).toBeUndefined();
+    });
+
+    test("an explicit boxup_version requirement is reported before the job-slot arm", () => {
+      const b = facts({ ver: "5.2.0", jobState: "running", job: "abc123" });
+      expect(
+        ineligibleReason(b, elig({ require: { boxup_version: "5.10.0", job_runner: true } })),
+      ).toBe("boxup 5.2.0 < required 5.10.0");
+    });
+  });
+
   test("the rollout canary opens ONLY for an ephemeral allow_canary lease (L3/r3-n4)", () => {
     const i = elig({ rolloutCanary: "grok-box-001" });
     expect(ineligibleReason(facts(), i)).toBe("configured rollout canary");
@@ -294,6 +368,34 @@ describe("L2 — POST /v1/leases", () => {
       "grok-box-001": "observed asleep",
       "grok-box-002": "observed unhealthy",
     });
+  });
+
+  // S3 (memo B3): end-to-end through the real snapshot/report round-trip.
+  test("acquire with require.job_runner: true is refused on a held slot, plain acquire is not", async () => {
+    const dir = seedFleet("acquire-jobslot", {
+      boxes: [
+        { name: "grok-box-001", jobState: "running", job: "job-abc" },
+        { name: "grok-box-002" },
+        { name: "grok-box-003" },
+      ],
+    });
+    const fetch = makeFetch(await ctxFor(dir));
+
+    // Plain acquire is not refused by default — it may land on the held box.
+    const plain = await fetch(postReq("/v1/leases", ADMIN, { purpose: "gate", box: "grok-box-001" }));
+    expect(plain.status).toBe(201);
+
+    // A fresh fleet, named box, WITH require.job_runner: refused, id carried.
+    const dir2 = seedFleet("acquire-jobslot-2", {
+      boxes: [{ name: "grok-box-001", jobState: "running", job: "job-abc" }],
+    });
+    const fetch2 = makeFetch(await ctxFor(dir2));
+    const res = await fetch2(
+      postReq("/v1/leases", ADMIN, { purpose: "gate", box: "grok-box-001", require: { job_runner: true } }),
+    );
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { reasons: Record<string, string> };
+    expect(body.reasons["grok-box-001"]).toBe("job slot held by job-abc");
   });
 
   test("TWO CONCURRENT acquires for the same named box: one 201, one 409 (L2)", async () => {

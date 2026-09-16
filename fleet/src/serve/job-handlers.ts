@@ -469,6 +469,8 @@ function boxFacts(
       observed: s?.observed,
       ver: s?.ver,
       lease: leased.get(r.name),
+      jobState: s?.jobState,
+      job: s?.job,
     };
   });
   return { facts, snapshotTs: snap?.ts ?? null };

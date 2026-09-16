@@ -1566,6 +1566,8 @@ leased by … > lost lease in grace (…) > leased by … (expired, grace)
   > snapshot stale (<age>)
   > drifted (require.no_drift)
   > boxup <v> < required <v>
+  > boxup lacks job runner
+  > job slot held by <id> / job slot held
   > phase <p>
 ```
 
@@ -1751,6 +1753,15 @@ Eligibility gains ONE reason, `boxup lacks job runner`, after an explicit
 `boxup_version` requirement — a caller who asked about a version hears about
 that, not about a runner they never mentioned. It only fires during the rollout
 window.
+
+Eligibility also knows about a held job slot: a box whose latest snapshot report
+carries `job_state=running` is refused for job placement (`job run`/`job start`
+with no supplied lease) and for a plain `lease acquire` that opts in with
+`require.job_runner: true`. Reason is `job slot held by <id>` when the report
+carries the id, else `job slot held`. Plain `lease acquire` is **not** refused
+by default — builds, tests and interactive ssh never touch the job slot. A box
+that has not been status-seen (no report) is treated as unknown and the arm
+does not fire.
 
 ### CLI (J8)
 

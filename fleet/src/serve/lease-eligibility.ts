@@ -29,12 +29,18 @@ export interface BoxFacts {
   ver?: string;
   /** the deferring lease on this box (`released_at IS NULL`), if any. */
   lease?: LeaseRow;
+  /** `job_state=<state>` from the latest snapshot's report blob, if any (S3). */
+  jobState?: string;
+  /** `job=<id>` from the latest snapshot's report blob, if any (S3). */
+  job?: string;
 }
 
 export interface LeaseRequire {
   no_drift?: boolean;
   boxup_version?: string;
   allow_canary?: boolean;
+  /** S3 (memo B3): opt-in refusal when the box's job slot is held. */
+  job_runner?: boolean;
 }
 
 export interface EligibilityInput {
@@ -128,6 +134,7 @@ const OBSERVED_BAD = new Set(["asleep", "incoherent", "hostkey_mismatch", "unhea
  *   > drifted (require.no_drift)
  *   > boxup <v> < required <v>
  *   > boxup lacks job runner          (jobs J3, only when a job is being placed)
+ *   > job slot held by <id> / job slot held  (S3, job placement or require.job_runner)
  *   > phase <p>
  *
  * DEVIATION, stated: a box the latest snapshot carries NO ROW for has no
@@ -173,6 +180,15 @@ export function ineligibleReason(b: BoxFacts, i: EligibilityInput): string | und
     if (!versionKnown(b.ver) || compareVersions(b.ver, JOB_RUNNER_MIN_BOXUP) < 0) {
       return "boxup lacks job runner";
     }
+  }
+
+  // S3 (memo B3): a job placement, or a caller who opted in via
+  // `require.job_runner`, cannot land on a box whose job slot is already held.
+  // Plain `lease acquire` is NOT refused by default (rationale #3 in the memo).
+  // A missing report (box not status-seen) is "unknown, do not fire" — such a
+  // box has already failed an earlier arm.
+  if ((i.requireJobRunner === true || i.require.job_runner === true) && b.jobState === "running") {
+    return b.job !== undefined ? `job slot held by ${b.job}` : "job slot held";
   }
 
   // --- membership, last (L2 precedence) ---

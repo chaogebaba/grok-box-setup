@@ -58,7 +58,7 @@ export const LEASE_HELP = [
   "grokfleet lease <sub>  — reserve a box, then hand it back",
   "",
   "  acquire [--purpose <p>] [--kind ephemeral|service] [--ttl 2h] [--box NNN]",
-  "          [--no-drift] [--boxup-version <v>] [--allow-canary] [--max-disk <pct>] [--json]",
+  "          [--no-drift] [--boxup-version <v>] [--allow-canary] [--job-runner] [--max-disk <pct>] [--json]",
   "  renew <id> [--ttl 2h] [--json]",
   "  release <id> [--json]",
   "  ls [--all] [--state <s>] [--json]",
@@ -155,6 +155,10 @@ export function parseLeaseFlags(args: string[], _opts: { commandTail: boolean })
     }
     if (a === "--allow-canary") {
       flags.require["allow_canary"] = true;
+      continue;
+    }
+    if (a === "--job-runner") {
+      flags.require["job_runner"] = true;
       continue;
     }
     const eq = a.indexOf("=");
