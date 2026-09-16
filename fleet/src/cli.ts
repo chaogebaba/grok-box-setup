@@ -140,6 +140,11 @@ async function main(argv: string[]): Promise<number> {
       } catch (e) {
         if (!(e instanceof TuiConfigError)) throw e;
         api = undefined;
+        // SHOULD-5 (gate r1): a wrong-mode tui.toml is a MISCONFIGURATION, not
+        // an absence — `grokfleet lease ls` refuses loudly on the same file,
+        // and `list` folding it to a silent "-" reads as a dead fleet. One
+        // stderr line, rc and the column stay unchanged.
+        log(`list: ${e.message} — OBSERVED will show '-'`);
       }
       return cmdList(runner, stdout, wantsJson(rest), api);
     }
