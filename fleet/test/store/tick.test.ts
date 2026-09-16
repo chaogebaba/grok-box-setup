@@ -274,11 +274,11 @@ describe("D4 candidate exclusion (ships in Phase A)", () => {
   });
 });
 
-// 5.15.0 S1(b): the sqlite path. `alertClear` here is an UPDATE (cleared_at,
-// last_sent=NULL) rather than the file backend's `rm -f`, so this is the one
-// backend that can show a row SURVIVING an unobserved tick rather than merely
-// being absent both before and after.
-describe("5.15.0 S1(b) — sqlite StoreState survives an unobserved tick", () => {
+// 5.15.0 S1(b) + SHOULD-1: the sqlite path. `alertClear` here is an UPDATE
+// (cleared_at, last_sent=NULL) rather than the file backend's `rm -f`, so this
+// is the one backend that can show a row SURVIVING an unobserved tick rather
+// than merely being absent both before and after.
+describe("5.15.0 S1(b) + SHOULD-1 — sqlite StoreState survives an unobserved tick", () => {
   const BOX = "grok-box-003";
   const LISTEN = 'LISTEN 0 128 127.0.0.1:20003 0.0.0.0:* users:(("sshd",pid=41,fd=7))\n';
 
@@ -322,6 +322,64 @@ describe("5.15.0 S1(b) — sqlite StoreState survives an unobserved tick", () =>
         .get(id, "incident:reachable-cannot-converge") as { last_sent: number | null; cleared_at: number | null };
       expect(after.last_sent).toBe(before.last_sent);
       expect(after.cleared_at).toBeNull();
+      h.close();
+    } finally {
+      cleanup(h.dir);
+    }
+  });
+
+  const healthy = () =>
+    new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: LISTEN });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND)
+        return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
+      return result({ code: 1 });
+    });
+  const failedDevs = { code: 500, body: "" };
+
+  test("SHOULD-1(a): devices GET failure (online=unknown) leaves asleep_since/asleep_last_alert untouched", async () => {
+    const h = harness("should1-a", { withExport: false });
+    try {
+      h.st.recordEnrolled(BOX, 20003);
+      // tick 1: tunnel down, devices readable, online=no (no matching device)
+      // ⇒ row e raises alert-asleep, stamping the marker.
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 }));
+      }
+      const before = h.st.readAsleep(BOX);
+      expect(before).toBeDefined();
+      // tick 2: devices GET fails ⇒ online="unknown". Row e cannot fire, so
+      // `rowEAlert` is false — the pre-5.15.0 code reset the marker here
+      // unconditionally. SHOULD-1 gates the reset on online !== "unknown".
+      {
+        const { keys, ctx } = fakeKeysWith(() => failedDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 + 300 }));
+      }
+      const after = h.st.readAsleep(BOX);
+      expect(after).toEqual(before);
+      h.close();
+    } finally {
+      cleanup(h.dir);
+    }
+  });
+
+  test("SHOULD-1(b): a normal healthy (status-seen) tick still resets the asleep marker", async () => {
+    const h = harness("should1-b", { withExport: false });
+    try {
+      h.st.recordEnrolled(BOX, 20003);
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 }));
+      }
+      expect(h.st.readAsleep(BOX)).toBeDefined();
+      // tick 2: box recovers — tunnel up, check OK, devices readable (online
+      // known, not "unknown") ⇒ the reset must still run.
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: healthy(), targetBoxes: [BOX], nowSec: T0 + 300 }));
+      }
+      expect(h.st.readAsleep(BOX)).toBeUndefined();
       h.close();
     } finally {
       cleanup(h.dir);

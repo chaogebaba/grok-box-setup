@@ -748,7 +748,12 @@ async function reconcileOne(
   // mirrors THIS tick, not the preceding one.
   const rowEAlert =
     actions.includes("alert-asleep") || actions.includes("alert-incident:incoherent-both-dead");
-  if (!rowEAlert) {
+  // Memo SHOULD 1: a devices-GET failure sets `online = "unknown"` (above,
+  // devs.trim() === "" branch), under which row e cannot fire (decide.ts) even
+  // though the box may still be asleep — it is unobserved, not recovered. Gate
+  // the reset on `online !== "unknown"` so that tick does not restart the 2h
+  // first-alert timer / daily digest for a box the tick had no opinion about.
+  if (!rowEAlert && online !== "unknown") {
     deps.state.resetAsleep(box);
     deps.state.resetIncoherent(box);
   }
