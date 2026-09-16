@@ -139,6 +139,26 @@ describe("J8 — exit codes", () => {
     expect(env.reasons["grok-box-001"]).toBe("boxup lacks job runner");
   });
 
+  // SHOULD-4 (gate r1): text mode was printing only the summary line and
+  // dropping the per-box reason map --json already carried, mirroring
+  // lease.ts:325's stderr loop closes the gap.
+  test("a start that never happened prints the reason map on stderr in text mode too", async () => {
+    const api = fakeApi({
+      startJob: async () => ({
+        ok: false,
+        kind: "error",
+        status: 409,
+        message: "no box satisfies the request",
+        reasons: { "grok-box-001": "boxup lacks job runner", "grok-box-002": "job slot held by held-job" },
+      }),
+    } as unknown as Partial<ApiClient>);
+    const rc = await cmdJob(["run", "--purpose", "gate", "--", "make test"], deps(api));
+    expect(rc).toBe(RC_NOTHING_RAN);
+    expect(logs.some((l) => l.includes("job: no box satisfies the request"))).toBe(true);
+    expect(logs.some((l) => l.includes("grok-box-001: boxup lacks job runner"))).toBe(true);
+    expect(logs.some((l) => l.includes("grok-box-002: job slot held by held-job"))).toBe(true);
+  });
+
   test("job start returns immediately with the id, rc 0", async () => {
     const out: string[] = [];
     const rc = await cmdJob(["start", "--json", "--purpose", "gate", "--", "sleep 600"], deps(fakeApi(), out));

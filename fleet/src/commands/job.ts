@@ -246,7 +246,12 @@ export async function cmdJob(argv: string[], deps: JobDeps): Promise<number> {
           state: "not_started",
           ...(started.reasons === undefined ? {} : { reasons: started.reasons }),
         });
-        return emit(d, env, [`job: ${started.message}`]);
+        // SHOULD-4 (gate r1): mirror lease.ts:325's stderr loop — text mode was
+        // printing only the summary line and losing the per-box reason map that
+        // --json already carried, which is exactly what S3's REFUSE ruling
+        // needs an operator to see up front.
+        const reasonLines = Object.entries(started.reasons ?? {}).map(([box, why]) => `  ${box}: ${why}`);
+        return emit(d, env, [`job: ${started.message}`, ...reasonLines]);
       }
       const { job_id, box, lease_id } = started.value;
       if (sub === "start") {
