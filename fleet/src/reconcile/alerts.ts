@@ -291,10 +291,18 @@ export async function alertBoxConditions(box: string, report: BoxReport, deps: A
   //    column / snapshot unchanged, D3a) but takes no alertDue and sends no
   //    notify. Suppression is per-tick, not sticky — it re-evaluates `diskFail`
   //    every tick, so the very next tick after disk-fail clears pages normally.
+  //
+  //    Gate memo r1 SHOULD 1: `repairFailing` and `refreshFailing` are two
+  //    independent counters (status.ts, boxup's `repair=failing:N` and
+  //    `refresh=failing:N`). The disk mechanism above explains the REPAIR
+  //    counter only, so the suppression arm fires only when repair (not
+  //    refresh) is what tripped the OR — a refresh-driven failure alongside an
+  //    unrelated disk-fail still pages.
   const repairFailing = report.repairFailing >= 3 || report.refreshFailing >= 3;
+  const suppressForDisk = diskFail && report.repairFailing >= 3 && report.refreshFailing < 3;
   if (repairFailing) {
     active.push(shortCondition("condition:repair-failing"));
-    if (!diskFail && deps.state.alertDue(box, "condition:repair-failing", renotify, deps.nowSec)) {
+    if (!suppressForDisk && deps.state.alertDue(box, "condition:repair-failing", renotify, deps.nowSec)) {
       await deps.notify(
         "warn",
         `${box}: condition:repair-failing (refresh=${report.refreshFailing} repair=${report.repairFailing})`,

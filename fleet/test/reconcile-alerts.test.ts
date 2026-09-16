@@ -390,6 +390,28 @@ describe("alertBoxConditions — raises, clears, and the conditions array", () =
       expect(active).not.toContain("disk-fail");
       expect(notes.some(([l, m]) => l === "warn" && m.includes("condition:repair-failing"))).toBe(true);
     });
+
+    // Gate memo r1 SHOULD 1: repairFailing and refreshFailing are independent
+    // counters; the disk mechanism only explains the REPAIR one, so a
+    // refresh-driven failure alongside an unrelated disk-fail must still page.
+    test("disk-fail + REFRESH-driven repair-failing (refreshFailing>=3, repairFailing<3) still notifies", async () => {
+      const { fs } = memState();
+      const s = new ReconcileState(SD, fs);
+      const notes: Array<[string, string]> = [];
+      const active = await runPass(
+        "grok-box-1",
+        s,
+        rpt({ disk: { pct: 97, level: "fail" }, refreshFailing: 5, repairFailing: 0 }),
+        1000,
+        notes,
+      );
+      expect(active).toContain("disk-fail");
+      expect(active).toContain("repair-failing");
+      // TWO notifies: disk-fail's own, AND repair-failing's — the repair
+      // counter never tripped, so the disk-fail suppression arm must not fire.
+      expect(notes.length).toBe(2);
+      expect(notes.some(([l, m]) => l === "warn" && m.includes("condition:repair-failing"))).toBe(true);
+    });
   });
 
   test("24 ticks of a persisting condition ⇒ ONE message (dedup)", async () => {
