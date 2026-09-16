@@ -98,6 +98,7 @@ refresh_exitnode() { :; }
 # pgrep above answers with $$) satisfies the "is this our tailscaled" guard
 # without needing to fake /proc. `kill -0` is made to say "already gone" so
 # the post-kill wait loop exits on its first check instead of sleeping.
+# shellcheck disable=SC2034  # read inside recycle_tailscaled, extracted below
 STATE_DIR=""
 kill() {
   case "$1" in

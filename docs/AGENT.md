@@ -153,14 +153,31 @@ on it.
 boxup 5.6.3 (log-noise audit R1/R6): the `keepawake: off` breadcrumb now logs
 once on the off TRANSITION instead of once an hour (it was ~60% of the
 fleet's log volume with keep-awake disabled fleet-wide); steady-state off
-logs nothing, and a `keepawake: on (interval_min=N)` line marks leaving off.
-The `keepawake=` status token is unaffected. Separately, when boxup's own
+logs nothing, and a `keepawake: on (interval_min = N)` line (note the spaces
+around `=`, matching what the code actually emits) marks leaving off. The
+`keepawake=` status token is unaffected. Separately, when boxup's own
 selfheal recycles tailscaled, the next 2-3 ticks legitimately see
 `backend=NoState`/`Starting` while the daemon restarts — that window is no
 longer logged as `tick: unhealthy` or repaired (no `do_ensure_body`, no
 `fail.repair` bump); at most one `tick: tailscaled starting after recycle`
 line appears per recycle. Any OTHER failing predicate inside that same
 window (e.g. `online=no`) still reports and repairs exactly as before.
+
+**Trade-off (gate r1 SHOULD-1):** `check_reason` is "first failure wins" and
+`backend` is checked first, so if the backend is NoState/Starting AND some
+unrelated predicate is ALSO failing (sshd down, a locked account, missing
+host keys, node identity) at the same moment, `check_reason` only ever
+reports the backend reason — the unrelated fault is invisible to the tick
+until the backend clears. Inside that window the tick does not call
+`do_ensure_body` at all, so the co-occurring fault is not repaired until the
+post-recycle window closes, bounded by `RECYCLE_COOLDOWN` (120s) from the
+recycle. `boxup check` still reports the real underlying predicate the whole
+time (only the TICK suppresses, not the health check itself — see the P1-1
+comment in `do_tick`), and the hourly `boxup once` remains a second,
+independent repair path. In practice the daemon has reached Running within
+one 15s tick on every recycle observed live, so the added latency is small,
+but an operator reading `repair=failing:N` staying flat during a recycle
+should know this is why.
 
 ## D. Something is wrong
 
