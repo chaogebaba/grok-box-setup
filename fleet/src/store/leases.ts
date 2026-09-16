@@ -89,6 +89,20 @@ export function leasesAvailable(store: Store): boolean {
   return store.userVersion() >= 3;
 }
 
+/**
+ * F7 (VPS audit r3): delete RELEASED leases whose `released_at` is older than
+ * `retentionDays`, same retention-constant style as `pruneAudit`/`pruneSnapshots`.
+ * `released_at IS NULL` (the live/deferring set — active, or expired/lost still
+ * in grace) is NEVER touched, no matter its age; nothing pruned this table
+ * before, so it grew forever.
+ */
+export function pruneLeases(store: Store, retentionDays: number, at: number): number {
+  if (!leasesAvailable(store)) return 0;
+  const cutoff = at - retentionDays * 86400;
+  const r = store.db.query("DELETE FROM leases WHERE released_at IS NOT NULL AND released_at < ?").run(cutoff);
+  return Number(r.changes ?? 0);
+}
+
 const SELECT_JOINED =
   `SELECT l.lease_id, l.box_id, b.name AS box, l.kind, l.holder, l.purpose, l.created_at,
           l.expires_at, l.renewed_at, l.released_at, l.state, l.expired_at, l.lost_at, l.lost_reason

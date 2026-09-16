@@ -21,6 +21,7 @@ import {
   listLeases,
   markLost,
   newLeaseId,
+  pruneLeases,
   releaseLease,
   renewLease,
   sweepGraces,
@@ -30,6 +31,7 @@ import {
   LEASE_LOST_GRACE_S,
   type LeaseRow,
 } from "../../src/store/leases.ts";
+import { LEASE_RETENTION_DAYS } from "../../src/store/schema.ts";
 import { memStore, T0 } from "./helpers.ts";
 import type { Store } from "../../src/store/db.ts";
 
@@ -412,6 +414,66 @@ describe("L2 — listing and audit", () => {
     acquire(s, "grok-box-008");
     s.db.query("DELETE FROM boxes WHERE box_id=?").run(id);
     expect(listLeases(s, { all: true })).toHaveLength(0);
+    s.close();
+  });
+});
+
+// --- F7 (VPS audit r3): nothing pruned `leases` before this; DELETE released
+// rows past LEASE_RETENTION_DAYS, never rows still deferring (released_at IS
+// NULL), never rows within the window. --------------------------------------
+
+describe("F7 pruneLeases", () => {
+  const RET = LEASE_RETENTION_DAYS * 86400;
+
+  test("a released row older than the retention window is deleted", () => {
+    const s = memStore();
+    seedBox(s, "grok-box-008");
+    const a = acquire(s, "grok-box-008", { now: T0 });
+    releaseLease(s, listLeases(s)[0]!.lease_id, T0 - RET - 1);
+    expect(a.ok).toBe(true);
+    const n = pruneLeases(s, LEASE_RETENTION_DAYS, T0);
+    expect(n).toBe(1);
+    expect(listLeases(s, { all: true })).toHaveLength(0);
+    s.close();
+  });
+
+  test("MUTANT (M6): a released row still within the window survives", () => {
+    const s = memStore();
+    seedBox(s, "grok-box-008");
+    acquire(s, "grok-box-008", { now: T0 });
+    releaseLease(s, listLeases(s)[0]!.lease_id, T0 - RET + 1);
+    const n = pruneLeases(s, LEASE_RETENTION_DAYS, T0);
+    expect(n).toBe(0);
+    expect(listLeases(s, { all: true })).toHaveLength(1);
+    s.close();
+  });
+
+  test("MUTANT (M5): an unreleased row (released_at IS NULL) is never pruned, no matter its age", () => {
+    const s = memStore();
+    seedBox(s, "grok-box-008");
+    // acquired long before the retention cutoff — still ACTIVE, never released.
+    acquire(s, "grok-box-008", { now: T0 - RET - 100_000 });
+    const n = pruneLeases(s, LEASE_RETENTION_DAYS, T0);
+    expect(n).toBe(0);
+    expect(listLeases(s)).toHaveLength(1);
+    s.close();
+  });
+
+  test("a lease still in its expired/lost grace (released_at NULL) is untouched", () => {
+    const s = memStore();
+    seedBox(s, "grok-box-008");
+    acquire(s, "grok-box-008", { now: T0 - RET - 100_000, ttlS: 1 });
+    expireDue(s, T0 - RET - 100_000 + 2); // ⇒ state='expired', released_at still NULL
+    const n = pruneLeases(s, LEASE_RETENTION_DAYS, T0);
+    expect(n).toBe(0);
+    expect(listLeases(s, { all: true })).toHaveLength(1);
+    s.close();
+  });
+
+  test("a v2 store (no lease layer) is inert, not throwing", () => {
+    const s = openStore({ path: ":memory:", now: () => T0 });
+    s.db.run("PRAGMA user_version = 2");
+    expect(pruneLeases(s, LEASE_RETENTION_DAYS, T0)).toBe(0);
     s.close();
   });
 });

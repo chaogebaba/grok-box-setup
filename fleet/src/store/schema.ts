@@ -25,6 +25,11 @@ export const AUDIT_RETENTION_DAYS = 92;
 /** D3 (v2): the same 92-day window for `snapshots` (children cascade). */
 export const SNAPSHOT_RETENTION_DAYS = 92;
 
+/** F7 (VPS audit r3): released leases outlive their usefulness after 30 days —
+ *  nothing pruned `leases` before this; unreleased rows (`released_at IS NULL`)
+ *  are the live/deferring set and must never age out. */
+export const LEASE_RETENTION_DAYS = 30;
+
 export interface Migration {
   /** the `user_version` this migration produces. */
   to: number;
