@@ -148,6 +148,8 @@ export interface BoxReport {
   jumps: number;
   /** `job_state=<state>` or null. */
   jobState: string | null;
+  /** `job=<id>`; `-` or absent ⇒ null. */
+  job: string | null;
   /** `refresh=failing:N`, else 0. */
   refreshFailing: number;
   /** `repair=failing:N`, else 0. */
@@ -204,6 +206,7 @@ export function toReport(status: BoxStatus): BoxReport {
     keepawakeLast: parseKeepawakeLast(t["keepawake_last"]),
     jumps: intToken(t["jumps"]),
     jobState: t["job_state"] ?? null,
+    job: t["job"] !== undefined && t["job"] !== "-" ? t["job"] : null,
     refreshFailing: failingCount(t["refresh"]),
     repairFailing: failingCount(t["repair"]),
   };
