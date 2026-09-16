@@ -35,6 +35,8 @@ import { log } from "./log.ts";
 
 import { decide, emit, versionString } from "./commands/dispatch.ts";
 import { cmdList } from "./commands/list.ts";
+import { makeApiClient } from "./tui/api-client.ts";
+import { resolveTuiConfig, TuiConfigError } from "./tui/config.ts";
 import { cmdSsh } from "./commands/ssh.ts";
 import { cmdInstallTimer, cmdRemoveTimer } from "./commands/timers.ts";
 import { cmdConfig } from "./commands/config.ts";
@@ -128,8 +130,19 @@ async function main(argv: string[]): Promise<number> {
 
   switch (decision.command) {
     // --- laptop-runnable (M1): no locality guard ---
-    case "list":
-      return cmdList(runner, stdout, wantsJson(rest));
+    case "list": {
+      // S4 (memo B4): the OBSERVED column's data path — an absent/unconfigured
+      // TUI config must not fail `list`, it must print "-" in that column.
+      let api: ReturnType<typeof makeApiClient> | undefined;
+      try {
+        const c = resolveTuiConfig();
+        api = makeApiClient(c.url, c.token);
+      } catch (e) {
+        if (!(e instanceof TuiConfigError)) throw e;
+        api = undefined;
+      }
+      return cmdList(runner, stdout, wantsJson(rest), api);
+    }
     case "ssh":
       // lease-api L4: `env` is what makes `--via tunnel` and its rc-6 refusal
       // possible; without it the transport resolves to tailnet as before.

@@ -10,6 +10,7 @@
 // M1).
 
 import type { Runner } from "../runner.ts";
+import type { ApiClient } from "../tui/api-client.ts";
 
 const TAILSCALE_TIMEOUT_MS = 15_000;
 
@@ -18,6 +19,14 @@ export interface DiscoverRow {
   name: string;
   ip: string;
   online: string; // "yes" | "no"
+  /**
+   * S4 (memo B4): `snapshot_boxes.observed` verbatim, one of the seven
+   * `Observed` names, or absent/"-" when it cannot be obtained (no API
+   * configured, unreachable, or no snapshot row for this peer). Optional so
+   * `DiscoverRow` stays the shared shape `reconcile/*` also builds — those
+   * callers never populate it, and `renderList`/`renderListJson` default it.
+   */
+  observed?: string;
 }
 
 const BOX_RE = /^grok-box-([0-9]+)$/;
@@ -65,9 +74,11 @@ function pad(s: string, w: number): string {
 /** Render the list table body (header + rows + empty-fleet line), pure. */
 export function renderList(rows: DiscoverRow[]): string {
   const out: string[] = [];
-  out.push(`${pad("NAME", 14)} ${pad("TAILSCALE IP", 16)} ${pad("ONLINE", 6)}`);
+  // S4 (memo B4): OBSERVED is the new trailing column; ONLINE keeps its
+  // meaning and its position.
+  out.push(`${pad("NAME", 14)} ${pad("TAILSCALE IP", 16)} ${pad("ONLINE", 6)} OBSERVED`);
   for (const r of rows) {
-    out.push(`${pad(r.name, 14)} ${pad(r.ip, 16)} ${pad(r.online, 6)}`);
+    out.push(`${pad(r.name, 14)} ${pad(r.ip, 16)} ${pad(r.online, 6)} ${r.observed ?? "-"}`);
   }
   if (rows.length === 0) out.push("(no grok-box-N peers found on the tailnet)");
   return out.join("\n");
@@ -88,16 +99,46 @@ export async function discover(runner: Runner): Promise<DiscoverRow[]> {
 export function renderListJson(rows: DiscoverRow[]): string {
   return (
     JSON.stringify(
-      { boxes: rows.map((r) => ({ index: r.index, name: r.name, ip: r.ip, online: r.online === "yes" })) },
+      {
+        boxes: rows.map((r) => ({
+          index: r.index,
+          name: r.name,
+          ip: r.ip,
+          online: r.online === "yes",
+          observed: r.observed ?? "-",
+        })),
+      },
       null,
       2,
     ) + "\n"
   );
 }
 
+/**
+ * S4 (memo B4): the OBSERVED column's data path is the typed `ApiClient`,
+ * resolved through `tui/config.ts` — NEVER the store, on either machine, the
+ * same convention `grokfleet lease` follows. One `GET /v1/fleet` request
+ * serves every row. An absent client, an unreachable API, an unconfigured
+ * base URL, no snapshot row, or a name the fleet view does not carry all fold
+ * to "-" — `list` must still work with no API configured.
+ */
+async function attachObserved(rows: DiscoverRow[], api: ApiClient | undefined): Promise<DiscoverRow[]> {
+  if (api === undefined || rows.length === 0) return rows;
+  const r = await api.fleet();
+  if (!r.ok) return rows;
+  const observed = new Map<string, string>();
+  for (const b of r.value.boxes) if (b.observed !== undefined) observed.set(b.name, b.observed);
+  return rows.map((row) => ({ ...row, observed: observed.get(row.name) ?? "-" }));
+}
+
 /** cmd_list: print the table (or the JSON document) to stdout, rc 0 always. */
-export async function cmdList(runner: Runner, write: (s: string) => void, json = false): Promise<number> {
-  const rows = await discover(runner);
+export async function cmdList(
+  runner: Runner,
+  write: (s: string) => void,
+  json = false,
+  api?: ApiClient,
+): Promise<number> {
+  const rows = await attachObserved(await discover(runner), api);
   write(json ? renderListJson(rows) : renderList(rows) + "\n");
   return 0;
 }
