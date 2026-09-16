@@ -753,7 +753,17 @@ async function reconcileOne(
   // though the box may still be asleep — it is unobserved, not recovered. Gate
   // the reset on `online !== "unknown"` so that tick does not restart the 2h
   // first-alert timer / daily digest for a box the tick had no opinion about.
-  if (!rowEAlert && online !== "unknown") {
+  //
+  // Gate memo r1 SHOULD 2: `online !== "unknown"` alone also blocks the reset
+  // for a box that IS observed a different way — tunnel up, status-seen,
+  // healthy — purely because the fleet-wide devices GET failed on this tick.
+  // Such a box is definitively not asleep, and the marker feeds a display
+  // (`readAsleep` → the snapshot row and both API surfaces), so leaving it set
+  // greys a recovered box for the duration of an unrelated Tailscale API
+  // outage — a narrower echo of the 5.11.2 marker-leak shape. Widen the gate
+  // to `(online !== "unknown" || report !== undefined)` so a status-seen tick
+  // still resets even when the device list could not be read.
+  if (!rowEAlert && (online !== "unknown" || report !== undefined)) {
     deps.state.resetAsleep(box);
     deps.state.resetIncoherent(box);
   }

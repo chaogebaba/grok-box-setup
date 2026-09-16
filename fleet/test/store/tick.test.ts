@@ -385,4 +385,32 @@ describe("5.15.0 S1(b) + SHOULD-1 — sqlite StoreState survives an unobserved t
       cleanup(h.dir);
     }
   });
+
+  // Gate memo r1 SHOULD 2: `online !== "unknown"` alone also blocks the reset
+  // for a box that IS observed a different way this tick (status-seen,
+  // healthy) — purely because the devices GET failed. Widened gate:
+  // `(online !== "unknown" || report !== undefined)`.
+  test("gate SHOULD 2: devices GET fails but the box is status-seen and healthy ⇒ asleep marker IS cleared", async () => {
+    const h = harness("should2", { withExport: false });
+    try {
+      h.st.recordEnrolled(BOX, 20003);
+      // tick 1: tunnel down, devices readable ⇒ alert-asleep, marker set.
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 }));
+      }
+      expect(h.st.readAsleep(BOX)).toBeDefined();
+      // tick 2: box recovers (tunnel up, check OK ⇒ status-seen, report
+      // defined) but the devices GET fails this same tick (online="unknown").
+      // The box is definitively not asleep — the reset must still run.
+      {
+        const { keys, ctx } = fakeKeysWith(() => failedDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: healthy(), targetBoxes: [BOX], nowSec: T0 + 300 }));
+      }
+      expect(h.st.readAsleep(BOX)).toBeUndefined();
+      h.close();
+    } finally {
+      cleanup(h.dir);
+    }
+  });
 });
