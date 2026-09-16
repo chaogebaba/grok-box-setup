@@ -276,6 +276,21 @@ export function recoverSelection(state: TuiState): TuiState {
  *  own feedback, and the immediate post-action refresh must not wipe it. */
 export const CONNECTING_MESSAGE = "connecting…";
 
+/** The message `r` shows while its refresh is in flight. It is the TUI's own
+ *  progress note, not an action's result, so the poll that ends the refresh —
+ *  success OR failure — is what retires it. */
+export const REFRESHING_MESSAGE = "refreshing…";
+
+/** The messages the TUI owns and therefore may clear on a poll. Every OTHER
+ *  message is an action's own feedback and must survive the immediate
+ *  post-action refresh (r2 fix 4). */
+const TRANSIENT_MESSAGES: ReadonlySet<string> = new Set([CONNECTING_MESSAGE, REFRESHING_MESSAGE]);
+
+function clearTransient(state: TuiState): TuiState {
+  if (state.message === undefined || !TRANSIENT_MESSAGES.has(state.message)) return state;
+  return { ...state, message: undefined };
+}
+
 export function applyFleet(state: TuiState, view: FleetView, nowMs: number): TuiState {
   const prevList = filteredBoxes(state);
   const prevName = prevList[state.selected]?.name;
@@ -292,9 +307,10 @@ export function applyFleet(state: TuiState, view: FleetView, nowMs: number): Tui
     nowMs,
   };
   next = deriveFreshness(next);
-  // The first successful poll retires the opening banner; an action's message
-  // survives the refresh that the action itself triggers.
-  if (next.message === CONNECTING_MESSAGE) next = { ...next, message: undefined };
+  // The first successful poll retires the opening banner; a successful `r`
+  // poll retires its own "refreshing…" note; an action's message survives
+  // the refresh that the action itself triggers.
+  next = clearTransient(next);
   const list = filteredBoxes(next);
   if (prevName !== undefined) {
     const idx = list.findIndex((b) => b.name === prevName);
@@ -305,8 +321,9 @@ export function applyFleet(state: TuiState, view: FleetView, nowMs: number): Tui
 
 /** Mark the link down (keep last-good data). */
 export function applyLinkDown(state: TuiState, nowMs: number): TuiState {
-  if (state.link.up) return deriveFreshness({ ...state, link: { up: false, sinceMs: nowMs }, nowMs });
-  return deriveFreshness({ ...state, nowMs });
+  const s = clearTransient(state);
+  if (s.link.up) return deriveFreshness({ ...s, link: { up: false, sinceMs: nowMs }, nowMs });
+  return deriveFreshness({ ...s, nowMs });
 }
 
 /** A single key/byte handled against the current state. Returns the next state
@@ -345,7 +362,7 @@ export function handleKey(state: TuiState, key: string, size: Size = DEFAULT_SIZ
     case "\x03": // Ctrl-C
       return { state, effect: { type: "quit" } };
     case "r":
-      return { state: { ...state, message: "refreshing…" }, effect: { type: "refresh" } };
+      return { state: { ...state, message: REFRESHING_MESSAGE }, effect: { type: "refresh" } };
     case "/":
       return { state: { ...state, filtering: true, filter: "" }, effect: { type: "none" } };
     case "f":
