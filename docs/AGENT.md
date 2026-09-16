@@ -150,6 +150,18 @@ monotonic and never reset by adoption; a climbing count alongside `tunnel=up`
 is a flapping tunnel that `tunnelfail` cannot show. `boxup check` never fails
 on it.
 
+boxup 5.6.3 (log-noise audit R1/R6): the `keepawake: off` breadcrumb now logs
+once on the off TRANSITION instead of once an hour (it was ~60% of the
+fleet's log volume with keep-awake disabled fleet-wide); steady-state off
+logs nothing, and a `keepawake: on (interval_min=N)` line marks leaving off.
+The `keepawake=` status token is unaffected. Separately, when boxup's own
+selfheal recycles tailscaled, the next 2-3 ticks legitimately see
+`backend=NoState`/`Starting` while the daemon restarts — that window is no
+longer logged as `tick: unhealthy` or repaired (no `do_ensure_body`, no
+`fail.repair` bump); at most one `tick: tailscaled starting after recycle`
+line appears per recycle. Any OTHER failing predicate inside that same
+window (e.g. `online=no`) still reports and repairs exactly as before.
+
 ## D. Something is wrong
 
 | Symptom | Meaning | Do |
