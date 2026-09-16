@@ -8,7 +8,7 @@
 import { test, expect, describe } from "bun:test";
 import { mount, settle, silentClient } from "./ink-harness.ts";
 import { box, state } from "./helpers.ts";
-import { applyFleet, applyLinkDown, handleKey, REFRESHING_MESSAGE } from "../../src/tui/state.ts";
+import { applyFleet, applyLinkDown, handleKey, initialState, REFRESHING_MESSAGE } from "../../src/tui/state.ts";
 import type { ApiClient, FleetView } from "../../src/tui/api-client.ts";
 import type { SnapshotBox } from "../../src/history/schema.ts";
 
@@ -42,6 +42,15 @@ describe("the `refreshing…` message is retired by the poll it started", () => 
   test("an ACTION's message still survives the refresh the action triggers", () => {
     const s = { ...state({ boxes: [box("grok-box-1")] }), message: "check grok-box-1 → rc=0" };
     expect(applyFleet(s, view(), NOW).message).toBe("check grok-box-1 → rc=0");
+  });
+
+  // note (S1, gate r1): the same clearTransient() path also retires the
+  // opening "connecting…" banner when the FIRST poll fails, not just when it
+  // succeeds — base code left "connecting…" under LINK DOWN forever, since
+  // applyLinkDown never touched `message` at all.
+  test("a FIRST failed poll clears the connecting… banner too", () => {
+    const s = initialState(NOW, true);
+    expect(applyLinkDown(s, NOW).message).toBeUndefined();
   });
 });
 
