@@ -30,6 +30,10 @@
 #   (f) a reason OTHER than backend=NoState/Starting (here: online=no) inside
 #       the same recycle window is NOT suppressed — normal path fires
 #                                                                    [mutant M4]
+#   (g) recycle_tailscaled itself clears $RUN_DIR/recycle-wait-noted, so a
+#       SECOND real recycle's window logs its own waiting line instead of
+#       staying silent forever behind the first recycle's marker
+#                                                                    [mutant M6]
 set -u
 
 BOXUP="$(cd "$(dirname "$0")/.." && pwd)/boxup"
@@ -75,12 +79,39 @@ repair_fail_count() {
 refresh_backoff_window() { echo 0; }
 # The "healthy" branch of tick_handle_reason (empty reason) touches these —
 # stub them so the sanity case below is quiet and asserts nothing about them.
+# recycle_tailscaled (case (g) below) also calls pgrep, this time as
+# `pgrep -n -x tailscaled`, and needs it to find a PID: it answers with THIS
+# shell's own $$ only for that exact invocation, so /proc/$$/cmdline is real
+# and readable, and everything else (the tick_handle_reason healthy-branch
+# `pgrep -x tailscaled`) keeps the old "not found" behavior.
 read_box_name() { :; }
-pgrep() { return 1; }
+pgrep() {
+  case "$*" in
+    "-n -x tailscaled") echo "$$"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
 refresh_exitnode() { :; }
+# recycle_tailscaled's own dependencies (case (g)). STATE_DIR is deliberately
+# empty: `echo "$cmd" | grep -q -- "$STATE_DIR"` with an empty pattern matches
+# any cmdline, so the real /proc/$$/cmdline read (this shell's own, since
+# pgrep above answers with $$) satisfies the "is this our tailscaled" guard
+# without needing to fake /proc. `kill -0` is made to say "already gone" so
+# the post-kill wait loop exits on its first check instead of sleeping.
+STATE_DIR=""
+kill() {
+  case "$1" in
+    -0) return 1 ;;
+    *)  return 0 ;;
+  esac
+}
+start_tailscaled() { :; }
+wait_for_backend() { :; }
+ensure_login() { :; }
 
 eval "$(extract_fn_from "$BOXUP" recycled_recently)"
 eval "$(extract_fn_from "$BOXUP" tick_handle_reason)"
+eval "$(extract_fn_from "$BOXUP" recycle_tailscaled)"
 
 backdate() { echo $(( $(date +%s) - "$2" )) > "$1"; }
 fail_repair() { [ -f "$RUN_DIR/fail.repair" ] && tr -d '[:space:]' < "$RUN_DIR/fail.repair" || echo NONE; }
@@ -157,6 +188,28 @@ if grep -q 'tick: unhealthy (reason=online=no (want yes))' "$LOGLINES" \
   ok "(f) online=no inside the recycle window is NOT suppressed — normal unhealthy path fires  [mutant M4]"
 else
   bad "(f) online=no wrongly suppressed: log=[$(cat "$LOGLINES")] ensure_calls=$(ensure_calls) fail.repair=$(fail_repair)"
+fi
+
+# ===========================================================================
+# (g) MUTANT M6. recycle_tailscaled clears $RUN_DIR/recycle-wait-noted right
+# after it stamps last-recycle, so a SECOND recycle's post-recycle window logs
+# its own waiting line instead of staying silent forever because the FIRST
+# recycle's marker survived. Drive the real recycle_tailscaled (extracted from
+# boxup, not reimplemented) twice, with a suppressed tick in between to plant
+# the marker the first recycle would have to clear.
+# ===========================================================================
+reset_env
+recycle_tailscaled "test recycle #1"
+tick_handle_reason "backend=NoState (want Running)"   # plants the marker
+recycle_tailscaled "test recycle #2"                  # must clear it
+tick_handle_reason "backend=NoState (want Running)"   # must log again
+waiting_lines="$(grep -c 'tick: tailscaled starting after recycle' "$LOGLINES")"
+if [ "$waiting_lines" = 2 ] \
+   && [ "$(grep -c 'selfheal: test recycle #1' "$LOGLINES")" = 1 ] \
+   && [ "$(grep -c 'selfheal: test recycle #2' "$LOGLINES")" = 1 ]; then
+  ok "(g) two real recycles => two waiting lines (recycle_tailscaled clears the marker each time)  [mutant M6]"
+else
+  bad "(g) recycle marker-clearing wrong: waiting_lines=$waiting_lines log=[$(cat "$LOGLINES")]"
 fi
 
 # ===========================================================================
