@@ -262,6 +262,23 @@ describe("J7 — POST /v1/jobs", () => {
     expect(typeof b.job_id).toBe("string");
   });
 
+  // SHOULD-2 (gate r1): the existing "skips a box" test above only asserts
+  // WHICH box was chosen, never the reason string for the one that wasn't —
+  // so dropping `job: s?.job` from job-handlers.ts's own `boxFacts` builder
+  // (as opposed to lease-handlers.ts's) survived the whole suite. Every box
+  // held ⇒ 409, and the reasons map is built from job-handlers.ts's boxFacts.
+  test("job placement's 409 reasons carry the held id from job-handlers' own BoxFacts", async () => {
+    const dir = seedFleet("jobslot-409", [
+      { name: "grok-box-001", jobState: "running", job: "held-job-1" },
+      { name: "grok-box-002", jobState: "running", job: "held-job" },
+    ]);
+    const fetch = makeFetch(await ctxFor(dir));
+    const r = await fetch(postReq("/v1/jobs", ADMIN, START));
+    expect(r.status).toBe(409);
+    const b = await jsonBody(r);
+    expect((b.reasons as Record<string, string>)["grok-box-002"]).toBe("job slot held by held-job");
+  });
+
   test("a fleet with no job-runner boxes answers 409 and NAMES the reason", async () => {
     const dir = seedFleet("old", [{ name: "grok-box-001", ver: "5.4.0" }]);
     const fetch = makeFetch(await ctxFor(dir));
