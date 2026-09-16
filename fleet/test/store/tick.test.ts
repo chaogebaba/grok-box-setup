@@ -10,13 +10,14 @@ import { RunContext, TailscaleKeys, type KeyTransport } from "../../src/reconcil
 import { openStore, storePath } from "../../src/store/db.ts";
 import { StoreState } from "../../src/store/state.ts";
 import { selectCandidates } from "../../src/reconcile/discover.ts";
-import { FakeRunner, result } from "../fake-runner.ts";
+import { FakeRunner, result, isSs } from "../fake-runner.ts";
 import { testEnv, testRollout } from "../helpers.ts";
 import { setLogSink } from "../../src/log.ts";
 import type { ManagedSource } from "../../src/actions/config-push.ts";
 import type { UpgradeDeps } from "../../src/upgrade.ts";
 import { cleanup, suiteScratch, T0 } from "./helpers.ts";
 import { utcDate } from "../../src/store/backup.ts";
+import { CHECK_COMMAND } from "../../src/remote.ts";
 
 // This file's own scratch bucket; dropped whole when the file finishes.
 const SCRATCH = suiteScratch("tick");
@@ -266,6 +267,61 @@ describe("D4 candidate exclusion (ships in Phase A)", () => {
       // and neither is a MEMBER (D7/r2-B5 — this is what makes the B→A rollback
       // safe: a 5.8.0 binary parks both rather than adopting them).
       expect(h.st.membership()).toEqual(["grok-box-003"]);
+      h.close();
+    } finally {
+      cleanup(h.dir);
+    }
+  });
+});
+
+// 5.15.0 S1(b): the sqlite path. `alertClear` here is an UPDATE (cleared_at,
+// last_sent=NULL) rather than the file backend's `rm -f`, so this is the one
+// backend that can show a row SURVIVING an unobserved tick rather than merely
+// being absent both before and after.
+describe("5.15.0 S1(b) — sqlite StoreState survives an unobserved tick", () => {
+  const BOX = "grok-box-003";
+  const LISTEN = 'LISTEN 0 128 127.0.0.1:20003 0.0.0.0:* users:(("sshd",pid=41,fd=7))\n';
+
+  function fakeKeysWith(responder: () => { code: number; body: string }): { keys: TailscaleKeys; ctx: RunContext } {
+    const transport: KeyTransport = { async request() { return responder(); } };
+    const ctx = new RunContext();
+    return { keys: new TailscaleKeys(transport, "https://api", "-", "PAT", ctx), ctx };
+  }
+  const cannotConverge = () =>
+    new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: LISTEN });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 1, stdout: "check=FAIL" });
+      return result({ code: 1 });
+    });
+  const tunnelDown = () => new FakeRunner(() => result({ stdout: "" }));
+  const okDevs = { code: 200, body: '{"devices":[]}' };
+
+  test("(b) a NOT status-seen tick leaves the reachable-cannot-converge row AND last_sent intact", async () => {
+    const h = harness("s1-b", { withExport: false });
+    try {
+      h.st.recordEnrolled(BOX, 20003);
+      // Raise the incident: checkfailRuns > 3.
+      for (let i = 0; i < 5; i++) {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: cannotConverge(), targetBoxes: [BOX], nowSec: T0 + i * 300 }));
+      }
+      const id = h.st.boxId(BOX)!;
+      const before = h.store.db
+        .query("SELECT last_sent, cleared_at FROM alerts WHERE box_id=? AND kind=?")
+        .get(id, "incident:reachable-cannot-converge") as { last_sent: number | null; cleared_at: number | null };
+      expect(before.last_sent).not.toBeNull();
+      expect(before.cleared_at).toBeNull();
+
+      // NOT status-seen: tunnel down this tick. Must not clear the row.
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 + 5 * 300 }));
+      }
+      const after = h.store.db
+        .query("SELECT last_sent, cleared_at FROM alerts WHERE box_id=? AND kind=?")
+        .get(id, "incident:reachable-cannot-converge") as { last_sent: number | null; cleared_at: number | null };
+      expect(after.last_sent).toBe(before.last_sent);
+      expect(after.cleared_at).toBeNull();
       h.close();
     } finally {
       cleanup(h.dir);

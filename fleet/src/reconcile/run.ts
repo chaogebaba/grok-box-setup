@@ -28,7 +28,14 @@ import type { ReconcileStateApi } from "./state.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
 import { decide } from "./decide.ts";
 import { devFields, daysUntil } from "./inputs.ts";
-import { alertAsleep, alertIncoherent, alertBoxConditions, INCIDENT_KINDS, INCIDENT_RENOTIFY_SECS } from "./alerts.ts";
+import {
+  alertAsleep,
+  alertIncoherent,
+  alertBoxConditions,
+  INCIDENT_KINDS,
+  INCIDENT_OBSERVED_BY,
+  INCIDENT_RENOTIFY_SECS,
+} from "./alerts.ts";
 import { identityPass } from "./identity.ts";
 import { mintKey, mintWindowValid, type MintDeps } from "../actions/mint.ts";
 import { rotate } from "../actions/rotate.ts";
@@ -757,8 +764,17 @@ async function reconcileOne(
   const raised = new Set(
     actions.filter((a) => a.startsWith("alert-")).map((a) => a.slice("alert-".length)),
   );
+  // S1 (memo B2 amended): per-kind re-arm, gated on whether THIS tick could
+  // observe the thing the kind is about — not on status-seen for all three.
+  // `statusSeen` gates the two tunnel-derived kinds; `devicesSeen` gates
+  // duplicate-both-online, whose only input is the Tailscale device list and
+  // which a failed devices GET (devs="") must leave untouched.
+  const statusSeen = report !== undefined;
+  const devicesSeen = devs.trim() !== "";
   for (const kind of INCIDENT_KINDS) {
-    if (!raised.has(kind)) deps.state.alertClear(box, kind);
+    if (raised.has(kind)) continue;
+    const seen = INCIDENT_OBSERVED_BY[kind] === "status" ? statusSeen : devicesSeen;
+    if (seen) deps.state.alertClear(box, kind);
   }
 
   // Box-reported conditions (5.13.0 D2/D3a): a POST-VERDICT pass, run HERE — for

@@ -56,6 +56,27 @@ export const INCIDENT_KINDS = [
   "incident:duplicate-both-online",
 ] as const;
 
+/**
+ * Which observation a tick needs before it may re-arm (clear) a given
+ * INCIDENT_KINDS row (memo B2, S1 amended). The three kinds do not share one
+ * observability predicate: `incoherent-both-dead` and `reachable-cannot-converge`
+ * are tunnel-derived (decide.ts row e / N-1), so they re-arm only on a
+ * STATUS-SEEN tick; `duplicate-both-online` is derived entirely from the
+ * Tailscale device list, so it re-arms only when THAT list was readable this
+ * tick, independent of the tunnel. A tick that could not observe a kind must
+ * leave its row untouched rather than clear it out from under an incident it
+ * had no opinion about.
+ *
+ * `Record<(typeof INCIDENT_KINDS)[number], …>` makes this exhaustive at
+ * compile time: a fourth incident kind cannot be added to INCIDENT_KINDS
+ * without choosing its predicate here.
+ */
+export const INCIDENT_OBSERVED_BY: Record<(typeof INCIDENT_KINDS)[number], "status" | "devices"> = {
+  "incident:incoherent-both-dead": "status",
+  "incident:reachable-cannot-converge": "status",
+  "incident:duplicate-both-online": "devices",
+};
+
 /** reconcile_alert_asleep (main:3218-3242). */
 export async function alertAsleep(box: string, deps: AlertDeps): Promise<void> {
   const tSecs = deps.asleepTSecs ?? 7200;

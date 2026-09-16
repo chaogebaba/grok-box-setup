@@ -10,6 +10,7 @@ import {
   CONDITION_KINDS,
   KEEPAWAKE_STALE_SECS,
   INCIDENT_KINDS,
+  INCIDENT_OBSERVED_BY,
   INCIDENT_RENOTIFY_SECS,
 } from "../src/reconcile/alerts.ts";
 import { readFileSync } from "node:fs";
@@ -257,6 +258,16 @@ describe("incident dedup", () => {
     for (const kind of emitted) expect([...known]).toContain(kind);
     // direction 2: and no declared kind is dead.
     for (const kind of [...INCIDENT_KINDS, ...CONDITION_KINDS]) expect([...emitted]).toContain(kind);
+  });
+
+  test("S1(e): every INCIDENT_KINDS entry has an INCIDENT_OBSERVED_BY entry", () => {
+    // Runtime twin of the compile-time exhaustiveness the Record<> type gives
+    // us — a builder who edits INCIDENT_OBSERVED_BY without checking types (or
+    // a mutant that strips one arm from the object literal) still fails here.
+    for (const kind of INCIDENT_KINDS) {
+      expect(["status", "devices"]).toContain(INCIDENT_OBSERVED_BY[kind]);
+    }
+    expect(Object.keys(INCIDENT_OBSERVED_BY).sort()).toEqual([...INCIDENT_KINDS].sort());
   });
 });
 
