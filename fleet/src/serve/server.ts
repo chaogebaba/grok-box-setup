@@ -125,18 +125,71 @@ export function parseServeArgs(rest: string[]): ServeArgs | { err: string } {
 /** Danger classification: mutations require {confirm} (TUI-D10). */
 const CONFIRM_ACTIONS = new Set(["config-push", "rotate-key", "rename", "reconcile"]);
 
+// F6: the API otherwise logs NOTHING per request — only `audit:` lines for
+// mutating actions — so a 401 storm or a wedged handler is invisible outside
+// the audit table. A 5s TUI poll would add ~17k lines/day if every 2xx logged,
+// so 2xx-fast requests stay silent; only non-2xx and slow requests do.
+const REQUEST_LOG_SLOW_MS = 2000;
+
+/**
+ * The URL shape for structured request logging — dynamic segments named, never
+ * the raw path, so a box name or lease/job id never lands in the log stream.
+ * Kept independent of `route`'s own matching (logging-only, read-only concern).
+ */
+function routeTemplate(path: string): string {
+  const templates: Array<[RegExp, string]> = [
+    [/^\/v1\/health$/, "/v1/health"],
+    [/^\/v1\/fleet$/, "/v1/fleet"],
+    [/^\/v1\/history$/, "/v1/history"],
+    [/^\/v1\/leases$/, "/v1/leases"],
+    [/^\/v1\/leases\/[^/]+\/renew$/, "/v1/leases/:id/renew"],
+    [/^\/v1\/leases\/[^/]+$/, "/v1/leases/:id"],
+    [/^\/v1\/reconcile$/, "/v1/reconcile"],
+    [/^\/v1\/reconcile\/[^/]+$/, "/v1/reconcile/:id"],
+    [/^\/v1\/jobs$/, "/v1/jobs"],
+    [/^\/v1\/jobs\/[^/]+\/log$/, "/v1/jobs/:id/log"],
+    [/^\/v1\/jobs\/[^/]+\/stop$/, "/v1/jobs/:id/stop"],
+    [/^\/v1\/jobs\/[^/]+$/, "/v1/jobs/:id"],
+    [/^\/v1\/boxes\/[^/]+\/diff$/, "/v1/boxes/:box/diff"],
+    [/^\/v1\/boxes\/[^/]+\/journal$/, "/v1/boxes/:box/journal"],
+    [/^\/v1\/boxes\/[^/]+\/check$/, "/v1/boxes/:box/check"],
+    [/^\/v1\/boxes\/[^/]+\/config-push$/, "/v1/boxes/:box/config-push"],
+    [/^\/v1\/boxes\/[^/]+\/rotate-key$/, "/v1/boxes/:box/rotate-key"],
+    [/^\/v1\/boxes\/[^/]+\/rename$/, "/v1/boxes/:box/rename"],
+    [/^\/v1\/boxes\/[^/]+$/, "/v1/boxes/:box"],
+  ];
+  for (const [re, tmpl] of templates) if (re.test(path)) return tmpl;
+  return path.startsWith("/v1/") ? "/v1/*unmatched*" : "*unmatched*";
+}
+
 /**
  * Build the request handler. Auth + routing + confirm + scope; delegates to
  * handlers.ts. Exposed for tests (they call this with a fake ctx and Request).
  */
 export function makeFetch(ctx: ServerContext): (req: Request) => Promise<Response> {
   return async (req: Request): Promise<Response> => {
+    const nowMs = ctx.nowMs ?? Date.now;
+    const startMs = nowMs();
+    let status = 500;
     try {
-      return await route(ctx, req);
+      const res = await route(ctx, req);
+      status = res.status;
+      return res;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       log(`serve: unhandled error — ${msg}`);
+      status = 500;
       return err.internal();
+    } finally {
+      const durationMs = nowMs() - startMs;
+      if (status >= 400 || durationMs > REQUEST_LOG_SLOW_MS) {
+        const url = new URL(req.url);
+        // token NAME only (F6) — never the presented token or its digest.
+        const tokenName = ctx.tokens.authenticate(bearer(req))?.name ?? "-";
+        log(
+          `serve: ${req.method.toUpperCase()} ${routeTemplate(url.pathname)} ${status} ${durationMs}ms token=${tokenName}`,
+        );
+      }
     }
   };
 }

@@ -38,6 +38,8 @@ export interface ServerContext {
   whichJournalctl?: (bin: string) => boolean;
   /** clock for audit / snapshot_ts (tests). */
   now?: () => Date;
+  /** clock (epoch ms) for the F6 request-duration log (tests). */
+  nowMs?: () => number;
   /** rename deps factory for the API rename path (lock-held variant). */
   makeRenameDeps?: unknown;
   /** override the full ReconcileDeps assembly (tests). */

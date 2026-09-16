@@ -120,6 +120,7 @@ export interface FakeCtxOpts {
   lockDeps?: WithLockDeps;
   whichJournalctl?: (bin: string) => boolean;
   now?: () => Date;
+  nowMs?: () => number;
   jobs?: JobRegistry;
   /** lease-api: a REAL $FLEET_STATE, for tests whose endpoint reads the store. */
   fleetState?: string;
@@ -156,6 +157,7 @@ export async function fakeContext(opts: FakeCtxOpts = {}): Promise<ServerContext
     enrolledBoxes: () => opts.enrolled ?? ["grok-box-1", "grok-box-8"],
     whichJournalctl: opts.whichJournalctl,
     now: opts.now,
+    nowMs: opts.nowMs,
   };
 }
 
