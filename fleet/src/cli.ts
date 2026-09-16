@@ -55,7 +55,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.14.6"; // 5.14.6: TUI crash barrier — injectable exit and a cancellable fallback timer; the crash-barrier test no longer kills a single-process `bun test` (issue #16)
+const PKG_VERSION = "5.14.7"; // 5.14.7: TUI `r` refresh retires its own "refreshing…" note on both poll outcomes, success and failure (tui-refresh-hang)
 
 async function gitShaFromGit(): Promise<string> {
   try {
