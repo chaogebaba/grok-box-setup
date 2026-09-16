@@ -44,8 +44,9 @@ import type { Store } from "../store/db.ts";
 import type { StoreState } from "../store/state.ts";
 import { checkDivergence } from "../store/divergence.ts";
 import { dailyMaintenance } from "../store/backup.ts";
-import { AUDIT_RETENTION_DAYS, SNAPSHOT_RETENTION_DAYS } from "../store/schema.ts";
+import { AUDIT_RETENTION_DAYS, SNAPSHOT_RETENTION_DAYS, LEASE_RETENTION_DAYS } from "../store/schema.ts";
 import { pruneSnapshots } from "../store/snapshots.ts";
+import { pruneLeases } from "../store/leases.ts";
 import { jobsAvailable, pruneJobs } from "../store/jobs.ts";
 import { observe, type Observed } from "./observe.ts";
 import type { DeferringLease, LeaseTickApi } from "./lease-tick.ts";
@@ -281,6 +282,11 @@ export async function runReconcile(deps: ReconcileDeps): Promise<ReconcileResult
       const old = pruneSnapshots(deps.store, SNAPSHOT_RETENTION_DAYS, now(deps));
       if (old > 0) log(`reconcile: pruned ${old} snapshot(s) older than ${SNAPSHOT_RETENTION_DAYS} days`);
     }
+    // F7 (VPS audit r3): the same 30-day window for RELEASED leases — never
+    // pruned before, and `released_at IS NULL` (the live/deferring set) is
+    // untouched no matter its age (pruneLeases itself guards that).
+    const oldLeases = pruneLeases(deps.store, LEASE_RETENTION_DAYS, now(deps));
+    if (oldLeases > 0) log(`reconcile: pruned ${oldLeases} released lease(s) older than ${LEASE_RETENTION_DAYS} days`);
     // jobs J12 (D3): terminal-job retention, once per tick, next to the audit
     // and snapshot prunes. Guarded by `jobsAvailable` (NOT a bare
     // `userVersion() >= 4`) so a v3 store ticks without throwing. `retain_days`

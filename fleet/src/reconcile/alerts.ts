@@ -75,7 +75,9 @@ export async function alertAsleep(box: string, deps: AlertDeps): Promise<void> {
   } else {
     // already alerted once: daily digest only
     if (now - last >= digestSecs) {
-      await deps.notify("info", `${box}: still asleep (daily digest) — both paths dead since ${since}`);
+      // F5: elapsed-duration formatting, same shape as the first-alert branch
+      // above — a raw epoch (`since 1789395355`) is meaningless in a digest.
+      await deps.notify("info", `${box}: still asleep (daily digest) — both paths dead for ${Math.floor((now - since) / 3600)}h`);
       last = now;
     }
   }
