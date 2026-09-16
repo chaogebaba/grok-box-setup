@@ -348,6 +348,50 @@ describe("alertBoxConditions — raises, clears, and the conditions array", () =
     );
   });
 
+  describe("S2′ — repair-failing suppressed while disk-fail is active (one fault, one page)", () => {
+    test("disk-fail + repair-failing ⇒ one notify, both short names in conditions", async () => {
+      const { fs } = memState();
+      const s = new ReconcileState(SD, fs);
+      const notes: Array<[string, string]> = [];
+      const active = await runPass(
+        "grok-box-1",
+        s,
+        rpt({ disk: { pct: 97, level: "fail" }, repairFailing: 5 }),
+        1000,
+        notes,
+      );
+      expect(active).toContain("disk-fail");
+      expect(active).toContain("repair-failing");
+      // exactly one notify — the disk-fail one; repair-failing's is suppressed.
+      expect(notes.length).toBe(1);
+      expect(notes[0]![1]).toContain("condition:disk-fail");
+    });
+
+    test("repair-failing alone (no disk-fail) ⇒ notifies as today", async () => {
+      const { fs } = memState();
+      const s = new ReconcileState(SD, fs);
+      const notes: Array<[string, string]> = [];
+      const active = await runPass("grok-box-1", s, rpt({ repairFailing: 5 }), 1000, notes);
+      expect(active).toContain("repair-failing");
+      expect(notes.some(([l, m]) => l === "warn" && m.includes("condition:repair-failing"))).toBe(true);
+    });
+
+    test("disk-fail clears ⇒ repair-failing pages again (suppression is per-tick, not sticky)", async () => {
+      const { fs } = memState();
+      const s = new ReconcileState(SD, fs);
+      const notes: Array<[string, string]> = [];
+      // tick 1: both active — repair-failing suppressed (M5 killer: a sticky
+      // suppression never sends this notify even after disk-fail clears).
+      await runPass("grok-box-1", s, rpt({ disk: { pct: 97, level: "fail" }, repairFailing: 5 }), 1000, notes);
+      expect(notes.some(([, m]) => m.includes("condition:repair-failing"))).toBe(false);
+      // tick 2: disk-fail clears, repair-failing persists ⇒ pages.
+      const active = await runPass("grok-box-1", s, rpt({ disk: { pct: 5, level: "ok" }, repairFailing: 5 }), 2000, notes);
+      expect(active).toContain("repair-failing");
+      expect(active).not.toContain("disk-fail");
+      expect(notes.some(([l, m]) => l === "warn" && m.includes("condition:repair-failing"))).toBe(true);
+    });
+  });
+
   test("24 ticks of a persisting condition ⇒ ONE message (dedup)", async () => {
     const { fs } = memState();
     const s = new ReconcileState(SD, fs);

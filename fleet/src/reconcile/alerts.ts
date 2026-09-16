@@ -284,10 +284,17 @@ export async function alertBoxConditions(box: string, report: BoxReport, deps: A
   }
 
   // 5. repair-failing (warn) — repairFailing >= 3 || refreshFailing >= 3.
+  //    S2′ (memo B1 amendment): repair-failing is caused by disk-fail when both
+  //    are active — check_reason returns the disk predicate, do_ensure_body
+  //    cannot clear it, and fail.repair climbs. One fault, one page: while
+  //    disk-fail is active THIS tick, repair-failing stays in `conditions` (COND
+  //    column / snapshot unchanged, D3a) but takes no alertDue and sends no
+  //    notify. Suppression is per-tick, not sticky — it re-evaluates `diskFail`
+  //    every tick, so the very next tick after disk-fail clears pages normally.
   const repairFailing = report.repairFailing >= 3 || report.refreshFailing >= 3;
   if (repairFailing) {
     active.push(shortCondition("condition:repair-failing"));
-    if (deps.state.alertDue(box, "condition:repair-failing", renotify, deps.nowSec)) {
+    if (!diskFail && deps.state.alertDue(box, "condition:repair-failing", renotify, deps.nowSec)) {
       await deps.notify(
         "warn",
         `${box}: condition:repair-failing (refresh=${report.refreshFailing} repair=${report.repairFailing})`,
