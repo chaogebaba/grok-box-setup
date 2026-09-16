@@ -2398,7 +2398,7 @@ KEEPAWAKE_STAMP="$RUN_DIR/last-keepawake"                   # main cadence stamp
 KEEPAWAKE_UNREACH_STAMP="$RUN_DIR/last-keepawake-unreach"   # 90 s retry floor
 KEEPAWAKE_UNREACH_WARN="$RUN_DIR/last-keepawake-unreach-warn"
 KEEPAWAKE_WARN_STAMP="$RUN_DIR/last-keepawake-warn"         # parked-approval WARN
-KEEPAWAKE_OFF_STAMP="$RUN_DIR/last-keepawake-off"           # `off` notice
+KEEPAWAKE_OFF_MARKER="$RUN_DIR/keepawake-off-noted"          # R1: on/off transition
 KEEPAWAKE_RC_FILE="$RUN_DIR/keepawake"                      # "<rc> <epoch>"
 # /workspace state: SURVIVES an image swap. The attempt log is the experiment's
 # raw data and the baseline is what makes the `jumps` token a per-install count
@@ -2559,12 +2559,25 @@ keepawake_guard() {
   now=$(date +%s)
   interval_min="$(keepawake_interval_min)"
 
-  # OFF: a no-op with a once-an-hour breadcrumb, so an operator reading the
-  # worker log can tell "configured off" from "silently broken".
+  # OFF: a no-op with a breadcrumb on the OFF TRANSITION ONLY (R1). This used
+  # to be an hourly breadcrumb — cheap per box, but ~60% of the fleet's log
+  # volume with keep-awake disabled fleet-wide since 2026-09-06. A marker file
+  # replaces the hourly stamp: absent -> entering off, write it and log once;
+  # present -> steady state, log nothing. The `keepawake=off` status token
+  # (keepawake_status_tokens) is unchanged — this only touches the log line.
   if [ "$interval_min" = 0 ]; then
-    keepawake_hourly "$KEEPAWAKE_OFF_STAMP" "$now" && \
+    if [ ! -f "$KEEPAWAKE_OFF_MARKER" ]; then
+      touch "$KEEPAWAKE_OFF_MARKER" 2>/dev/null || true
       log "keepawake: off ([keepawake] interval_min = 0)"
+    fi
     return 0
+  fi
+  # Leaving OFF: marker present means the previous tick(s) were off, so log
+  # the on-transition once and clear the marker so a future off period logs
+  # again.
+  if [ -f "$KEEPAWAKE_OFF_MARKER" ]; then
+    rm -f "$KEEPAWAKE_OFF_MARKER" 2>/dev/null || true
+    log "keepawake: on (interval_min = $interval_min)"
   fi
   interval_s=$((interval_min * 60))
 

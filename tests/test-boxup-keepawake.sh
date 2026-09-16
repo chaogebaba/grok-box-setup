@@ -169,7 +169,7 @@ KEEPAWAKE_STAMP="\$RUN_DIR/last-keepawake"
 KEEPAWAKE_UNREACH_STAMP="\$RUN_DIR/last-keepawake-unreach"
 KEEPAWAKE_UNREACH_WARN="\$RUN_DIR/last-keepawake-unreach-warn"
 KEEPAWAKE_WARN_STAMP="\$RUN_DIR/last-keepawake-warn"
-KEEPAWAKE_OFF_STAMP="\$RUN_DIR/last-keepawake-off"
+KEEPAWAKE_OFF_MARKER="\$RUN_DIR/keepawake-off-noted"
 KEEPAWAKE_RC_FILE="\$RUN_DIR/keepawake"
 KEEPAWAKE_LOG="\$WORK/boxup-keepawake.log"
 KEEPAWAKE_BASELINE="\$WORK/.boxup-keepawake-baseline"
@@ -229,6 +229,36 @@ case "$scenario" in
   off-twice)
     keepawake_guard; keepawake_guard; grc=\$?
     ;;
+  off-thrice-stale-marker)
+    # R1 (a)+(b): three off ticks, but the marker is back-dated over an hour
+    # between the first and the rest, so a mutant that reverts to the OLD
+    # hourly gate (keepawake_hourly on the marker file) would log again — the
+    # marker file has no notion of time at all in the new code, only presence.
+    keepawake_guard
+    backdate "\$KEEPAWAKE_OFF_MARKER" 7200
+    keepawake_guard
+    keepawake_guard; grc=\$?
+    ;;
+  off-then-on)
+    # R1 (c): off, then the operator sets a real interval — the ON transition
+    # must log exactly once and the marker must be gone (so a LATER off period
+    # logs again instead of staying silent forever).
+    INTERVAL_CFG=0
+    keepawake_guard
+    INTERVAL_CFG=5
+    keepawake_guard; grc=\$?
+    ;;
+  off-on-off)
+    # the marker must be gone after the ON transition, so a SECOND off period
+    # logs its own "off" line rather than staying silent because a stale
+    # marker survived the ON transition.
+    INTERVAL_CFG=0
+    keepawake_guard
+    INTERVAL_CFG=5
+    keepawake_guard
+    INTERVAL_CFG=0
+    keepawake_guard; grc=\$?
+    ;;
   parked-warn-twice)
     # Two parked-blocked fires inside the hour: two attempt lines, ONE WARN.
     keepawake_guard
@@ -264,7 +294,8 @@ esac
 rec=NONE; [ -f "\$KEEPAWAKE_RC_FILE" ] && rec="\$(cat "\$KEEPAWAKE_RC_FILE")"
 stamp=no; [ -f "\$KEEPAWAKE_STAMP" ] && stamp=yes
 retry=no; [ -f "\$KEEPAWAKE_UNREACH_STAMP" ] && retry=yes
-echo "rc=\${grc:-?} record=\${rec%% *} stamp=\$stamp retry=\$retry hits=\$(tr '\n' ',' < "\$CURL_HITS")"
+offmarker=no; [ -f "\$KEEPAWAKE_OFF_MARKER" ] && offmarker=yes
+echo "rc=\${grc:-?} record=\${rec%% *} stamp=\$stamp retry=\$retry offmarker=\$offmarker hits=\$(tr '\n' ',' < "\$CURL_HITS")"
 echo "attemptstart:"
 cat "\$KEEPAWAKE_LOG" 2>/dev/null || true
 echo "attemptend:"
@@ -446,13 +477,15 @@ fi
 # ===========================================================================
 # (6) OFF. interval_min = 0 is the ABANDON setting the experiment can reach, and
 # it must cost exactly nothing: no /health, no fire, no attempt line — just one
-# breadcrumb an hour so an operator can tell "configured off" from "broken".
+# breadcrumb ON THE OFF TRANSITION (boxup-5.6.3 R1: was hourly, ~60% of the
+# fleet's log volume with keep-awake off since 2026-09-06; now marker-based —
+# see (6c)-(6e) below for the transition edges).
 # ===========================================================================
 o="$(run_case "$(h_idle 1000)" off-twice 0)"
 if [ -z "$(field "$(r1 "$o")" hits)" ] \
    && [ -z "$(attempts "$o")" ] \
    && [ "$(printf '%s\n' "$(logs "$o")" | grep -c 'keepawake: off')" = 1 ]; then
-  pass "(6) interval_min=0 => nothing called, no attempt lines, ONE 'off' line an hour"
+  pass "(6) interval_min=0 => nothing called, no attempt lines, ONE 'off' line on entry"
 else
   bad  "(6) off is not a no-op: [$(r1 "$o")] log=[$(logs "$o")]"
 fi
@@ -464,6 +497,49 @@ if printf '%s\n' "$o" | grep -q 'tokens:keepawake=on'; then
   pass "(6b) interval_min=3 is accepted as ON (raised to the 10-minute floor)"
 else
   bad  "(6b) sub-floor interval did not stay on: [$o]"
+fi
+
+# ===========================================================================
+# (6c) R1(a)+(b), MUTANT M1. Three off ticks, with the marker file back-dated
+# over an hour between the first and the rest: a mutant that reverts to the
+# old keepawake_hourly gate on the marker (M1: "marker never written" is one
+# equivalent shape — the gate never actually latches, so it fires again once
+# the hour has passed) would produce a SECOND "off" log line here. The new
+# code has no notion of time in this path at all, only file presence, so the
+# count MUST stay 1 regardless of how stale the marker looks.
+# ===========================================================================
+o="$(run_case "$(h_idle 1000)" off-thrice-stale-marker 0)"
+if [ "$(printf '%s\n' "$(logs "$o")" | grep -c 'keepawake: off')" = 1 ] \
+   && [ "$(field "$(r1 "$o")" offmarker)" = yes ]; then
+  pass "(6c) three off ticks (marker back-dated 2h) => still exactly ONE 'off' line  [mutant M1]"
+else
+  bad  "(6c) stale-marker off ticks logged wrong: [$(r1 "$o")] log=[$(logs "$o")]"
+fi
+
+# ===========================================================================
+# (6d) R1(c), MUTANT M2. OFF then a real interval: the ON transition logs
+# exactly once and clears the marker. M2 (marker never removed) would leave
+# the marker behind and never log the "on" line.
+# ===========================================================================
+o="$(run_case "$(h_idle 1000)" off-then-on)"
+if [ "$(printf '%s\n' "$(logs "$o")" | grep -c 'keepawake: on (interval_min = 10)')" = 1 ] \
+   && [ "$(field "$(r1 "$o")" offmarker)" = no ]; then
+  pass "(6d) off => on logs the on line ONCE and clears the marker  [mutant M2]"
+else
+  bad  "(6d) on-transition wrong: [$(r1 "$o")] log=[$(logs "$o")]"
+fi
+
+# ===========================================================================
+# (6e) the marker must not leak past the ON transition: off, on, off again
+# must log its OWN 'off' line (two 'off' lines total across the run), not stay
+# silent because a stale marker from the first off period survived.
+# ===========================================================================
+o="$(run_case "$(h_idle 1000)" off-on-off)"
+if [ "$(printf '%s\n' "$(logs "$o")" | grep -c 'keepawake: off')" = 2 ] \
+   && [ "$(printf '%s\n' "$(logs "$o")" | grep -c 'keepawake: on')" = 1 ]; then
+  pass "(6e) off -> on -> off logs off, on, off — the marker does not leak across the transition"
+else
+  bad  "(6e) off/on/off sequence wrong: log=[$(logs "$o")]"
 fi
 
 # ===========================================================================
