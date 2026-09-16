@@ -56,6 +56,27 @@ export const INCIDENT_KINDS = [
   "incident:duplicate-both-online",
 ] as const;
 
+/**
+ * Which observation a tick needs before it may re-arm (clear) a given
+ * INCIDENT_KINDS row (memo B2, S1 amended). The three kinds do not share one
+ * observability predicate: `incoherent-both-dead` and `reachable-cannot-converge`
+ * are tunnel-derived (decide.ts row e / N-1), so they re-arm only on a
+ * STATUS-SEEN tick; `duplicate-both-online` is derived entirely from the
+ * Tailscale device list, so it re-arms only when THAT list was readable this
+ * tick, independent of the tunnel. A tick that could not observe a kind must
+ * leave its row untouched rather than clear it out from under an incident it
+ * had no opinion about.
+ *
+ * `Record<(typeof INCIDENT_KINDS)[number], …>` makes this exhaustive at
+ * compile time: a fourth incident kind cannot be added to INCIDENT_KINDS
+ * without choosing its predicate here.
+ */
+export const INCIDENT_OBSERVED_BY: Record<(typeof INCIDENT_KINDS)[number], "status" | "devices"> = {
+  "incident:incoherent-both-dead": "status",
+  "incident:reachable-cannot-converge": "status",
+  "incident:duplicate-both-online": "devices",
+};
+
 /** reconcile_alert_asleep (main:3218-3242). */
 export async function alertAsleep(box: string, deps: AlertDeps): Promise<void> {
   const tSecs = deps.asleepTSecs ?? 7200;
@@ -263,10 +284,25 @@ export async function alertBoxConditions(box: string, report: BoxReport, deps: A
   }
 
   // 5. repair-failing (warn) — repairFailing >= 3 || refreshFailing >= 3.
+  //    S2′ (memo B1 amendment): repair-failing is caused by disk-fail when both
+  //    are active — check_reason returns the disk predicate, do_ensure_body
+  //    cannot clear it, and fail.repair climbs. One fault, one page: while
+  //    disk-fail is active THIS tick, repair-failing stays in `conditions` (COND
+  //    column / snapshot unchanged, D3a) but takes no alertDue and sends no
+  //    notify. Suppression is per-tick, not sticky — it re-evaluates `diskFail`
+  //    every tick, so the very next tick after disk-fail clears pages normally.
+  //
+  //    Gate memo r1 SHOULD 1: `repairFailing` and `refreshFailing` are two
+  //    independent counters (status.ts, boxup's `repair=failing:N` and
+  //    `refresh=failing:N`). The disk mechanism above explains the REPAIR
+  //    counter only, so the suppression arm fires only when repair (not
+  //    refresh) is what tripped the OR — a refresh-driven failure alongside an
+  //    unrelated disk-fail still pages.
   const repairFailing = report.repairFailing >= 3 || report.refreshFailing >= 3;
+  const suppressForDisk = diskFail && report.repairFailing >= 3 && report.refreshFailing < 3;
   if (repairFailing) {
     active.push(shortCondition("condition:repair-failing"));
-    if (deps.state.alertDue(box, "condition:repair-failing", renotify, deps.nowSec)) {
+    if (!suppressForDisk && deps.state.alertDue(box, "condition:repair-failing", renotify, deps.nowSec)) {
       await deps.notify(
         "warn",
         `${box}: condition:repair-failing (refresh=${report.refreshFailing} repair=${report.repairFailing})`,

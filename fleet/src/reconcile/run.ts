@@ -28,7 +28,14 @@ import type { ReconcileStateApi } from "./state.ts";
 import { RunContext, TailscaleKeys } from "./tailscale-keys.ts";
 import { decide } from "./decide.ts";
 import { devFields, daysUntil } from "./inputs.ts";
-import { alertAsleep, alertIncoherent, alertBoxConditions, INCIDENT_KINDS, INCIDENT_RENOTIFY_SECS } from "./alerts.ts";
+import {
+  alertAsleep,
+  alertIncoherent,
+  alertBoxConditions,
+  INCIDENT_KINDS,
+  INCIDENT_OBSERVED_BY,
+  INCIDENT_RENOTIFY_SECS,
+} from "./alerts.ts";
 import { identityPass } from "./identity.ts";
 import { mintKey, mintWindowValid, type MintDeps } from "../actions/mint.ts";
 import { rotate } from "../actions/rotate.ts";
@@ -741,7 +748,22 @@ async function reconcileOne(
   // mirrors THIS tick, not the preceding one.
   const rowEAlert =
     actions.includes("alert-asleep") || actions.includes("alert-incident:incoherent-both-dead");
-  if (!rowEAlert) {
+  // Memo SHOULD 1: a devices-GET failure sets `online = "unknown"` (above,
+  // devs.trim() === "" branch), under which row e cannot fire (decide.ts) even
+  // though the box may still be asleep — it is unobserved, not recovered. Gate
+  // the reset on `online !== "unknown"` so that tick does not restart the 2h
+  // first-alert timer / daily digest for a box the tick had no opinion about.
+  //
+  // Gate memo r1 SHOULD 2: `online !== "unknown"` alone also blocks the reset
+  // for a box that IS observed a different way — tunnel up, status-seen,
+  // healthy — purely because the fleet-wide devices GET failed on this tick.
+  // Such a box is definitively not asleep, and the marker feeds a display
+  // (`readAsleep` → the snapshot row and both API surfaces), so leaving it set
+  // greys a recovered box for the duration of an unrelated Tailscale API
+  // outage — a narrower echo of the 5.11.2 marker-leak shape. Widen the gate
+  // to `(online !== "unknown" || report !== undefined)` so a status-seen tick
+  // still resets even when the device list could not be read.
+  if (!rowEAlert && (online !== "unknown" || report !== undefined)) {
     deps.state.resetAsleep(box);
     deps.state.resetIncoherent(box);
   }
@@ -757,8 +779,17 @@ async function reconcileOne(
   const raised = new Set(
     actions.filter((a) => a.startsWith("alert-")).map((a) => a.slice("alert-".length)),
   );
+  // S1 (memo B2 amended): per-kind re-arm, gated on whether THIS tick could
+  // observe the thing the kind is about — not on status-seen for all three.
+  // `statusSeen` gates the two tunnel-derived kinds; `devicesSeen` gates
+  // duplicate-both-online, whose only input is the Tailscale device list and
+  // which a failed devices GET (devs="") must leave untouched.
+  const statusSeen = report !== undefined;
+  const devicesSeen = devs.trim() !== "";
   for (const kind of INCIDENT_KINDS) {
-    if (!raised.has(kind)) deps.state.alertClear(box, kind);
+    if (raised.has(kind)) continue;
+    const seen = INCIDENT_OBSERVED_BY[kind] === "status" ? statusSeen : devicesSeen;
+    if (seen) deps.state.alertClear(box, kind);
   }
 
   // Box-reported conditions (5.13.0 D2/D3a): a POST-VERDICT pass, run HERE — for

@@ -2002,6 +2002,39 @@ tokens — a kind missing from it still dedups but never re-arms, which is the
 quiet failure. `test/reconcile-alerts.test.ts` greps decide.ts for the token list
 and asserts it.
 
+**S1, 5.15.0: per-kind re-arm.** The re-arm loop above used to clear all three
+`INCIDENT_KINDS` rows on any tick that did not raise them, with no gate at
+all — so a devices-GET failure or a tunnel-down tick, neither of which
+*observed* anything, silently re-armed a still-open incident. That produced 17
+duplicate pages for grok-box-002/004 over 8 days against the 24h renotify
+window, because `incoherent-both-dead` and `reachable-cannot-converge` are
+tunnel-derived (their observation is `report !== undefined`, i.e. the tick was
+status-seen) while `duplicate-both-online` comes entirely from the Tailscale
+device list (its observation is `devs.trim() !== ""`) — two different ticks
+can fail to observe two different things. `INCIDENT_OBSERVED_BY`, exported
+beside `INCIDENT_KINDS` in `alerts.ts`, maps each kind to `"status"` or
+`"devices"`; `run.ts` computes both booleans once and the re-arm loop only
+clears a row when the kind's own predicate held this tick. A kind that goes
+permanently unobserved keeps a stale row forever, which is bounded and
+harmless: `alertDue` fires again on its own once `now - last_sent >=
+INCIDENT_RENOTIFY_SECS`, so the worst case is one suppressed page in the 24h
+window after a recovery the tick could not see.
+
+**S2′, 5.15.0: repair-failing suppressed under disk-fail.** A box with a
+100%-full root paged `condition:disk-fail` AND `condition:repair-failing`
+daily — two pages for one fault, because `boxup`'s `check_reason` returns the
+disk predicate, `do_ensure_body` cannot converge past it, and
+`$RUN_DIR/fail.repair` climbs (already rate-limited on boxup's own
+20→60→180→600s backoff ladder; there is no missing cap to add on the brain
+side, which is why the original S2 — a `[reconcile]` repair-backoff config
+key — was dropped). `alertBoxConditions` now takes no `alertDue`/notify for
+`condition:repair-failing` while `condition:disk-fail` is active the same
+tick; the short name stays in the returned `conditions` array (the COND
+column and the snapshot are unchanged, D3a stays the single source of truth).
+The check re-runs every tick, so the tick after disk-fail clears pages
+repair-failing normally — suppression is not sticky. No config key, no schema
+change, no new alert kind.
+
 ## Prior art / reference URLs
 
 (Consolidated; also inline above.)

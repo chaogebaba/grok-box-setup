@@ -56,7 +56,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.14.8"; // 5.14.8: brain log/alert hygiene — reconcile's rc-N line no longer doubles, the asleep digest formats a duration not a raw epoch, the API logs one line per non-2xx/slow request, and released leases are pruned after 30d (VPS audit r3, F3/F5/F6/F7)
+const PKG_VERSION = "5.15.0"; // 5.15.0: quiet the pager — S1 gates incident re-arm per kind (status-seen vs devices-seen) instead of clearing all three on any unobserved tick, S2' suppresses repair-failing while disk-fail is active (one fault, one page), and SHOULD-1 stops a devices-GET failure from restarting the asleep/incoherent timers
 
 async function gitShaFromGit(): Promise<string> {
   try {

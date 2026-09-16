@@ -888,3 +888,107 @@ describe("an unresolved incident alerts once a day, and re-arms when it clears",
     expect(converge(notes).length).toBe(2);
   });
 });
+
+describe("S1 (5.15.0 memo B2) — per-kind incident re-arm", () => {
+  const NOWS = 4_000_000;
+  const LISTEN = 'LISTEN 0 128 127.0.0.1:20008 0.0.0.0:* users:(("sshd",pid=41,fd=7))\n';
+  const BOX = "grok-box-008";
+
+  const cannotConverge = () =>
+    new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: LISTEN });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 1, stdout: "check=FAIL" });
+      return result({ code: 1 });
+    });
+  const healthy = () =>
+    new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: LISTEN });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND)
+        return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
+      return result({ code: 1 });
+    });
+  const tunnelDown = () => new FakeRunner(() => result({ stdout: "" })); // ss empty ⇒ tunnel down
+
+  const noDevs = { code: 200, body: '{"devices":[]}' };
+  const dupDevs = (nowSec: number) =>
+    JSON.stringify({
+      devices: [
+        { hostname: BOX, nodeId: "A", online: true, lastSeen: new Date(nowSec * 1000).toISOString() },
+        { hostname: BOX, nodeId: "B", online: true, lastSeen: new Date(nowSec * 1000).toISOString() },
+      ],
+    });
+
+  const tickWith = async (
+    state: ReconcileState,
+    notes: string[],
+    runner: FakeRunner,
+    nowSec: number,
+    devices: { code: number; body: string } = noDevs,
+  ) => {
+    const { keys, ctx } = fakeKeys(() => devices);
+    await runReconcile(
+      baseDeps({
+        state,
+        keys,
+        ctx,
+        runner,
+        targetBoxes: [BOX],
+        nowSec,
+        notify: (_l, m) => void notes.push(m),
+      }),
+    );
+  };
+  const converge = (notes: string[]) => notes.filter((m) => m.includes("reachable-cannot-converge"));
+  const dup = (notes: string[]) => notes.filter((m) => m.includes("duplicate-both-online"));
+
+  test("(a) a status-seen tick with no incident clears the reachable-cannot-converge row", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    const notes: string[] = [];
+    for (let i = 0; i < 5; i++) await tickWith(state, notes, cannotConverge(), NOWS + i * 300);
+    expect(converge(notes).length).toBe(1);
+    // status-seen recovery tick, no incident this tick ⇒ clears the row.
+    await tickWith(state, notes, healthy(), NOWS + 5 * 300);
+    // A fresh alertDue call (large window) proves the row is gone, not merely
+    // still-throttled: a still-throttled row would read false here.
+    expect(state.alertDue(BOX, "incident:reachable-cannot-converge", 999_999, NOWS + 6 * 300)).toBe(true);
+  });
+
+  test("(c) raise -> unobserved (tunnel down) -> raise pages once inside the window", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    const notes: string[] = [];
+    for (let i = 0; i < 5; i++) await tickWith(state, notes, cannotConverge(), NOWS + i * 300);
+    expect(converge(notes).length).toBe(1);
+    // Unobserved: tunnel down ⇒ NOT status-seen. Must leave the row untouched
+    // (S1's per-kind gate), not clear it out from under an incident the tick
+    // had no opinion about (this is the mutant M3/noop-marker-leak family:
+    // moving the re-arm loop into the action loop, after a `continue`, would
+    // also skip it here and give the same observable result on THIS tick, but
+    // the next assertion below distinguishes it from a wrongly-cleared row).
+    await tickWith(state, notes, tunnelDown(), NOWS + 5 * 300);
+    // Recurs minutes later, still inside INCIDENT_RENOTIFY_SECS (86400s) of the
+    // first page ⇒ dedup holds, no second notify.
+    for (let i = 6; i < 10; i++) await tickWith(state, notes, cannotConverge(), NOWS + i * 300);
+    expect(converge(notes).length).toBe(1);
+  });
+
+  test("(d) duplicate-both-online row survives a status-seen tick whose devices GET returned \"\"", async () => {
+    const { fs } = memState();
+    const state = new ReconcileState("/s", fs);
+    const notes: string[] = [];
+    // tick 1: status-seen (tunnel up, check OK) + duplicate devices ⇒ raises, pages once.
+    await tickWith(state, notes, healthy(), NOWS, { code: 200, body: dupDevs(NOWS) });
+    expect(dup(notes).length).toBe(1);
+    // tick 2: STILL status-seen, but the devices GET fails (non-2xx) ⇒ devs=""
+    // ⇒ devicesSeen=false. The row must NOT clear even though the tick WAS
+    // status-seen — this is the M1 killer: a builder who gates all three
+    // INCIDENT_KINDS on statusSeen (instead of the per-kind predicate) clears
+    // this row here, because report !== undefined is true this tick.
+    await tickWith(state, notes, healthy(), NOWS + 300, { code: 500, body: "" });
+    // tick 3: duplicates readable again, inside the renotify window ⇒ still
+    // suppressed because the row survived tick 2.
+    await tickWith(state, notes, healthy(), NOWS + 600, { code: 200, body: dupDevs(NOWS + 600) });
+    expect(dup(notes).length).toBe(1);
+  });
+});

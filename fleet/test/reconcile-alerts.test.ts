@@ -10,6 +10,7 @@ import {
   CONDITION_KINDS,
   KEEPAWAKE_STALE_SECS,
   INCIDENT_KINDS,
+  INCIDENT_OBSERVED_BY,
   INCIDENT_RENOTIFY_SECS,
 } from "../src/reconcile/alerts.ts";
 import { readFileSync } from "node:fs";
@@ -258,6 +259,26 @@ describe("incident dedup", () => {
     // direction 2: and no declared kind is dead.
     for (const kind of [...INCIDENT_KINDS, ...CONDITION_KINDS]) expect([...emitted]).toContain(kind);
   });
+
+  test("S1(e): every INCIDENT_KINDS entry has an INCIDENT_OBSERVED_BY entry", () => {
+    // Runtime twin of the compile-time exhaustiveness the Record<> type gives
+    // us — a builder who edits INCIDENT_OBSERVED_BY without checking types (or
+    // a mutant that strips one arm from the object literal) still fails here.
+    for (const kind of INCIDENT_KINDS) {
+      expect(["status", "devices"]).toContain(INCIDENT_OBSERVED_BY[kind]);
+    }
+    expect(Object.keys(INCIDENT_OBSERVED_BY).sort()).toEqual([...INCIDENT_KINDS].sort());
+  });
+
+  // Gate memo r1 SHOULD 3 (mutant N5): S1(e) only asserts every kind has SOME
+  // entry, not WHICH one. `incoherent-both-dead` is tunnel-derived
+  // (decide.ts row e, `tunnel === "down"`), so flipping its mapping to
+  // "devices" would re-arm it on any devices-readable tick — including the
+  // asleep ticks of a box flapping between incoherent and asleep, which is
+  // exactly the pager-flood shape this release exists to remove. Pin it.
+  test("SHOULD 3: incoherent-both-dead is status-observed, not devices-observed", () => {
+    expect(INCIDENT_OBSERVED_BY["incident:incoherent-both-dead"]).toBe("status");
+  });
 });
 
 
@@ -335,6 +356,72 @@ describe("alertBoxConditions — raises, clears, and the conditions array", () =
     expect(await runPass("grok-box-3", s, rpt({ refreshFailing: 2, repairFailing: 2 }), 1000, notes)).not.toContain(
       "repair-failing",
     );
+  });
+
+  describe("S2′ — repair-failing suppressed while disk-fail is active (one fault, one page)", () => {
+    test("disk-fail + repair-failing ⇒ one notify, both short names in conditions", async () => {
+      const { fs } = memState();
+      const s = new ReconcileState(SD, fs);
+      const notes: Array<[string, string]> = [];
+      const active = await runPass(
+        "grok-box-1",
+        s,
+        rpt({ disk: { pct: 97, level: "fail" }, repairFailing: 5 }),
+        1000,
+        notes,
+      );
+      expect(active).toContain("disk-fail");
+      expect(active).toContain("repair-failing");
+      // exactly one notify — the disk-fail one; repair-failing's is suppressed.
+      expect(notes.length).toBe(1);
+      expect(notes[0]![1]).toContain("condition:disk-fail");
+    });
+
+    test("repair-failing alone (no disk-fail) ⇒ notifies as today", async () => {
+      const { fs } = memState();
+      const s = new ReconcileState(SD, fs);
+      const notes: Array<[string, string]> = [];
+      const active = await runPass("grok-box-1", s, rpt({ repairFailing: 5 }), 1000, notes);
+      expect(active).toContain("repair-failing");
+      expect(notes.some(([l, m]) => l === "warn" && m.includes("condition:repair-failing"))).toBe(true);
+    });
+
+    test("disk-fail clears ⇒ repair-failing pages again (suppression is per-tick, not sticky)", async () => {
+      const { fs } = memState();
+      const s = new ReconcileState(SD, fs);
+      const notes: Array<[string, string]> = [];
+      // tick 1: both active — repair-failing suppressed (M5 killer: a sticky
+      // suppression never sends this notify even after disk-fail clears).
+      await runPass("grok-box-1", s, rpt({ disk: { pct: 97, level: "fail" }, repairFailing: 5 }), 1000, notes);
+      expect(notes.some(([, m]) => m.includes("condition:repair-failing"))).toBe(false);
+      // tick 2: disk-fail clears, repair-failing persists ⇒ pages.
+      const active = await runPass("grok-box-1", s, rpt({ disk: { pct: 5, level: "ok" }, repairFailing: 5 }), 2000, notes);
+      expect(active).toContain("repair-failing");
+      expect(active).not.toContain("disk-fail");
+      expect(notes.some(([l, m]) => l === "warn" && m.includes("condition:repair-failing"))).toBe(true);
+    });
+
+    // Gate memo r1 SHOULD 1: repairFailing and refreshFailing are independent
+    // counters; the disk mechanism only explains the REPAIR one, so a
+    // refresh-driven failure alongside an unrelated disk-fail must still page.
+    test("disk-fail + REFRESH-driven repair-failing (refreshFailing>=3, repairFailing<3) still notifies", async () => {
+      const { fs } = memState();
+      const s = new ReconcileState(SD, fs);
+      const notes: Array<[string, string]> = [];
+      const active = await runPass(
+        "grok-box-1",
+        s,
+        rpt({ disk: { pct: 97, level: "fail" }, refreshFailing: 5, repairFailing: 0 }),
+        1000,
+        notes,
+      );
+      expect(active).toContain("disk-fail");
+      expect(active).toContain("repair-failing");
+      // TWO notifies: disk-fail's own, AND repair-failing's — the repair
+      // counter never tripped, so the disk-fail suppression arm must not fire.
+      expect(notes.length).toBe(2);
+      expect(notes.some(([l, m]) => l === "warn" && m.includes("condition:repair-failing"))).toBe(true);
+    });
   });
 
   test("24 ticks of a persisting condition ⇒ ONE message (dedup)", async () => {

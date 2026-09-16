@@ -10,13 +10,14 @@ import { RunContext, TailscaleKeys, type KeyTransport } from "../../src/reconcil
 import { openStore, storePath } from "../../src/store/db.ts";
 import { StoreState } from "../../src/store/state.ts";
 import { selectCandidates } from "../../src/reconcile/discover.ts";
-import { FakeRunner, result } from "../fake-runner.ts";
+import { FakeRunner, result, isSs } from "../fake-runner.ts";
 import { testEnv, testRollout } from "../helpers.ts";
 import { setLogSink } from "../../src/log.ts";
 import type { ManagedSource } from "../../src/actions/config-push.ts";
 import type { UpgradeDeps } from "../../src/upgrade.ts";
 import { cleanup, suiteScratch, T0 } from "./helpers.ts";
 import { utcDate } from "../../src/store/backup.ts";
+import { CHECK_COMMAND } from "../../src/remote.ts";
 
 // This file's own scratch bucket; dropped whole when the file finishes.
 const SCRATCH = suiteScratch("tick");
@@ -266,6 +267,147 @@ describe("D4 candidate exclusion (ships in Phase A)", () => {
       // and neither is a MEMBER (D7/r2-B5 — this is what makes the B→A rollback
       // safe: a 5.8.0 binary parks both rather than adopting them).
       expect(h.st.membership()).toEqual(["grok-box-003"]);
+      h.close();
+    } finally {
+      cleanup(h.dir);
+    }
+  });
+});
+
+// 5.15.0 S1(b) + SHOULD-1: the sqlite path. `alertClear` here is an UPDATE
+// (cleared_at, last_sent=NULL) rather than the file backend's `rm -f`, so this
+// is the one backend that can show a row SURVIVING an unobserved tick rather
+// than merely being absent both before and after.
+describe("5.15.0 S1(b) + SHOULD-1 — sqlite StoreState survives an unobserved tick", () => {
+  const BOX = "grok-box-003";
+  const LISTEN = 'LISTEN 0 128 127.0.0.1:20003 0.0.0.0:* users:(("sshd",pid=41,fd=7))\n';
+
+  function fakeKeysWith(responder: () => { code: number; body: string }): { keys: TailscaleKeys; ctx: RunContext } {
+    const transport: KeyTransport = { async request() { return responder(); } };
+    const ctx = new RunContext();
+    return { keys: new TailscaleKeys(transport, "https://api", "-", "PAT", ctx), ctx };
+  }
+  const cannotConverge = () =>
+    new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: LISTEN });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND) return result({ code: 1, stdout: "check=FAIL" });
+      return result({ code: 1 });
+    });
+  const tunnelDown = () => new FakeRunner(() => result({ stdout: "" }));
+  const okDevs = { code: 200, body: '{"devices":[]}' };
+
+  test("(b) a NOT status-seen tick leaves the reachable-cannot-converge row AND last_sent intact", async () => {
+    const h = harness("s1-b", { withExport: false });
+    try {
+      h.st.recordEnrolled(BOX, 20003);
+      // Raise the incident: checkfailRuns > 3.
+      for (let i = 0; i < 5; i++) {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: cannotConverge(), targetBoxes: [BOX], nowSec: T0 + i * 300 }));
+      }
+      const id = h.st.boxId(BOX)!;
+      const before = h.store.db
+        .query("SELECT last_sent, cleared_at FROM alerts WHERE box_id=? AND kind=?")
+        .get(id, "incident:reachable-cannot-converge") as { last_sent: number | null; cleared_at: number | null };
+      expect(before.last_sent).not.toBeNull();
+      expect(before.cleared_at).toBeNull();
+
+      // NOT status-seen: tunnel down this tick. Must not clear the row.
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 + 5 * 300 }));
+      }
+      const after = h.store.db
+        .query("SELECT last_sent, cleared_at FROM alerts WHERE box_id=? AND kind=?")
+        .get(id, "incident:reachable-cannot-converge") as { last_sent: number | null; cleared_at: number | null };
+      expect(after.last_sent).toBe(before.last_sent);
+      expect(after.cleared_at).toBeNull();
+      h.close();
+    } finally {
+      cleanup(h.dir);
+    }
+  });
+
+  const healthy = () =>
+    new FakeRunner((argv) => {
+      if (isSs(argv)) return result({ stdout: LISTEN });
+      if ((argv[argv.length - 1] ?? "") === CHECK_COMMAND)
+        return result({ code: 0, stdout: "check=OK v=5.3.0/abc tunnel=up" });
+      return result({ code: 1 });
+    });
+  const failedDevs = { code: 500, body: "" };
+
+  test("SHOULD-1(a): devices GET failure (online=unknown) leaves asleep_since/asleep_last_alert untouched", async () => {
+    const h = harness("should1-a", { withExport: false });
+    try {
+      h.st.recordEnrolled(BOX, 20003);
+      // tick 1: tunnel down, devices readable, online=no (no matching device)
+      // ⇒ row e raises alert-asleep, stamping the marker.
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 }));
+      }
+      const before = h.st.readAsleep(BOX);
+      expect(before).toBeDefined();
+      // tick 2: devices GET fails ⇒ online="unknown". Row e cannot fire, so
+      // `rowEAlert` is false — the pre-5.15.0 code reset the marker here
+      // unconditionally. SHOULD-1 gates the reset on online !== "unknown".
+      {
+        const { keys, ctx } = fakeKeysWith(() => failedDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 + 300 }));
+      }
+      const after = h.st.readAsleep(BOX);
+      expect(after).toEqual(before);
+      h.close();
+    } finally {
+      cleanup(h.dir);
+    }
+  });
+
+  test("SHOULD-1(b): a normal healthy (status-seen) tick still resets the asleep marker", async () => {
+    const h = harness("should1-b", { withExport: false });
+    try {
+      h.st.recordEnrolled(BOX, 20003);
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 }));
+      }
+      expect(h.st.readAsleep(BOX)).toBeDefined();
+      // tick 2: box recovers — tunnel up, check OK, devices readable (online
+      // known, not "unknown") ⇒ the reset must still run.
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: healthy(), targetBoxes: [BOX], nowSec: T0 + 300 }));
+      }
+      expect(h.st.readAsleep(BOX)).toBeUndefined();
+      h.close();
+    } finally {
+      cleanup(h.dir);
+    }
+  });
+
+  // Gate memo r1 SHOULD 2: `online !== "unknown"` alone also blocks the reset
+  // for a box that IS observed a different way this tick (status-seen,
+  // healthy) — purely because the devices GET failed. Widened gate:
+  // `(online !== "unknown" || report !== undefined)`.
+  test("gate SHOULD 2: devices GET fails but the box is status-seen and healthy ⇒ asleep marker IS cleared", async () => {
+    const h = harness("should2", { withExport: false });
+    try {
+      h.st.recordEnrolled(BOX, 20003);
+      // tick 1: tunnel down, devices readable ⇒ alert-asleep, marker set.
+      {
+        const { keys, ctx } = fakeKeysWith(() => okDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: tunnelDown(), targetBoxes: [BOX], nowSec: T0 }));
+      }
+      expect(h.st.readAsleep(BOX)).toBeDefined();
+      // tick 2: box recovers (tunnel up, check OK ⇒ status-seen, report
+      // defined) but the devices GET fails this same tick (online="unknown").
+      // The box is definitively not asleep — the reset must still run.
+      {
+        const { keys, ctx } = fakeKeysWith(() => failedDevs);
+        await runReconcile(h.deps({ keys, ctx, runner: healthy(), targetBoxes: [BOX], nowSec: T0 + 300 }));
+      }
+      expect(h.st.readAsleep(BOX)).toBeUndefined();
       h.close();
     } finally {
       cleanup(h.dir);
