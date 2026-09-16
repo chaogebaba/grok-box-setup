@@ -262,6 +262,14 @@ describe("L2 — eligibility and the r3-n5 reason precedence", () => {
       expect(ineligibleReason(b, elig({ require: { job_runner: true } }))).toBeUndefined();
     });
 
+    // MUTANT M2 (build-report): the job-slot arm must stay AFTER "boxup lacks
+    // job runner" — a caller placing a job on a pre-5.5.0, slot-held box hears
+    // about the missing runner, not the slot.
+    test("'boxup lacks job runner' outranks the job-slot arm", () => {
+      const b = facts({ ver: "5.4.0", jobState: "running", job: "abc123" });
+      expect(ineligibleReason(b, elig({ requireJobRunner: true }))).toBe("boxup lacks job runner");
+    });
+
     test("an explicit boxup_version requirement is reported before the job-slot arm", () => {
       const b = facts({ ver: "5.2.0", jobState: "running", job: "abc123" });
       expect(
