@@ -108,7 +108,33 @@ describe("T8 asleep throttle", () => {
     });
     expect(notes.length).toBe(1);
     expect(notes[0]).toContain("still asleep (daily digest)");
+    // F5: elapsed duration, not the raw `since` epoch (100).
+    expect(notes[0]).toContain("24h");
+    expect(notes[0]).not.toContain(" since 100");
     expect(store.get(`${SD}/grok-box-1.asleep`)).toBe(`100 ${1000 + 86400}\n`);
+  });
+
+  // F5 (VPS audit r3): the digest used to print the raw `since` epoch verbatim
+  // — "both paths dead since 1789395355" — instead of an elapsed duration like
+  // the first-alert branch a few lines up already formats. Regression-test the
+  // exact epoch from the audit finding.
+  test("F5: digest text contains a duration, never a 10-digit epoch", async () => {
+    const { fs } = memState();
+    const s = new ReconcileState(SD, fs);
+    const since = 1789395355 - 50 * 3600; // 50h before the audit's `now`
+    fs.write(`${SD}/grok-box-1.asleep`, `${since} 1000\n`);
+    const notes: string[] = [];
+    await alertAsleep("grok-box-1", {
+      state: s,
+      notify: (_l, m) => {
+        notes.push(m);
+      },
+      nowSec: 1789395355,
+      asleepDigestSecs: 86400,
+    });
+    expect(notes.length).toBe(1);
+    expect(notes[0]).not.toMatch(/\b\d{10}\b/);
+    expect(notes[0]).toMatch(/\d+h/);
   });
 });
 
