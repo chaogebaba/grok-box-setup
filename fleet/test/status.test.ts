@@ -161,6 +161,7 @@ describe("toReport — the typed BoxReport", () => {
     expect(r.keepawakeLast).toBe("2026-09-06T05:52:58Z");
     expect(r.jumps).toBe(0);
     expect(r.jobState).toBe("-"); // job_state=- ⇒ the literal "-" (a value)
+    expect(r.job).toBeNull(); // job=- ⇒ null (unlike job_state, "-" is not kept)
     expect(r.refreshFailing).toBe(0); // absent ⇒ 0
     expect(r.repairFailing).toBe(0);
   });
@@ -180,6 +181,7 @@ describe("toReport — the typed BoxReport", () => {
     expect(r.keepawakeLast).toBe("2026-09-06T05:52:58Z");
     expect(r.jumps).toBe(3);
     expect(r.jobState).toBe("running");
+    expect(r.job).toBe("j1");
     expect(r.refreshFailing).toBe(5);
     expect(r.repairFailing).toBe(2);
   });

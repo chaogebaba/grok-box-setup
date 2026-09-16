@@ -179,7 +179,17 @@ describe("L4 — flag parsing", () => {
 
   test("the require flags land in the `require` object, including the reserved one", () => {
     const p = parseLeaseFlags(
-      ["--purpose", "gate", "--no-drift", "--allow-canary", "--boxup-version", "5.10.0", "--max-disk", "80"],
+      [
+        "--purpose",
+        "gate",
+        "--no-drift",
+        "--allow-canary",
+        "--boxup-version",
+        "5.10.0",
+        "--job-runner",
+        "--max-disk",
+        "80",
+      ],
       { commandTail: false },
     );
     expect("flags" in p).toBe(true);
@@ -188,6 +198,8 @@ describe("L4 — flag parsing", () => {
       no_drift: true,
       allow_canary: true,
       boxup_version: "5.10.0",
+      // S3 (memo B3): opt-in refusal on a held job slot.
+      job_runner: true,
       // r1-B3: forwarded so the API refuses it BY NAME rather than the CLI
       // silently dropping a predicate the caller relied on.
       max_disk_pct: 80,

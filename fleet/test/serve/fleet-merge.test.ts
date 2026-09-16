@@ -131,4 +131,42 @@ describe("GET /v1/fleet snapshot + live-marker merge", () => {
     const body = await jsonBody(await fetch(getReq("/v1/health")));
     expect(body.tick_age_s).toBeNull();
   });
+
+  // S4 (memo B4): `observed` is additive on GET /v1/fleet, verbatim from the
+  // LATEST snapshot row, beside `lease` and `job` (M7 mutant guard: omitted).
+  test("boxes carry `observed` verbatim from the latest snapshot row", async () => {
+    const line: SnapshotLine = {
+      v: 1,
+      ts: "2026-04-04T00:00:00Z",
+      apply: true,
+      canary: null,
+      boxes: [
+        { name: "grok-box-1", tunnel: "up", check: "OK", ver: "5.3.0", drift: "no", config: "in-sync", checkfail: false, asleep: false, expiry_days: 40 },
+        { name: "grok-box-2", tunnel: "up", check: "OK", ver: "5.3.0", drift: "yes", config: "drift", checkfail: false, asleep: false, expiry_days: 40 },
+      ],
+    };
+    const s = SCRATCH.dir("grokfleet-merge");
+    dirs.push(s);
+    seedSnapshots(s, [line], {
+      observed: new Map([
+        ["grok-box-1", "healthy"],
+        ["grok-box-2", "drifted"],
+      ]),
+    });
+    const ctx = await ctxFor(s, ["grok-box-1", "grok-box-2"]);
+    const fetch = makeFetch(ctx);
+    const body = await jsonBody<FleetBody>(await fetch(getReq("/v1/fleet", "READSECRET")));
+    const byName = new Map(body.boxes.map((b) => [b.name as string, b.observed]));
+    expect(byName.get("grok-box-1")).toBe("healthy");
+    expect(byName.get("grok-box-2")).toBe("drifted");
+  });
+
+  test("`observed` is absent when there is no snapshot at all", async () => {
+    const s = SCRATCH.dir("grokfleet-merge");
+    dirs.push(s);
+    const ctx = await ctxFor(s, []);
+    const fetch = makeFetch(ctx);
+    const body = await jsonBody<FleetBody>(await fetch(getReq("/v1/fleet", "READSECRET")));
+    expect(body.boxes).toEqual([]);
+  });
 });

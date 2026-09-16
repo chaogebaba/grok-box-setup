@@ -22,6 +22,12 @@ export interface FleetBox extends SnapshotBox {
   lease?: BoxLease | null;
   /** jobs J12: the open job on this box, attached at serve time like `lease`. */
   job?: BoxJob | null;
+  /**
+   * S4 (memo B4): the reconciler's own `snapshot_boxes.observed` value,
+   * verbatim — one of the seven `Observed` names, or absent when it cannot be
+   * obtained. No new vocabulary and no mapping.
+   */
+  observed?: string;
 }
 
 /** The compact per-box job field on `/v1/fleet` and `/v1/boxes/:name`. */

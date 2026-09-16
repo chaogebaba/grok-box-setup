@@ -295,6 +295,7 @@ function rpt(over: Partial<BoxReport> = {}): BoxReport {
     keepawakeLast: null,
     jumps: 0,
     jobState: null,
+    job: null,
     refreshFailing: 0,
     repairFailing: 0,
     ...over,

@@ -12,6 +12,7 @@ import { listLeases } from "../../src/store/leases.ts";
 import { listJobs } from "../../src/store/jobs.ts";
 import { ineligibleReason, type BoxFacts } from "../../src/serve/lease-eligibility.ts";
 import type { SnapshotBox } from "../../src/history/schema.ts";
+import type { BoxReport } from "../../src/status.ts";
 import type { Observed } from "../../src/reconcile/observe.ts";
 
 const SCRATCH = suiteScratch("serve-jobs");
@@ -23,7 +24,24 @@ const READ = "READSECRET";
 /** The fleet runs boxup 5.5.2; anything below 5.5.0 has no job runner (J3). */
 const WITH_RUNNER = "5.5.2";
 
-function snapBox(name: string, ver: string): SnapshotBox {
+/** A minimal all-clear BoxReport with only jobState/job set (S3 test seeding). */
+function minimalReport(jobState: string, job: string | null): BoxReport {
+  return {
+    tickwedge: 0,
+    tunnelfail: 0,
+    disk: { pct: 5, level: "ok" },
+    keepawakeOn: false,
+    keepawakeRc: null,
+    keepawakeLast: null,
+    jumps: 0,
+    jobState,
+    job,
+    refreshFailing: 0,
+    repairFailing: 0,
+  };
+}
+
+function snapBox(name: string, ver: string, over: Partial<SnapshotBox> = {}): SnapshotBox {
   return {
     name,
     tunnel: "up",
@@ -34,10 +52,14 @@ function snapBox(name: string, ver: string): SnapshotBox {
     checkfail: false,
     asleep: false,
     expiry_days: 40,
+    ...over,
   };
 }
 
-function seedFleet(prefix: string, boxes: Array<{ name: string; ver?: string }>): string {
+function seedFleet(
+  prefix: string,
+  boxes: Array<{ name: string; ver?: string; jobState?: string; job?: string }>,
+): string {
   const dir = SCRATCH.dir(prefix);
   const store = openStore({ path: storePath(dir), dir, now: () => NOW });
   try {
@@ -55,7 +77,13 @@ function seedFleet(prefix: string, boxes: Array<{ name: string; ver?: string }>)
         ts: new Date(NOW * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
         apply: true,
         canary: null,
-        boxes: boxes.map((b) => snapBox(b.name, b.ver ?? WITH_RUNNER)),
+        boxes: boxes.map((b) =>
+          snapBox(
+            b.name,
+            b.ver ?? WITH_RUNNER,
+            b.jobState === undefined ? {} : { report: minimalReport(b.jobState, b.job ?? null) },
+          ),
+        ),
       },
       observed,
     });
@@ -208,6 +236,47 @@ describe("J7 — POST /v1/jobs", () => {
     const dir = seedFleet("scope", [{ name: "grok-box-001" }]);
     const fetch = makeFetch(await ctxFor(dir));
     expect((await fetch(postReq("/v1/jobs", READ, START))).status).toBe(403);
+  });
+
+  // S3 (memo B3): job placement on a held slot moves to the next eligible box
+  // rather than failing at start time with the box's rc 75.
+  test("job placement skips a box whose job slot is already held", async () => {
+    // grok-box-002 has the HIGHER index (chooseBox picks the highest eligible
+    // index), so without the S3 arm it would be chosen despite its held slot.
+    const dir = seedFleet("jobslot", [
+      { name: "grok-box-001" },
+      { name: "grok-box-002", jobState: "running", job: "held-job" },
+    ]);
+    const ctx = await ctxFor(dir);
+    const fetch = makeFetch(ctx);
+
+    const r = await fetch(postReq("/v1/jobs", ADMIN, START));
+    expect(r.status).toBe(201);
+    const b = await jsonBody(r);
+
+    const store = openStore({ path: storePath(dir), dir });
+    const rows = listJobs(store);
+    expect(rows.length).toBe(1);
+    expect(listLeases(store)[0]!.box).toBe("grok-box-001");
+    store.close();
+    expect(typeof b.job_id).toBe("string");
+  });
+
+  // SHOULD-2 (gate r1): the existing "skips a box" test above only asserts
+  // WHICH box was chosen, never the reason string for the one that wasn't —
+  // so dropping `job: s?.job` from job-handlers.ts's own `boxFacts` builder
+  // (as opposed to lease-handlers.ts's) survived the whole suite. Every box
+  // held ⇒ 409, and the reasons map is built from job-handlers.ts's boxFacts.
+  test("job placement's 409 reasons carry the held id from job-handlers' own BoxFacts", async () => {
+    const dir = seedFleet("jobslot-409", [
+      { name: "grok-box-001", jobState: "running", job: "held-job-1" },
+      { name: "grok-box-002", jobState: "running", job: "held-job" },
+    ]);
+    const fetch = makeFetch(await ctxFor(dir));
+    const r = await fetch(postReq("/v1/jobs", ADMIN, START));
+    expect(r.status).toBe(409);
+    const b = await jsonBody(r);
+    expect((b.reasons as Record<string, string>)["grok-box-002"]).toBe("job slot held by held-job");
   });
 
   test("a fleet with no job-runner boxes answers 409 and NAMES the reason", async () => {

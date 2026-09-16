@@ -321,7 +321,7 @@ discovers every `grok-box-NNN` peer; it never touches other machines.
 > [`docs/FLEET-BRAIN.md`](docs/FLEET-BRAIN.md) §"Upgrades and inventory (grokfleet)".
 
 ```bash
-./grokfleet list                 # name, tailscale IP, online — all grok-box-NNN peers
+./grokfleet list                 # name, tailscale IP, online, observed — all grok-box-NNN peers
 ./grokfleet status               # boxup status line per online box + sha/drift (read-only)
 ./grokfleet check                # quiet health gate; exit 1 + prints only problems
 ./grokfleet rollout grok-box-003 # deploy current git HEAD to explicit boxes

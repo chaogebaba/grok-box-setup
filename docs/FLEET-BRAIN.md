@@ -523,7 +523,7 @@ path, no second implementation.
 - `grokfleet version [--json]` — prints `grokfleet <version> (<git sha>) (bun <ver>)`, or `{name, version, sha, bun}`.
 - `grokfleet rc [--json]` — the exit-code table (see below). Needs no config, so it answers on any host.
 - `grokfleet ssh [--tty] [--no-stdin] [--timeout <s>] <box> [cmd…]` — run one command on a box, or open a session. See "For agents" below.
-- `grokfleet list [--json]` — the tailnet peers named `grok-box-N`, with their Tailscale IP and online state.
+- `grokfleet list [--json]` — the tailnet peers named `grok-box-N`, with their Tailscale IP, online state and observed liveness.
 - `grokfleet inventory [--json] [box…]` — one row per enrolled box: `NAME API TUNNEL CHECK VERSION SHA TARGET DRIFT AUTHKEY`. `API` (online/offline + `lastSeen`) comes from the Tailscale devices endpoint (`GET /tailnet/<tailnet>/devices?fields=all`, Bearer token from the same 0600 file bash `grokfleet` uses — `FLEET_API_TOKEN_FILE` > `[fleet-brain].api_token_file` > `$FLEET_ETC/api-token`); the API is unavailable ⇒ `?`. `TUNNEL` is the VPS-side `ss -tln` probe; a tunnel-down box shows `-` for CHECK/VERSION/SHA/DRIFT. From 5.9.0 it PERSISTS NOTHING: `inventory.json` is retired (state-store D3/D7) and the pass renders from the store's `boxes` rows plus the last tick's snapshot, which is also where the staleness header's previous timestamp comes from. `--json` prints the same object it always did. Always exits 0; `inventory` never fails on an unresolvable target (TARGET/DRIFT render `?`) nor on an API failure.
 - `grokfleet upgrade [--to REF] [--all | box…] [--apply] [--canary BOX] [--json]` — **dry-run by default**: prints the plan (`box  running v/sha  target v/sha  action`) and exits 0 without staging. `--apply` stages the tree once and deploys **serially**: canary first, then the rest in enrolled order. Tunnel-down non-canary ⇒ skip; in-sync ⇒ skip; **canary unreachable or verified-failure ⇒ ABORT** (zero others touched). Rollback is the same command with `--to <previous sha>` — no special path.
 
@@ -1566,6 +1566,8 @@ leased by … > lost lease in grace (…) > leased by … (expired, grace)
   > snapshot stale (<age>)
   > drifted (require.no_drift)
   > boxup <v> < required <v>
+  > boxup lacks job runner
+  > job slot held by <id> / job slot held
   > phase <p>
 ```
 
@@ -1751,6 +1753,15 @@ Eligibility gains ONE reason, `boxup lacks job runner`, after an explicit
 `boxup_version` requirement — a caller who asked about a version hears about
 that, not about a runner they never mentioned. It only fires during the rollout
 window.
+
+Eligibility also knows about a held job slot: a box whose latest snapshot report
+carries `job_state=running` is refused for job placement (`job run`/`job start`
+with no supplied lease) and for a plain `lease acquire` that opts in with
+`require.job_runner: true`. Reason is `job slot held by <id>` when the report
+carries the id, else `job slot held`. Plain `lease acquire` is **not** refused
+by default — builds, tests and interactive ssh never touch the job slot. A box
+that has not been status-seen (no report) is treated as unknown and the arm
+does not fire.
 
 ### CLI (J8)
 

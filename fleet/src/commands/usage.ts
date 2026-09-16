@@ -21,7 +21,7 @@ export const USAGE = `grokfleet — grok-fleet brain (VPS-side; list/ssh also ru
 Usage: grokfleet <command> [args] [flags]
 
 Laptop or VPS:
-  grokfleet list                              — discover grok-box-N peers (name, tailscale IP, online)
+  grokfleet list                              — discover grok-box-N peers (name, tailscale IP, online, observed)
   grokfleet ssh <box>|--lease <id> [cmd...]   — run ONE quoted command on a box, or open a session
   grokfleet tui [--utc]                       — laptop admin panel over the serve API
   grokfleet remove-timer                      — remove the retired laptop check timer (once per laptop)

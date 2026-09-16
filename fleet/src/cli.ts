@@ -35,6 +35,8 @@ import { log } from "./log.ts";
 
 import { decide, emit, versionString } from "./commands/dispatch.ts";
 import { cmdList } from "./commands/list.ts";
+import { makeApiClient } from "./tui/api-client.ts";
+import { resolveTuiConfig, TuiConfigError } from "./tui/config.ts";
 import { cmdSsh } from "./commands/ssh.ts";
 import { cmdInstallTimer, cmdRemoveTimer } from "./commands/timers.ts";
 import { cmdConfig } from "./commands/config.ts";
@@ -56,7 +58,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.15.0"; // 5.15.0: quiet the pager — S1 gates incident re-arm per kind (status-seen vs devices-seen) instead of clearing all three on any unobserved tick, S2' suppresses repair-failing while disk-fail is active (one fault, one page), and SHOULD-1 stops a devices-GET failure from restarting the asleep/incoherent timers
+const PKG_VERSION = "5.16.0"; // 5.16.0: agent-facing contracts from the r1 audit — S3 lease eligibility knows about a held job slot (require.job_runner opt-in, job placement refused by default), S4 `grokfleet list` gains an OBSERVED column served from the typed ApiClient
 
 async function gitShaFromGit(): Promise<string> {
   try {
@@ -128,8 +130,24 @@ async function main(argv: string[]): Promise<number> {
 
   switch (decision.command) {
     // --- laptop-runnable (M1): no locality guard ---
-    case "list":
-      return cmdList(runner, stdout, wantsJson(rest));
+    case "list": {
+      // S4 (memo B4): the OBSERVED column's data path — an absent/unconfigured
+      // TUI config must not fail `list`, it must print "-" in that column.
+      let api: ReturnType<typeof makeApiClient> | undefined;
+      try {
+        const c = resolveTuiConfig();
+        api = makeApiClient(c.url, c.token);
+      } catch (e) {
+        if (!(e instanceof TuiConfigError)) throw e;
+        api = undefined;
+        // SHOULD-5 (gate r1): a wrong-mode tui.toml is a MISCONFIGURATION, not
+        // an absence — `grokfleet lease ls` refuses loudly on the same file,
+        // and `list` folding it to a silent "-" reads as a dead fleet. One
+        // stderr line, rc and the column stay unchanged.
+        log(`list: ${e.message} — OBSERVED will show '-'`);
+      }
+      return cmdList(runner, stdout, wantsJson(rest), api);
+    }
     case "ssh":
       // lease-api L4: `env` is what makes `--via tunnel` and its rc-6 refusal
       // possible; without it the transport resolves to tailnet as before.

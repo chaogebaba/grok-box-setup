@@ -314,14 +314,43 @@ export function pruneSnapshots(store: Store, retentionDays: number, at: number):
  */
 export function readLatestBoxFacts(
   store: Store,
-): { tick: number; ts: number; boxes: Map<string, { observed: string; ver: string; drift: string }> } | undefined {
+): {
+  tick: number;
+  ts: number;
+  boxes: Map<string, { observed: string; ver: string; drift: string; jobState?: string; job?: string }>;
+} | undefined {
   const row = (store.db.query("SELECT tick, ts FROM snapshots ORDER BY ts DESC, tick DESC LIMIT 1").get() ??
     undefined) as { tick: number; ts: number } | undefined;
   if (row === undefined) return undefined;
-  const rows = store.db
-    .query("SELECT name, observed, ver, drift FROM snapshot_boxes WHERE tick = ?")
-    .all(row.tick) as Array<{ name: string; observed: string; ver: string; drift: string }>;
-  const boxes = new Map<string, { observed: string; ver: string; drift: string }>();
-  for (const b of rows) boxes.set(b.name, { observed: b.observed, ver: b.ver, drift: b.drift });
+  // S3 (memo B3): also select `report` (present from userVersion() >= 5) so the
+  // job-slot fields can be extracted. Fail-open to undefined on any unreadable
+  // blob or a pre-v5 store, exactly as `toSnapshotLine` does.
+  const hasReport = store.userVersion() >= 5;
+  const cols = hasReport ? "name, observed, ver, drift, report" : "name, observed, ver, drift, NULL AS report";
+  const rows = store.db.query(`SELECT ${cols} FROM snapshot_boxes WHERE tick = ?`).all(row.tick) as Array<{
+    name: string;
+    observed: string;
+    ver: string;
+    drift: string;
+    report: string | null;
+  }>;
+  const boxes = new Map<string, { observed: string; ver: string; drift: string; jobState?: string; job?: string }>();
+  for (const b of rows) {
+    const fact: { observed: string; ver: string; drift: string; jobState?: string; job?: string } = {
+      observed: b.observed,
+      ver: b.ver,
+      drift: b.drift,
+    };
+    if (b.report !== null) {
+      try {
+        const parsed = JSON.parse(b.report) as { report?: { jobState?: string | null; job?: string | null } };
+        if (parsed.report?.jobState != null) fact.jobState = parsed.report.jobState;
+        if (parsed.report?.job != null) fact.job = parsed.report.job;
+      } catch {
+        /* malformed blob ⇒ fields stay absent, the safe direction */
+      }
+    }
+    boxes.set(b.name, fact);
+  }
   return { tick: row.tick, ts: row.ts, boxes };
 }

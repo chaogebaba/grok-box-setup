@@ -164,7 +164,7 @@ function guard(open: () => Handle | undefined): Handle | undefined {
 // --- POST /v1/leases (admin) -------------------------------------------------
 
 const RESERVED_REQUIRE = new Set(["max_disk_pct"]);
-const KNOWN_REQUIRE = new Set(["no_drift", "boxup_version", "allow_canary"]);
+const KNOWN_REQUIRE = new Set(["no_drift", "boxup_version", "allow_canary", "job_runner"]);
 
 export function handleLeaseAcquire(ctx: ServerContext, auth: RequestAuth, body: Record<string, unknown>): Response {
   const purpose = typeof body["purpose"] === "string" ? (body["purpose"] as string).trim() : "";
@@ -225,6 +225,10 @@ export function handleLeaseAcquire(ctx: ServerContext, auth: RequestAuth, body: 
       }
       reqSpec.boxup_version = r["boxup_version"] as string;
     }
+    if (r["job_runner"] !== undefined) {
+      if (typeof r["job_runner"] !== "boolean") return err.badBody("leases: require.job_runner must be a boolean");
+      reqSpec.job_runner = r["job_runner"] as boolean;
+    }
   }
 
   const h = openLeaseStoreWrite(ctx);
@@ -250,6 +254,8 @@ export function handleLeaseAcquire(ctx: ServerContext, auth: RequestAuth, body: 
         observed: s?.observed,
         ver: s?.ver,
         lease: leased.get(r.name),
+        jobState: s?.jobState,
+        job: s?.job,
       };
     });
 
