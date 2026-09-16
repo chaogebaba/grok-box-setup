@@ -32,7 +32,7 @@
 #   * NoState right after daemon start is not NeedsLogin — wait, don't mint
 set -u
 
-BOXUP_VERSION=5.6.2
+BOXUP_VERSION=5.6.3
 
 # The box user's PATH lacks /usr/sbin; nft, sshd and friends live there.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -1961,6 +1961,9 @@ recycle_tailscaled() {
   # Stamp BEFORE the kill: if this tick is slow or dies mid-recycle, the next
   # tick must still honor the cooldown instead of recycling again.
   date +%s > "$RUN_DIR/last-recycle" 2>/dev/null || true
+  # R6: a fresh recycle means the post-recycle NoState/Starting window (below,
+  # in tick_handle_reason) needs to log its one "waiting" line again.
+  rm -f "$RUN_DIR/recycle-wait-noted" 2>/dev/null || true
   kill "$pid" 2>/dev/null || true
   i=0
   while [ "$i" -lt 20 ]; do
@@ -2398,7 +2401,7 @@ KEEPAWAKE_STAMP="$RUN_DIR/last-keepawake"                   # main cadence stamp
 KEEPAWAKE_UNREACH_STAMP="$RUN_DIR/last-keepawake-unreach"   # 90 s retry floor
 KEEPAWAKE_UNREACH_WARN="$RUN_DIR/last-keepawake-unreach-warn"
 KEEPAWAKE_WARN_STAMP="$RUN_DIR/last-keepawake-warn"         # parked-approval WARN
-KEEPAWAKE_OFF_STAMP="$RUN_DIR/last-keepawake-off"           # `off` notice
+KEEPAWAKE_OFF_MARKER="$RUN_DIR/keepawake-off-noted"          # R1: on/off transition
 KEEPAWAKE_RC_FILE="$RUN_DIR/keepawake"                      # "<rc> <epoch>"
 # /workspace state: SURVIVES an image swap. The attempt log is the experiment's
 # raw data and the baseline is what makes the `jumps` token a per-install count
@@ -2559,12 +2562,25 @@ keepawake_guard() {
   now=$(date +%s)
   interval_min="$(keepawake_interval_min)"
 
-  # OFF: a no-op with a once-an-hour breadcrumb, so an operator reading the
-  # worker log can tell "configured off" from "silently broken".
+  # OFF: a no-op with a breadcrumb on the OFF TRANSITION ONLY (R1). This used
+  # to be an hourly breadcrumb — cheap per box, but ~60% of the fleet's log
+  # volume with keep-awake disabled fleet-wide since 2026-09-06. A marker file
+  # replaces the hourly stamp: absent -> entering off, write it and log once;
+  # present -> steady state, log nothing. The `keepawake=off` status token
+  # (keepawake_status_tokens) is unchanged — this only touches the log line.
   if [ "$interval_min" = 0 ]; then
-    keepawake_hourly "$KEEPAWAKE_OFF_STAMP" "$now" && \
+    if [ ! -f "$KEEPAWAKE_OFF_MARKER" ]; then
+      touch "$KEEPAWAKE_OFF_MARKER" 2>/dev/null || true
       log "keepawake: off ([keepawake] interval_min = 0)"
+    fi
     return 0
+  fi
+  # Leaving OFF: marker present means the previous tick(s) were off, so log
+  # the on-transition once and clear the marker so a future off period logs
+  # again.
+  if [ -f "$KEEPAWAKE_OFF_MARKER" ]; then
+    rm -f "$KEEPAWAKE_OFF_MARKER" 2>/dev/null || true
+    log "keepawake: on (interval_min = $interval_min)"
   fi
   interval_s=$((interval_min * 60))
 
@@ -3464,40 +3480,37 @@ cmd_job() {
   esac
 }
 
-# --- selfheal: worker --------------------------------------------------------
-# The actual tick body. Runs under the converge lock (via run_tick).
-do_tick() {
-  # Freeze checks first — they need the OLD heartbeat.
-  if pgrep -x tailscaled >/dev/null 2>&1; then
-    maybe_wake_recycle || true
-    recycle_offline_tailscaled || true
-  else
-    start_tailscaled || true
+# tick_handle_reason <reason>: what do_tick does with check_reason's verdict.
+# Factored out of do_tick so the R6 post-recycle quiet window is a plain
+# function the test suite can extract and drive directly (extract_fn_from),
+# the same way tests/test-boxup-keepawake.sh drives keepawake_guard.
+#
+# R6: recycle_tailscaled (selfheal) restarts tailscaled and the daemon spends
+# the next 2-3 ticks in backend=NoState or backend=Starting before it reaches
+# Running again — that is expected startup, not a fault. Without this guard
+# every one of those ticks logged "tick: unhealthy ... reason=backend=NoState"
+# and the THIRD one ran a full do_ensure_body and armed the 60 s backoff
+# (fail.repair), which then delayed the response to a REAL fault landing right
+# after a routine recycle. `recycled_recently` (last-recycle + the same
+# RECYCLE_COOLDOWN the recycle path itself honors) scopes the quiet window; it
+# is checked in ADDITION to the exact reason string, so an unrelated failure
+# (e.g. online=no, sshd=down) inside the same window is never swallowed —
+# that is still reported and repaired on the normal path.
+tick_handle_reason() {
+  local reason="$1"
+  if [ -n "$reason" ] && recycled_recently && \
+     { [ "$reason" = "backend=NoState (want Running)" ] || \
+       [ "$reason" = "backend=Starting (want Running)" ]; }; then
+    if [ ! -f "$RUN_DIR/recycle-wait-noted" ]; then
+      local rec=0 now_r
+      [ -f "$RUN_DIR/last-recycle" ] && rec=$(tr -d '[:space:]' < "$RUN_DIR/last-recycle" 2>/dev/null || echo 0)
+      case "$rec" in ''|*[!0-9]*) rec=0 ;; esac
+      now_r=$(date +%s)
+      log "tick: tailscaled starting after recycle ($((now_r - rec))s ago), waiting" >&2
+      touch "$RUN_DIR/recycle-wait-noted" 2>/dev/null || true
+    fi
+    return 0
   fi
-  # Write hb immediately after the checks: a slow recycle above must not leave
-  # a stale hb for the next tick to mistake for another freeze.
-  date +%s > "$RUN_DIR/hb" 2>/dev/null || true
-
-  ensure_forwarding || true
-  ensure_nat || true
-
-  # FLEET-BRAIN §1: supervise the out-of-band reverse tunnel every tick, like
-  # tailscaled/sshd. Unconfigured ([fleet].vps unset) is a silent no-op, so an
-  # un-enrolled box is unaffected. Runs regardless of the check-repair backoff
-  # (the tunnel is liveness the brain needs even while a box is unhealthy).
-  supervise_tunnel || true
-
-  # P1-1 (H12, unified): the tick's health probe IS `check_reason` — the SINGLE
-  # health predicate, so the tick and `boxup check` can never diverge. If any
-  # predicate fails, run the FULL do_ensure_body under this tick's lock (stop
-  # hand-picking which repair a tick may run: the tick's job is "if not
-  # converged, converge"). A persistently UNSATISFIABLE predicate is bounded by
-  # the SAME backoff shape as refresh (20→60→180→600s cap) with `repair=failing:N`
-  # in status and a log line naming the reason — never a blind fixed loop. The
-  # freeze/recycle above stays: it handles sleep/thaw liveness that check can't
-  # express, and it must run every tick regardless of the backoff window.
-  local reason
-  reason="$(check_reason)"
   if [ -n "$reason" ]; then
     local fails window now last
     fails=$(repair_fail_count)
@@ -3531,6 +3544,51 @@ do_tick() {
         ;;
     esac
   fi
+}
+
+# --- selfheal: worker --------------------------------------------------------
+# The actual tick body. Runs under the converge lock (via run_tick).
+do_tick() {
+  # Freeze checks first — they need the OLD heartbeat.
+  if pgrep -x tailscaled >/dev/null 2>&1; then
+    maybe_wake_recycle || true
+    recycle_offline_tailscaled || true
+  else
+    start_tailscaled || true
+  fi
+  # Write hb immediately after the checks: a slow recycle above must not leave
+  # a stale hb for the next tick to mistake for another freeze.
+  date +%s > "$RUN_DIR/hb" 2>/dev/null || true
+
+  ensure_forwarding || true
+  ensure_nat || true
+
+  # FLEET-BRAIN §1: supervise the out-of-band reverse tunnel every tick, like
+  # tailscaled/sshd. Unconfigured ([fleet].vps unset) is a silent no-op, so an
+  # un-enrolled box is unaffected. Runs regardless of the check-repair backoff
+  # (the tunnel is liveness the brain needs even while a box is unhealthy).
+  supervise_tunnel || true
+
+  # P1-1 (H12, unified): the tick's health probe IS `check_reason` — the SINGLE
+  # health predicate, so the tick and `boxup check` can never diverge. If any
+  # predicate fails, run the FULL do_ensure_body under this tick's lock (stop
+  # hand-picking which repair a tick may run: the tick's job is "if not
+  # converged, converge"). A persistently UNSATISFIABLE predicate is bounded by
+  # the SAME backoff shape as refresh (20→60→180→600s cap) with `repair=failing:N`
+  # in status and a log line naming the reason — never a blind fixed loop. The
+  # freeze/recycle above stays: it handles sleep/thaw liveness that check can't
+  # express, and it must run every tick regardless of the backoff window.
+  #
+  # ONE EXCEPTION (R6, gate r1 SHOULD-2): inside the post-recycle quiet window
+  # (tick_handle_reason, recycled_recently && reason is exactly
+  # backend=NoState/Starting) the tick deliberately does NOT run do_ensure_body
+  # even though `boxup check` still reports FAIL for the same reason — that is
+  # the whole point of the window (below the RECYCLE_COOLDOWN cap, and only for
+  # that one predicate). "Can never diverge" holds everywhere else; in this one
+  # bounded case `boxup check` and the tick disagree on purpose.
+  local reason
+  reason="$(check_reason)"
+  tick_handle_reason "$reason"
   date +%s > "$RUN_DIR/hb" 2>/dev/null || true
 }
 
