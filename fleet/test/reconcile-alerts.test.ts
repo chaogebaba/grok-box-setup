@@ -269,6 +269,16 @@ describe("incident dedup", () => {
     }
     expect(Object.keys(INCIDENT_OBSERVED_BY).sort()).toEqual([...INCIDENT_KINDS].sort());
   });
+
+  // Gate memo r1 SHOULD 3 (mutant N5): S1(e) only asserts every kind has SOME
+  // entry, not WHICH one. `incoherent-both-dead` is tunnel-derived
+  // (decide.ts row e, `tunnel === "down"`), so flipping its mapping to
+  // "devices" would re-arm it on any devices-readable tick — including the
+  // asleep ticks of a box flapping between incoherent and asleep, which is
+  // exactly the pager-flood shape this release exists to remove. Pin it.
+  test("SHOULD 3: incoherent-both-dead is status-observed, not devices-observed", () => {
+    expect(INCIDENT_OBSERVED_BY["incident:incoherent-both-dead"]).toBe("status");
+  });
 });
 
 
