@@ -1961,6 +1961,9 @@ recycle_tailscaled() {
   # Stamp BEFORE the kill: if this tick is slow or dies mid-recycle, the next
   # tick must still honor the cooldown instead of recycling again.
   date +%s > "$RUN_DIR/last-recycle" 2>/dev/null || true
+  # R6: a fresh recycle means the post-recycle NoState/Starting window (below,
+  # in tick_handle_reason) needs to log its one "waiting" line again.
+  rm -f "$RUN_DIR/recycle-wait-noted" 2>/dev/null || true
   kill "$pid" 2>/dev/null || true
   i=0
   while [ "$i" -lt 20 ]; do
@@ -3477,6 +3480,72 @@ cmd_job() {
   esac
 }
 
+# tick_handle_reason <reason>: what do_tick does with check_reason's verdict.
+# Factored out of do_tick so the R6 post-recycle quiet window is a plain
+# function the test suite can extract and drive directly (extract_fn_from),
+# the same way tests/test-boxup-keepawake.sh drives keepawake_guard.
+#
+# R6: recycle_tailscaled (selfheal) restarts tailscaled and the daemon spends
+# the next 2-3 ticks in backend=NoState or backend=Starting before it reaches
+# Running again — that is expected startup, not a fault. Without this guard
+# every one of those ticks logged "tick: unhealthy ... reason=backend=NoState"
+# and the THIRD one ran a full do_ensure_body and armed the 60 s backoff
+# (fail.repair), which then delayed the response to a REAL fault landing right
+# after a routine recycle. `recycled_recently` (last-recycle + the same
+# RECYCLE_COOLDOWN the recycle path itself honors) scopes the quiet window; it
+# is checked in ADDITION to the exact reason string, so an unrelated failure
+# (e.g. online=no, sshd=down) inside the same window is never swallowed —
+# that is still reported and repaired on the normal path.
+tick_handle_reason() {
+  local reason="$1"
+  if [ -n "$reason" ] && recycled_recently && \
+     { [ "$reason" = "backend=NoState (want Running)" ] || \
+       [ "$reason" = "backend=Starting (want Running)" ]; }; then
+    if [ ! -f "$RUN_DIR/recycle-wait-noted" ]; then
+      local rec=0 now_r
+      [ -f "$RUN_DIR/last-recycle" ] && rec=$(tr -d '[:space:]' < "$RUN_DIR/last-recycle" 2>/dev/null || echo 0)
+      case "$rec" in ''|*[!0-9]*) rec=0 ;; esac
+      now_r=$(date +%s)
+      log "tick: tailscaled starting after recycle ($((now_r - rec))s ago), waiting" >&2
+      touch "$RUN_DIR/recycle-wait-noted" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  if [ -n "$reason" ]; then
+    local fails window now last
+    fails=$(repair_fail_count)
+    window=$(refresh_backoff_window "$fails")
+    now=$(date +%s); last=0
+    [ -f "$RUN_DIR/last-repair" ] && last=$(tr -d '[:space:]' < "$RUN_DIR/last-repair" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$window" ]; then
+      log "tick: unhealthy (reason=$reason) but repair backing off (window=${window}s fails=${fails})" >&2
+    else
+      log "tick: unhealthy (reason=$reason) — running full do_ensure_body under the lock" >&2
+      echo "$now" > "$RUN_DIR/last-repair" 2>/dev/null || true
+      do_ensure_body || true
+      # Re-evaluate: a cleared predicate resets the backoff, a persistent one
+      # stretches it (bounded, visible via repair=failing:N in status).
+      if [ -n "$(check_reason)" ]; then
+        fails=$((fails + 1))
+        echo "$fails" > "$RUN_DIR/fail.repair" 2>/dev/null || true
+        window=$(refresh_backoff_window "$fails")
+        log "tick: still unhealthy after repair (consecutive=${fails}, next window=${window}s)" >&2
+      else
+        echo 0 > "$RUN_DIR/fail.repair" 2>/dev/null || true
+      fi
+    fi
+  else
+    # Healthy: reset the repair backoff and do the cheap idempotent maintenance.
+    echo 0 > "$RUN_DIR/fail.repair" 2>/dev/null || true
+    case "$(read_box_name || true)" in
+      grok-box-[0-9]*)
+        pgrep -x tailscaled >/dev/null 2>&1 && refresh_exitnode || true
+        ;;
+    esac
+  fi
+}
+
 # --- selfheal: worker --------------------------------------------------------
 # The actual tick body. Runs under the converge lock (via run_tick).
 do_tick() {
@@ -3511,39 +3580,7 @@ do_tick() {
   # express, and it must run every tick regardless of the backoff window.
   local reason
   reason="$(check_reason)"
-  if [ -n "$reason" ]; then
-    local fails window now last
-    fails=$(repair_fail_count)
-    window=$(refresh_backoff_window "$fails")
-    now=$(date +%s); last=0
-    [ -f "$RUN_DIR/last-repair" ] && last=$(tr -d '[:space:]' < "$RUN_DIR/last-repair" 2>/dev/null || echo 0)
-    case "$last" in ''|*[!0-9]*) last=0 ;; esac
-    if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$window" ]; then
-      log "tick: unhealthy (reason=$reason) but repair backing off (window=${window}s fails=${fails})" >&2
-    else
-      log "tick: unhealthy (reason=$reason) — running full do_ensure_body under the lock" >&2
-      echo "$now" > "$RUN_DIR/last-repair" 2>/dev/null || true
-      do_ensure_body || true
-      # Re-evaluate: a cleared predicate resets the backoff, a persistent one
-      # stretches it (bounded, visible via repair=failing:N in status).
-      if [ -n "$(check_reason)" ]; then
-        fails=$((fails + 1))
-        echo "$fails" > "$RUN_DIR/fail.repair" 2>/dev/null || true
-        window=$(refresh_backoff_window "$fails")
-        log "tick: still unhealthy after repair (consecutive=${fails}, next window=${window}s)" >&2
-      else
-        echo 0 > "$RUN_DIR/fail.repair" 2>/dev/null || true
-      fi
-    fi
-  else
-    # Healthy: reset the repair backoff and do the cheap idempotent maintenance.
-    echo 0 > "$RUN_DIR/fail.repair" 2>/dev/null || true
-    case "$(read_box_name || true)" in
-      grok-box-[0-9]*)
-        pgrep -x tailscaled >/dev/null 2>&1 && refresh_exitnode || true
-        ;;
-    esac
-  fi
+  tick_handle_reason "$reason"
   date +%s > "$RUN_DIR/hb" 2>/dev/null || true
 }
 

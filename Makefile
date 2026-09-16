@@ -15,6 +15,7 @@ lint:
 	bash -n tests/test-boxup-jobs.sh
 	bash -n tests/keepawake-readout.sh
 	bash -n tests/test-boxup-watchdog.sh
+	bash -n tests/test-boxup-recycle-quiet.sh
 	bash -n tests/test-make-lint.sh
 	@if command -v shellcheck >/dev/null; then shellcheck -S warning boxup install.sh box-bootstrap.sh vps/install-vps.sh fleet/scripts/release-build.sh fleet/scripts/release-check.sh fleet/scripts/release-publish.sh fleet/scripts/run-tests.sh tests/keepawake-readout.sh tests/test-release-check.sh; else echo "shellcheck not installed; skipped"; fi
 
@@ -33,6 +34,7 @@ test: release-check
 	bash tests/test-boxup-disk-guard.sh
 	bash tests/test-boxup-keepawake.sh
 	bash tests/test-boxup-watchdog.sh
+	bash tests/test-boxup-recycle-quiet.sh
 	bash tests/test-boxup-jobs.sh
 	bash tests/test-install-boxup-symlink.sh
 	bash tests/test-makefile-targets.sh
