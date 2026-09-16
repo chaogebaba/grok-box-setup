@@ -29,6 +29,7 @@ import { tailscaleDevicesApi, resolveTokenFile, fetchTransport } from "./tailsca
 import { runUpgradePass, takeLockAndReexec, RC, type UpgradeArgs, type UpgradeDeps } from "./upgrade.ts";
 import { fsTelegramSource, fetchPoster, notify as notifyFn } from "./notify.ts";
 import { cliReconcile } from "./reconcile/cli-reconcile.ts";
+import type { Spawner } from "./reexec.ts";
 import { buildGitSha } from "./build-flags.ts";
 import { log } from "./log.ts";
 
@@ -509,12 +510,13 @@ async function runRolloutCmd(
   return runUpgradeCmd(forced, env, cfg, rollout, runner, /*alias*/ true);
 }
 
-async function runReconcileCmd(
+export async function runReconcileCmd(
   rest: string[],
   env: ReturnType<typeof resolveEnv>,
   cfg: ParsedConfig,
   rollout: ReturnType<typeof resolveRollout>,
   argv: string[],
+  spawner?: Spawner, // test-only injection point; production uses the real spawner.
 ): Promise<number> {
   let apply = false;
   let debugExec = false;
@@ -530,10 +532,16 @@ async function runReconcileCmd(
       return RC.USAGE;
     }
   }
-  const rc = await cliReconcile({ env, cfg, rollout, apply, debugExec, argv, version: PKG_VERSION });
+  const rc = await cliReconcile({ env, cfg, rollout, apply, debugExec, argv, version: PKG_VERSION, spawner });
   // U4: cliReconcile's own arms log, but a rc it invents without a line would
   // otherwise be silent — name the code so the tick is never a mystery.
-  if (rc !== RC.OK) log(`reconcile: pass finished with rc ${rc} (see the lines above; grokfleet rc)`);
+  // F3: gated on GROKFLEET_LOCKED (mirrors runUpgradeCmd's early-return at
+  // apply&&!locked) so only the locked child that actually ran the tick logs
+  // this — the unlocked parent already returns the re-exec'd child's own rc,
+  // and logging it again here would double the line for every failed tick.
+  // The parent's own refusal arms (flock missing/held) already log their own
+  // line, so nothing goes silent.
+  if (rc !== RC.OK && env.GROKFLEET_LOCKED) log(`reconcile: pass finished with rc ${rc} (see the lines above; grokfleet rc)`);
   return rc;
 }
 

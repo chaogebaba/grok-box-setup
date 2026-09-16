@@ -5,8 +5,10 @@
 
 import { test, expect, describe } from "bun:test";
 import { cliReconcile, assembleTickDeps, type ReconcileCliDeps } from "../src/reconcile/cli-reconcile.ts";
+import { runReconcileCmd } from "../src/cli.ts";
 import { parseConfig, loadConfig } from "../src/config.ts";
 import { testEnv, testRollout } from "./helpers.ts";
+import { setLogSink } from "../src/log.ts";
 import type { ReexecResult } from "../src/reexec.ts";
 
 function deps(spawnRes: ReexecResult, over: Partial<ReconcileCliDeps> = {}): ReconcileCliDeps {
@@ -42,6 +44,54 @@ describe("T13/m15 cliReconcile lock rc", () => {
     // The spawner represents the flock child having run the locked tick to rc 0.
     const rc = await cliReconcile(deps({ code: 0, launched: true }));
     expect(rc).toBe(0);
+  });
+});
+
+// --- F3: "pass finished with rc N" logs once per failed tick, not twice ----
+// (VPS audit r3). The unlocked parent re-execs under flock and forwards the
+// locked child's rc; only the process that actually ran the tick should name
+// it (gated on GROKFLEET_LOCKED, mirroring runUpgradeCmd's early-return).
+
+describe("F3 reconcile pass-finished line logs once", () => {
+  test("unlocked parent forwarding a failed child's rc does NOT log the summary", async () => {
+    const logs: string[] = [];
+    const prev = setLogSink((l) => logs.push(l));
+    try {
+      // Spawner stands in for a re-exec whose locked child ran the tick and
+      // exited 1 — the child, in its own separate process, owns the summary.
+      const rc = await runReconcileCmd(
+        ["--dry-run"],
+        testEnv({ GROKFLEET_LOCKED: false }),
+        parseConfig("", "/x"),
+        testRollout(),
+        ["bun", "cli.ts", "reconcile", "--dry-run"],
+        async () => ({ code: 1, launched: true }),
+      );
+      expect(rc).toBe(1);
+      expect(logs.filter((l) => l.includes("pass finished with rc"))).toHaveLength(0);
+    } finally {
+      setLogSink(prev);
+    }
+  });
+
+  test("locked child that fails the tick logs the summary exactly once", async () => {
+    const logs: string[] = [];
+    const prev = setLogSink((l) => logs.push(l));
+    try {
+      // GROKFLEET_LOCKED: true ⇒ this IS the re-exec'd child; an unwritable
+      // FLEET_STATE makes assembleTickDeps throw ConfigError (rc 3 / STORE).
+      const rc = await runReconcileCmd(
+        ["--dry-run"],
+        testEnv({ GROKFLEET_LOCKED: true, FLEET_STATE: "/proc/1/grokfleet-nope" }),
+        await loadConfig("/nonexistent-config.toml"),
+        testRollout(),
+        ["bun", "cli.ts", "reconcile", "--dry-run"],
+      );
+      expect(rc).toBe(3);
+      expect(logs.filter((l) => l.includes("pass finished with rc"))).toHaveLength(1);
+    } finally {
+      setLogSink(prev);
+    }
   });
 });
 
