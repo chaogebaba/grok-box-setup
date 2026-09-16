@@ -58,7 +58,7 @@ import { makeRenameDeps } from "./commands/rename-wiring.ts";
 import { renderRcTable, renderRcJson } from "./commands/rc.ts";
 import { wantsJson } from "./commands/json-flag.ts";
 
-const PKG_VERSION = "5.15.0"; // 5.15.0: quiet the pager — S1 gates incident re-arm per kind (status-seen vs devices-seen) instead of clearing all three on any unobserved tick, S2' suppresses repair-failing while disk-fail is active (one fault, one page), and SHOULD-1 stops a devices-GET failure from restarting the asleep/incoherent timers
+const PKG_VERSION = "5.16.0"; // 5.16.0: agent-facing contracts from the r1 audit — S3 lease eligibility knows about a held job slot (require.job_runner opt-in, job placement refused by default), S4 `grokfleet list` gains an OBSERVED column served from the typed ApiClient
 
 async function gitShaFromGit(): Promise<string> {
   try {

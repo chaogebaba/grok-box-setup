@@ -78,9 +78,11 @@ function seedFleet(
         apply: true,
         canary: null,
         boxes: boxes.map((b) =>
-          snapBox(b.name, b.ver ?? WITH_RUNNER, {
-            ...(b.jobState === undefined ? {} : { report: minimalReport(b.jobState, b.job ?? null) }),
-          }),
+          snapBox(
+            b.name,
+            b.ver ?? WITH_RUNNER,
+            b.jobState === undefined ? {} : { report: minimalReport(b.jobState, b.job ?? null) },
+          ),
         ),
       },
       observed,
