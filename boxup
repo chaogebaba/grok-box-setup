@@ -3578,6 +3578,14 @@ do_tick() {
   # in status and a log line naming the reason — never a blind fixed loop. The
   # freeze/recycle above stays: it handles sleep/thaw liveness that check can't
   # express, and it must run every tick regardless of the backoff window.
+  #
+  # ONE EXCEPTION (R6, gate r1 SHOULD-2): inside the post-recycle quiet window
+  # (tick_handle_reason, recycled_recently && reason is exactly
+  # backend=NoState/Starting) the tick deliberately does NOT run do_ensure_body
+  # even though `boxup check` still reports FAIL for the same reason — that is
+  # the whole point of the window (below the RECYCLE_COOLDOWN cap, and only for
+  # that one predicate). "Can never diverge" holds everywhere else; in this one
+  # bounded case `boxup check` and the tick disagree on purpose.
   local reason
   reason="$(check_reason)"
   tick_handle_reason "$reason"
