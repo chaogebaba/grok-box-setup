@@ -439,6 +439,9 @@ describe("L2 — POST /v1/leases", () => {
       [{ purpose: "x", box: "not-a-box" }, "box"],
       [{ purpose: "x", require: { max_disk_pct: 80 } }, "max_disk_pct"],
       [{ purpose: "x", require: { nonsense: 1 } }, "nonsense"],
+      // SHOULD-3 (gate r1): job_runner's boolean type check, by name — the
+      // string "true" must not slip through as truthy.
+      [{ purpose: "x", require: { job_runner: "true" } }, "job_runner"],
     ];
     for (const [body, needle] of cases) {
       const res = await fetch(postReq("/v1/leases", ADMIN, body));
