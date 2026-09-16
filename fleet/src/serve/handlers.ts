@@ -14,7 +14,7 @@ import { withReconcileLock } from "./lock.ts";
 import { writeAudit } from "./audit.ts";
 import { withCapture } from "./log-capture.ts";
 import type { SnapshotBox, SnapshotLine } from "../history/schema.ts";
-import { observedFor, readLatestSnapshot, readSnapshotSlice } from "../store/snapshots.ts";
+import { observedFor, readLatestBoxFacts, readLatestSnapshot, readSnapshotSlice } from "../store/snapshots.ts";
 import type { Observed } from "../reconcile/observe.ts";
 import type { Phase } from "../store/state.ts";
 import { pushManaged } from "../actions/config-push.ts";
@@ -64,6 +64,27 @@ function latestSnapshot(env: ServerContext["env"]): SnapshotLine | undefined {
   } finally {
     h.close();
   }
+}
+
+/**
+ * S4 (memo B4): `GET /v1/fleet`'s per-box `observed` map, from the LATEST
+ * snapshot row only (never `observedFor`'s "newest tick that recorded this
+ * box" walk-back — the whole point is one word, from one tick, verbatim).
+ * Empty when there is no store, it predates the `report`/observed columns'
+ * generation, or the store predates v2.
+ */
+function fleetObservedMap(env: ServerContext["env"]): Map<string, string> {
+  const out = new Map<string, string>();
+  const h = openReadHandle(env);
+  try {
+    if (h.store === undefined || h.store.userVersion() < 2) return out;
+    const facts = readLatestBoxFacts(h.store);
+    if (facts === undefined) return out;
+    for (const [name, f] of facts.boxes) out.set(name, f.observed);
+  } finally {
+    h.close();
+  }
+  return out;
 }
 
 /** Live per-box marker mirror read from FLEET_STATE (TUI-D4 merge inputs). */
@@ -267,10 +288,15 @@ export function handleFleet(ctx: ServerContext, auth: RequestAuth): Response {
   // per box — so the TUI's JOB column and its `jobs=<n>` count come from the
   // poll it already makes. `SnapshotBox`/`SnapshotLine`/`/v1/history` untouched.
   const jobs = fleetJobMap(ctx);
+  // S4 (memo B4): `observed` rides the same single-endpoint rule — ONE read of
+  // the latest snapshot row, not one per box — so `grokfleet list` needs one
+  // request rather than one per box.
+  const observedMap = fleetObservedMap(ctx.env);
   const boxes = (latest?.boxes ?? []).map((b) => ({
     ...mergeBox(ctx.env, b),
     lease: leases.get(b.name) ?? null,
     job: jobs.get(b.name) ?? null,
+    observed: observedMap.get(b.name),
   }));
   // `apply` is read LIVE from the config; every OTHER field still comes from the
   // snapshot (and tick_age_s / staleness are unchanged).
